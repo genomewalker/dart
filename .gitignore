@@ -1,0 +1,29 @@
+# Build
+build/
+*.o
+*.a
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Output files
+*.gff
+*.faa
+*.fna
+
+# Temporary
+*.tmp
+*.log
+
+# Large model files (keep in models/ but ignore if regenerated)
+# models/*.pt
+# models/*.npz
