@@ -1,0 +1,29 @@
+name: ancient-gene-predictor
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+
+dependencies:
+  # C++ compiler and build tools
+  - gcc_linux-64>=10.0
+  - gxx_linux-64>=10.0
+  - cmake>=3.18
+  - make
+
+  # Required libraries
+  - zlib
+
+  # Optional: for parallelization
+  - openmp
+
+  # Python for testing/analysis (optional)
+  - python>=3.8
+  - numpy
+  - scipy
+  - matplotlib
+  - biopython
+
+  # Development tools
+  - gdb
+  - valgrind
