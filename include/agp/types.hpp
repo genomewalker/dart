@@ -154,12 +154,14 @@ struct alignas(64) Gene {
     Score coding_prob;       // Probability of being coding (for fragments)
     Score frame_score;       // Frame selection confidence score
     Score damage_score = 0;  // Observed damage magnitude (0-6 scale: T's at 5' + A's at 3')
+    Score strand_conf = 0.5f; // Strand confidence (0.5 = uncertain, 1.0 = confident)
     std::string sequence;    // Predicted gene sequence (potentially damaged)
     std::string protein;     // Translated protein sequence (from damaged DNA)
     std::string corrected_sequence;   // Damage-corrected DNA sequence
     std::string corrected_protein;    // Damage-corrected protein sequence
     size_t dna_corrections = 0;       // Number of DNA corrections made
     size_t aa_corrections = 0;        // Number of amino acid changes from correction
+    char correction_pattern = 'N';    // 'F'=forward strand, 'R'=reverse strand, 'N'=none
 };
 
 // Damage profile for a sequence

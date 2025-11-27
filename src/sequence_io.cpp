@@ -396,17 +396,40 @@ void GeneWriter::write_gene(const std::string& sequence_id,
                             int gene_num,
                             const std::string& source) {
     // Use snprintf to avoid ostringstream allocation overhead
-    int len = snprintf(impl_->fmt_buffer_, sizeof(impl_->fmt_buffer_),
-        "%s\t%s\tgene\t%u\t%u\t%g\t%c\t.\tID=gene%d;ancient_prob=%g;damage_pct=%g\n",
-        sequence_id.c_str(),
-        source.c_str(),
-        gene.start + 1,  // GFF is 1-based
-        gene.end,
-        gene.score,
-        gene.is_forward ? '+' : '-',
-        gene_num,
-        gene.ancient_prob,
-        gene.damage_score);
+    // Include frame= attribute for validation tools
+    // Include correction stats if present
+    int len;
+    if (gene.dna_corrections > 0) {
+        len = snprintf(impl_->fmt_buffer_, sizeof(impl_->fmt_buffer_),
+            "%s\t%s\tgene\t%u\t%u\t%g\t%c\t.\tID=gene%d;frame=%d;ancient_prob=%g;damage_pct=%g;strand_conf=%g;dna_corr=%zu;aa_corr=%zu\n",
+            sequence_id.c_str(),
+            source.c_str(),
+            gene.start + 1,  // GFF is 1-based
+            gene.end,
+            gene.score,
+            gene.is_forward ? '+' : '-',
+            gene_num,
+            gene.frame,
+            gene.ancient_prob,
+            gene.damage_score,
+            gene.strand_conf,
+            gene.dna_corrections,
+            gene.aa_corrections);
+    } else {
+        len = snprintf(impl_->fmt_buffer_, sizeof(impl_->fmt_buffer_),
+            "%s\t%s\tgene\t%u\t%u\t%g\t%c\t.\tID=gene%d;frame=%d;ancient_prob=%g;damage_pct=%g;strand_conf=%g\n",
+            sequence_id.c_str(),
+            source.c_str(),
+            gene.start + 1,  // GFF is 1-based
+            gene.end,
+            gene.score,
+            gene.is_forward ? '+' : '-',
+            gene_num,
+            gene.frame,
+            gene.ancient_prob,
+            gene.damage_score,
+            gene.strand_conf);
+    }
     impl_->write(impl_->fmt_buffer_, len);
 }
 
@@ -700,18 +723,33 @@ void FastaWriter::write_genes_nucleotide(const std::string& sequence_id,
         const auto& gene = genes[i];
         impl_->gene_counter_++;
 
+        // Use corrected sequence if available, otherwise original
+        const std::string& output_seq = !gene.corrected_sequence.empty() ?
+            gene.corrected_sequence : gene.sequence;
+
         // Use snprintf to avoid ostringstream allocation
         char id_buf[64];
         snprintf(id_buf, sizeof(id_buf), "gene_%d", impl_->gene_counter_);
 
-        int desc_len = snprintf(impl_->fmt_buffer_, sizeof(impl_->fmt_buffer_),
-            "%s_gene_%zu %c %u..%u score=%g ancient_prob=%g damage_pct=%g",
-            sequence_id.c_str(), i + 1,
-            gene.is_forward ? '+' : '-',
-            gene.start, gene.end,
-            gene.score, gene.ancient_prob, gene.damage_score);
+        int desc_len;
+        if (gene.dna_corrections > 0) {
+            desc_len = snprintf(impl_->fmt_buffer_, sizeof(impl_->fmt_buffer_),
+                "%s_gene_%zu %c %u..%u score=%g ancient_prob=%g damage_pct=%g dna_corr=%zu",
+                sequence_id.c_str(), i + 1,
+                gene.is_forward ? '+' : '-',
+                gene.start, gene.end,
+                gene.score, gene.ancient_prob, gene.damage_score,
+                gene.dna_corrections);
+        } else {
+            desc_len = snprintf(impl_->fmt_buffer_, sizeof(impl_->fmt_buffer_),
+                "%s_gene_%zu %c %u..%u score=%g ancient_prob=%g damage_pct=%g",
+                sequence_id.c_str(), i + 1,
+                gene.is_forward ? '+' : '-',
+                gene.start, gene.end,
+                gene.score, gene.ancient_prob, gene.damage_score);
+        }
 
-        write_sequence(id_buf, std::string(impl_->fmt_buffer_, desc_len), gene.sequence);
+        write_sequence(id_buf, std::string(impl_->fmt_buffer_, desc_len), output_seq);
     }
 }
 
@@ -721,41 +759,32 @@ void FastaWriter::write_genes_protein(const std::string& sequence_id,
         const auto& gene = genes[i];
         impl_->gene_counter_++;
 
+        // Always output the original protein (what's actually in the DNA)
+        // Corrected protein is metadata, not the biological sequence
+        const std::string& output_protein = gene.protein;
+
         char id_buf[64];
         snprintf(id_buf, sizeof(id_buf), "protein_%d", impl_->gene_counter_);
 
         int desc_len;
-        if (gene.dna_corrections > 0 || gene.aa_corrections > 0) {
+        if (gene.aa_corrections > 0) {
             desc_len = snprintf(impl_->fmt_buffer_, sizeof(impl_->fmt_buffer_),
-                "%s_gene_%zu %c %u..%u length=%zuaa damage_pct=%g dna_corr=%zu aa_corr=%zu",
+                "%s_gene_%zu %c %u..%u length=%zuaa damage_pct=%g aa_corr=%zu",
                 sequence_id.c_str(), i + 1,
                 gene.is_forward ? '+' : '-',
                 gene.start, gene.end,
-                gene.protein.length(), gene.damage_score,
-                gene.dna_corrections, gene.aa_corrections);
+                output_protein.length(), gene.damage_score,
+                gene.aa_corrections);
         } else {
             desc_len = snprintf(impl_->fmt_buffer_, sizeof(impl_->fmt_buffer_),
                 "%s_gene_%zu %c %u..%u length=%zuaa damage_pct=%g",
                 sequence_id.c_str(), i + 1,
                 gene.is_forward ? '+' : '-',
                 gene.start, gene.end,
-                gene.protein.length(), gene.damage_score);
+                output_protein.length(), gene.damage_score);
         }
 
-        write_sequence(id_buf, std::string(impl_->fmt_buffer_, desc_len), gene.protein);
-
-        // If corrections were made, also output the corrected protein
-        if (!gene.corrected_protein.empty() && gene.aa_corrections > 0) {
-            snprintf(id_buf, sizeof(id_buf), "protein_%d_corrected", impl_->gene_counter_);
-            desc_len = snprintf(impl_->fmt_buffer_, sizeof(impl_->fmt_buffer_),
-                "%s_gene_%zu_corrected %c %u..%u length=%zuaa damage_corrected=true",
-                sequence_id.c_str(), i + 1,
-                gene.is_forward ? '+' : '-',
-                gene.start, gene.end,
-                gene.corrected_protein.length());
-
-            write_sequence(id_buf, std::string(impl_->fmt_buffer_, desc_len), gene.corrected_protein);
-        }
+        write_sequence(id_buf, std::string(impl_->fmt_buffer_, desc_len), output_protein);
     }
 }
 

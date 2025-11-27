@@ -9,6 +9,21 @@
 namespace agp {
 
 /**
+ * Terminal region damage detection result
+ * Focuses on first/last 15bp where damage signal is strongest
+ */
+struct TerminalDamageResult {
+    float damage_score_5prime;      // Damage score from 5' terminal region (0-1)
+    float damage_score_3prime;      // Damage score from 3' terminal region (0-1)
+    float combined_damage_score;    // Combined damage score (0-1)
+    int damaged_hexamers_5prime;    // Count of high-probability damage hexamers at 5'
+    int damaged_hexamers_3prime;    // Count of high-probability damage hexamers at 3'
+    int total_hexamers_5prime;      // Total hexamers analyzed at 5'
+    int total_hexamers_3prime;      // Total hexamers analyzed at 3'
+    bool is_likely_damaged;         // True if damage score exceeds threshold
+};
+
+/**
  * Ancient DNA damage model
  *
  * Implements position-dependent damage patterns characteristic of ancient DNA:
@@ -85,6 +100,12 @@ public:
                                       float delta_background);
 
     /**
+     * Update damage model from sample-wide damage profile (Pass 1 results)
+     * This ensures Pass 2 predictions use the actual observed damage patterns
+     */
+    void update_from_sample_profile(const struct SampleDamageProfile& profile);
+
+    /**
      * Create damage model by estimating from sequences
      * This infers damage patterns from codon frequency anomalies
      */
@@ -101,7 +122,7 @@ public:
      * Create a damage profile with caching for high-throughput processing
      * Thread-safe for concurrent access
      */
-    const DamageProfile& create_profile_cached(size_t seq_len);
+    const DamageProfile& create_profile_cached(size_t seq_len) const;
 
     /**
      * Calculate the likelihood that a sequence exhibits ancient DNA damage
@@ -150,6 +171,158 @@ public:
         const std::string& dna_seq,
         const std::string& protein_seq,
         float confidence_threshold = 0.3f) const;
+
+    /**
+     * Dual-strand damage correction for dsDNA libraries
+     *
+     * For double-stranded library preparation, reads come from both strands:
+     * - Forward strand reads: C→T at 5', G→A at 3'
+     * - Reverse strand reads: G→A at 5', C→T at 3'
+     *
+     * This method tries both correction patterns and returns the one that
+     * produces better protein quality (fewer stop codons, better codon usage).
+     *
+     * @param seq DNA sequence to correct
+     * @param confidence_threshold Base threshold for correction
+     * @param frame Reading frame offset (0, 1, or 2), or -1 if unknown
+     * @return Tuple of (corrected sequence, number of corrections, chosen pattern: 'F'=forward, 'R'=reverse)
+     */
+    std::tuple<std::string, size_t, char> correct_damage_dual(
+        const std::string& seq,
+        float confidence_threshold,
+        int frame) const;
+
+    /**
+     * Score a DNA sequence based on protein quality
+     * Used to compare different correction strategies
+     * Lower score is better (fewer problems)
+     */
+    static float score_protein_quality(const std::string& dna, int frame);
+
+    /**
+     * Sample-profile-aware damage correction
+     *
+     * Uses the sample-wide damage profile from Phase 1 to make better correction
+     * decisions, and scales the correction threshold by the per-read ancient_prob.
+     *
+     * @param seq DNA sequence to correct
+     * @param sample_profile Sample-wide damage profile from Phase 1
+     * @param ancient_prob Per-read damage probability (0-1)
+     * @param frame Reading frame offset (0, 1, or 2), or -1 if unknown
+     * @return Pair of (corrected sequence, number of corrections made)
+     */
+    std::pair<std::string, size_t> correct_damage_with_profile(
+        const std::string& seq,
+        const SampleDamageProfile& sample_profile,
+        float ancient_prob,
+        int frame) const;
+
+    /**
+     * Bayesian stop codon correction
+     *
+     * Uses sample-wide damage patterns to fix stop codons that are likely
+     * damage artifacts. Stop codons in coding regions are rare, so when we
+     * see one at a position with high damage probability, it's likely spurious.
+     *
+     * Damage-induced stop codons:
+     * - C→T: CAA→TAA, CAG→TAG, CGA→TGA (first position)
+     * - G→A: TGG→TGA (third position)
+     *
+     * For dsDNA libraries, we also consider reverse patterns:
+     * - G→A at 5': GAA→TAA (complement), GGA→TGA
+     * - C→T at 3': TGC→TGA (complement)
+     *
+     * @param seq DNA sequence
+     * @param seq_len Sequence length
+     * @param frame Reading frame (0, 1, 2)
+     * @return Pair of (corrected sequence, number of stop codons fixed)
+     */
+    std::pair<std::string, size_t> correct_stop_codons_bayesian(
+        const std::string& seq,
+        int frame) const;
+
+    /**
+     * Calculate probability that a stop codon at given position is damage-induced
+     * Uses Bayesian inference with position-dependent damage rates
+     *
+     * @param codon The observed stop codon (TAA, TAG, TGA)
+     * @param codon_start Position of codon start in sequence
+     * @param seq_len Total sequence length
+     * @return Probability (0-1) that this stop is damage-induced
+     */
+    float stop_codon_damage_probability(
+        const std::string& codon,
+        size_t codon_start,
+        size_t seq_len) const;
+
+    /**
+     * Calculate amino acid probability distribution for a codon
+     * considering position-dependent damage rates.
+     *
+     * For each observed codon, calculates P(AA | observed_codon, position, damage)
+     * by considering all possible original codons that could have been damaged
+     * to produce the observed sequence.
+     *
+     * @param codon Observed codon (3 nucleotides)
+     * @param codon_start Position of codon in sequence
+     * @param seq_len Total sequence length
+     * @return Array of 21 probabilities (20 amino acids + stop)
+     *         Indices: A=0, C=1, D=2, E=3, F=4, G=5, H=6, I=7, K=8, L=9,
+     *                  M=10, N=11, P=12, Q=13, R=14, S=15, T=16, V=17, W=18, Y=19, *=20
+     */
+    std::array<float, 21> calculate_aa_probabilities(
+        const std::string& codon,
+        size_t codon_start,
+        size_t seq_len) const;
+
+    /**
+     * Translate DNA with damage-aware probability distribution
+     * Returns the most likely protein and per-position confidence
+     *
+     * @param seq DNA sequence
+     * @param frame Reading frame (0, 1, 2)
+     * @return Pair of (protein sequence, per-position confidence scores)
+     */
+    std::pair<std::string, std::vector<float>> translate_with_confidence(
+        const std::string& seq,
+        int frame) const;
+
+    /**
+     * Detect damage using GTDB hexamer frequencies in terminal regions
+     *
+     * Analyzes only the first and last 15bp of a sequence, where ancient DNA
+     * damage signal is strongest. Uses GTDB-derived hexamer rarity to identify
+     * hexamers that are likely damage artifacts (rare in real coding sequences
+     * but common when their undamaged versions exist).
+     *
+     * Key insight: Hexamers starting with TGA, TAG, TAA (stop codons) are
+     * essentially absent from real coding sequences. Their presence in the
+     * terminal 15bp strongly indicates C→T damage at the first position.
+     *
+     * @param seq DNA sequence to analyze
+     * @param terminal_length Maximum positions from each end to analyze (default 15)
+     * @return TerminalDamageResult with damage scores and hexamer counts
+     */
+    static TerminalDamageResult detect_terminal_damage(
+        const std::string& seq,
+        size_t terminal_length = 15);
+
+    /**
+     * Enhanced stop codon damage probability using GTDB hexamer frequencies
+     *
+     * Combines position-dependent damage rates with GTDB hexamer rarity
+     * to calculate probability that a stop codon is damage-induced.
+     * Hexamers that are rare in GTDB (like TGA*) get higher damage probability.
+     *
+     * @param codon The observed stop codon (TAA, TAG, TGA)
+     * @param codon_start Position of codon start in sequence
+     * @param seq Full sequence (for hexamer context)
+     * @return Probability (0-1) that this stop is damage-induced
+     */
+    float stop_codon_damage_probability_gtdb(
+        const std::string& codon,
+        size_t codon_start,
+        const std::string& seq) const;
 
     // Getters
     float lambda_5prime() const { return lambda_5prime_; }
