@@ -7,6 +7,7 @@
 
 #include "agp/frame_selector.hpp"
 #include "agp/codon_tables.hpp"
+#include "agp/hexamer_damage_lookup.hpp"
 #include <cmath>
 #include <algorithm>
 #include <array>
@@ -964,222 +965,220 @@ float FrameSelector::estimate_ancient_prob_codon_aware(
 
     if (seq.length() < 15) return 0.5f;
 
-    size_t len = seq.length();
-    float log_odds = 0.0f;
+    // ==========================================================================
+    // BAYESIAN LIKELIHOOD-BASED DAMAGE DETECTION
+    //
+    // Uses sample profile's position-specific damage rates to calculate:
+    //   log_LR = sum over positions of log(P(base|ancient) / P(base|modern))
+    //
+    // Key insight: Ancient DNA damage shows EXPONENTIAL DECAY from termini
+    // Position 0 has highest damage, decaying with distance according to lambda
+    // Sample profile gives us actual damage rates at each position
+    // ==========================================================================
 
-    // =========================================================================
-    // FEATURE 1: Terminal base patterns (standard damage signal)
-    // =========================================================================
-    if (fast_upper(seq[0]) == 'T') log_odds += 0.6f;
-    else if (fast_upper(seq[0]) == 'C') log_odds -= 0.15f;
+    const size_t len = seq.length();
+    float log_lr = 0.0f;  // Log-likelihood ratio
 
-    if (fast_upper(seq[len - 1]) == 'A') log_odds += 0.5f;
-    else if (fast_upper(seq[len - 1]) == 'G') log_odds -= 0.12f;
+    // Get baseline frequencies from sample profile (middle of reads)
+    // These represent the UNDAMAGED base composition
+    float baseline_t = 0.25f, baseline_c = 0.25f;
+    float baseline_a = 0.25f, baseline_g = 0.25f;
 
-    // =========================================================================
-    // FEATURE 1b: Terminal DINUCLEOTIDE patterns (stronger damage signal)
-    // CT→TT, CG→TG at 5' end; GA→AA, CA→TA at 3' end
-    // =========================================================================
-    if (len >= 2) {
-        char b0 = fast_upper(seq[0]);
-        char b1 = fast_upper(seq[1]);
+    if (sample_profile.is_valid()) {
+        baseline_t = static_cast<float>(sample_profile.baseline_t_freq);
+        baseline_c = static_cast<float>(sample_profile.baseline_c_freq);
+        baseline_a = static_cast<float>(sample_profile.baseline_a_freq);
+        baseline_g = static_cast<float>(sample_profile.baseline_g_freq);
 
-        // 5' dinucleotide patterns indicative of C→T damage
-        if (b0 == 'T' && b1 == 'T') log_odds += 0.2f;      // TT from CT
-        if (b0 == 'T' && b1 == 'G') log_odds += 0.35f;     // TG from CG (CpG damage!)
-        if (b0 == 'T' && b1 == 'A') log_odds += 0.15f;     // TA from CA
-
-        char bm1 = fast_upper(seq[len - 1]);
-        char bm2 = fast_upper(seq[len - 2]);
-
-        // 3' dinucleotide patterns indicative of G→A damage
-        if (bm1 == 'A' && bm2 == 'A') log_odds += 0.2f;    // AA from GA
-        if (bm1 == 'A' && bm2 == 'C') log_odds += 0.3f;    // CA from CG on complement
-        if (bm1 == 'A' && bm2 == 'T') log_odds += 0.15f;   // TA from TG on complement
+        // Ensure reasonable bounds
+        baseline_t = std::max(0.15f, std::min(0.35f, baseline_t));
+        baseline_c = std::max(0.15f, std::min(0.35f, baseline_c));
+        baseline_a = std::max(0.15f, std::min(0.35f, baseline_a));
+        baseline_g = std::max(0.15f, std::min(0.35f, baseline_g));
     }
 
-    // =========================================================================
-    // FEATURE 1c: Joint 5' AND 3' damage - BONUS only (no penalty)
-    // Only ~6% of ancient reads have damage at BOTH ends, so don't penalize
-    // =========================================================================
-    bool has_5prime_signal = (fast_upper(seq[0]) == 'T');
-    bool has_3prime_signal = (fast_upper(seq[len-1]) == 'A');
+    // ==========================================================================
+    // 5' END LIKELIHOOD: C→T DAMAGE
+    // Analyze first 10 positions with position-specific damage rates
+    // ==========================================================================
 
-    if (has_5prime_signal && has_3prime_signal) {
-        log_odds += 0.4f;  // Damage at BOTH ends - very strong signal
+    const size_t analyze_5prime = std::min(size_t(10), len);
+
+    for (size_t i = 0; i < analyze_5prime; ++i) {
+        char base = fast_upper(seq[i]);
+
+        // Get damage rate at this position
+        float dmg_rate = 0.0f;
+        if (sample_profile.is_valid() && i < 15) {
+            dmg_rate = sample_profile.damage_rate_5prime[i];
+        } else {
+            // Default exponential decay: ~15% at pos 0, decaying with lambda=0.3
+            dmg_rate = 0.15f * std::exp(-0.3f * static_cast<float>(i));
+        }
+
+        // Codon position modulation: wobble position (3rd) more tolerant
+        int codon_pos = (static_cast<int>(i) - frame + 300) % 3;
+        float codon_mod = 1.0f;
+        if (codon_pos == 2) {
+            // Wobble position: damage more likely preserved (synonymous)
+            codon_mod = 1.2f;
+        } else if (codon_pos == 0) {
+            // First codon position: damage less likely preserved
+            codon_mod = 0.9f;
+        }
+
+        float effective_dmg = dmg_rate * codon_mod;
+
+        if (base == 'T') {
+            // T observed: could be original T or C→T damage
+            // P(T|ancient) = baseline_T + baseline_C * damage_rate
+            // P(T|modern) = baseline_T
+            float p_t_ancient = baseline_t + baseline_c * effective_dmg;
+            float p_t_modern = baseline_t;
+
+            if (p_t_modern > 0.01f) {
+                log_lr += std::log(p_t_ancient / p_t_modern);
+            }
+        } else if (base == 'C') {
+            // C observed: C that survived (wasn't damaged)
+            // P(C|ancient) = baseline_C * (1 - damage_rate)
+            // P(C|modern) = baseline_C
+            float p_c_ancient = baseline_c * (1.0f - effective_dmg);
+            float p_c_modern = baseline_c;
+
+            if (p_c_modern > 0.01f) {
+                log_lr += std::log(p_c_ancient / p_c_modern);
+            }
+        }
+        // A and G at 5' end are uninformative for C→T damage
     }
-    // No penalty for single-end or no damage - too common in real ancient DNA
 
-    // =========================================================================
-    // FEATURE 1d: T/C ratio in first 5 bases (gradient damage)
-    // Damage decays with distance from ends - check positions 0-4
-    // =========================================================================
-    if (len >= 5) {
-        int t_5prime = 0, c_5prime = 0;
-        for (size_t i = 0; i < 5; ++i) {
-            char b = fast_upper(seq[i]);
-            if (b == 'T') t_5prime++;
-            else if (b == 'C') c_5prime++;
-        }
-        // Elevated T/(T+C) ratio suggests damage even if position 0 isn't T
-        if (t_5prime + c_5prime >= 2) {
-            float tc_ratio = (float)t_5prime / (t_5prime + c_5prime);
-            if (tc_ratio > 0.65f) log_odds += 0.25f;  // >65% T suggests damage
-            else if (tc_ratio > 0.55f) log_odds += 0.1f;  // Modest elevation
+    // ==========================================================================
+    // 3' END LIKELIHOOD: G→A DAMAGE
+    // Analyze last 10 positions with position-specific damage rates
+    // ==========================================================================
+
+    const size_t analyze_3prime = std::min(size_t(10), len);
+
+    for (size_t i = 0; i < analyze_3prime; ++i) {
+        size_t pos = len - 1 - i;  // Position from end of sequence
+        char base = fast_upper(seq[pos]);
+
+        // Get damage rate at this position (distance from 3' end)
+        float dmg_rate = 0.0f;
+        if (sample_profile.is_valid() && i < 15) {
+            dmg_rate = sample_profile.damage_rate_3prime[i];
+        } else {
+            // Default exponential decay
+            dmg_rate = 0.12f * std::exp(-0.25f * static_cast<float>(i));
         }
 
-        // Same for 3' end (A/G ratio)
-        int a_3prime = 0, g_3prime = 0;
-        for (size_t i = len - 5; i < len; ++i) {
-            char b = fast_upper(seq[i]);
-            if (b == 'A') a_3prime++;
-            else if (b == 'G') g_3prime++;
+        // Codon position modulation
+        int codon_pos = (static_cast<int>(pos) - frame + 300) % 3;
+        float codon_mod = 1.0f;
+        if (codon_pos == 2) {
+            codon_mod = 1.2f;  // Wobble more tolerant
+        } else if (codon_pos == 0) {
+            codon_mod = 0.9f;
         }
-        if (a_3prime + g_3prime >= 2) {
-            float ag_ratio = (float)a_3prime / (a_3prime + g_3prime);
-            if (ag_ratio > 0.65f) log_odds += 0.2f;
-            else if (ag_ratio > 0.55f) log_odds += 0.08f;
+
+        float effective_dmg = dmg_rate * codon_mod;
+
+        if (base == 'A') {
+            // A observed: could be original A or G→A damage
+            // P(A|ancient) = baseline_A + baseline_G * damage_rate
+            // P(A|modern) = baseline_A
+            float p_a_ancient = baseline_a + baseline_g * effective_dmg;
+            float p_a_modern = baseline_a;
+
+            if (p_a_modern > 0.01f) {
+                log_lr += std::log(p_a_ancient / p_a_modern);
+            }
+        } else if (base == 'G') {
+            // G observed: G that survived
+            // P(G|ancient) = baseline_G * (1 - damage_rate)
+            // P(G|modern) = baseline_G
+            float p_g_ancient = baseline_g * (1.0f - effective_dmg);
+            float p_g_modern = baseline_g;
+
+            if (p_g_modern > 0.01f) {
+                log_lr += std::log(p_g_ancient / p_g_modern);
+            }
         }
     }
 
-    // =========================================================================
-    // FEATURE 2: Codon-position-aware damage at 5' end
-    // C→T damage should show codon position pattern in real coding regions
-    // =========================================================================
+    // ==========================================================================
+    // DAMAGED STOP CODON DETECTION
+    // Stop codons near 5' end that could be from C→T damage are strong signals:
+    //   TAA from CAA (Gln), TAG from CAG (Gln), TGA from CGA (Arg)
+    // ==========================================================================
 
-    // Count T and C at each codon position in first ~15 bases
+    for (size_t i = static_cast<size_t>(frame); i + 2 < std::min(size_t(15), len); i += 3) {
+        char c1 = fast_upper(seq[i]);
+        char c2 = fast_upper(seq[i + 1]);
+        char c3 = fast_upper(seq[i + 2]);
+
+        int ds = is_damaged_stop_codon(c1, c2, c3);
+        if (ds > 0 && i < 12) {
+            // Weight by position: closer to 5' = more likely damage
+            float pos_weight = std::exp(-0.2f * static_cast<float>(i));
+            log_lr += ds * 0.5f * pos_weight;
+        }
+    }
+
+    // ==========================================================================
+    // WOBBLE POSITION T ENRICHMENT (5' end)
+    // In coding regions with C→T damage, wobble position should show more T
+    // because synonymous C→T changes are preserved by selection
+    // ==========================================================================
+
     std::array<int, 3> t_count = {0, 0, 0};
     std::array<int, 3> c_count = {0, 0, 0};
 
     for (size_t i = 0; i < std::min(size_t(15), len); ++i) {
-        int codon_pos = (i - frame + 300) % 3;  // +300 to handle negative
+        int codon_pos = (static_cast<int>(i) - frame + 300) % 3;
         char base = fast_upper(seq[i]);
 
         if (base == 'T') t_count[codon_pos]++;
         else if (base == 'C') c_count[codon_pos]++;
     }
 
-    // Calculate T/(T+C) ratio at each codon position
-    std::array<float, 3> tc_ratio;
-    for (int p = 0; p < 3; p++) {
-        tc_ratio[p] = (t_count[p] + c_count[p] > 0) ?
-            (float)t_count[p] / (t_count[p] + c_count[p]) : 0.5f;
+    // Calculate T/(T+C) at wobble vs other positions
+    float tc_wobble = (t_count[2] + c_count[2] > 0) ?
+        static_cast<float>(t_count[2]) / (t_count[2] + c_count[2]) : 0.5f;
+    float tc_other = 0.5f;
+    int other_total = t_count[0] + c_count[0] + t_count[1] + c_count[1];
+    if (other_total > 0) {
+        tc_other = static_cast<float>(t_count[0] + t_count[1]) / other_total;
     }
 
-    // Key insight: In real coding regions with C→T damage,
-    // position 3 (wobble) should show MORE T enrichment because
-    // synonymous changes are tolerated/preserved
-    float wobble_enrichment = tc_ratio[2] - (tc_ratio[0] + tc_ratio[1]) / 2.0f;
-
+    float wobble_enrichment = tc_wobble - tc_other;
     if (wobble_enrichment > 0.1f) {
-        log_odds += 0.4f * wobble_enrichment;  // Strong signal of coding + damage
+        // Wobble enrichment is strong evidence for coding + damage
+        log_lr += 0.6f * wobble_enrichment;
     }
 
-    // =========================================================================
-    // FEATURE 3: Damaged stop codon detection
-    // TAA from CAA (Gln), TAG from CAG (Gln), TGA from CGA (Arg)
-    // =========================================================================
+    // ==========================================================================
+    // SAMPLE-LEVEL PRIOR
+    // Use the sample's overall damage probability as a prior
+    // ==========================================================================
 
-    int damaged_stop_score = 0;
-    for (size_t i = frame; i + 2 < std::min(size_t(15), len); i += 3) {
-        char c1 = fast_upper(seq[i]);
-        char c2 = fast_upper(seq[i + 1]);
-        char c3 = fast_upper(seq[i + 2]);
-
-        int ds = is_damaged_stop_codon(c1, c2, c3);
-        if (ds > 0 && i < 9) {  // Stronger signal if near 5' end
-            damaged_stop_score += ds * (3 - i / 3);  // Weight by position
-        }
-    }
-
-    log_odds += damaged_stop_score * 0.2f;
-
-    // =========================================================================
-    // FEATURE 4: T at codon position 1 patterns
-    // TNN where CNN would be common (Pro, Leu, His, Gln, Arg)
-    // =========================================================================
-
-    int t_pos1_damage_patterns = 0;
-    for (size_t i = frame; i + 2 < std::min(size_t(12), len); i += 3) {
-        char c1 = fast_upper(seq[i]);
-        char c2 = fast_upper(seq[i + 1]);
-        char c3 = fast_upper(seq[i + 2]);
-
-        if (c1 == 'T') {
-            // TCA/TCG/TCC/TCT could be from SCA/SCG... (Ser from damage)
-            // But also check for patterns that suggest C→T
-            if (c2 == 'C' || c2 == 'G' || c2 == 'A') {
-                t_pos1_damage_patterns++;
-            }
-        }
-    }
-
-    if (t_pos1_damage_patterns >= 2) {
-        log_odds += 0.15f;
-    }
-
-    // =========================================================================
-    // FEATURE 5: 3' end G→A damage at codon position 3 (wobble)
-    // =========================================================================
-
-    std::array<int, 3> a_count_3prime = {0, 0, 0};
-    std::array<int, 3> g_count_3prime = {0, 0, 0};
-
-    size_t end_region = (len > 15) ? len - 15 : 0;
-    for (size_t i = end_region; i < len; ++i) {
-        int codon_pos = (i - frame + 300) % 3;
-        char base = fast_upper(seq[i]);
-
-        if (base == 'A') a_count_3prime[codon_pos]++;
-        else if (base == 'G') g_count_3prime[codon_pos]++;
-    }
-
-    // A enrichment at position 3 (wobble) at 3' end
-    float ag_ratio_wobble = (a_count_3prime[2] + g_count_3prime[2] > 0) ?
-        (float)a_count_3prime[2] / (a_count_3prime[2] + g_count_3prime[2]) : 0.5f;
-
-    if (ag_ratio_wobble > 0.6f) {
-        log_odds += 0.25f;
-    }
-
-    // =========================================================================
-    // FEATURE 6: Sample-level calibration (CRITICAL for reducing false positives)
-    // =========================================================================
-
+    float prior_log_odds = 0.0f;
     if (sample_profile.is_valid()) {
-        // Scale by observed sample damage level
-        float sample_scale = sample_profile.max_damage_5prime / 0.1f;
-        sample_scale = std::clamp(sample_scale, 0.1f, 2.0f);  // Allow lower minimum
+        // Convert sample_damage_prob to log-odds
+        float sample_prior = std::clamp(sample_profile.sample_damage_prob, 0.1f, 0.9f);
+        prior_log_odds = std::log(sample_prior / (1.0f - sample_prior));
 
-        // Scale the codon-specific signals by sample damage level
-        log_odds *= sample_scale;
-
-        // Sample-level prior: CRUCIAL for false positive reduction
-        if (sample_profile.sample_damage_prob > 0.7f) {
-            log_odds += 0.3f;  // High-damage sample: boost ancient signal
-        } else if (sample_profile.sample_damage_prob < 0.3f) {
-            // MODERN sample: apply strong penalty
-            // Per-read signals without sample-level support are likely noise
-            log_odds -= 0.8f;
-        } else {
-            // Mixed/uncertain sample: slight penalty
-            log_odds -= 0.2f;
-        }
+        // Weight the prior based on sample size (more reads = more confidence)
+        float prior_weight = std::min(1.0f, static_cast<float>(sample_profile.n_reads) / 10000.0f);
+        prior_log_odds *= prior_weight * 0.5f;  // Dampen to not overwhelm read evidence
     }
 
-    // =========================================================================
-    // FEATURE 7: Joint 5' + 3' pattern
-    // =========================================================================
+    // Combine likelihood and prior
+    float total_log_odds = log_lr + prior_log_odds;
 
-    bool strong_5prime = (fast_upper(seq[0]) == 'T' && t_count[2] > t_count[0]);
-    bool strong_3prime = (fast_upper(seq[len-1]) == 'A' && ag_ratio_wobble > 0.5f);
-
-    if (strong_5prime && strong_3prime) {
-        log_odds += 0.35f;  // Both ends show frame-consistent damage
-    }
-
-    // Convert to probability
-    float prob = 1.0f / (1.0f + std::exp(-log_odds));
+    // Convert log-odds to probability
+    float prob = 1.0f / (1.0f + std::exp(-total_log_odds));
 
     return std::clamp(prob, 0.05f, 0.95f);
 }
@@ -1201,18 +1200,17 @@ float FrameSelector::compute_damage_log_likelihood(
 
     float log_lr = 0.0f;  // Log likelihood ratio: log(P(seq|ancient) / P(seq|modern))
 
-    // Get damage rates from sample profile
-    float p_damage_5prime = sample_profile.is_valid() ?
-        sample_profile.max_damage_5prime : 0.15f;  // Default ancient rate
-    float p_damage_3prime = sample_profile.is_valid() ?
-        sample_profile.max_damage_3prime : 0.12f;
+    // Use fixed baseline of 0.5 for damage likelihood calculation
+    // This creates better contrast for per-read classification
+    // The sample-specific rates are used for the damage at each position
+    const float baseline_T = 0.50f;
+    const float baseline_A = 0.50f;
 
-    // Background rates (modern DNA)
-    float p_modern = 0.01f;  // Very low damage in modern DNA
-
-    // Position decay constants (use sample-specific if available)
-    const float lambda_5 = sample_profile.is_valid() ? sample_profile.lambda_5prime : 0.3f;
-    const float lambda_3 = sample_profile.is_valid() ? sample_profile.lambda_3prime : 0.25f;
+    // Default damage rates (used if sample profile not available)
+    const float default_damage_5prime = 0.15f;
+    const float default_damage_3prime = 0.12f;
+    const float default_lambda_5 = 0.3f;
+    const float default_lambda_3 = 0.25f;
 
     // Phred to error probability
     auto phred_to_error = [](char q) -> float {
@@ -1222,85 +1220,161 @@ float FrameSelector::compute_damage_log_likelihood(
     };
 
     // =========================================================================
-    // 5' END: C→T damage likelihood
+    // 5' END: FEATURE-BASED DAMAGE DETECTION
+    // Use fixed bonuses for specific damage signatures (more discriminative than
+    // Bayesian likelihood ratios which have tiny contrast in AT-rich samples)
     // =========================================================================
-    for (size_t i = 0; i < std::min(size_t(10), len); ++i) {
-        char base = fast_upper(seq[i]);
-        float pos_weight = std::exp(-lambda_5 * static_cast<float>(i));
-        float p_ancient = p_damage_5prime * pos_weight + p_modern;
-        p_ancient = std::clamp(p_ancient, 0.01f, 0.5f);
 
-        // Quality adjustment: low quality = less informative, high quality C = strong evidence against damage
-        float quality_weight = 1.0f;
+    // Terminal base pattern (position 0)
+    if (fast_upper(seq[0]) == 'T') {
+        log_lr += 0.7f;  // T at position 0 - primary damage signal
+    } else if (fast_upper(seq[0]) == 'C') {
+        log_lr -= 0.2f;  // C at position 0 - evidence against damage
+    }
+
+    // Position 1 pattern
+    if (len > 1 && fast_upper(seq[1]) == 'T') {
+        log_lr += 0.3f;  // T at position 1 - secondary damage signal
+    }
+
+    // Dinucleotide patterns at 5' end (strong damage indicators)
+    if (len >= 2) {
+        char b0 = fast_upper(seq[0]);
+        char b1 = fast_upper(seq[1]);
+        if (b0 == 'T' && b1 == 'G') log_lr += 0.5f;  // TG from CG (CpG damage!)
+        if (b0 == 'T' && b1 == 'T') log_lr += 0.2f;  // TT from CT
+        if (b0 == 'T' && b1 == 'A') log_lr += 0.15f; // TA from CA
+    }
+
+    // Quality-weighted position scoring for first 5 positions
+    float decay_weights[] = {1.0f, 0.6f, 0.4f, 0.25f, 0.15f};
+    for (size_t i = 2; i < std::min(size_t(5), len); ++i) {
+        char base = fast_upper(seq[i]);
+        float weight = decay_weights[i];
+
+        float quality_mod = 1.0f;
         if (has_quality) {
             float error_prob = phred_to_error(quality[i]);
-            // Low quality bases are less informative (could be miscall)
-            if (error_prob > 0.1f) {
-                quality_weight = 0.5f;  // Reduce weight for unreliable bases
-            }
-            // High quality C is strong evidence against damage
-            if (base == 'C' && error_prob < 0.01f) {
-                quality_weight = 1.5f;  // Strengthen negative evidence
-            }
+            if (error_prob > 0.1f) quality_mod = 0.5f;
         }
 
         if (base == 'T') {
-            // T observed: P(T|ancient,C→T) vs P(T|modern)
-            // In CpG context, damage is more likely
-            bool in_cpg = (i + 1 < len && fast_upper(seq[i + 1]) == 'G');
-            float cpg_boost = in_cpg ? 1.5f : 1.0f;
-
-            // Codon position: wobble (pos 3) tolerates damage better
-            int codon_pos = (i - frame + 300) % 3;
-            float codon_boost = (codon_pos == 2) ? 1.2f : 1.0f;  // Wobble
-
-            float lr = (p_ancient * cpg_boost * codon_boost) /
-                       (0.25f + p_modern);  // 0.25 = background T frequency
-            log_lr += std::log(lr) * pos_weight * quality_weight;
-        }
-        else if (base == 'C') {
-            // C observed: evidence AGAINST damage at this position
-            // High quality C is especially strong evidence
-            float lr = (1.0f - p_ancient) / (1.0f - p_modern);
-            log_lr += std::log(lr) * pos_weight * quality_weight;
+            log_lr += 0.15f * weight * quality_mod;
+        } else if (base == 'C') {
+            log_lr -= 0.08f * weight * quality_mod;
         }
     }
 
     // =========================================================================
-    // 3' END: G→A damage likelihood
+    // 3' END: FEATURE-BASED DAMAGE DETECTION
     // =========================================================================
-    for (size_t i = 0; i < std::min(size_t(10), len); ++i) {
+
+    // Terminal base pattern (last position)
+    if (fast_upper(seq[len - 1]) == 'A') {
+        log_lr += 0.6f;  // A at last position - primary 3' damage signal
+    } else if (fast_upper(seq[len - 1]) == 'G') {
+        log_lr -= 0.15f;  // G at last position - evidence against damage
+    }
+
+    // Position len-2 pattern
+    if (len > 1 && fast_upper(seq[len - 2]) == 'A') {
+        log_lr += 0.25f;
+    }
+
+    // Dinucleotide patterns at 3' end
+    if (len >= 2) {
+        char bm1 = fast_upper(seq[len - 1]);
+        char bm2 = fast_upper(seq[len - 2]);
+        if (bm1 == 'A' && bm2 == 'C') log_lr += 0.4f;  // CA from CG complement
+        if (bm1 == 'A' && bm2 == 'A') log_lr += 0.2f;  // AA from GA
+        if (bm1 == 'A' && bm2 == 'T') log_lr += 0.15f; // TA from TG complement
+    }
+
+    // Quality-weighted position scoring for last 5 positions
+    for (size_t i = 2; i < std::min(size_t(5), len); ++i) {
         size_t pos = len - 1 - i;
         char base = fast_upper(seq[pos]);
-        float pos_weight = std::exp(-lambda_3 * static_cast<float>(i));
-        float p_ancient = p_damage_3prime * pos_weight + p_modern;
-        p_ancient = std::clamp(p_ancient, 0.01f, 0.5f);
+        float weight = decay_weights[i];
 
-        // Quality adjustment: low quality = less informative, high quality G = strong evidence against damage
-        float quality_weight = 1.0f;
+        float quality_mod = 1.0f;
         if (has_quality) {
             float error_prob = phred_to_error(quality[pos]);
-            if (error_prob > 0.1f) {
-                quality_weight = 0.5f;  // Reduce weight for unreliable bases
-            }
-            if (base == 'G' && error_prob < 0.01f) {
-                quality_weight = 1.5f;  // Strengthen negative evidence
-            }
+            if (error_prob > 0.1f) quality_mod = 0.5f;
         }
 
         if (base == 'A') {
-            // A observed at 3' end
-            int codon_pos = (pos - frame + 300) % 3;
-            float codon_boost = (codon_pos == 2) ? 1.2f : 1.0f;
+            log_lr += 0.12f * weight * quality_mod;
+        } else if (base == 'G') {
+            log_lr -= 0.06f * weight * quality_mod;
+        }
+    }
 
-            float lr = (p_ancient * codon_boost) / (0.25f + p_modern);
-            log_lr += std::log(lr) * pos_weight * quality_weight;
+    // =========================================================================
+    // HEXAMER DAMAGE LOOKUP (5' end)
+    // Use GTDB-derived hexamer damage probabilities
+    // =========================================================================
+    if (len >= 6) {
+        // Check first few hexamers at 5' end
+        for (size_t i = 0; i < std::min(size_t(3), len - 5); ++i) {
+            float hex_prob = get_hexamer_damage_prob(seq.c_str() + i);
+            if (hex_prob > 0.9f) {
+                // High-confidence damage hexamer (e.g., TGA from CGA)
+                float weight = 1.0f / (1 << i);  // 1.0, 0.5, 0.25
+                log_lr += std::log(hex_prob / 0.1f) * weight * 0.3f;
+            }
         }
-        else if (base == 'G') {
-            // G observed: evidence AGAINST damage at this position
-            float lr = (1.0f - p_ancient) / (1.0f - p_modern);
-            log_lr += std::log(lr) * pos_weight * quality_weight;
+    }
+
+    // =========================================================================
+    // DAMAGED STOP CODON DETECTION
+    // TAA from CAA (Gln), TAG from CAG (Gln), TGA from CGA (Arg)
+    // These are strong signals when found near 5' end
+    // =========================================================================
+    for (size_t i = frame; i + 2 < std::min(size_t(15), len); i += 3) {
+        char c1 = fast_upper(seq[i]);
+        char c2 = fast_upper(seq[i + 1]);
+        char c3 = fast_upper(seq[i + 2]);
+
+        // Check for damaged stop codons
+        bool is_damaged_stop = false;
+        if (c1 == 'T' && c2 == 'A' && c3 == 'A') is_damaged_stop = true;  // TAA from CAA
+        if (c1 == 'T' && c2 == 'A' && c3 == 'G') is_damaged_stop = true;  // TAG from CAG
+        if (c1 == 'T' && c2 == 'G' && c3 == 'A') is_damaged_stop = true;  // TGA from CGA
+
+        if (is_damaged_stop && i < 12) {
+            // Weight by position (closer to 5' = more likely damage)
+            float pos_weight = std::exp(-0.3f * static_cast<float>(i));
+            log_lr += 0.8f * pos_weight;  // Strong signal
         }
+    }
+
+    // =========================================================================
+    // WOBBLE POSITION T ENRICHMENT (5' end)
+    // In coding regions with C→T damage, wobble position (pos 3) should
+    // show more T because synonymous changes are better tolerated
+    // =========================================================================
+    std::array<int, 3> t_count = {0, 0, 0};
+    std::array<int, 3> c_count = {0, 0, 0};
+
+    for (size_t i = 0; i < std::min(size_t(15), len); ++i) {
+        int codon_pos = (static_cast<int>(i) - frame + 300) % 3;
+        char base = fast_upper(seq[i]);
+        if (base == 'T') t_count[codon_pos]++;
+        else if (base == 'C') c_count[codon_pos]++;
+    }
+
+    // Calculate T/(T+C) ratio at wobble position vs others
+    float tc_wobble = (t_count[2] + c_count[2] > 0) ?
+        static_cast<float>(t_count[2]) / (t_count[2] + c_count[2]) : 0.5f;
+    float tc_other = 0.5f;
+    int other_total = t_count[0] + c_count[0] + t_count[1] + c_count[1];
+    if (other_total > 0) {
+        tc_other = static_cast<float>(t_count[0] + t_count[1]) / other_total;
+    }
+
+    float wobble_enrichment = tc_wobble - tc_other;
+    if (wobble_enrichment > 0.1f) {
+        log_lr += 0.5f * wobble_enrichment;  // Coding + damage signal
     }
 
     // =========================================================================
@@ -1311,13 +1385,81 @@ float FrameSelector::compute_damage_log_likelihood(
     }
 
     // =========================================================================
-    // SAMPLE-LEVEL PRIOR
+    // WITHIN-READ GRADIENT: terminal vs interior contrast
+    // Damaged reads should have higher T/(T+C) at terminals than interior
+    // This helps discriminate in AT-rich samples
+    // =========================================================================
+    if (len >= 20) {
+        // 5' gradient: compare positions 0-4 to positions 10-14
+        int t_term5 = 0, c_term5 = 0;
+        int t_int5 = 0, c_int5 = 0;
+        for (int i = 0; i < 5; ++i) {
+            char b = fast_upper(seq[i]);
+            if (b == 'T') t_term5++;
+            else if (b == 'C') c_term5++;
+        }
+        for (int i = 10; i < 15 && i < static_cast<int>(len); ++i) {
+            char b = fast_upper(seq[i]);
+            if (b == 'T') t_int5++;
+            else if (b == 'C') c_int5++;
+        }
+
+        // Compare terminal to interior T/(T+C)
+        if (t_term5 + c_term5 >= 2 && t_int5 + c_int5 >= 2) {
+            float tc_term = static_cast<float>(t_term5) / (t_term5 + c_term5);
+            float tc_int = static_cast<float>(t_int5) / (t_int5 + c_int5);
+            float gradient_5 = tc_term - tc_int;  // Positive = more T at terminal
+            // Lower threshold and higher weight for better sensitivity
+            if (gradient_5 > 0.10f) {
+                log_lr += 1.0f * gradient_5;  // Strong gradient signal
+            } else if (gradient_5 < -0.10f) {
+                log_lr += 0.5f * gradient_5;  // Less T at terminal = evidence against damage
+            }
+        }
+
+        // 3' gradient: compare positions len-5 to len-1 vs len-15 to len-11
+        int a_term3 = 0, g_term3 = 0;
+        int a_int3 = 0, g_int3 = 0;
+        for (size_t i = len - 5; i < len; ++i) {
+            char b = fast_upper(seq[i]);
+            if (b == 'A') a_term3++;
+            else if (b == 'G') g_term3++;
+        }
+        for (size_t i = len - 15; i < len - 10; ++i) {
+            char b = fast_upper(seq[i]);
+            if (b == 'A') a_int3++;
+            else if (b == 'G') g_int3++;
+        }
+
+        if (a_term3 + g_term3 >= 2 && a_int3 + g_int3 >= 2) {
+            float ag_term = static_cast<float>(a_term3) / (a_term3 + g_term3);
+            float ag_int = static_cast<float>(a_int3) / (a_int3 + g_int3);
+            float gradient_3 = ag_term - ag_int;
+            // Lower threshold and higher weight for better sensitivity
+            if (gradient_3 > 0.10f) {
+                log_lr += 0.8f * gradient_3;
+            } else if (gradient_3 < -0.10f) {
+                log_lr += 0.4f * gradient_3;
+            }
+        }
+    }
+
+    // =========================================================================
+    // SAMPLE-LEVEL CALIBRATION
+    // Don't add a sample-wide prior as it reduces per-read discrimination
+    // Instead, use sample info to scale feature weights based on expected damage level
     // =========================================================================
     if (sample_profile.is_valid()) {
-        // Add prior based on sample classification
-        float prior_odds = sample_profile.sample_damage_prob /
-                          (1.0f - sample_profile.sample_damage_prob + 0.01f);
-        log_lr += 0.3f * std::log(prior_odds);
+        // In high-damage samples, we expect more damage patterns, so they're less surprising
+        // Scale down the bonus slightly in high-damage samples to maintain discrimination
+        float damage_level = (sample_profile.max_damage_5prime + sample_profile.max_damage_3prime) / 2.0f;
+        if (damage_level > 0.15f) {
+            // High damage sample: the signal is expected, so dampen slightly
+            log_lr *= 0.9f;
+        } else if (damage_level < 0.05f) {
+            // Low damage sample: damage signal is more surprising when present
+            log_lr *= 1.1f;
+        }
     }
 
     return log_lr;

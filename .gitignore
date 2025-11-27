@@ -14,6 +14,7 @@ __pycache__/
 .idea/
 *.swp
 *.swo
+.groupedtimelineinclude
 
 # Output files
 *.gff
@@ -27,3 +28,6 @@ __pycache__/
 # Large model files (keep in models/ but ignore if regenerated)
 # models/*.pt
 # models/*.npz
+
+# Intermediate hexamer extraction files
+include/agp/*_hexamers.json

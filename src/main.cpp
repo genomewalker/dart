@@ -1,8 +1,10 @@
 #include "agp/damage_model.hpp"
 #include "agp/sequence_io.hpp"
 #include "agp/frame_selector.hpp"
+#include "agp/multi_domain_hexamer.hpp"
 #include "agp/version.h"
 #include <iostream>
+#include <fstream>
 #include <chrono>
 #include <iomanip>
 #include <mutex>
@@ -35,6 +37,11 @@ void print_usage(const char* program_name) {
     std::cout << "  --single-strand          Score only forward strand\n";
     std::cout << "  --both-strands           Output predictions for both strands\n";
     std::cout << "  --no-aggregate           Disable two-pass damage aggregation\n";
+    std::cout << "  --stop-only              Use stop-codon-only frame selection (97% accuracy)\n";
+    std::cout << "  --domain <name>          Taxonomic domain for hexamer scoring (default: gtdb)\n";
+    std::cout << "                           Options: gtdb, fungi, plant, protozoa, invertebrate,\n";
+    std::cout << "                                    viral, mammal, vertebrate, meta\n";
+    std::cout << "                           Use 'meta' for weighted ensemble scoring across all domains\n";
     std::cout << "  -v, --verbose            Verbose output\n";
     std::cout << "  -V, --version            Show version and exit\n";
     std::cout << "  -h, --help               Show this help message\n";
@@ -58,6 +65,7 @@ struct Options {
     std::string output_file = "predictions.gff";
     std::string fasta_nt;
     std::string fasta_aa;
+    std::string domain_name = "gtdb";  // Default to bacteria/archaea for ancient DNA
     bool use_damage = true;
     size_t min_length = 30;
     float min_coding_prob = 0.3f;
@@ -66,6 +74,8 @@ struct Options {
     bool dual_strand = true;       // Default ON for short aDNA
     bool best_strand_only = true;  // Default ON: output only best-scoring strand (cleaner output)
     bool aggregate_damage = true;  // Default ON for better damage detection
+    bool stop_only = false;        // Use stop-codon-only frame selection (experimental)
+    bool metagenome_mode = false;   // Use weighted ensemble scoring across all domains
 };
 
 Options parse_args(int argc, char* argv[]) {
@@ -110,6 +120,16 @@ Options parse_args(int argc, char* argv[]) {
             opts.aggregate_damage = false;
         } else if (arg == "--aggregate-damage") {
             opts.aggregate_damage = true;
+        } else if (arg == "--stop-only") {
+            opts.stop_only = true;
+        } else if (arg == "--domain") {
+            if (i + 1 < argc) {
+                opts.domain_name = argv[++i];
+                // "meta" enables weighted ensemble scoring across all domains
+                if (opts.domain_name == "meta" || opts.domain_name == "metagenome" || opts.domain_name == "all") {
+                    opts.metagenome_mode = true;
+                }
+            }
         } else if (arg[0] != '-') {
             opts.input_file = arg;
         } else {
@@ -145,16 +165,26 @@ int main(int argc, char* argv[]) {
         // Check if stderr is a TTY for inline progress updates
         bool is_tty = isatty(fileno(stderr));
 
+        // Set active domain for hexamer scoring
+        agp::Domain active_domain = agp::parse_domain(opts.domain_name);
+        agp::set_active_domain(active_domain);
+
         // Always show basic info
         std::cerr << "Ancient Gene Predictor v" << AGP_VERSION << "\n";
         std::cerr << "Input: " << opts.input_file << "\n";
         std::cerr << "Output: " << opts.output_file << "\n";
+        if (opts.metagenome_mode) {
+            std::cerr << "Domain: metagenome (weighted ensemble scoring)\n";
+        } else {
+            std::cerr << "Domain: " << agp::domain_name(active_domain) << "\n";
+        }
         std::cerr << "Threads: " << num_threads << "\n";
 
         if (opts.verbose) {
             std::cerr << "Min coding prob: " << opts.min_coding_prob << "\n";
             std::cerr << "Damage detection: " << (opts.use_damage ? "ON" : "OFF") << "\n";
             if (opts.aggregate_damage) std::cerr << "Aggregate damage: ON (two-pass)\n";
+            if (opts.stop_only) std::cerr << "Frame selection: STOP-ONLY (97% accuracy mode)\n";
             if (opts.dual_strand) {
                 std::cerr << "Dual-strand: ON";
                 if (opts.best_strand_only) std::cerr << " (best only)";
@@ -283,6 +313,9 @@ int main(int argc, char* argv[]) {
                 std::cerr << "  [DEBUG] Library type: " << sample_profile.library_type_str() << "\n";
             }
 
+            // Update damage model from Pass 1 profile
+            damage_model.update_from_sample_profile(sample_profile);
+
             std::cerr << "\n";
         }
 
@@ -320,6 +353,12 @@ int main(int argc, char* argv[]) {
         // Damage percentage distribution bins: [0-10), [10-20), ..., [90-100]
         std::array<size_t, 10> damage_pct_hist = {};
         double total_damage_pct = 0.0;  // For computing mean
+
+        // Correction statistics
+        size_t total_genes_corrected = 0;
+        size_t total_dna_corrections = 0;
+        size_t total_aa_corrections = 0;
+
         std::mutex hist_mutex;
 
         // Read first batch synchronously
@@ -359,6 +398,16 @@ int main(int argc, char* argv[]) {
                 // Use quality if available and lengths match (no cleaning removed bases)
                 const std::string& quality = (rec.quality.length() == seq.length()) ? rec.quality : "";
 
+                // Enable ensemble mode for metagenome scoring (weighted across all domains)
+                if (opts.metagenome_mode && seq.length() >= 30) {
+                    agp::MultiDomainResult domain_result = agp::score_all_domains(seq, 0);
+                    agp::set_ensemble_mode(true);
+                    agp::set_domain_probs(domain_result);
+                } else {
+                    agp::set_ensemble_mode(false);
+                    agp::set_active_domain(active_domain);
+                }
+
                 // Create damage profile
                 const agp::DamageProfile* profile_ptr = nullptr;
                 agp::DamageProfile local_profile;
@@ -371,7 +420,19 @@ int main(int argc, char* argv[]) {
 
                 if (opts.dual_strand) {
                     // Output best frame from BOTH strands
-                    auto [best_fwd, best_rev] = agp::FrameSelector::select_best_per_strand(seq, profile_ptr);
+                    // Use appropriate frame selection method based on options
+                    std::pair<agp::FrameScore, agp::FrameScore> strand_results;
+                    if (opts.stop_only) {
+                        // Stop-only frame selection: 97% accuracy, uses ONLY stop codon count
+                        strand_results = agp::FrameSelector::select_best_per_strand_stop_only(seq);
+                    } else {
+                        // Standard scoring: strict stop penalties
+                        // Use this regardless of damage detection settings
+                        // (Damage-aware frame selection was found to hurt accuracy)
+                        // Hexamer corrections are applied after frame selection
+                        strand_results = agp::FrameSelector::select_best_per_strand(seq, profile_ptr);
+                    }
+                    auto [best_fwd, best_rev] = strand_results;
 
                     // Calculate ancient_prob using codon-aware detection for each strand
                     // This uses the reading frame information for better accuracy
@@ -491,19 +552,46 @@ int main(int argc, char* argv[]) {
                 }
 
                 // Apply damage correction if confident
+                // Use sample-profile-aware correction that scales by ancient_prob
+                size_t batch_dna_corrections = 0;
+                size_t batch_aa_corrections = 0;
+                size_t batch_genes_corrected = 0;
+
                 if (!genes.empty() && profile_ptr && opts.use_damage) {
                     for (auto& gene : genes) {
-                        if (gene.coding_prob > 0.7f || gene.ancient_prob > 0.7f) {
-                            float threshold = (gene.coding_prob > 0.9f) ? 0.25f : 0.35f;
-                            auto [corrected_dna, dna_corr] = damage_model.correct_damage(
-                                gene.sequence, threshold);
+                        // Apply correction to reads with moderate-to-high damage probability
+                        if (gene.ancient_prob > 0.6f) {
+                            // Use new sample-profile-aware correction
+                            // This uses position-specific damage rates from Phase 1
+                            // and scales threshold by ancient_prob
+                            auto [corrected_dna, dna_corr] = damage_model.correct_damage_with_profile(
+                                gene.sequence, sample_profile, gene.ancient_prob, gene.frame);
                             gene.corrected_sequence = corrected_dna;
                             gene.dna_corrections = dna_corr;
 
-                            auto [corrected_prot, aa_corr] = damage_model.correct_protein_damage(
-                                gene.sequence, gene.protein, threshold);
-                            gene.corrected_protein = corrected_prot;
-                            gene.aa_corrections = aa_corr;
+                            // Re-translate corrected DNA to get corrected protein
+                            if (dna_corr > 0) {
+                                batch_dna_corrections += dna_corr;
+                                batch_genes_corrected++;
+
+                                gene.corrected_protein.clear();
+                                for (size_t i = gene.frame; i + 2 < corrected_dna.length(); i += 3) {
+                                    char c1 = corrected_dna[i];
+                                    char c2 = corrected_dna[i + 1];
+                                    char c3 = corrected_dna[i + 2];
+                                    char aa = agp::CodonTable::translate_codon(c1, c2, c3);
+                                    gene.corrected_protein += aa;
+                                }
+
+                                // Count amino acid changes
+                                gene.aa_corrections = 0;
+                                for (size_t i = 0; i < std::min(gene.protein.length(), gene.corrected_protein.length()); ++i) {
+                                    if (gene.protein[i] != gene.corrected_protein[i]) {
+                                        gene.aa_corrections++;
+                                    }
+                                }
+                                batch_aa_corrections += gene.aa_corrections;
+                            }
                         }
                     }
                 }
@@ -512,11 +600,16 @@ int main(int argc, char* argv[]) {
             }
 
             // Write results and track damage probability distribution
+            size_t batch_total_dna_corr = 0;
+            size_t batch_total_aa_corr = 0;
+            size_t batch_total_genes_corr = 0;
+
             for (const auto& [id, genes] : results) {
                 if (!genes.empty()) {
                     writer.write_genes(id, genes);
                     if (fasta_nt_writer) fasta_nt_writer->write_genes_nucleotide(id, genes);
                     if (fasta_aa_writer) fasta_aa_writer->write_genes_protein(id, genes);
+
                     total_genes += genes.size();
 
                     // Update damage probability and percentage histograms
@@ -528,9 +621,21 @@ int main(int argc, char* argv[]) {
                         int pct_bin = std::min(9, static_cast<int>(gene.damage_score / 10.0));
                         damage_pct_hist[pct_bin]++;
                         total_damage_pct += gene.damage_score;
+
+                        // Track corrections
+                        if (gene.dna_corrections > 0) {
+                            batch_total_dna_corr += gene.dna_corrections;
+                            batch_total_aa_corr += gene.aa_corrections;
+                            batch_total_genes_corr++;
+                        }
                     }
                 }
             }
+
+            // Update global correction stats
+            total_dna_corrections += batch_total_dna_corr;
+            total_aa_corrections += batch_total_aa_corr;
+            total_genes_corrected += batch_total_genes_corr;
 
             seq_count += batch.size();
             if (seq_count % 1000000 < batch.size()) {
@@ -595,6 +700,21 @@ int main(int argc, char* argv[]) {
         if (opts.verbose) {
             std::cerr << "\n  [DEBUG] Gene/seq ratio: " << std::setprecision(3)
                      << (seq_count > 0 ? (double)total_genes / seq_count : 0.0) << "\n";
+
+            // Correction statistics
+            if (total_genes_corrected > 0) {
+                double corr_pct = 100.0 * total_genes_corrected / total_genes;
+                double avg_dna_corr = (double)total_dna_corrections / total_genes_corrected;
+                double avg_aa_corr = (double)total_aa_corrections / total_genes_corrected;
+                std::cerr << "\n  [CORRECTION] Genes corrected: " << total_genes_corrected
+                         << " / " << total_genes << " (" << std::setprecision(1) << corr_pct << "%)\n";
+                std::cerr << "  [CORRECTION] Total DNA corrections: " << total_dna_corrections
+                         << " (avg " << std::setprecision(2) << avg_dna_corr << " per gene)\n";
+                std::cerr << "  [CORRECTION] Total AA corrections: " << total_aa_corrections
+                         << " (avg " << std::setprecision(2) << avg_aa_corr << " per gene)\n";
+            } else {
+                std::cerr << "\n  [CORRECTION] No genes corrected (0 / " << total_genes << ")\n";
+            }
         }
 
         std::cerr << "\nDone.\n";

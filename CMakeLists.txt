@@ -115,12 +115,16 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(agp OpenMP::OpenMP_CXX)
 endif()
 
-# Validation tools
+# Unified validation tool
 add_executable(agp-validate src/validate.cpp)
 target_link_libraries(agp-validate ${ZLIB_LIBRARIES})
 
-add_executable(agp-validate-sequences src/validate_sequences.cpp)
-target_link_libraries(agp-validate-sequences ${ZLIB_LIBRARIES})
+# Hexamer extraction tool
+add_executable(extract-hexamers scripts/extract_refseq_hexamers.cpp)
+target_link_libraries(extract-hexamers ${ZLIB_LIBRARIES})
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(extract-hexamers OpenMP::OpenMP_CXX)
+endif()
 
 # Install
-install(TARGETS agp agp-validate agp-validate-sequences DESTINATION bin)
+install(TARGETS agp agp-validate extract-hexamers DESTINATION bin)
