@@ -126,5 +126,12 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(extract-hexamers OpenMP::OpenMP_CXX)
 endif()
 
+# Position-specific hexamer extraction tool
+add_executable(extract-positional-hexamers scripts/extract_positional_hexamers.cpp)
+target_link_libraries(extract-positional-hexamers ${ZLIB_LIBRARIES})
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(extract-positional-hexamers OpenMP::OpenMP_CXX)
+endif()
+
 # Install
-install(TARGETS agp agp-validate extract-hexamers DESTINATION bin)
+install(TARGETS agp agp-validate extract-hexamers extract-positional-hexamers DESTINATION bin)

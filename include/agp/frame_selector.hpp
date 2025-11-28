@@ -339,6 +339,27 @@ public:
     static void merge_sample_profiles(SampleDamageProfile& dst, const SampleDamageProfile& src);
 
     /**
+     * Update sample profile with a weighted contribution
+     * Used for iterative damage refinement - weights by coding probability
+     *
+     * @param profile Profile to update
+     * @param seq DNA sequence to add
+     * @param weight Weight for this sequence (0.0-1.0, typically coding_prob)
+     */
+    static void update_sample_profile_weighted(
+        SampleDamageProfile& profile,
+        const std::string& seq,
+        float weight);
+
+    /**
+     * Reset sample profile for a fresh damage estimation pass
+     * Clears all counts while preserving structure
+     *
+     * @param profile Profile to reset
+     */
+    static void reset_sample_profile(SampleDamageProfile& profile);
+
+    /**
      * Bayesian damage detection using proper likelihood ratios
      * P(seq|ancient) / P(seq|modern) with all signals
      *
@@ -418,6 +439,37 @@ public:
         const std::string& seq);
 
     /**
+     * Stop-priority frame selection: stops as primary signal, hexamer LLR as tiebreaker
+     *
+     * Algorithm:
+     * 1. Group frames by internal stop count
+     * 2. Within each stop-count group, rank by hexamer LLR score
+     * 3. Return best frame per strand
+     *
+     * This combines the high accuracy of stop-based selection with
+     * hexamer evidence for breaking ties when multiple frames have same stop count.
+     *
+     * @param seq DNA sequence
+     * @return Pair of FrameScores: (best_forward, best_reverse)
+     */
+    static std::pair<FrameScore, FrameScore> select_best_per_strand_stop_priority(
+        const std::string& seq);
+
+    /**
+     * Return all 6 reading frames with full scoring information
+     *
+     * Used for --all-frames mode where all 6 translations are output per read.
+     * Returns frames sorted by score (best first).
+     *
+     * @param seq DNA sequence
+     * @param damage Damage profile (optional)
+     * @return Vector of 6 FrameScores, sorted by total_score descending
+     */
+    static std::vector<FrameScore> score_all_frames_full(
+        const std::string& seq,
+        const DamageProfile* damage = nullptr);
+
+    /**
      * Calculate wobble position T enrichment for strand prediction
      * In damaged DNA, C→T at wobble position (codon pos 3) is often synonymous
      * If T's are enriched at wobble position, this suggests correct strand/frame
@@ -462,6 +514,22 @@ public:
         int fwd_frame,
         int rev_frame,
         const SampleDamageProfile& sample_profile);
+
+    /**
+     * Compute damage codon score for iterative enrichment
+     *
+     * Scores reads by presence of damage-diagnostic codon patterns:
+     * 1. Terminal T's in first 3 positions (C→T damage signature)
+     * 2. Internal stop codons near 5' (TAA/TAG/TGA from CAA/CAG/CGA damage)
+     * 3. T-rich codons at 5' end that are consistent with damaged C-containing codons
+     *
+     * This allows filtering for reads that show actual damage signal,
+     * rather than just coding potential.
+     *
+     * @param seq DNA sequence
+     * @return Damage codon score 0.0-1.0 (higher = more damage-indicative)
+     */
+    static float compute_damage_codon_score(const std::string& seq);
 };
 
 // Free functions for hexamer-based scoring and correction

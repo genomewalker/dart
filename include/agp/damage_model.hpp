@@ -330,6 +330,12 @@ public:
     float delta_max() const { return delta_max_; }
     float delta_background() const { return delta_background_; }
 
+    // Convenience getters for terminal damage rates (for positional hexamer weighting)
+    // Returns estimated 5' terminal damage rate (typically delta_max for C→T)
+    float get_delta_5() const { return delta_max_; }
+    // Returns estimated 3' terminal damage rate (typically delta_max for G→A)
+    float get_delta_3() const { return delta_max_; }
+
 private:
     float lambda_5prime_ = 0.1f;        // Decay rate from 5' end
     float lambda_3prime_ = 0.1f;        // Decay rate from 3' end

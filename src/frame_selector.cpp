@@ -9,6 +9,7 @@
 #include "agp/damage_model.hpp"
 #include "agp/gtdb_hexamer_table.hpp"
 #include "agp/hexamer_damage_lookup.hpp"
+#include "agp/multi_domain_positional_hexamer.hpp"
 #include <cmath>
 #include <algorithm>
 #include <climits>
@@ -44,11 +45,13 @@ std::string FrameSelector::reverse_complement(const std::string& seq) {
 }
 
 // Optimized frame scoring - no vector allocations
-// Now includes damage-frame consistency for ancient DNA
+// Now uses unified positional hexamer scoring with damage awareness
 static float score_frame_fast(
     const std::string& seq,
     int frame,
-    std::string& protein_out) {
+    std::string& protein_out,
+    float delta_5 = 0.0f,  // Optional damage parameters for damage-aware scoring
+    float delta_3 = 0.0f) {
 
     if (seq.length() < static_cast<size_t>(3 + frame)) {
         return -1000.0f;
@@ -65,8 +68,11 @@ static float score_frame_fast(
     float codon = calculate_codon_usage_score_direct(seq, frame);
     float stop = FrameSelector::calculate_stop_penalty(protein_out);
     float aa_comp = FrameSelector::calculate_aa_composition_score(protein_out);
-    float dicodon = calculate_dicodon_score(seq, frame);
     float dipeptide = calculate_dipeptide_score(protein_out);
+
+    // Unified positional hexamer score (replaces calculate_dicodon_score + positional_bonus)
+    // Uses position-specific tables (START/INTERNAL/END) and damage-weighted scoring
+    float hexamer = positional::calculate_hexamer_score_damage_aware(seq, frame, delta_5, delta_3);
 
     // GC3
     int gc3_count = 0, total3 = 0;
@@ -78,16 +84,15 @@ static float score_frame_fast(
         }
     }
     float gc3 = total3 > 0 ? static_cast<float>(gc3_count) / total3 : 0.5f;
-    float gc3_bonus = (gc3 > 0.5f) ? 0.1f : 0.0f;
+    // Smooth sigmoid bonus: centered at 0.5, max bonus 0.1 at gc3=0.7+
+    float gc3_bonus = 0.1f / (1.0f + std::exp(-10.0f * (gc3 - 0.5f)));
 
     float len_bonus = std::min(0.2f, static_cast<float>(protein_out.length()) / 100.0f);
 
-    // Damage-frame consistency score
-    // If sequence shows damage pattern, check if it's consistent with this frame
-    float damage_consistency = FrameSelector::score_damage_frame_consistency(seq, frame);
-    // Only apply if there's evidence of damage (T at 5' or A at 3')
+    // Damage-frame consistency score (simple T at 5' / A at 3' check)
     float damage_bonus = 0.0f;
-    if (seq.length() > 0) {
+    if (seq.length() > 0 && (delta_5 > 0.01f || delta_3 > 0.01f)) {
+        float damage_consistency = FrameSelector::score_damage_frame_consistency(seq, frame);
         bool has_damage_signal = (fast_upper(seq[0]) == 'T') ||
                                   (fast_upper(seq[seq.length()-1]) == 'A');
         if (has_damage_signal) {
@@ -95,11 +100,25 @@ static float score_frame_fast(
         }
     }
 
-    // Standard weights (validated)
-    return 0.15f * codon + 0.28f * stop + 0.10f * aa_comp +
-           0.13f * dicodon + 0.13f * dipeptide +
+    // Dynamic weights: when no stop codons (stop=1.0), redistribute weight to hexamer
+    // Base weights: codon=0.15, stop=0.28, aa=0.10, hexamer=0.18, dipeptide=0.13, gc3=0.05, len=0.05
+    // Note: hexamer weight increased since it now includes positional information
+    float stop_weight = 0.28f;
+    float hexamer_weight = 0.18f;  // Increased from 0.13 to account for positional info
+    float codon_weight = 0.15f;
+
+    // If stop penalty doesn't discriminate (no internal stops), boost hexamer weight
+    if (stop > 0.99f) {
+        // No stop codons detected - rely more heavily on sequence patterns
+        stop_weight = 0.0f;
+        hexamer_weight = 0.32f;  // +0.14: hexamer is most discriminative for frame
+        codon_weight = 0.29f;    // +0.14: codon usage also frame-specific
+    }
+
+    return codon_weight * codon + stop_weight * stop + 0.10f * aa_comp +
+           hexamer_weight * hexamer + 0.13f * dipeptide +
            0.05f * gc3_bonus + 0.05f * len_bonus +
-           damage_bonus;  // Add damage consistency
+           damage_bonus;
 }
 
 FrameScore FrameSelector::score_frame(
@@ -691,6 +710,10 @@ std::pair<FrameScore, FrameScore> FrameSelector::select_best_per_strand_damage_a
         return {empty, empty};
     }
 
+    // Get damage parameters from model for hexamer weighting
+    float delta_5 = damage_model.get_delta_5();
+    float delta_3 = damage_model.get_delta_3();
+
     // Compute reverse complement ONCE
     const std::string& rc_seq = reverse_complement_fast(seq);
 
@@ -702,7 +725,7 @@ std::pair<FrameScore, FrameScore> FrameSelector::select_best_per_strand_damage_a
 
     std::string protein;
 
-    // Score all 6 frames with damage-adjusted stop multiplier
+    // Score all 6 frames with damage-adjusted scoring
     for (int frame = 0; frame < 3; ++frame) {
         // Forward frame
         protein = translate_sequence(seq, frame);
@@ -711,8 +734,10 @@ std::pair<FrameScore, FrameScore> FrameSelector::select_best_per_strand_damage_a
             float codon = calculate_codon_usage_score_direct(seq, frame);
             float stop = calculate_damage_adjusted_stop_multiplier(seq, protein, frame, damage_model);
             float aa_comp = calculate_aa_composition_score(protein);
-            float dicodon = calculate_dicodon_score(seq, frame);
             float dipeptide = calculate_dipeptide_score(protein);
+
+            // Unified positional hexamer score with damage weighting
+            float hexamer = positional::calculate_hexamer_score_damage_aware(seq, frame, delta_5, delta_3);
 
             // GC3 bonus
             int gc3_count = 0, total3 = 0;
@@ -724,7 +749,7 @@ std::pair<FrameScore, FrameScore> FrameSelector::select_best_per_strand_damage_a
                 }
             }
             float gc3 = total3 > 0 ? static_cast<float>(gc3_count) / total3 : 0.5f;
-            float gc3_bonus = (gc3 > 0.5f) ? 0.1f : 0.0f;
+            float gc3_bonus = 0.1f / (1.0f + std::exp(-10.0f * (gc3 - 0.5f)));
 
             float len_bonus = std::min(0.2f, static_cast<float>(protein.length()) / 100.0f);
 
@@ -743,8 +768,19 @@ std::pair<FrameScore, FrameScore> FrameSelector::select_best_per_strand_damage_a
             float wobble_enrich = calculate_wobble_enrichment(seq, frame, 15);
             float wobble_bonus = (wobble_enrich - 0.5f) * 0.10f;  // +/- 0.05 max
 
-            float total = 0.15f * codon + 0.28f * stop + 0.10f * aa_comp +
-                         0.13f * dicodon + 0.13f * dipeptide +
+            // Dynamic weights
+            float stop_weight = 0.28f;
+            float hexamer_weight = 0.18f;
+            float codon_weight = 0.15f;
+
+            if (stop > 0.99f) {
+                stop_weight = 0.0f;
+                hexamer_weight = 0.32f;
+                codon_weight = 0.29f;
+            }
+
+            float total = codon_weight * codon + stop_weight * stop + 0.10f * aa_comp +
+                         hexamer_weight * hexamer + 0.13f * dipeptide +
                          0.05f * gc3_bonus + 0.05f * len_bonus +
                          damage_bonus + wobble_bonus;
 
@@ -767,8 +803,10 @@ std::pair<FrameScore, FrameScore> FrameSelector::select_best_per_strand_damage_a
             float codon = calculate_codon_usage_score_direct(rc_seq, frame);
             float stop = calculate_damage_adjusted_stop_multiplier(rc_seq, protein, frame, damage_model);
             float aa_comp = calculate_aa_composition_score(protein);
-            float dicodon = calculate_dicodon_score(rc_seq, frame);
             float dipeptide = calculate_dipeptide_score(protein);
+
+            // Unified positional hexamer score with damage weighting
+            float hexamer = positional::calculate_hexamer_score_damage_aware(rc_seq, frame, delta_5, delta_3);
 
             // GC3 bonus
             int gc3_count = 0, total3 = 0;
@@ -780,7 +818,7 @@ std::pair<FrameScore, FrameScore> FrameSelector::select_best_per_strand_damage_a
                 }
             }
             float gc3 = total3 > 0 ? static_cast<float>(gc3_count) / total3 : 0.5f;
-            float gc3_bonus = (gc3 > 0.5f) ? 0.1f : 0.0f;
+            float gc3_bonus = 0.1f / (1.0f + std::exp(-10.0f * (gc3 - 0.5f)));
 
             float len_bonus = std::min(0.2f, static_cast<float>(protein.length()) / 100.0f);
 
@@ -799,8 +837,19 @@ std::pair<FrameScore, FrameScore> FrameSelector::select_best_per_strand_damage_a
             float wobble_enrich = calculate_wobble_enrichment(rc_seq, frame, 15);
             float wobble_bonus = (wobble_enrich - 0.5f) * 0.10f;  // +/- 0.05 max
 
-            float total = 0.15f * codon + 0.28f * stop + 0.10f * aa_comp +
-                         0.13f * dicodon + 0.13f * dipeptide +
+            // Dynamic weights
+            float stop_weight = 0.28f;
+            float hexamer_weight = 0.18f;
+            float codon_weight = 0.15f;
+
+            if (stop > 0.99f) {
+                stop_weight = 0.0f;
+                hexamer_weight = 0.32f;
+                codon_weight = 0.29f;
+            }
+
+            float total = codon_weight * codon + stop_weight * stop + 0.10f * aa_comp +
+                         hexamer_weight * hexamer + 0.13f * dipeptide +
                          0.05f * gc3_bonus + 0.05f * len_bonus +
                          damage_bonus + wobble_bonus;
 
@@ -904,6 +953,151 @@ std::pair<FrameScore, FrameScore> FrameSelector::select_best_per_strand_stop_onl
     }
 
     return {best_fwd, best_rev};
+}
+
+std::pair<FrameScore, FrameScore> FrameSelector::select_best_per_strand_stop_priority(
+    const std::string& seq) {
+
+    if (seq.length() < 3) {
+        FrameScore empty;
+        empty.total_score = -1000.0f;
+        return {empty, empty};
+    }
+
+    // Compute reverse complement ONCE
+    const std::string& rc_seq = reverse_complement_fast(seq);
+
+    // Store all 6 frame results with stop counts and hexamer scores
+    struct FrameInfo {
+        int frame;
+        bool forward;
+        int stop_count;
+        float hexamer_llr;
+        std::string protein;
+        float stop_penalty;
+    };
+
+    std::vector<FrameInfo> fwd_frames(3);
+    std::vector<FrameInfo> rev_frames(3);
+
+    // Score all 6 frames
+    for (int frame = 0; frame < 3; ++frame) {
+        // Forward frame
+        std::string protein = translate_sequence(seq, frame);
+        int stops = 0;
+        for (size_t i = 0; i + 1 < protein.length(); ++i) {
+            if (protein[i] == '*') stops++;
+        }
+        float hexamer_llr = calculate_hexamer_llr_score(seq, frame);
+        float stop_pen = calculate_stop_penalty(protein);
+        fwd_frames[frame] = {frame, true, stops, hexamer_llr, std::move(protein), stop_pen};
+
+        // Reverse frame
+        protein = translate_sequence(rc_seq, frame);
+        stops = 0;
+        for (size_t i = 0; i + 1 < protein.length(); ++i) {
+            if (protein[i] == '*') stops++;
+        }
+        hexamer_llr = calculate_hexamer_llr_score(rc_seq, frame);
+        stop_pen = calculate_stop_penalty(protein);
+        rev_frames[frame] = {frame, false, stops, hexamer_llr, std::move(protein), stop_pen};
+    }
+
+    // Sort by: (1) stop_count ascending, (2) hexamer_llr descending
+    auto compare = [](const FrameInfo& a, const FrameInfo& b) {
+        if (a.stop_count != b.stop_count) return a.stop_count < b.stop_count;
+        return a.hexamer_llr > b.hexamer_llr;  // Higher LLR is better
+    };
+
+    std::sort(fwd_frames.begin(), fwd_frames.end(), compare);
+    std::sort(rev_frames.begin(), rev_frames.end(), compare);
+
+    // Build result FrameScores
+    FrameScore best_fwd, best_rev;
+
+    // Best forward
+    const auto& bf = fwd_frames[0];
+    best_fwd.frame = bf.frame;
+    best_fwd.forward = true;
+    best_fwd.protein = bf.protein;
+    best_fwd.stop_codon_penalty = bf.stop_penalty;
+    best_fwd.codon_score = calculate_codon_usage_score_direct(seq, bf.frame);
+    best_fwd.aa_composition_score = calculate_aa_composition_score(bf.protein);
+    best_fwd.damage_consistency = 0.5f;
+    // Composite score: primarily stop penalty, with hexamer bonus
+    // Normalize hexamer LLR to 0-0.3 range for small bonus
+    float hexamer_bonus_fwd = std::max(0.0f, std::min(0.3f, bf.hexamer_llr * 0.05f + 0.15f));
+    best_fwd.total_score = bf.stop_penalty * 0.7f + hexamer_bonus_fwd;
+
+    // Best reverse
+    const auto& br = rev_frames[0];
+    best_rev.frame = br.frame;
+    best_rev.forward = false;
+    best_rev.protein = br.protein;
+    best_rev.stop_codon_penalty = br.stop_penalty;
+    best_rev.codon_score = calculate_codon_usage_score_direct(rc_seq, br.frame);
+    best_rev.aa_composition_score = calculate_aa_composition_score(br.protein);
+    best_rev.damage_consistency = 0.5f;
+    float hexamer_bonus_rev = std::max(0.0f, std::min(0.3f, br.hexamer_llr * 0.05f + 0.15f));
+    best_rev.total_score = br.stop_penalty * 0.7f + hexamer_bonus_rev;
+
+    return {best_fwd, best_rev};
+}
+
+std::vector<FrameScore> FrameSelector::score_all_frames_full(
+    const std::string& seq,
+    const DamageProfile* damage) {
+
+    std::vector<FrameScore> scores;
+    scores.reserve(6);
+
+    if (seq.length() < 3) {
+        return scores;
+    }
+
+    // Compute reverse complement ONCE
+    const std::string& rc_seq = reverse_complement_fast(seq);
+
+    std::string protein;
+
+    // Score all 6 frames
+    for (int frame = 0; frame < 3; ++frame) {
+        // Forward frame
+        FrameScore fwd;
+        fwd.frame = frame;
+        fwd.forward = true;
+        fwd.total_score = score_frame_fast(seq, frame, protein);
+        fwd.protein = protein;
+        if (fwd.total_score > -100.0f) {
+            fwd.codon_score = calculate_codon_usage_score_direct(seq, frame);
+            fwd.stop_codon_penalty = calculate_stop_penalty(protein);
+            fwd.aa_composition_score = calculate_aa_composition_score(protein);
+            fwd.damage_consistency = score_damage_frame_consistency(seq, frame);
+        }
+        scores.push_back(std::move(fwd));
+
+        // Reverse frame
+        FrameScore rev;
+        rev.frame = frame;
+        rev.forward = false;
+        rev.total_score = score_frame_fast(rc_seq, frame, protein);
+        rev.protein = protein;
+        if (rev.total_score > -100.0f) {
+            rev.codon_score = calculate_codon_usage_score_direct(rc_seq, frame);
+            rev.stop_codon_penalty = calculate_stop_penalty(protein);
+            rev.aa_composition_score = calculate_aa_composition_score(protein);
+            rev.damage_consistency = score_damage_frame_consistency(rc_seq, frame);
+        }
+        scores.push_back(std::move(rev));
+    }
+
+    // Sort by score descending
+    std::sort(scores.begin(), scores.end(),
+              [](const FrameScore& a, const FrameScore& b) {
+                  return a.total_score > b.total_score;
+              });
+
+    return scores;
 }
 
 std::pair<FrameScore, FrameScore> FrameSelector::select_best_per_strand_hexamer_aware(
