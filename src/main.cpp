@@ -23,13 +23,13 @@ void print_version() {
 
 void print_usage(const char* program_name) {
     std::cout << "Ancient Gene Predictor v" << AGP_VERSION << "\n\n";
-    std::cout << "Usage: " << program_name << " -i <input> -o <output> [options]\n";
-    std::cout << "       " << program_name << " [options] <input.fasta|fastq>\n\n";
+    std::cout << "Usage: " << program_name << " -i <input> -o <output> [options]\n\n";
     std::cout << "Options:\n";
     std::cout << "  -i, --input <file>       Input FASTA/FASTQ file (or .gz)\n";
     std::cout << "  -o, --output <file>      Output GFF3 file (default: predictions.gff)\n";
     std::cout << "  --fasta-nt <file>        Output nucleotide FASTA\n";
     std::cout << "  --fasta-aa <file>        Output amino acid FASTA\n";
+    std::cout << "  --summary <file>         Output sample statistics (JSON format)\n";
     std::cout << "  --min-length <int>       Minimum sequence length (default: 30)\n";
     std::cout << "  --min-coding-prob <f>    Minimum coding probability (default: 0.3)\n";
     std::cout << "  --threads <int>          Number of threads (default: auto)\n";
@@ -38,10 +38,16 @@ void print_usage(const char* program_name) {
     std::cout << "  --both-strands           Output predictions for both strands\n";
     std::cout << "  --no-aggregate           Disable two-pass damage aggregation\n";
     std::cout << "  --stop-only              Use stop-codon-only frame selection (97% accuracy)\n";
+    std::cout << "  --stop-priority          Use stop-count-priority scoring (stops primary, hexamer tiebreaker)\n";
+    std::cout << "  --all-frames             Output all 6 reading frames per read\n";
     std::cout << "  --domain <name>          Taxonomic domain for hexamer scoring (default: gtdb)\n";
     std::cout << "                           Options: gtdb, fungi, plant, protozoa, invertebrate,\n";
     std::cout << "                                    viral, mammal, vertebrate, meta\n";
     std::cout << "                           Use 'meta' for weighted ensemble scoring across all domains\n";
+    std::cout << "  --iterative-damage       Enable iterative damage refinement (4-pass mode)\n";
+    std::cout << "                           Re-estimates damage using only high-scoring genes\n";
+    std::cout << "                           Recommended for metagenomes with mixed damage signals\n";
+    std::cout << "  --iterative-threshold <f> Min coding probability for damage re-estimation (default: 0.5)\n";
     std::cout << "  -v, --verbose            Verbose output\n";
     std::cout << "  -V, --version            Show version and exit\n";
     std::cout << "  -h, --help               Show this help message\n";
@@ -53,11 +59,13 @@ void print_usage(const char* program_name) {
     std::cout << "\n";
     std::cout << "Examples:\n";
     std::cout << "  # Standard usage (best strand + aggregate damage)\n";
-    std::cout << "  " << program_name << " reads.fastq -o predictions.gff\n\n";
+    std::cout << "  " << program_name << " -i reads.fastq -o predictions.gff\n\n";
     std::cout << "  # Output both strands per read\n";
-    std::cout << "  " << program_name << " --both-strands reads.fastq\n\n";
+    std::cout << "  " << program_name << " -i reads.fastq -o predictions.gff --both-strands\n\n";
     std::cout << "  # Undamaged DNA (skip damage detection)\n";
-    std::cout << "  " << program_name << " --no-damage reads.fastq\n\n";
+    std::cout << "  " << program_name << " -i reads.fastq -o predictions.gff --no-damage\n\n";
+    std::cout << "  # Iterative damage refinement for mixed metagenomes\n";
+    std::cout << "  " << program_name << " -i reads.fastq -o predictions.gff --iterative-damage\n\n";
 }
 
 struct Options {
@@ -65,6 +73,7 @@ struct Options {
     std::string output_file = "predictions.gff";
     std::string fasta_nt;
     std::string fasta_aa;
+    std::string summary_file;  // Summary statistics output file (JSON format)
     std::string domain_name = "gtdb";  // Default to bacteria/archaea for ancient DNA
     bool use_damage = true;
     size_t min_length = 30;
@@ -75,7 +84,11 @@ struct Options {
     bool best_strand_only = true;  // Default ON: output only best-scoring strand (cleaner output)
     bool aggregate_damage = true;  // Default ON for better damage detection
     bool stop_only = false;        // Use stop-codon-only frame selection (experimental)
+    bool stop_priority = false;    // Use stop-count-priority scoring (stops primary, hexamer tiebreaker)
+    bool all_frames = false;       // Output all 6 reading frames per read
     bool metagenome_mode = false;   // Use weighted ensemble scoring across all domains
+    bool iterative_damage = false;  // Iterative damage refinement for low-signal samples
+    float iterative_threshold = 0.5f;  // Min coding_prob for damage re-estimation
 };
 
 Options parse_args(int argc, char* argv[]) {
@@ -98,6 +111,8 @@ Options parse_args(int argc, char* argv[]) {
             if (i + 1 < argc) opts.fasta_nt = argv[++i];
         } else if (arg == "--fasta-aa") {
             if (i + 1 < argc) opts.fasta_aa = argv[++i];
+        } else if (arg == "--summary") {
+            if (i + 1 < argc) opts.summary_file = argv[++i];
         } else if (arg == "--no-damage") {
             opts.use_damage = false;
         } else if (arg == "--min-coding-prob") {
@@ -122,6 +137,15 @@ Options parse_args(int argc, char* argv[]) {
             opts.aggregate_damage = true;
         } else if (arg == "--stop-only") {
             opts.stop_only = true;
+        } else if (arg == "--stop-priority") {
+            opts.stop_priority = true;
+        } else if (arg == "--all-frames") {
+            opts.all_frames = true;
+            opts.best_strand_only = false;  // All-frames implies outputting all strands
+        } else if (arg == "--iterative-damage") {
+            opts.iterative_damage = true;
+        } else if (arg == "--iterative-threshold") {
+            if (i + 1 < argc) opts.iterative_threshold = std::stof(argv[++i]);
         } else if (arg == "--domain") {
             if (i + 1 < argc) {
                 opts.domain_name = argv[++i];
@@ -130,10 +154,9 @@ Options parse_args(int argc, char* argv[]) {
                     opts.metagenome_mode = true;
                 }
             }
-        } else if (arg[0] != '-') {
-            opts.input_file = arg;
         } else {
             std::cerr << "Unknown option: " << arg << "\n";
+            std::cerr << "All arguments must be named (e.g., -i input.fa -o output.gff)\n";
             exit(1);
         }
     }
@@ -184,7 +207,13 @@ int main(int argc, char* argv[]) {
             std::cerr << "Min coding prob: " << opts.min_coding_prob << "\n";
             std::cerr << "Damage detection: " << (opts.use_damage ? "ON" : "OFF") << "\n";
             if (opts.aggregate_damage) std::cerr << "Aggregate damage: ON (two-pass)\n";
+            if (opts.iterative_damage) {
+                std::cerr << "Iterative damage: ON (4-pass refinement)\n";
+                std::cerr << "Iterative threshold: " << opts.iterative_threshold << "\n";
+            }
             if (opts.stop_only) std::cerr << "Frame selection: STOP-ONLY (97% accuracy mode)\n";
+            if (opts.stop_priority) std::cerr << "Frame selection: STOP-PRIORITY (stops primary, hexamer tiebreaker)\n";
+            if (opts.all_frames) std::cerr << "Output mode: ALL-FRAMES (6 frames per read)\n";
             if (opts.dual_strand) {
                 std::cerr << "Dual-strand: ON";
                 if (opts.best_strand_only) std::cerr << " (best only)";
@@ -319,9 +348,233 @@ int main(int argc, char* argv[]) {
             std::cerr << "\n";
         }
 
+        // ========================================================================
+        // ITERATIVE DAMAGE REFINEMENT (Pass 2 + Pass 3)
+        // When enabled, performs:
+        //   Pass 2: Quick gene scoring (coding probability only)
+        //   Pass 3: Re-estimate damage using only high-scoring sequences
+        // This helps extract damage signal from metagenomes with mixed content
+        // ========================================================================
+        agp::SampleDamageProfile refined_profile;  // Will hold refined damage profile
+        if (opts.iterative_damage && opts.aggregate_damage && opts.use_damage) {
+            // Store initial profile for comparison
+            float initial_5prime = sample_profile.max_damage_5prime;
+            float initial_3prime = sample_profile.max_damage_3prime;
+
+            std::cerr << "[Pass 2] Codon-damage scoring for damage enrichment...\n";
+            auto pass2_start = std::chrono::high_resolution_clock::now();
+
+            // Re-read file for scoring pass
+            agp::SequenceReader scoring_pass(opts.input_file);
+            const size_t PASS2_BATCH_SIZE = 50000;
+            std::vector<agp::SequenceRecord> batch;
+            batch.reserve(PASS2_BATCH_SIZE);
+
+            // Thread-local profiles for refined damage estimation
+            std::vector<agp::SampleDamageProfile> thread_profiles(num_threads);
+            size_t high_score_count = 0;
+            size_t pass2_count = 0;
+
+            while (true) {
+                batch.clear();
+                agp::SequenceRecord record;
+                while (batch.size() < PASS2_BATCH_SIZE && scoring_pass.read_next(record)) {
+                    batch.push_back(std::move(record));
+                }
+                if (batch.empty()) break;
+
+                // Thread-local counters for high-scoring sequences
+                std::vector<size_t> thread_high_count(num_threads, 0);
+
+                #pragma omp parallel for schedule(static)
+                for (size_t i = 0; i < batch.size(); ++i) {
+                    int tid = 0;
+                    #ifdef _OPENMP
+                    tid = omp_get_thread_num();
+                    #endif
+
+                    std::string seq = agp::SequenceUtils::clean(batch[i].sequence);
+                    if (seq.length() < opts.min_length) continue;
+
+                    // Use damage codon score to identify reads with damage patterns
+                    // This scores reads by damage-diagnostic codon patterns:
+                    // - Terminal T enrichment (C→T damage)
+                    // - Damage-induced stop codons (TAA/TAG/TGA from CAA/CAG/CGA)
+                    // - Within-read T/(T+C) gradient
+                    float damage_codon_score = agp::FrameSelector::compute_damage_codon_score(seq);
+
+                    // Include sequences with damage signal above threshold
+                    // Higher threshold = more stringent filtering for damage-indicative reads
+                    if (damage_codon_score >= opts.iterative_threshold) {
+                        // Weight by damage codon score: higher scores = more damage signal
+                        float weight = damage_codon_score;
+                        agp::FrameSelector::update_sample_profile_weighted(
+                            thread_profiles[tid], seq, weight);
+                        thread_high_count[tid]++;
+                    }
+                }
+
+                // Sum up high-score counts
+                for (int t = 0; t < num_threads; ++t) {
+                    high_score_count += thread_high_count[t];
+                    thread_high_count[t] = 0;  // Reset for next batch
+                }
+
+                pass2_count += batch.size();
+                if (pass2_count % 1000000 < PASS2_BATCH_SIZE) {
+                    if (is_tty) {
+                        std::cerr << "\r  Scanned " << pass2_count / 1000000 << "M sequences ("
+                                 << high_score_count / 1000 << "K damage-indicative)..." << std::flush;
+                    } else {
+                        std::cerr << "  Scanned " << pass2_count / 1000000 << "M sequences ("
+                                 << high_score_count / 1000 << "K damage-indicative)..." << std::endl;
+                    }
+                }
+            }
+
+            // Merge thread-local profiles into refined profile
+            for (int t = 0; t < num_threads; ++t) {
+                agp::FrameSelector::merge_sample_profiles(refined_profile, thread_profiles[t]);
+            }
+
+            // Finalize the refined profile
+            agp::FrameSelector::finalize_sample_profile(refined_profile);
+
+            auto pass2_end = std::chrono::high_resolution_clock::now();
+            auto pass2_duration = std::chrono::duration_cast<std::chrono::milliseconds>(pass2_end - pass2_start);
+
+            if (is_tty) std::cerr << "\r                                                            \r";
+
+            // Report refinement results
+            float refined_avg = (refined_profile.max_damage_5prime + refined_profile.max_damage_3prime) / 2.0f;
+            float initial_avg = (initial_5prime + initial_3prime) / 2.0f;
+
+            std::cerr << "  Damage-indicative reads: " << high_score_count << " / " << pass2_count
+                     << " (" << std::fixed << std::setprecision(1)
+                     << (100.0 * high_score_count / (pass2_count + 1)) << "%)\n";
+            std::cerr << "  Refined damage: 5'=" << std::setprecision(1)
+                     << refined_profile.max_damage_5prime * 100.0f << "% 3'="
+                     << refined_profile.max_damage_3prime * 100.0f << "%";
+
+            // Show improvement or note if refinement helped
+            if (refined_avg > initial_avg + 0.01f) {
+                std::cerr << " (+" << std::setprecision(1)
+                         << (refined_avg - initial_avg) * 100.0f << "% vs all-reads)\n";
+            } else if (refined_avg < initial_avg - 0.01f) {
+                std::cerr << " (" << std::setprecision(1)
+                         << (refined_avg - initial_avg) * 100.0f << "% vs all-reads)\n";
+            } else {
+                std::cerr << " (similar to all-reads)\n";
+            }
+
+            std::cerr << "  | " << std::setprecision(1) << pass2_duration.count() / 1000.0 << "s\n";
+
+            // Determine if we should trust the refined profile
+            // The codon-damage enrichment can produce false positives on modern DNA
+            // by selecting naturally AT-biased sequences. We detect this by checking
+            // whether the enrichment produced a physically plausible damage signal.
+
+            float initial_t_ratio = 0.5f;
+            float baseline_t_ratio = 0.5f;
+            if (sample_profile.t_freq_5prime[0] + sample_profile.c_freq_5prime[0] > 0) {
+                initial_t_ratio = sample_profile.t_freq_5prime[0] /
+                    (sample_profile.t_freq_5prime[0] + sample_profile.c_freq_5prime[0]);
+            }
+            if (sample_profile.baseline_t_freq + sample_profile.baseline_c_freq > 0) {
+                baseline_t_ratio = sample_profile.baseline_t_freq /
+                    (sample_profile.baseline_t_freq + sample_profile.baseline_c_freq);
+            }
+
+            // Check if refined profile shows DECAY pattern (hallmark of real damage)
+            // Real damage: high at position 0, decreasing toward interior
+            // False positive: high at ALL positions (just AT-biased reads)
+            float refined_pos0_t = 0.5f;
+            float refined_pos4_t = 0.5f;  // Position 4-5 for decay check
+            if (refined_profile.t_freq_5prime[0] + refined_profile.c_freq_5prime[0] > 0) {
+                refined_pos0_t = refined_profile.t_freq_5prime[0] /
+                    (refined_profile.t_freq_5prime[0] + refined_profile.c_freq_5prime[0]);
+            }
+            if (refined_profile.t_freq_5prime[4] + refined_profile.c_freq_5prime[4] > 0) {
+                refined_pos4_t = refined_profile.t_freq_5prime[4] /
+                    (refined_profile.t_freq_5prime[4] + refined_profile.c_freq_5prime[4]);
+            }
+
+            // Decay signal: position 0 should be notably higher than position 4
+            // If no decay, we're just selecting AT-biased sequences
+            float decay_signal = refined_pos0_t - refined_pos4_t;
+            bool has_decay_pattern = decay_signal > 0.03f;  // At least 3% decay over 4 positions
+
+            // Initial profile must show SOME damage signal for refinement to be trusted
+            bool initial_has_damage_signal = (initial_t_ratio > baseline_t_ratio + 0.01f) ||
+                                              (initial_5prime > 0.01f) || (initial_3prime > 0.01f);
+
+            // Use refined profile if:
+            // 1. Sufficient reads and signal, AND
+            // 2. Either initial profile had signal, OR refined shows decay pattern
+            bool use_refined = refined_profile.n_reads >= 1000 && refined_avg > 0.01f;
+
+            if (!initial_has_damage_signal && !has_decay_pattern) {
+                // Sample showed NO initial damage AND refined has no decay pattern
+                // This indicates we're just selecting AT-biased reads, not damaged ones
+                if (refined_avg > 0.05f && initial_avg < 0.005f) {
+                    use_refined = false;
+                    if (opts.verbose) {
+                        std::cerr << "  [WARNING] Initial profile shows no damage signal (T/(T+C)="
+                                  << std::fixed << std::setprecision(1) << initial_t_ratio * 100.0f
+                                  << "% vs baseline=" << baseline_t_ratio * 100.0f << "%)\n";
+                        std::cerr << "  [WARNING] Refined profile has no decay pattern (pos0="
+                                  << refined_pos0_t * 100.0f << "% pos4=" << refined_pos4_t * 100.0f
+                                  << "% decay=" << decay_signal * 100.0f << "%)\n";
+                        std::cerr << "  [WARNING] Refined profile likely false positive from AT-biased reads\n";
+                    }
+                }
+            } else if (!initial_has_damage_signal && has_decay_pattern && opts.verbose) {
+                std::cerr << "  [INFO] Initial profile has no signal but refined shows decay pattern\n";
+                std::cerr << "  [INFO] (pos0=" << std::fixed << std::setprecision(1)
+                          << refined_pos0_t * 100.0f << "% pos4=" << refined_pos4_t * 100.0f
+                          << "% decay=" << decay_signal * 100.0f << "%) - using refined\n";
+            }
+
+            if (use_refined) {
+                // Update the main sample_profile with refined estimates
+                sample_profile.max_damage_5prime = refined_profile.max_damage_5prime;
+                sample_profile.max_damage_3prime = refined_profile.max_damage_3prime;
+                sample_profile.lambda_5prime = refined_profile.lambda_5prime;
+                sample_profile.lambda_3prime = refined_profile.lambda_3prime;
+                sample_profile.library_type = refined_profile.library_type;
+                sample_profile.sample_damage_prob = refined_profile.sample_damage_prob;
+
+                // Copy damage rate arrays
+                for (int i = 0; i < 15; ++i) {
+                    sample_profile.damage_rate_5prime[i] = refined_profile.damage_rate_5prime[i];
+                    sample_profile.damage_rate_3prime[i] = refined_profile.damage_rate_3prime[i];
+                }
+
+                // Update damage model with refined profile
+                damage_model.update_from_sample_profile(sample_profile);
+
+                if (opts.verbose) {
+                    std::cerr << "  [DEBUG] Using refined damage profile for gene prediction\n";
+                    std::cerr << "  [DEBUG] Library type: " << refined_profile.library_type_str() << "\n";
+                }
+            } else if (opts.verbose) {
+                if (!initial_has_damage_signal && refined_avg > 0.05f) {
+                    std::cerr << "  [DEBUG] Rejecting refined profile (false positive safeguard)\n";
+                } else {
+                    std::cerr << "  [DEBUG] Refined profile has insufficient signal, keeping original\n";
+                }
+            }
+
+            std::cerr << "\n";
+        }
+
         // Main processing with double-buffering
         if (opts.aggregate_damage && opts.use_damage) {
-            std::cerr << "[Pass 2] Gene prediction...\n";
+            if (opts.iterative_damage) {
+                std::cerr << "[Pass 3] Gene prediction with refined damage model...\n";
+            } else {
+                std::cerr << "[Pass 2] Gene prediction...\n";
+            }
         } else {
             std::cerr << "[Processing] Gene prediction...\n";
         }
@@ -418,13 +671,47 @@ int main(int argc, char* argv[]) {
 
                 std::vector<agp::Gene> genes;
 
-                if (opts.dual_strand) {
+                // Handle --all-frames mode: output all 6 reading frames
+                if (opts.all_frames) {
+                    std::vector<agp::FrameScore> all_frames = agp::FrameSelector::score_all_frames_full(seq, profile_ptr);
+                    float damage_pct = agp::FrameSelector::compute_damage_percentage(seq, sample_profile);
+
+                    for (const auto& frame_score : all_frames) {
+                        if (frame_score.total_score < -100.0f) continue;  // Skip invalid frames
+
+                        agp::Gene gene;
+                        gene.start = 0;
+                        gene.end = seq.length();
+                        gene.is_forward = frame_score.forward;
+                        gene.is_fragment = true;
+                        gene.coding_prob = frame_score.total_score;
+                        gene.score = frame_score.total_score;
+                        gene.frame = frame_score.frame;
+                        gene.damage_score = damage_pct;
+
+                        if (frame_score.forward) {
+                            gene.sequence = seq;
+                            gene.ancient_prob = agp::FrameSelector::estimate_ancient_prob_codon_aware(
+                                seq, frame_score.frame, sample_profile);
+                        } else {
+                            gene.sequence = agp::FrameSelector::reverse_complement(seq);
+                            int orig_frame = (seq.length() - frame_score.frame) % 3;
+                            gene.ancient_prob = agp::FrameSelector::estimate_ancient_prob_codon_aware(
+                                seq, orig_frame, sample_profile);
+                        }
+                        gene.protein = frame_score.protein;
+                        genes.push_back(std::move(gene));
+                    }
+                } else if (opts.dual_strand) {
                     // Output best frame from BOTH strands
                     // Use appropriate frame selection method based on options
                     std::pair<agp::FrameScore, agp::FrameScore> strand_results;
                     if (opts.stop_only) {
                         // Stop-only frame selection: 97% accuracy, uses ONLY stop codon count
                         strand_results = agp::FrameSelector::select_best_per_strand_stop_only(seq);
+                    } else if (opts.stop_priority) {
+                        // Stop-priority frame selection: stops primary, hexamer LLR tiebreaker
+                        strand_results = agp::FrameSelector::select_best_per_strand_stop_priority(seq);
                     } else {
                         // Standard scoring: strict stop penalties
                         // Use this regardless of damage detection settings
@@ -718,6 +1005,69 @@ int main(int argc, char* argv[]) {
         }
 
         std::cerr << "\nDone.\n";
+
+        // Write JSON summary if requested
+        if (!opts.summary_file.empty()) {
+            std::ofstream summary(opts.summary_file);
+            if (summary.is_open()) {
+                double mean_dmg_pct = total_genes > 0 ? total_damage_pct / total_genes : 0.0;
+                float avg_damage = (sample_profile.max_damage_5prime + sample_profile.max_damage_3prime) / 2.0f;
+
+                // Determine damage level classification
+                std::string damage_level;
+                if (avg_damage > 0.10f) damage_level = "high";
+                else if (avg_damage > 0.05f) damage_level = "moderate";
+                else if (avg_damage > 0.02f) damage_level = "low";
+                else damage_level = "minimal";
+
+                summary << "{\n";
+                summary << "  \"version\": \"" << AGP_VERSION << "\",\n";
+                summary << "  \"input\": \"" << opts.input_file << "\",\n";
+                summary << "  \"output\": \"" << opts.output_file << "\",\n";
+                summary << "  \"domain\": \"" << (opts.metagenome_mode ? "meta" : opts.domain_name) << "\",\n";
+                summary << "  \"sequences\": " << seq_count << ",\n";
+                summary << "  \"genes\": " << total_genes << ",\n";
+                summary << "  \"processing_time_seconds\": " << std::fixed << std::setprecision(1)
+                        << duration.count() / 1000.0 << ",\n";
+                summary << "  \"damage\": {\n";
+                summary << "    \"detection_enabled\": " << (opts.use_damage ? "true" : "false") << ",\n";
+                summary << "    \"aggregate_mode\": " << (opts.aggregate_damage ? "true" : "false") << ",\n";
+                summary << "    \"level\": \"" << damage_level << "\",\n";
+                summary << "    \"five_prime_percent\": " << std::setprecision(2)
+                        << sample_profile.max_damage_5prime * 100.0f << ",\n";
+                summary << "    \"three_prime_percent\": " << std::setprecision(2)
+                        << sample_profile.max_damage_3prime * 100.0f << ",\n";
+                summary << "    \"d_max\": " << std::setprecision(2)
+                        << avg_damage * 100.0f << ",\n";
+                summary << "    \"lambda_5prime\": " << std::setprecision(3)
+                        << sample_profile.lambda_5prime << ",\n";
+                summary << "    \"lambda_3prime\": " << std::setprecision(3)
+                        << sample_profile.lambda_3prime << ",\n";
+                summary << "    \"library_type\": \"" << sample_profile.library_type_str() << "\"\n";
+                summary << "  },\n";
+                summary << "  \"ancient_prob_distribution\": [";
+                for (int i = 0; i < 10; ++i) {
+                    double pct = total_genes > 0 ? 100.0 * damage_prob_hist[i] / total_genes : 0.0;
+                    summary << std::setprecision(2) << pct;
+                    if (i < 9) summary << ", ";
+                }
+                summary << "],\n";
+                summary << "  \"damage_pct_distribution\": [";
+                for (int i = 0; i < 10; ++i) {
+                    double pct = total_genes > 0 ? 100.0 * damage_pct_hist[i] / total_genes : 0.0;
+                    summary << std::setprecision(2) << pct;
+                    if (i < 9) summary << ", ";
+                }
+                summary << "],\n";
+                summary << "  \"corrections\": {\n";
+                summary << "    \"genes_corrected\": " << total_genes_corrected << ",\n";
+                summary << "    \"total_dna_corrections\": " << total_dna_corrections << ",\n";
+                summary << "    \"total_aa_corrections\": " << total_aa_corrections << "\n";
+                summary << "  }\n";
+                summary << "}\n";
+                summary.close();
+            }
+        }
 
         writer.close();
         return 0;

@@ -457,19 +457,26 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
     // For ancient DNA: damage converts C→T, so we measure T's where C was expected
     // Damage rate = mismatches / (matches + mismatches) where mismatch = T at C site
 
+    // Compute baseline T/C and A/G ratios from the middle of reads (already normalized)
+    // This is more accurate than assuming 50% as genomes have varying GC content
+    double baseline_tc = profile.baseline_t_freq /
+                        (profile.baseline_t_freq + profile.baseline_c_freq + 0.001);
+    double baseline_ag = profile.baseline_a_freq /
+                        (profile.baseline_a_freq + profile.baseline_g_freq + 0.001);
+
     // Normalize position-specific frequencies and compute damage rates
     for (int i = 0; i < 15; ++i) {
         // 5' end: C→T damage
         // The damage rate is the fraction of C+T sites that show T
         // For aDNA with 30% damage: if original had 50% C, now 35% C + 15% T from damage
         // T/(T+C) = (original_T + damaged_C) / (original_T + original_C)
-        // We report T/(T+C) - 0.5 (assuming balanced genome) as the damage signal
+        // We report T/(T+C) - baseline_tc as the damage signal (using actual genome baseline)
         double tc_total = profile.t_freq_5prime[i] + profile.c_freq_5prime[i];
         if (tc_total > 0) {
             double t_freq = profile.t_freq_5prime[i] / tc_total;
-            // Report C→T rate: fraction of T's at C/T sites above baseline 50%
+            // Report C→T rate: fraction of T's at C/T sites above the sample baseline
             // For highly damaged reads, this will be high (e.g., 0.65 - 0.5 = 0.15 = 15%)
-            profile.damage_rate_5prime[i] = std::max(0.0f, static_cast<float>(t_freq - 0.5));
+            profile.damage_rate_5prime[i] = std::max(0.0f, static_cast<float>(t_freq - baseline_tc));
 
             profile.t_freq_5prime[i] = t_freq;
             profile.c_freq_5prime[i] = 1.0 - t_freq;
@@ -479,20 +486,15 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         double ag_total = profile.a_freq_3prime[i] + profile.g_freq_3prime[i];
         if (ag_total > 0) {
             double a_freq = profile.a_freq_3prime[i] / ag_total;
-            // Report G→A rate: fraction of A's at A/G sites above baseline 50%
-            profile.damage_rate_3prime[i] = std::max(0.0f, static_cast<float>(a_freq - 0.5));
+            // Report G→A rate: fraction of A's at A/G sites above the sample baseline
+            profile.damage_rate_3prime[i] = std::max(0.0f, static_cast<float>(a_freq - baseline_ag));
 
             profile.a_freq_3prime[i] = a_freq;
             profile.g_freq_3prime[i] = 1.0 - a_freq;
         }
     }
 
-    // Compute codon-position-aware damage rates
-    double baseline_tc = profile.baseline_t_freq /
-                        (profile.baseline_t_freq + profile.baseline_c_freq + 0.001);
-    double baseline_ag = profile.baseline_a_freq /
-                        (profile.baseline_a_freq + profile.baseline_g_freq + 0.001);
-
+    // Compute codon-position-aware damage rates (using baseline_tc and baseline_ag from above)
     for (int p = 0; p < 3; p++) {
         // 5' end codon position rates
         size_t tc_total = profile.codon_pos_t_count_5prime[p] + profile.codon_pos_c_count_5prime[p];
@@ -653,6 +655,128 @@ void FrameSelector::merge_sample_profiles(SampleDamageProfile& dst, const Sample
 
     // Merge read count
     dst.n_reads += src.n_reads;
+}
+
+void FrameSelector::update_sample_profile_weighted(
+    SampleDamageProfile& profile,
+    const std::string& seq,
+    float weight) {
+
+    if (seq.length() < 30 || weight < 0.001f) return;
+
+    size_t len = seq.length();
+
+    // Count bases at 5' end positions (weighted)
+    for (size_t i = 0; i < std::min(size_t(15), len); ++i) {
+        char base = fast_upper(seq[i]);
+        if (base == 'T') profile.t_freq_5prime[i] += weight;
+        else if (base == 'C') profile.c_freq_5prime[i] += weight;
+    }
+
+    // Count bases at 3' end positions (weighted)
+    for (size_t i = 0; i < std::min(size_t(15), len); ++i) {
+        size_t pos = len - 1 - i;
+        char base = fast_upper(seq[pos]);
+        if (base == 'A') profile.a_freq_3prime[i] += weight;
+        else if (base == 'G') profile.g_freq_3prime[i] += weight;
+    }
+
+    // Count bases in middle (undamaged baseline) - weighted
+    size_t mid_start = len / 3;
+    size_t mid_end = 2 * len / 3;
+    for (size_t i = mid_start; i < mid_end; ++i) {
+        char base = fast_upper(seq[i]);
+        if (base == 'T') profile.baseline_t_freq += weight;
+        else if (base == 'C') profile.baseline_c_freq += weight;
+        else if (base == 'A') profile.baseline_a_freq += weight;
+        else if (base == 'G') profile.baseline_g_freq += weight;
+    }
+
+    // Codon-position-aware counting at 5' end (weighted as integer approximation)
+    // For simplicity, round weight to get integer count contribution
+    size_t weight_count = std::max(size_t(1), static_cast<size_t>(weight * 10 + 0.5));
+    for (size_t i = 0; i < std::min(size_t(15), len); ++i) {
+        int codon_pos = i % 3;
+        char base = fast_upper(seq[i]);
+        if (base == 'T') profile.codon_pos_t_count_5prime[codon_pos] += weight_count;
+        else if (base == 'C') profile.codon_pos_c_count_5prime[codon_pos] += weight_count;
+    }
+
+    // Codon-position-aware counting at 3' end (weighted)
+    for (size_t i = 0; i < std::min(size_t(15), len); ++i) {
+        size_t pos = len - 1 - i;
+        int codon_pos = (len - 1 - i) % 3;
+        char base = fast_upper(seq[pos]);
+        if (base == 'A') profile.codon_pos_a_count_3prime[codon_pos] += weight_count;
+        else if (base == 'G') profile.codon_pos_g_count_3prime[codon_pos] += weight_count;
+    }
+
+    // CpG context damage tracking (weighted)
+    for (size_t i = 0; i < std::min(size_t(5), len - 1); ++i) {
+        char base = fast_upper(seq[i]);
+        char next = fast_upper(seq[i + 1]);
+
+        if (next == 'G') {
+            if (base == 'C') {
+                profile.cpg_c_count += weight_count;
+            } else if (base == 'T') {
+                profile.cpg_t_count += weight_count;
+            }
+        } else {
+            if (base == 'C') {
+                profile.non_cpg_c_count += weight_count;
+            } else if (base == 'T') {
+                profile.non_cpg_t_count += weight_count;
+            }
+        }
+    }
+
+    profile.n_reads++;
+}
+
+void FrameSelector::reset_sample_profile(SampleDamageProfile& profile) {
+    // Reset all position-specific counts
+    for (int i = 0; i < 15; ++i) {
+        profile.t_freq_5prime[i] = 0.0;
+        profile.c_freq_5prime[i] = 0.0;
+        profile.a_freq_3prime[i] = 0.0;
+        profile.g_freq_3prime[i] = 0.0;
+        profile.damage_rate_5prime[i] = 0.0f;
+        profile.damage_rate_3prime[i] = 0.0f;
+    }
+
+    // Reset baseline counts
+    profile.baseline_t_freq = 0.0;
+    profile.baseline_c_freq = 0.0;
+    profile.baseline_a_freq = 0.0;
+    profile.baseline_g_freq = 0.0;
+
+    // Reset codon position counts
+    for (int p = 0; p < 3; ++p) {
+        profile.codon_pos_t_count_5prime[p] = 0;
+        profile.codon_pos_c_count_5prime[p] = 0;
+        profile.codon_pos_a_count_3prime[p] = 0;
+        profile.codon_pos_g_count_3prime[p] = 0;
+        profile.codon_pos_t_rate_5prime[p] = 0.5f;
+        profile.codon_pos_a_rate_3prime[p] = 0.5f;
+    }
+
+    // Reset CpG counts
+    profile.cpg_c_count = 0;
+    profile.cpg_t_count = 0;
+    profile.non_cpg_c_count = 0;
+    profile.non_cpg_t_count = 0;
+    profile.cpg_damage_rate = 0.0f;
+    profile.non_cpg_damage_rate = 0.0f;
+
+    // Reset summary statistics
+    profile.max_damage_5prime = 0.0f;
+    profile.max_damage_3prime = 0.0f;
+    profile.sample_damage_prob = 0.0f;
+    profile.lambda_5prime = 0.3f;
+    profile.lambda_3prime = 0.3f;
+    profile.library_type = SampleDamageProfile::LibraryType::UNKNOWN;
+    profile.n_reads = 0;
 }
 
 SampleDamageProfile FrameSelector::compute_sample_profile(
@@ -1485,6 +1609,236 @@ float FrameSelector::estimate_ancient_prob_with_quality(
     float prob = 1.0f / (1.0f + std::exp(-log_lr));
 
     return std::clamp(prob, 0.05f, 0.95f);
+}
+
+// ============================================================================
+// DAMAGE CODON SCORE FOR ITERATIVE ENRICHMENT
+// ============================================================================
+
+float FrameSelector::compute_damage_codon_score(const std::string& seq) {
+    if (seq.length() < 15) return 0.0f;
+
+    const size_t len = seq.length();
+    float score = 0.0f;
+    float max_possible = 0.0f;
+
+    // =========================================================================
+    // FEATURE 1: Terminal T enrichment at 5' end (positions 0-4)
+    // C→T damage creates T's at terminal positions
+    // Weight by position (closer to 5' = more indicative of damage)
+    // =========================================================================
+    const float pos_weights[] = {1.0f, 0.7f, 0.5f, 0.35f, 0.25f};
+
+    for (size_t i = 0; i < std::min(size_t(5), len); ++i) {
+        char base = fast_upper(seq[i]);
+        float weight = pos_weights[i];
+        max_possible += weight;
+
+        if (base == 'T') {
+            score += weight;  // T at 5' = damage signal
+        } else if (base == 'C') {
+            score -= weight * 0.3f;  // C at 5' = evidence against damage
+        }
+    }
+
+    // =========================================================================
+    // FEATURE 2: Terminal A enrichment at 3' end (positions len-1 to len-5)
+    // G→A damage creates A's at terminal positions
+    // =========================================================================
+    for (size_t i = 0; i < std::min(size_t(5), len); ++i) {
+        size_t pos = len - 1 - i;
+        char base = fast_upper(seq[pos]);
+        float weight = pos_weights[i] * 0.8f;  // 3' signal slightly weaker
+        max_possible += weight;
+
+        if (base == 'A') {
+            score += weight;  // A at 3' = damage signal
+        } else if (base == 'G') {
+            score -= weight * 0.3f;  // G at 3' = evidence against damage
+        }
+    }
+
+    // =========================================================================
+    // FEATURE 3: Damage-susceptible dinucleotide patterns at 5' end
+    // CpG context shows elevated damage - TG from CG is strong signal
+    // =========================================================================
+    for (size_t i = 0; i < std::min(size_t(4), len - 1); ++i) {
+        char b1 = fast_upper(seq[i]);
+        char b2 = fast_upper(seq[i + 1]);
+        float pos_mod = 1.0f - (i * 0.2f);  // Position decay
+
+        if (b1 == 'T' && b2 == 'G') {
+            // TG from CpG damage - very strong signal
+            score += 0.8f * pos_mod;
+            max_possible += 0.8f * pos_mod;
+        } else if (b1 == 'T' && b2 == 'A') {
+            // TA from CA - moderate signal
+            score += 0.3f * pos_mod;
+            max_possible += 0.3f * pos_mod;
+        } else if (b1 == 'C' && b2 == 'G') {
+            // Intact CpG at 5' - evidence against damage
+            score -= 0.4f * pos_mod;
+            max_possible += 0.4f * pos_mod;
+        }
+    }
+
+    // =========================================================================
+    // FEATURE 4: Damage-induced stop codons near 5' end
+    // TAA from CAA (Gln), TAG from CAG (Gln), TGA from CGA (Arg)
+    // These are VERY strong damage indicators in coding sequences
+    // =========================================================================
+    // Check all 3 frames for damage stops in first 15bp
+    for (int frame = 0; frame < 3; ++frame) {
+        for (size_t i = frame; i + 2 < std::min(size_t(15), len); i += 3) {
+            char c1 = fast_upper(seq[i]);
+            char c2 = fast_upper(seq[i + 1]);
+            char c3 = fast_upper(seq[i + 2]);
+
+            float pos_mod = std::exp(-0.2f * static_cast<float>(i));
+
+            // Check for damaged stop codons
+            bool is_damaged_stop = false;
+            float stop_weight = 0.0f;
+
+            if (c1 == 'T' && c2 == 'A' && c3 == 'A') {
+                // TAA from CAA (Gln) - very common damage pattern
+                is_damaged_stop = true;
+                stop_weight = 1.5f;
+            } else if (c1 == 'T' && c2 == 'A' && c3 == 'G') {
+                // TAG from CAG (Gln)
+                is_damaged_stop = true;
+                stop_weight = 1.5f;
+            } else if (c1 == 'T' && c2 == 'G' && c3 == 'A') {
+                // TGA from CGA (Arg)
+                is_damaged_stop = true;
+                stop_weight = 1.2f;
+            }
+
+            if (is_damaged_stop) {
+                score += stop_weight * pos_mod;
+                max_possible += stop_weight * pos_mod;
+            }
+
+            // Also check for TGG from CGG (Arg) - not stop but damage pattern
+            if (c1 == 'T' && c2 == 'G' && c3 == 'G') {
+                score += 0.5f * pos_mod;
+                max_possible += 0.5f * pos_mod;
+            }
+        }
+    }
+
+    // =========================================================================
+    // FEATURE 5: T-rich codons at 5' end consistent with C→T damage
+    // TNT, TTN patterns from CNC, CTN codons
+    // =========================================================================
+    for (int frame = 0; frame < 3; ++frame) {
+        for (size_t i = frame; i + 2 < std::min(size_t(12), len); i += 3) {
+            char c1 = fast_upper(seq[i]);
+            char c2 = fast_upper(seq[i + 1]);
+            char c3 = fast_upper(seq[i + 2]);
+
+            float pos_mod = std::exp(-0.25f * static_cast<float>(i));
+            int t_count = (c1 == 'T') + (c2 == 'T') + (c3 == 'T');
+            int c_count = (c1 == 'C') + (c2 == 'C') + (c3 == 'C');
+
+            // Multiple T's in a codon at 5' = potential damage
+            if (t_count >= 2 && c_count == 0) {
+                score += 0.3f * pos_mod;
+                max_possible += 0.3f * pos_mod;
+            }
+            // Multiple C's preserved at 5' = unlikely to be damaged
+            else if (c_count >= 2 && t_count == 0) {
+                score -= 0.2f * pos_mod;
+                max_possible += 0.2f * pos_mod;
+            }
+        }
+    }
+
+    // =========================================================================
+    // FEATURE 6: Within-read T gradient (terminal vs interior)
+    // Damaged reads should have higher T/(T+C) at terminals than interior
+    // This is the key discriminator for AT-rich samples
+    // =========================================================================
+    if (len >= 20) {
+        // 5' gradient: compare positions 0-4 to positions 10-14
+        int t_term = 0, c_term = 0;
+        int t_int = 0, c_int = 0;
+
+        for (int i = 0; i < 5; ++i) {
+            char b = fast_upper(seq[i]);
+            if (b == 'T') t_term++;
+            else if (b == 'C') c_term++;
+        }
+        for (int i = 10; i < 15 && i < static_cast<int>(len); ++i) {
+            char b = fast_upper(seq[i]);
+            if (b == 'T') t_int++;
+            else if (b == 'C') c_int++;
+        }
+
+        // Calculate T/(T+C) gradient
+        if (t_term + c_term >= 2 && t_int + c_int >= 2) {
+            float tc_term = static_cast<float>(t_term) / (t_term + c_term);
+            float tc_int = static_cast<float>(t_int) / (t_int + c_int);
+            float gradient = tc_term - tc_int;
+
+            // Positive gradient = more T at terminal = damage signal
+            if (gradient > 0.15f) {
+                score += gradient * 2.0f;  // Strong weight for gradient
+                max_possible += 0.5f;  // Cap contribution
+            } else if (gradient < -0.15f) {
+                // Negative gradient = MORE C at terminal than interior
+                // This is anti-damage signal
+                score += gradient * 1.0f;  // Negative contribution
+                max_possible += 0.3f;
+            }
+        }
+
+        // 3' gradient: compare positions len-5 to len-1 vs len-15 to len-11
+        int a_term3 = 0, g_term3 = 0;
+        int a_int3 = 0, g_int3 = 0;
+
+        for (size_t i = len - 5; i < len; ++i) {
+            char b = fast_upper(seq[i]);
+            if (b == 'A') a_term3++;
+            else if (b == 'G') g_term3++;
+        }
+        for (size_t i = len - 15; i < len - 10 && i < len; ++i) {
+            char b = fast_upper(seq[i]);
+            if (b == 'A') a_int3++;
+            else if (b == 'G') g_int3++;
+        }
+
+        if (a_term3 + g_term3 >= 2 && a_int3 + g_int3 >= 2) {
+            float ag_term = static_cast<float>(a_term3) / (a_term3 + g_term3);
+            float ag_int = static_cast<float>(a_int3) / (a_int3 + g_int3);
+            float gradient = ag_term - ag_int;
+
+            if (gradient > 0.15f) {
+                score += gradient * 1.5f;
+                max_possible += 0.4f;
+            } else if (gradient < -0.15f) {
+                score += gradient * 0.8f;
+                max_possible += 0.25f;
+            }
+        }
+    }
+
+    // =========================================================================
+    // FEATURE 7: Joint 5' + 3' terminal pattern
+    // T at 5' AND A at 3' together is stronger evidence than either alone
+    // =========================================================================
+    if (fast_upper(seq[0]) == 'T' && fast_upper(seq[len - 1]) == 'A') {
+        score += 0.6f;  // Bonus for joint pattern
+        max_possible += 0.6f;
+    }
+
+    // Normalize score to 0.0-1.0 range
+    if (max_possible > 0.0f) {
+        float normalized = (score + max_possible) / (2.0f * max_possible);
+        return std::clamp(normalized, 0.0f, 1.0f);
+    }
+
+    return 0.5f;  // Default neutral score
 }
 
 } // namespace agp
