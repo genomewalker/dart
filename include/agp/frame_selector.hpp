@@ -10,8 +10,9 @@
 
 namespace agp {
 
-// Forward declaration
+// Forward declarations
 class DamageModel;
+struct UnifiedDamageContext;
 
 /**
  * Sample-level damage profile computed from aggregate statistics
@@ -400,6 +401,22 @@ public:
         const DamageModel& damage_model);
 
     /**
+     * Select best frame per strand with unified damage context
+     *
+     * Uses UnifiedDamageContext for consistent damage handling:
+     * - Position-specific damage rates from calibrated sample profile
+     * - Per-read damage_signal to gate adjustments
+     * - Proper Bayesian stop penalty weighting
+     *
+     * @param seq DNA sequence
+     * @param ctx Unified damage context (sample + per-read evidence)
+     * @return Pair of FrameScores: (best_forward, best_reverse)
+     */
+    static std::pair<FrameScore, FrameScore> select_best_per_strand_damage_aware(
+        const std::string& seq,
+        const UnifiedDamageContext& ctx);
+
+    /**
      * Get reverse complement of a sequence (returns new string)
      */
     static std::string reverse_complement(const std::string& seq);
@@ -419,7 +436,7 @@ public:
      * @param seq DNA sequence
      * @return Probability 0.0-1.0 that this read shows ancient damage
      */
-    static float estimate_ancient_prob(const std::string& seq);
+    static float estimate_damage_signal(const std::string& seq);
 
     /**
      * Compute observed damage magnitude for a read
@@ -456,7 +473,7 @@ public:
      * @param forward True for forward strand
      * @return Probability 0.0-1.0 that this read shows ancient damage
      */
-    static float estimate_ancient_prob_with_codons(
+    static float estimate_damage_signal_with_codons(
         const std::string& seq,
         int frame,
         bool forward);
@@ -469,7 +486,7 @@ public:
      * @param sample_profile Pre-computed sample-level damage statistics
      * @return Probability 0.0-1.0 that this read shows ancient damage
      */
-    static float estimate_ancient_prob_with_sample_profile(
+    static float estimate_damage_signal_with_sample_profile(
         const std::string& seq,
         const SampleDamageProfile& sample_profile);
 
@@ -482,7 +499,7 @@ public:
      * @param sample_profile Pre-computed sample-level damage statistics
      * @return Probability 0.0-1.0 that this read shows ancient damage
      */
-    static float estimate_ancient_prob_advanced(
+    static float estimate_damage_signal_advanced(
         const std::string& seq,
         const std::string& quality,
         const SampleDamageProfile& sample_profile);
@@ -503,7 +520,7 @@ public:
      * @param sample_profile Pre-computed sample-level damage statistics
      * @return Probability 0.0-1.0 that this read shows ancient damage
      */
-    static float estimate_ancient_prob_codon_aware(
+    static float estimate_damage_signal_codon_aware(
         const std::string& seq,
         int frame,
         const SampleDamageProfile& sample_profile);
@@ -605,7 +622,7 @@ public:
      * @param sample_profile Pre-computed sample statistics
      * @return Probability 0.0-1.0 that this read shows ancient damage
      */
-    static float estimate_ancient_prob_with_quality(
+    static float estimate_damage_signal_with_quality(
         const std::string& seq,
         const std::string& quality,
         int frame,

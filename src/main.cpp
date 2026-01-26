@@ -4,6 +4,8 @@
 #include "agp/sequence_io.hpp"
 #include "agp/frame_selector.hpp"
 #include "agp/hexamer_tables.hpp"
+#include "agp/hexamer_fast.hpp"
+#include "agp/codon_tables.hpp"
 #include "agp/bdamage_reader.hpp"
 #include "agp/score_calibration_2d.hpp"
 #include "agp/score_calibration_4d.hpp"
@@ -23,6 +25,7 @@
 #include <unistd.h>
 #include <unordered_map>
 #include <algorithm>
+#include <cstring>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -264,7 +267,7 @@ int main(int argc, char* argv[]) {
                         agp::FrameSelector::update_sample_profile(thread_profiles[tid], seq);
 
                         if (!bdamage_loaded && opts.metagenome_mode && seq.length() >= 30) {
-                            agp::MultiDomainResult dom = agp::score_all_domains(seq, 0);
+                            agp::MultiDomainResult dom = agp::score_all_domains_fast(seq, 0);
                             const float probs[8] = {
                                 dom.gtdb_prob, dom.fungi_prob, dom.protozoa_prob, dom.invertebrate_prob,
                                 dom.plant_prob, dom.vertebrate_mammalian_prob, dom.vertebrate_other_prob,
@@ -818,7 +821,20 @@ int main(int argc, char* argv[]) {
                     sample_profile.d_max_combined = saved_d_max_combined;
                     sample_profile.d_max_source = saved_d_max_source;
                 }
-                // Otherwise keep d_max from refined profile
+                // ALWAYS use Pass 1's d_max when damage was validated
+                // Pass 2+ selects damage-indicative reads, which biases d_max upward
+                // Pass 1's estimate on ALL reads is unbiased and matches metaDMG methodology
+                else if (saved_damage_validated && saved_d_max_combined > 0.01f) {
+                    sample_profile.d_max_5prime = saved_d_max_5prime;
+                    sample_profile.d_max_3prime = saved_d_max_3prime;
+                    sample_profile.d_max_combined = saved_d_max_combined;
+                    sample_profile.d_max_source = saved_d_max_source;
+                    if (opts.verbose) {
+                        std::cerr << "  [D_MAX] Using Pass 1 estimate (unbiased): "
+                                  << saved_d_max_combined * 100.0f << "%\n";
+                    }
+                }
+                // Otherwise keep d_max from refined profile (for low-damage or unvalidated samples)
 
                 // Update damage model with refined profile
                 damage_model.update_from_sample_profile(sample_profile);
@@ -938,10 +954,11 @@ int main(int argc, char* argv[]) {
         };
         std::vector<ThreadFDRScores> thread_fdr_scores(num_threads);
 
-        // Buffer for FDR-filtered output (only used when fdr_threshold is set)
-        // Stores (id, genes) pairs for deferred writing after FDR computation
+        // Buffer for deferred output (FDR filtering or percentile computation)
+        // Stores (id, genes) pairs for deferred writing
         std::vector<std::pair<std::string, std::vector<agp::Gene>>> fdr_gene_buffer;
-        bool defer_output_for_fdr = opts.fdr_threshold >= 0.0f && opts.compute_fdr;
+        bool defer_output_for_fdr = (opts.fdr_threshold >= 0.0f && opts.compute_fdr) ||
+                                    (opts.min_damage_pctile > 0.0f);
 
         // Read first batch synchronously
         read_batch(batch_a);
@@ -990,21 +1007,21 @@ int main(int argc, char* argv[]) {
 
                     // 5' terminal (positions 0-5)
                     for (size_t j = 0; j < 6 && j < seq.length(); ++j) {
-                        char b = std::toupper(seq[j]);
+                        char b = agp::fast_upper(seq[j]);
                         if (b == 'T') tstats.terminal_5prime_t[j]++;
                         else if (b == 'C') tstats.terminal_5prime_c[j]++;
                     }
 
                     // 3' terminal (positions 0-5 from end)
                     for (size_t j = 0; j < 6 && j < seq.length(); ++j) {
-                        char b = std::toupper(seq[seq.length() - 1 - j]);
+                        char b = agp::fast_upper(seq[seq.length() - 1 - j]);
                         if (b == 'A') tstats.terminal_3prime_a[j]++;
                         else if (b == 'G') tstats.terminal_3prime_g[j]++;
                     }
 
                     // Interior (positions 15-25)
                     for (size_t j = 15; j < 25 && j < seq.length(); ++j) {
-                        char b = std::toupper(seq[j]);
+                        char b = agp::fast_upper(seq[j]);
                         if (b == 'T') tstats.interior_t++;
                         else if (b == 'C') tstats.interior_c++;
                         else if (b == 'A') tstats.interior_a++;
@@ -1016,7 +1033,7 @@ int main(int argc, char* argv[]) {
                 // Enable ensemble mode for metagenome scoring (weighted across all domains)
                 agp::MultiDomainResult domain_result;
                 if (opts.metagenome_mode && seq.length() >= 30) {
-                    domain_result = agp::score_all_domains(seq, 0);
+                    domain_result = agp::score_all_domains_fast(seq, 0);
                     agp::set_ensemble_mode(true);
                     agp::set_domain_probs(domain_result);
                     // Use best domain for position-dependent damage profile
@@ -1032,19 +1049,32 @@ int main(int argc, char* argv[]) {
                 agp::DamageProfile blended_profile;
                 if (opts.use_damage) {
                     if (opts.metagenome_mode && seq.length() >= 30) {
-                        // Blend per-domain profiles using ensemble weights with reusable buffers
-                        static thread_local std::unordered_map<size_t, agp::DamageProfile> blended_cache;
-                        agp::DamageProfile& bp = blended_cache[seq.length()];
+                        // Blend per-domain profiles using ensemble weights
+                        // Optimized: array-based cache indexed by length bucket (avoids hash map)
+                        static thread_local struct {
+                            std::array<agp::DamageProfile, 64> profiles;  // Buckets for lengths 0-31, 32-63, ...
+                            std::array<size_t, 64> cached_len;
+                        } profile_cache = {};
 
-                        // Ensure vectors sized once, then zero for this read
-                        bp.ct_prob_5prime.assign(seq.length(), 0.0f);
-                        bp.ga_prob_3prime.assign(seq.length(), 0.0f);
-                        bp.ga_prob_5prime.assign(seq.length(), 0.0f);
-                        bp.ct_prob_3prime.assign(seq.length(), 0.0f);
+                        const size_t len = seq.length();
+                        const size_t bucket = std::min(size_t(63), len / 8);  // 8bp per bucket
+                        agp::DamageProfile& bp = profile_cache.profiles[bucket];
+
+                        // Resize vectors only if needed (reuse allocation)
+                        if (bp.ct_prob_5prime.size() != len) {
+                            bp.ct_prob_5prime.resize(len);
+                            bp.ga_prob_3prime.resize(len);
+                            bp.ga_prob_5prime.resize(len);
+                            bp.ct_prob_3prime.resize(len);
+                        }
+
+                        // Zero scalars and vectors
                         bp.lambda_5prime = 0.0f;
                         bp.lambda_3prime = 0.0f;
                         bp.delta_max = 0.0f;
                         bp.delta_background = 0.0f;
+                        std::memset(bp.ct_prob_5prime.data(), 0, len * sizeof(float));
+                        std::memset(bp.ga_prob_3prime.data(), 0, len * sizeof(float));
 
                         const auto& probs = agp::get_domain_probs();
                         const float weights[8] = {
@@ -1053,31 +1083,52 @@ int main(int argc, char* argv[]) {
                             probs.viral_prob
                         };
 
-                        float weight_sum = 0.0f;
-                        for (int d = 0; d < 8; ++d) {
-                            if (weights[d] <= 0.001f) continue;
-                            weight_sum += weights[d];
-                            const auto& dom_profile = domain_damage_models[d].create_profile_cached(seq.length());
-                            bp.lambda_5prime += weights[d] * dom_profile.lambda_5prime;
-                            bp.lambda_3prime += weights[d] * dom_profile.lambda_3prime;
-                            bp.delta_max += weights[d] * dom_profile.delta_max;
-                            bp.delta_background += weights[d] * dom_profile.delta_background;
-                            for (size_t p = 0; p < seq.length(); ++p) {
-                                bp.ct_prob_5prime[p] += weights[d] * dom_profile.ct_prob_5prime[p];
-                                bp.ga_prob_3prime[p] += weights[d] * dom_profile.ga_prob_3prime[p];
+                        // Find best domain (skip blending if one dominates)
+                        int best_d = 0;
+                        float best_w = weights[0];
+                        for (int d = 1; d < 8; ++d) {
+                            if (weights[d] > best_w) { best_w = weights[d]; best_d = d; }
+                        }
+
+                        // If one domain dominates (>90%), just use that profile directly
+                        if (best_w > 0.90f) {
+                            blended_profile = domain_damage_models[best_d].create_profile_cached(len);
+                            profile_ptr = &blended_profile;
+                        } else {
+                            // Blend only significant domains (>1%)
+                            float weight_sum = 0.0f;
+                            for (int d = 0; d < 8; ++d) {
+                                if (weights[d] <= 0.01f) continue;
+                                weight_sum += weights[d];
+                                const auto& dom_profile = domain_damage_models[d].create_profile_cached(len);
+                                bp.lambda_5prime += weights[d] * dom_profile.lambda_5prime;
+                                bp.lambda_3prime += weights[d] * dom_profile.lambda_3prime;
+                                bp.delta_max += weights[d] * dom_profile.delta_max;
+                                bp.delta_background += weights[d] * dom_profile.delta_background;
+                                const float* ct_src = dom_profile.ct_prob_5prime.data();
+                                const float* ga_src = dom_profile.ga_prob_3prime.data();
+                                float* ct_dst = bp.ct_prob_5prime.data();
+                                float* ga_dst = bp.ga_prob_3prime.data();
+                                const float w = weights[d];
+                                for (size_t p = 0; p < len; ++p) {
+                                    ct_dst[p] += w * ct_src[p];
+                                    ga_dst[p] += w * ga_src[p];
+                                }
                             }
+                            if (weight_sum > 0.0f) {
+                                float inv = 1.0f / weight_sum;
+                                bp.lambda_5prime *= inv;
+                                bp.lambda_3prime *= inv;
+                                bp.delta_max *= inv;
+                                bp.delta_background *= inv;
+                                for (size_t p = 0; p < len; ++p) {
+                                    bp.ct_prob_5prime[p] *= inv;
+                                    bp.ga_prob_3prime[p] *= inv;
+                                }
+                            }
+                            blended_profile = bp;
+                            profile_ptr = &blended_profile;
                         }
-                        if (weight_sum > 0.0f) {
-                            float inv = 1.0f / weight_sum;
-                            bp.lambda_5prime *= inv;
-                            bp.lambda_3prime *= inv;
-                            bp.delta_max *= inv;
-                            bp.delta_background *= inv;
-                            for (auto& v : bp.ct_prob_5prime) v *= inv;
-                            for (auto& v : bp.ga_prob_3prime) v *= inv;
-                        }
-                        blended_profile = bp;  // Copy out to local for thread safety outside this scope
-                        profile_ptr = &blended_profile;
                     } else {
                         local_profile = damage_model.create_profile(seq.length());
                         profile_ptr = &local_profile;
@@ -1124,17 +1175,17 @@ int main(int argc, char* argv[]) {
 
                         if (frame_score.forward) {
                             gene.sequence = seq;
-                            gene.ancient_prob = agp::FrameSelector::estimate_ancient_prob_codon_aware(
+                            gene.damage_signal = agp::FrameSelector::estimate_damage_signal_codon_aware(
                                 seq, frame_score.frame, sample_profile);
                         } else {
                             gene.sequence = agp::FrameSelector::reverse_complement(seq);
                             int orig_frame = (seq.length() - frame_score.frame) % 3;
-                            gene.ancient_prob = agp::FrameSelector::estimate_ancient_prob_codon_aware(
+                            gene.damage_signal = agp::FrameSelector::estimate_damage_signal_codon_aware(
                                 seq, orig_frame, sample_profile);
                         }
                         gene.protein = frame_score.protein;
                         gene.p_correct = agp::calibrate_score_4d(frame_score.total_score, gene.sequence.size(),
-                                                                  gene.damage_score, gene.ancient_prob);
+                                                                  gene.damage_score, gene.damage_signal);
                         genes.push_back(std::move(gene));
                     }
                 } else if (opts.use_bayesian) {
@@ -1192,11 +1243,11 @@ int main(int argc, char* argv[]) {
 
                         // Estimate ancient probability
                         if (gene.is_forward) {
-                            gene.ancient_prob = agp::FrameSelector::estimate_ancient_prob_codon_aware(
+                            gene.damage_signal = agp::FrameSelector::estimate_damage_signal_codon_aware(
                                 seq, frame_result.frame, sample_profile);
                         } else {
                             int orig_frame = (seq.length() - frame_result.frame) % 3;
-                            gene.ancient_prob = agp::FrameSelector::estimate_ancient_prob_codon_aware(
+                            gene.damage_signal = agp::FrameSelector::estimate_damage_signal_codon_aware(
                                 seq, orig_frame, sample_profile);
                         }
 
@@ -1207,24 +1258,21 @@ int main(int argc, char* argv[]) {
                     }
                 } else if (opts.dual_strand) {
                     // Output best frame from BOTH strands
-                    // Standard scoring: strict stop penalties with hexamer evidence
-                    // Use PRE-CORRECTED sequence for frame selection to restore hexamer signal
-                    // Use sample_profile for damage-aware strand discrimination
                     auto strand_results = agp::FrameSelector::select_best_per_strand(seq_for_frame, profile_ptr, &sample_profile);
                     auto [best_fwd, best_rev] = strand_results;
 
-                    // Calculate ancient_prob using codon-aware detection for each strand
+                    // Calculate damage_signal using codon-aware detection for each strand
                     // This uses the reading frame information for better accuracy
-                    float ancient_prob_fwd = 0.5f;
-                    float ancient_prob_rev = 0.5f;
+                    float damage_signal_fwd = 0.5f;
+                    float damage_signal_rev = 0.5f;
 
                     if (best_fwd.total_score >= opts.min_coding_prob) {
                         // Use quality-aware detection if quality available, else codon-aware
                         if (!quality.empty()) {
-                            ancient_prob_fwd = agp::FrameSelector::estimate_ancient_prob_with_quality(
+                            damage_signal_fwd = agp::FrameSelector::estimate_damage_signal_with_quality(
                                 seq, quality, best_fwd.frame, sample_profile);
                         } else {
-                            ancient_prob_fwd = agp::FrameSelector::estimate_ancient_prob_codon_aware(
+                            damage_signal_fwd = agp::FrameSelector::estimate_damage_signal_codon_aware(
                                 seq, best_fwd.frame, sample_profile);
                         }
                     }
@@ -1235,10 +1283,10 @@ int main(int argc, char* argv[]) {
                         // The frame in RC corresponds to (len - frame) % 3 in original
                         int orig_frame = (seq.length() - best_rev.frame) % 3;
                         if (!quality.empty()) {
-                            ancient_prob_rev = agp::FrameSelector::estimate_ancient_prob_with_quality(
+                            damage_signal_rev = agp::FrameSelector::estimate_damage_signal_with_quality(
                                 seq, quality, orig_frame, sample_profile);
                         } else {
-                            ancient_prob_rev = agp::FrameSelector::estimate_ancient_prob_codon_aware(
+                            damage_signal_rev = agp::FrameSelector::estimate_damage_signal_codon_aware(
                                 seq, orig_frame, sample_profile);
                         }
                     }
@@ -1250,9 +1298,9 @@ int main(int argc, char* argv[]) {
                     // Adaptive confidence-based ORF output
                     // When enabled, uses score gap to decide between 1 or 2 ORFs
                     if (opts.orf_confidence_threshold >= 0.0f && output_fwd && output_rev) {
-                        // Use combined score with configurable ancient_prob weight
-                        float score_fwd = best_fwd.total_score * (1.0f + opts.strand_weight * ancient_prob_fwd);
-                        float score_rev = best_rev.total_score * (1.0f + opts.strand_weight * ancient_prob_rev);
+                        // Use combined score with configurable damage_signal weight
+                        float score_fwd = best_fwd.total_score * (1.0f + opts.strand_weight * damage_signal_fwd);
+                        float score_rev = best_rev.total_score * (1.0f + opts.strand_weight * damage_signal_rev);
                         
                         // Calculate score gap between top-1 and top-2
                         float score_gap = std::abs(score_fwd - score_rev);
@@ -1269,10 +1317,10 @@ int main(int argc, char* argv[]) {
                     }
                     // If --best-strand (legacy mode), only output the higher-scoring strand
                     else if (opts.best_strand_only && output_fwd && output_rev) {
-                        // Use combined score with configurable ancient_prob weight
+                        // Use combined score with configurable damage_signal weight
                         // strand_weight=0: pure coding, strand_weight=1: full damage bias
-                        float score_fwd = best_fwd.total_score * (1.0f + opts.strand_weight * ancient_prob_fwd);
-                        float score_rev = best_rev.total_score * (1.0f + opts.strand_weight * ancient_prob_rev);
+                        float score_fwd = best_fwd.total_score * (1.0f + opts.strand_weight * damage_signal_fwd);
+                        float score_rev = best_rev.total_score * (1.0f + opts.strand_weight * damage_signal_rev);
                         if (score_fwd >= score_rev) {
                             output_rev = false;
                         } else {
@@ -1297,10 +1345,10 @@ int main(int argc, char* argv[]) {
                         gene.frame = best_fwd.frame;
                         gene.sequence = seq;
                         gene.protein = std::move(best_fwd.protein);
-                        gene.ancient_prob = ancient_prob_fwd;
+                        gene.damage_signal = damage_signal_fwd;
                         gene.damage_score = damage_pct;
                         gene.p_correct = agp::calibrate_score_4d(best_fwd.total_score, gene.sequence.size(),
-                                                                  damage_pct, ancient_prob_fwd);
+                                                                  damage_pct, damage_signal_fwd);
                         genes.push_back(std::move(gene));
                     }
 
@@ -1316,10 +1364,10 @@ int main(int argc, char* argv[]) {
                         // Store reverse complement as the coding sequence
                         gene.sequence = agp::FrameSelector::reverse_complement(seq);
                         gene.protein = std::move(best_rev.protein);
-                        gene.ancient_prob = ancient_prob_rev;
+                        gene.damage_signal = damage_signal_rev;
                         gene.damage_score = damage_pct;
                         gene.p_correct = agp::calibrate_score_4d(best_rev.total_score, gene.sequence.size(),
-                                                                  damage_pct, ancient_prob_rev);
+                                                                  damage_pct, damage_signal_rev);
                         genes.push_back(std::move(gene));
                     }
                 } else {
@@ -1348,10 +1396,10 @@ int main(int argc, char* argv[]) {
                             working_seq = rc;  // Copy from cached buffer
                         }
                         if (!quality.empty()) {
-                            gene.ancient_prob = agp::FrameSelector::estimate_ancient_prob_with_quality(
+                            gene.damage_signal = agp::FrameSelector::estimate_damage_signal_with_quality(
                                 working_seq, quality, best.frame, sample_profile);
                         } else {
-                            gene.ancient_prob = agp::FrameSelector::estimate_ancient_prob_codon_aware(
+                            gene.damage_signal = agp::FrameSelector::estimate_damage_signal_codon_aware(
                                 working_seq, best.frame, sample_profile);
                         }
 
@@ -1362,7 +1410,7 @@ int main(int argc, char* argv[]) {
 
                         // Calibrate score to probability of correctness (4D: score, length, damage, ancient)
                         gene.p_correct = agp::calibrate_score_4d(best.total_score, seq.length(),
-                                                                  gene.damage_score, gene.ancient_prob);
+                                                                  gene.damage_score, gene.damage_signal);
 
                         gene.sequence = std::move(working_seq);
                         gene.protein = std::move(best.protein);
@@ -1456,7 +1504,7 @@ int main(int argc, char* argv[]) {
                                 // Count T and C in first 3 positions for 5' T/(T+C) ratio
                                 const std::string& seq = gene.sequence;
                                 for (size_t p = 0; p < std::min<size_t>(3, seq.length()); ++p) {
-                                    char nt = std::toupper(seq[p]);
+                                    char nt = agp::fast_upper(seq[p]);
                                     if (nt == 'T') dstats.domain_terminal_t[best_domain]++;
                                     else if (nt == 'C') dstats.domain_terminal_c[best_domain]++;
                                 }
@@ -1482,7 +1530,7 @@ int main(int argc, char* argv[]) {
                             // Forward strand: C→T at 5' end, G→A at 3' end
                             // Reverse strand: G→A at 5' end, C→T at 3' end (inverted due to revcomp)
                             auto result = damage_model.correct_damage_adaptive(
-                                gene.sequence, sample_profile, gene.ancient_prob, gene.frame,
+                                gene.sequence, sample_profile, gene.damage_signal, gene.frame,
                                 calibrator, gene.is_forward);
                             corrected_dna = std::move(result.first);
                             dna_corr = result.second;
@@ -1652,7 +1700,7 @@ int main(int argc, char* argv[]) {
 
                     // Update damage probability and percentage histograms
                     for (const auto& gene : genes) {
-                        int bin = std::min(9, static_cast<int>(gene.ancient_prob * 10));
+                        int bin = std::min(9, static_cast<int>(gene.damage_signal * 10));
                         damage_prob_hist[bin]++;
 
                         if (opts.use_damage) {
@@ -1690,7 +1738,7 @@ int main(int argc, char* argv[]) {
                             // frame=1: pos 0,1,2,3,4,5... -> codon_pos 1,2,0,1,2,0...
                             // frame=2: pos 0,1,2,3,4,5... -> codon_pos 2,0,1,2,0,1...
                             int codon_pos = (i + frame) % 3;
-                            char base = std::toupper(seq[i]);
+                            char base = agp::fast_upper(seq[i]);
                             if (base == 'T') {
                                 wobble_t_count[codon_pos].fetch_add(1, std::memory_order_relaxed);
                             } else if (base == 'C') {
@@ -1869,6 +1917,51 @@ int main(int argc, char* argv[]) {
             }
         }
 
+        // =====================================================================
+        // PERCENTILE RANK COMPUTATION
+        // Compute damage_signal percentile ranks for all buffered genes
+        // This enables contaminant filtering based on relative damage levels
+        // =====================================================================
+        if (defer_output_for_fdr && !fdr_gene_buffer.empty()) {
+            // Collect all damage_signal values
+            std::vector<float> all_damage_signals;
+            all_damage_signals.reserve(total_genes);
+            for (const auto& [id, genes] : fdr_gene_buffer) {
+                for (const auto& gene : genes) {
+                    all_damage_signals.push_back(gene.damage_signal);
+                }
+            }
+
+            // Sort for percentile computation
+            std::vector<float> sorted_signals = all_damage_signals;
+            std::sort(sorted_signals.begin(), sorted_signals.end());
+
+            // Create lookup function for percentile (0-100 scale)
+            auto compute_percentile = [&sorted_signals](float value) -> float {
+                if (sorted_signals.empty()) return 50.0f;
+                auto it = std::lower_bound(sorted_signals.begin(), sorted_signals.end(), value);
+                size_t rank = std::distance(sorted_signals.begin(), it);
+                return 100.0f * static_cast<float>(rank) / sorted_signals.size();
+            };
+
+            // Assign percentile ranks to all genes
+            for (auto& [id, genes] : fdr_gene_buffer) {
+                for (auto& gene : genes) {
+                    gene.damage_pctile = compute_percentile(gene.damage_signal);
+                }
+            }
+
+            if (opts.verbose) {
+                std::cerr << "[Percentile] Computed damage_signal percentiles for "
+                          << all_damage_signals.size() << " genes\n";
+                if (!sorted_signals.empty()) {
+                    std::cerr << "  Range: " << std::setprecision(3)
+                              << sorted_signals.front() << " - " << sorted_signals.back()
+                              << " | Median: " << sorted_signals[sorted_signals.size()/2] << "\n";
+                }
+            }
+        }
+
         // Write buffered genes with FDR filtering applied
         size_t fdr_filtered_genes = 0;
         if (defer_output_for_fdr && fdr_score_threshold > 0.0f) {
@@ -1889,7 +1982,7 @@ int main(int argc, char* argv[]) {
                     if (gene.score >= fdr_score_threshold) {
                         filtered.push_back(std::move(gene));
                         // Update histograms for filtered genes
-                        int prob_bucket = static_cast<int>(gene.ancient_prob * 10);
+                        int prob_bucket = static_cast<int>(gene.damage_signal * 10);
                         if (prob_bucket >= 10) prob_bucket = 9;
                         if (prob_bucket >= 0) damage_prob_hist[prob_bucket]++;
                         int dmg_bucket = std::min(9, static_cast<int>(gene.damage_score / 10.0));
@@ -1911,6 +2004,57 @@ int main(int argc, char* argv[]) {
             std::cerr << "  Wrote " << fdr_filtered_genes << " genes passing FDR threshold"
                       << " (filtered " << (total_genes - fdr_filtered_genes) << " genes)\n";
             total_genes = fdr_filtered_genes;  // Update for summary statistics
+        }
+        // Write buffered genes with percentile filtering (when FDR not enabled)
+        else if (defer_output_for_fdr && opts.min_damage_pctile > 0.0f) {
+            std::cerr << "\n[Percentile Filtering] Writing genes with damage_pctile >= "
+                      << std::setprecision(1) << opts.min_damage_pctile << "%...\n";
+
+            // Reset histograms for filtered data
+            std::fill(damage_prob_hist.begin(), damage_prob_hist.end(), 0);
+            std::fill(damage_pct_hist.begin(), damage_pct_hist.end(), 0);
+            total_damage_pct = 0.0;
+            size_t pctile_filtered_genes = 0;
+
+            for (auto& [id, genes] : fdr_gene_buffer) {
+                std::vector<agp::Gene> filtered;
+                filtered.reserve(genes.size());
+                for (auto& gene : genes) {
+                    if (gene.damage_pctile >= opts.min_damage_pctile) {
+                        filtered.push_back(std::move(gene));
+                        // Update histograms
+                        int prob_bucket = static_cast<int>(gene.damage_signal * 10);
+                        if (prob_bucket >= 10) prob_bucket = 9;
+                        if (prob_bucket >= 0) damage_prob_hist[prob_bucket]++;
+                        int dmg_bucket = std::min(9, static_cast<int>(gene.damage_score / 10.0));
+                        damage_pct_hist[dmg_bucket]++;
+                        total_damage_pct += gene.damage_score;
+                    }
+                }
+
+                if (!filtered.empty()) {
+                    writer.write_genes(id, filtered);
+                    if (fasta_nt_writer) fasta_nt_writer->write_genes_nucleotide(id, filtered);
+                    if (fasta_nt_corr_writer) fasta_nt_corr_writer->write_genes_nucleotide_corrected(id, filtered);
+                    if (fasta_aa_writer) fasta_aa_writer->write_genes_protein(id, filtered);
+                    if (fasta_corrected_writer) fasta_corrected_writer->write_genes_protein_corrected(id, filtered);
+                    pctile_filtered_genes += filtered.size();
+                }
+            }
+
+            std::cerr << "  Wrote " << pctile_filtered_genes << " genes above percentile threshold"
+                      << " (filtered " << (total_genes - pctile_filtered_genes) << " potential contaminants)\n";
+            total_genes = pctile_filtered_genes;
+        }
+        // Write buffered genes without filtering (percentile computation only)
+        else if (defer_output_for_fdr && !fdr_gene_buffer.empty()) {
+            for (auto& [id, genes] : fdr_gene_buffer) {
+                writer.write_genes(id, genes);
+                if (fasta_nt_writer) fasta_nt_writer->write_genes_nucleotide(id, genes);
+                if (fasta_nt_corr_writer) fasta_nt_corr_writer->write_genes_nucleotide_corrected(id, genes);
+                if (fasta_aa_writer) fasta_aa_writer->write_genes_protein(id, genes);
+                if (fasta_corrected_writer) fasta_corrected_writer->write_genes_protein_corrected(id, genes);
+            }
         }
 
         auto end_time = std::chrono::high_resolution_clock::now();
@@ -2195,7 +2339,7 @@ int main(int argc, char* argv[]) {
                 summary << "    \"damage_validated\": " << (sample_profile.damage_validated ? "true" : "false") << ",\n";
                 summary << "    \"damage_artifact\": " << (sample_profile.damage_artifact ? "true" : "false") << "\n";
                 summary << "  },\n";
-                summary << "  \"ancient_prob_distribution\": [";
+                summary << "  \"damage_signal_distribution\": [";
                 for (int i = 0; i < 10; ++i) {
                     double pct = total_genes > 0 ? 100.0 * damage_prob_hist[i] / total_genes : 0.0;
                     summary << std::setprecision(2) << pct;
