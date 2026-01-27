@@ -378,45 +378,6 @@ public:
         const SampleDamageProfile* sample_profile);
 
     /**
-     * Damage-aware frame selection with adjusted stop penalties
-     *
-     * Scores frames on UNCORRECTED sequences but adjusts stop codon penalties
-     * based on damage probability:
-     * 1. Score each frame normally (preserves natural codon patterns)
-     * 2. For stop codons, calculate probability they're damage-induced
-     * 3. Reduce penalty for likely damage stops (at 5' end, specific contexts)
-     * 4. Select frame with best adjusted score
-     *
-     * This improves frame selection because:
-     * - Correct frame with damage-induced stops → reduced penalties → better score
-     * - Wrong frame with real stops → full penalties → worse score
-     * - No sequence modification → preserves natural patterns for scoring
-     *
-     * @param seq DNA sequence
-     * @param damage_model DamageModel with sample-level damage parameters
-     * @return Pair of FrameScores: (best_forward, best_reverse)
-     */
-    static std::pair<FrameScore, FrameScore> select_best_per_strand_damage_aware(
-        const std::string& seq,
-        const DamageModel& damage_model);
-
-    /**
-     * Select best frame per strand with unified damage context
-     *
-     * Uses UnifiedDamageContext for consistent damage handling:
-     * - Position-specific damage rates from calibrated sample profile
-     * - Per-read damage_signal to gate adjustments
-     * - Proper Bayesian stop penalty weighting
-     *
-     * @param seq DNA sequence
-     * @param ctx Unified damage context (sample + per-read evidence)
-     * @return Pair of FrameScores: (best_forward, best_reverse)
-     */
-    static std::pair<FrameScore, FrameScore> select_best_per_strand_damage_aware(
-        const std::string& seq,
-        const UnifiedDamageContext& ctx);
-
-    /**
      * Get reverse complement of a sequence (returns new string)
      */
     static std::string reverse_complement(const std::string& seq);
