@@ -701,22 +701,7 @@ public:
         const SampleDamageProfile* sample_profile = nullptr);
 };
 
-// Free functions for hexamer-based scoring and correction
-
-/**
- * Correct stop codons using hexamer evidence
- * Fixes stop codons that are likely damage artifacts (TAA/TAG/TGA from C->T)
- * Uses GTDB hexamer frequencies to assess damage probability
- *
- * @param seq DNA sequence
- * @param frame Reading frame (0, 1, 2)
- * @param terminal_length Terminal region to consider (default 15bp)
- * @return Pair of (corrected sequence, number of corrections)
- */
-std::pair<std::string, size_t> correct_stop_codons_hexamer(
-    const std::string& seq,
-    int frame,
-    size_t terminal_length = 15);
+// Free functions for hexamer-based scoring
 
 /**
  * Calculate hexamer log-likelihood ratio score

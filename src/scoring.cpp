@@ -4,9 +4,8 @@
 
 #include "agp/frame_selector.hpp"
 #include "agp/codon_tables.hpp"
-#include "agp/gtdb_hexamer_table.hpp"
-#include "agp/hexamer_damage_lookup.hpp"
-#include "agp/multi_domain_hexamer.hpp"
+#include "agp/hexamer_tables.hpp"
+#include "agp/damage_likelihood.hpp"
 #include <cmath>
 #include <algorithm>
 #include <array>
@@ -318,100 +317,6 @@ float FrameSelector::calculate_damage_consistency(
     return std::max(0.0f, std::min(1.0f, score));
 }
 
-// Hexamer-based stop codon correction
-// Corrects stop codons that are likely damage artifacts based on GTDB hexamer evidence
-// Returns: (corrected sequence, number of corrections made)
-std::pair<std::string, size_t> correct_stop_codons_hexamer(
-    const std::string& seq,
-    int frame,
-    size_t terminal_length) {
-
-    std::string corrected = seq;
-    size_t corrections = 0;
-
-    if (seq.length() < static_cast<size_t>(frame + 6)) {
-        return {corrected, 0};
-    }
-
-    // Scan for stop codons in-frame
-    for (size_t i = frame; i + 2 < seq.length(); i += 3) {
-        char c1 = fast_upper(seq[i]);
-        char c2 = fast_upper(seq[i + 1]);
-        char c3 = fast_upper(seq[i + 2]);
-
-        // Check if this is a stop codon (TAA, TAG, TGA)
-        bool is_stop = false;
-        char original_base = '\0';
-        size_t correction_pos = 0;
-
-        if (c1 == 'T' && c2 == 'A' && c3 == 'A') {
-            // TAA - could come from CAA (C->T damage at position 0)
-            is_stop = true;
-            original_base = 'C';
-            correction_pos = i;
-        } else if (c1 == 'T' && c2 == 'A' && c3 == 'G') {
-            // TAG - could come from CAG (C->T damage at position 0)
-            is_stop = true;
-            original_base = 'C';
-            correction_pos = i;
-        } else if (c1 == 'T' && c2 == 'G' && c3 == 'A') {
-            // TGA - could come from CGA (C->T damage at position 0)
-            is_stop = true;
-            original_base = 'C';
-            correction_pos = i;
-        }
-
-        if (!is_stop) continue;
-
-        // Check position - only correct in terminal regions where damage is likely
-        bool in_5prime_terminal = (i < terminal_length);
-        bool in_3prime_terminal = (i >= seq.length() - terminal_length - 3);
-
-        if (!in_5prime_terminal && !in_3prime_terminal) continue;
-
-        // Get hexamer context if available (codon + next 3 bases)
-        float damage_prob = 0.0f;
-        if (i + 5 < seq.length()) {
-            char hexbuf[7];
-            hexbuf[0] = fast_upper(seq[i]);
-            hexbuf[1] = fast_upper(seq[i + 1]);
-            hexbuf[2] = fast_upper(seq[i + 2]);
-            hexbuf[3] = fast_upper(seq[i + 3]);
-            hexbuf[4] = fast_upper(seq[i + 4]);
-            hexbuf[5] = fast_upper(seq[i + 5]);
-            hexbuf[6] = '\0';
-
-            // Get damage probability from hexamer lookup
-            damage_prob = get_hexamer_damage_prob(hexbuf);
-
-            // Also check GTDB frequency - stop-starting hexamers should be very rare
-            float gtdb_freq = get_hexamer_freq(hexbuf);
-
-            // If GTDB frequency is very low (< 1e-6), this hexamer is rare in coding
-            // which supports it being a damage artifact
-            if (gtdb_freq < 1e-6f && damage_prob < 0.5f) {
-                // Boost damage probability for very rare hexamers
-                damage_prob = std::max(damage_prob, 0.7f);
-            }
-        } else {
-            // Short sequence, use position-based estimate
-            // 5' terminal damage rate peaks at ~30-40% for ancient DNA
-            if (in_5prime_terminal) {
-                float pos_factor = 1.0f - static_cast<float>(i) / terminal_length;
-                damage_prob = 0.3f * pos_factor;  // Conservative estimate
-            }
-        }
-
-        // Correct if damage probability is high enough
-        if (damage_prob >= 0.5f) {
-            corrected[correction_pos] = original_base;
-            corrections++;
-        }
-    }
-
-    return {corrected, corrections};
-}
-
 // Calculate hexamer log-likelihood score for frame selection
 // Higher score = more likely to be real coding sequence
 // Uses GTDB hexamer frequencies vs uniform background
@@ -471,77 +376,6 @@ float calculate_hexamer_llr_score(const std::string& seq, int frame) {
 
     // Return average log-likelihood ratio
     return log_prob_sum / hexamer_count;
-}
-
-// Damage-aware stop penalty using hexamer evidence
-// Returns a multiplier (0-1) where higher = fewer likely-real stops
-float calculate_stop_penalty_hexamer_aware(
-    const std::string& seq,
-    const std::string& protein,
-    int frame,
-    size_t terminal_length) {
-
-    if (protein.empty()) return 0.0f;
-
-    int real_internal_stops = 0;
-    int damage_induced_stops = 0;
-
-    // Scan for internal stop codons (not the last one)
-    size_t codon_idx = 0;
-    for (size_t i = frame; i + 2 < seq.length() && codon_idx + 1 < protein.length(); i += 3, codon_idx++) {
-        if (protein[codon_idx] != '*') continue;
-
-        // This is an internal stop - check if it's likely damage
-        char c1 = fast_upper(seq[i]);
-        char c2 = fast_upper(seq[i + 1]);
-        char c3 = fast_upper(seq[i + 2]);
-
-        // Only damage-correctable stops start with T (from C->T)
-        bool could_be_damage = (c1 == 'T');
-
-        // Check position
-        bool in_5prime = (i < terminal_length);
-        bool in_3prime = (i >= seq.length() - terminal_length - 3);
-        bool in_terminal = in_5prime || in_3prime;
-
-        // Get hexamer damage probability if available
-        float damage_prob = 0.0f;
-        if (could_be_damage && i + 5 < seq.length()) {
-            char hexbuf[7];
-            hexbuf[0] = c1; hexbuf[1] = c2; hexbuf[2] = c3;
-            hexbuf[3] = fast_upper(seq[i + 3]);
-            hexbuf[4] = fast_upper(seq[i + 4]);
-            hexbuf[5] = fast_upper(seq[i + 5]);
-            hexbuf[6] = '\0';
-
-            damage_prob = get_hexamer_damage_prob(hexbuf);
-
-            // Boost for terminal regions
-            if (in_terminal && damage_prob < 0.3f) {
-                float pos_factor = in_5prime ? (1.0f - static_cast<float>(i) / terminal_length)
-                                            : (static_cast<float>(i - (seq.length() - terminal_length)) / terminal_length);
-                damage_prob = std::max(damage_prob, 0.2f * pos_factor);
-            }
-        }
-
-        // Classify the stop
-        if (damage_prob >= 0.5f) {
-            damage_induced_stops++;
-        } else {
-            real_internal_stops++;
-        }
-    }
-
-    // Calculate penalty
-    // Real stops are heavily penalized, damage stops are lightly penalized
-    if (real_internal_stops == 0 && damage_induced_stops == 0) return 1.0f;
-    if (real_internal_stops == 0) {
-        // Only damage-induced stops - light penalty
-        if (damage_induced_stops == 1) return 0.8f;
-        return 0.6f;
-    }
-    if (real_internal_stops == 1) return 0.2f;
-    return 0.05f;
 }
 
 } // namespace agp
