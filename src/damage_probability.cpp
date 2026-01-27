@@ -1,14 +1,11 @@
 // Per-read damage probability estimation for ancient DNA
 
 #include "agp/frame_selector.hpp"
+#include "agp/codon_tables.hpp"
 #include <algorithm>
 #include <cmath>
 
 namespace agp {
-
-static inline char fast_upper(char c) {
-    return (c >= 'a' && c <= 'z') ? c - 32 : c;
-}
 
 float FrameSelector::estimate_damage_signal(const std::string& seq) {
     if (seq.length() < 10) return 0.5f;  // Too short to estimate
