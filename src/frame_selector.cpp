@@ -16,20 +16,15 @@
 #include "agp/strand_scoring.hpp"        // Strand LLR scoring functions
 #include "agp/frame_nn.hpp"  // Neural network for frame classification
 #include "agp/bayesian_frame.hpp"  // Bayesian frame selection using hexamer LLR
-#include "agp/unified_damage_context.hpp"  // Unified damage context for consistent damage handling
 #include <cmath>
 #include <algorithm>
 #include <climits>
 
 namespace agp {
 
-// Forward declarations for damage-adjusted stop penalty
+// Forward declaration for damage-adjusted stop penalty
 static float calculate_damage_adjusted_stop_multiplier(
     const std::string& seq, const std::string& protein, int frame, const DamageModel& damage_model);
-
-// New: UnifiedDamageContext-based version (preferred)
-static float calculate_damage_adjusted_stop_multiplier(
-    const std::string& seq, const std::string& protein, int frame, const UnifiedDamageContext& ctx);
 
 // ============================================================================
 // Phase 1.3: Poisson model for stop codons
@@ -1570,190 +1565,6 @@ static float calculate_damage_adjusted_stop_multiplier(
     if (damage_weighted_stops < 0.01f) return 1.0f;
     if (damage_weighted_stops < 1.0f) return 1.0f - (0.8f * damage_weighted_stops);  // Linear decay
     return 0.2f / damage_weighted_stops;  // Strong penalty for multiple stops
-}
-
-/**
- * Calculate damage-adjusted stop codon penalty using UnifiedDamageContext
- *
- * This version uses the unified damage architecture:
- * 1. Position-specific damage rates from calibrated sample profile
- * 2. Per-read damage_signal to gate discounting
- * 3. Proper Bayesian combination: logit(prior) + LLR(hexamer)
- * 4. Handles both C→T (5') and G→A (3') mutation paths for TGA
- */
-static float calculate_damage_adjusted_stop_multiplier(
-    const std::string& seq,
-    const std::string& protein,
-    int frame,
-    const UnifiedDamageContext& ctx) {
-
-    if (protein.empty()) return 1.0f;
-
-    // Fall back to standard penalty if damage context not enabled
-    if (!ctx.enabled()) {
-        return FrameSelector::calculate_stop_penalty(protein);
-    }
-
-    const size_t seq_len = seq.length();
-
-    // Helper for logit/sigmoid transforms
-    auto clamp01 = [](float x) { return std::clamp(x, 0.0f, 1.0f); };
-    auto sigmoid = [](float x) { return 1.0f / (1.0f + std::exp(-x)); };
-    auto logit = [](float p) {
-        p = std::clamp(p, 1e-6f, 1.0f - 1e-6f);
-        return std::log(p) - std::log1p(-p);
-    };
-
-    // Helper to get hexamer log probability
-    auto get_hexamer_log_prob = [&seq](size_t pos) -> float {
-        if (pos + 6 > seq.length()) return -10.0f;
-        uint32_t code = agp::encode_hexamer(seq.c_str() + pos);
-        if (code == UINT32_MAX) return -10.0f;
-        float freq = agp::get_hexamer_freq(code);
-        if (freq < 1e-8f) freq = 1e-8f;
-        return std::log(freq);
-    };
-
-    // Compute best hexamer LLR for a potential damage stop
-    // Returns positive LLR if corrected version is more likely (evidence for damage)
-    auto best_hexamer_llr = [&](size_t codon_start, char c1, char c2, char c3) -> float {
-        size_t hexamer_start = codon_start;
-        if (hexamer_start + 6 > seq_len) {
-            hexamer_start = (seq_len >= 6) ? seq_len - 6 : 0;
-        }
-        if (hexamer_start + 6 > seq_len) return 0.0f;
-
-        float log_p_stop = get_hexamer_log_prob(hexamer_start);
-        float best_llr = 0.0f;
-
-        // Path A: C→T at codon pos1 (TAA←CAA, TAG←CAG, TGA←CGA)
-        if (c1 == 'T') {
-            std::string corrected = seq.substr(hexamer_start, 6);
-            size_t mut_in_hex = codon_start - hexamer_start;
-            if (mut_in_hex < 6) {
-                corrected[mut_in_hex] = 'C';
-                float log_p_corr = get_hexamer_log_prob(0);
-                // Recalculate with corrected string
-                uint32_t code = agp::encode_hexamer(corrected.c_str());
-                if (code != UINT32_MAX) {
-                    float freq = agp::get_hexamer_freq(code);
-                    if (freq < 1e-8f) freq = 1e-8f;
-                    log_p_corr = std::log(freq);
-                }
-                best_llr = std::max(best_llr, log_p_corr - log_p_stop);
-            }
-        }
-
-        // Path B: G→A at codon pos3 (TGA←TGG only)
-        if (c1 == 'T' && c2 == 'G' && c3 == 'A') {
-            std::string corrected = seq.substr(hexamer_start, 6);
-            size_t mut_in_hex = (codon_start + 2) - hexamer_start;
-            if (mut_in_hex < 6) {
-                corrected[mut_in_hex] = 'G';
-                uint32_t code = agp::encode_hexamer(corrected.c_str());
-                if (code != UINT32_MAX) {
-                    float freq = agp::get_hexamer_freq(code);
-                    if (freq < 1e-8f) freq = 1e-8f;
-                    float log_p_corr = std::log(freq);
-                    best_llr = std::max(best_llr, log_p_corr - log_p_stop);
-                }
-            }
-        }
-
-        return best_llr;
-    };
-
-    // Tuning parameters
-    constexpr float LLR_CENTER = 0.5f;   // LLR below this reduces posterior
-    constexpr float LLR_SCALE = 1.0f;    // Scale for LLR contribution
-    constexpr float MAX_DISCOUNT_BASE = 0.7f;  // Maximum stop weight reduction
-
-    // Gate by per-read evidence
-    const float max_discount = MAX_DISCOUNT_BASE * ctx.damage_gate();
-
-    // Prior for real internal stop (rare in coding sequences)
-    constexpr float PRIOR_REAL_STOP = 0.001f;
-
-    // Prior probabilities for pre-damage codons
-    constexpr float P_CAA = 0.25f;  // Gln
-    constexpr float P_CAG = 0.25f;  // Gln
-    constexpr float P_CGA = 0.25f;  // Arg
-    constexpr float P_TGG = 0.25f;  // Trp
-
-    float damage_weighted_stops = 0.0f;
-
-    for (size_t i = 0; i + 1 < protein.length(); ++i) {  // Exclude terminal stop
-        if (protein[i] != '*') continue;
-
-        size_t codon_start = static_cast<size_t>(frame) + i * 3;
-        if (codon_start + 3 > seq_len) {
-            damage_weighted_stops += 1.0f;
-            continue;
-        }
-
-        char c1 = fast_upper(seq[codon_start]);
-        char c2 = fast_upper(seq[codon_start + 1]);
-        char c3 = fast_upper(seq[codon_start + 2]);
-
-        float stop_weight = 1.0f;  // Default: full penalty
-
-        const bool is_taa = (c1 == 'T' && c2 == 'A' && c3 == 'A');
-        const bool is_tag = (c1 == 'T' && c2 == 'A' && c3 == 'G');
-        const bool is_tga = (c1 == 'T' && c2 == 'G' && c3 == 'A');
-
-        if ((is_taa || is_tag || is_tga) && max_discount > 0.0f) {
-            // Step 1: Compute position-based damage prior
-            float p_damage_event = 0.0f;
-
-            // C→T at codon pos1 (5' damage)
-            float p_ct = ctx.ct_rate_at(codon_start, seq_len);
-
-            if (is_taa) {
-                p_damage_event = p_ct * P_CAA;
-            } else if (is_tag) {
-                p_damage_event = p_ct * P_CAG;
-            } else if (is_tga) {
-                // Two paths: CGA→TGA (C→T) or TGG→TGA (G→A)
-                float p_from_cga = p_ct * P_CGA;
-
-                // G→A at codon pos3 (3' damage)
-                float p_ga = ctx.ga_rate_at(codon_start + 2, seq_len);
-                float p_from_tgg = p_ga * P_TGG;
-
-                // Union of independent paths
-                p_damage_event = p_from_cga + p_from_tgg - (p_from_cga * p_from_tgg);
-            }
-
-            // Weight by per-read damage signal
-            p_damage_event *= clamp01(ctx.read.damage_signal);
-
-            // Convert to P(damage | observed stop) using Bayes
-            float p_stop = PRIOR_REAL_STOP + p_damage_event * (1.0f - PRIOR_REAL_STOP);
-            float p_damage_given_stop = (p_stop > 0.0f) ? (p_damage_event / p_stop) : 0.0f;
-            p_damage_given_stop = clamp01(p_damage_given_stop);
-
-            // Step 2: Update with hexamer evidence via logit + LLR
-            float llr = best_hexamer_llr(codon_start, c1, c2, c3);
-
-            float posterior = p_damage_given_stop;
-            if (llr != 0.0f) {
-                float z = logit(p_damage_given_stop);
-                z += LLR_SCALE * (llr - LLR_CENTER);
-                posterior = clamp01(sigmoid(z));
-            }
-
-            // Step 3: Compute stop weight with gating
-            stop_weight = 1.0f - max_discount * posterior;
-            stop_weight = std::clamp(stop_weight, 1.0f - max_discount, 1.0f);
-        }
-
-        damage_weighted_stops += stop_weight;
-    }
-
-    // Convert weighted stop count to multiplier
-    if (damage_weighted_stops < 0.01f) return 1.0f;
-    if (damage_weighted_stops < 1.0f) return 1.0f - (0.8f * damage_weighted_stops);
-    return 0.2f / damage_weighted_stops;
 }
 
 std::vector<FrameScore> FrameSelector::score_all_frames_full(
