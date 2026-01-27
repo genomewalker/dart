@@ -400,16 +400,6 @@ public:
     static float estimate_damage_signal(const std::string& seq);
 
     /**
-     * Compute observed damage magnitude for a read
-     * Counts T's at 5' end positions 0-2 and A's at 3' end positions 0-2
-     * Position-weighted: pos 0 = 1.0, pos 1 = 0.5, pos 2 = 0.25
-     *
-     * @param seq DNA sequence
-     * @return Damage score 0.0-3.5 (sum of 5' and 3' scores)
-     */
-    static float compute_damage_score(const std::string& seq);
-
-    /**
      * Compute per-read damage percentage using sample-level distribution
      * Similar to mapDamage/DamageProfiler approach:
      * - Uses sample's damage rates at each position
@@ -449,20 +439,6 @@ public:
      */
     static float estimate_damage_signal_with_sample_profile(
         const std::string& seq,
-        const SampleDamageProfile& sample_profile);
-
-    /**
-     * Advanced damage estimation combining all signals
-     * Uses quality scores, dinucleotide context, and joint probability model
-     *
-     * @param seq DNA sequence
-     * @param quality Quality string (Phred+33 encoded)
-     * @param sample_profile Pre-computed sample-level damage statistics
-     * @return Probability 0.0-1.0 that this read shows ancient damage
-     */
-    static float estimate_damage_signal_advanced(
-        const std::string& seq,
-        const std::string& quality,
         const SampleDamageProfile& sample_profile);
 
     /**

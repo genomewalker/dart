@@ -10,11 +10,7 @@ static inline char fast_upper(char c) {
     return (c >= 'a' && c <= 'z') ? c - 32 : c;
 }
 
-static inline float damage_prob_at_position(size_t pos, float lambda) {
-    return std::exp(-lambda * static_cast<float>(pos));
-}
-
-float FrameSelector::estimate_ancient_prob(const std::string& seq) {
+float FrameSelector::estimate_damage_signal(const std::string& seq) {
     if (seq.length() < 10) return 0.5f;  // Too short to estimate
 
     size_t len = seq.length();
@@ -65,32 +61,6 @@ float FrameSelector::estimate_ancient_prob(const std::string& seq) {
     float prob = 1.0f / (1.0f + std::exp(-log_odds));
 
     return std::clamp(prob, 0.05f, 0.95f);
-}
-
-float FrameSelector::compute_damage_score(const std::string& seq) {
-    if (seq.length() < 6) return 0.0f;
-
-    size_t len = seq.length();
-    float score = 0.0f;
-
-    // Position weights (exponential decay from terminals)
-    const float weights[] = {1.0f, 0.5f, 0.25f};
-
-    // 5' end T scoring
-    for (size_t i = 0; i < std::min(size_t(3), len); ++i) {
-        if (fast_upper(seq[i]) == 'T') {
-            score += weights[i];
-        }
-    }
-
-    // 3' end A scoring
-    for (size_t i = 0; i < std::min(size_t(3), len); ++i) {
-        if (fast_upper(seq[len - 1 - i]) == 'A') {
-            score += weights[i] * 0.8f;  // 3' slightly less weight
-        }
-    }
-
-    return score;  // Range ~0.0 to ~3.5
 }
 
 float FrameSelector::compute_damage_percentage(
@@ -200,7 +170,7 @@ float FrameSelector::compute_damage_percentage(
     return std::clamp(percentage, 0.0f, 100.0f);
 }
 
-float FrameSelector::estimate_ancient_prob_with_codons(
+float FrameSelector::estimate_damage_signal_with_codons(
     const std::string& seq,
     int frame,
     bool forward) {
@@ -210,7 +180,7 @@ float FrameSelector::estimate_ancient_prob_with_codons(
     size_t len = seq.length();
     float log_odds = 0.0f;
 
-    // Basic terminal signals (as in estimate_ancient_prob)
+    // Basic terminal signals (as in estimate_damage_signal)
     if (fast_upper(seq[0]) == 'T') log_odds += 0.7f;
     if (fast_upper(seq[len - 1]) == 'A') log_odds += 0.6f;
     if (len > 1 && fast_upper(seq[1]) == 'T') log_odds += 0.3f;
@@ -266,13 +236,13 @@ float FrameSelector::estimate_ancient_prob_with_codons(
     return std::clamp(prob, 0.05f, 0.95f);
 }
 
-float FrameSelector::estimate_ancient_prob_with_sample_profile(
+float FrameSelector::estimate_damage_signal_with_sample_profile(
     const std::string& seq,
     const SampleDamageProfile& sample_profile) {
 
     if (seq.length() < 15) return 0.5f;
     if (!sample_profile.is_valid()) {
-        return estimate_ancient_prob_with_codons(seq, 0, true);
+        return estimate_damage_signal_with_codons(seq, 0, true);
     }
 
     // =========================================================================
@@ -350,118 +320,6 @@ float FrameSelector::estimate_ancient_prob_with_sample_profile(
     // Negative signals
     if (len > 0 && fast_upper(seq[len - 1]) == 'G') log_odds -= 0.2f;
     if (len > 0 && fast_upper(seq[0]) == 'C') log_odds -= 0.2f;
-
-    float prob = 1.0f / (1.0f + std::exp(-log_odds));
-
-    return std::clamp(prob, 0.05f, 0.95f);
-}
-
-float FrameSelector::estimate_ancient_prob_advanced(
-    const std::string& seq,
-    const std::string& quality,
-    const SampleDamageProfile& sample_profile) {
-
-    if (seq.length() < 15) return 0.5f;
-
-    size_t len = seq.length();
-    bool has_quality = !quality.empty() && quality.length() == seq.length();
-
-    float log_odds = 0.0f;
-
-    // PRIMARY SIGNAL: Position-based damage detection
-    if (len > 0 && fast_upper(seq[0]) == 'T') log_odds += 0.7f;
-    if (len > 1 && fast_upper(seq[1]) == 'T') log_odds += 0.25f;
-    if (len > 0 && fast_upper(seq[len - 1]) == 'A') log_odds += 0.6f;
-    if (len > 1 && fast_upper(seq[len - 2]) == 'A') log_odds += 0.2f;
-
-    // Negative signals
-    if (len > 0 && fast_upper(seq[0]) == 'C') log_odds -= 0.2f;
-    if (len > 0 && fast_upper(seq[len - 1]) == 'G') log_odds -= 0.15f;
-
-    // FEATURE 1: Quality-weighted base observations
-    auto phred_to_prob = [](char q) -> float {
-        int phred = static_cast<int>(q) - 33;
-        phred = std::clamp(phred, 0, 40);
-        return 1.0f - std::pow(10.0f, -phred / 10.0f);
-    };
-
-    for (size_t i = 0; i < std::min(size_t(3), len); ++i) {
-        char base = fast_upper(seq[i]);
-        float quality_weight = has_quality ? phred_to_prob(quality[i]) : 0.9f;
-
-        if (base == 'T') {
-            float quality_bonus = (quality_weight < 0.95f) ? 0.1f : 0.0f;
-            log_odds += quality_bonus;
-        }
-        else if (base == 'C' && quality_weight > 0.99f) {
-            float pos_weight = 1.0f - (float)i / 3.0f;
-            log_odds -= pos_weight * 0.05f;
-        }
-    }
-
-    for (size_t i = 0; i < std::min(size_t(3), len); ++i) {
-        size_t pos = len - 1 - i;
-        char base = fast_upper(seq[pos]);
-        float quality_weight = has_quality ? phred_to_prob(quality[pos]) : 0.9f;
-
-        if (base == 'A') {
-            float quality_bonus = (quality_weight < 0.95f) ? 0.08f : 0.0f;
-            log_odds += quality_bonus;
-        }
-        else if (base == 'G' && quality_weight > 0.99f) {
-            float pos_weight = 1.0f - (float)i / 3.0f;
-            log_odds -= pos_weight * 0.04f;
-        }
-    }
-
-    // FEATURE 2: Dinucleotide context
-    for (size_t i = 0; i < std::min(size_t(4), len - 1); ++i) {
-        char b1 = fast_upper(seq[i]);
-        char b2 = fast_upper(seq[i + 1]);
-
-        if (b1 == 'T' && b2 == 'G') log_odds += 0.3f;
-        else if (b1 == 'T' && b2 == 'A') log_odds += 0.15f;
-    }
-
-    for (size_t i = len - 1; i > 0 && i > len - 5; --i) {
-        char b1 = fast_upper(seq[i - 1]);
-        char b2 = fast_upper(seq[i]);
-
-        if (b1 == 'C' && b2 == 'A') log_odds += 0.25f;
-    }
-
-    // FEATURE 3: Joint probability
-    bool t_at_5prime = (len > 0 && fast_upper(seq[0]) == 'T');
-    bool a_at_3prime = (len > 0 && fast_upper(seq[len - 1]) == 'A');
-
-    if (t_at_5prime && a_at_3prime) log_odds += 0.3f;
-
-    int t_count_5prime = 0;
-    for (size_t i = 0; i < std::min(size_t(3), len); ++i) {
-        if (fast_upper(seq[i]) == 'T') t_count_5prime++;
-    }
-    if (t_count_5prime >= 2) log_odds += 0.25f;
-
-    int a_count_3prime = 0;
-    for (size_t i = 0; i < std::min(size_t(3), len); ++i) {
-        if (fast_upper(seq[len - 1 - i]) == 'A') a_count_3prime++;
-    }
-    if (a_count_3prime >= 2) log_odds += 0.2f;
-
-    // FEATURE 4: Sample-calibrated weights
-    if (sample_profile.is_valid() && sample_profile.max_damage_5prime > 0.02f) {
-        float sample_damage_scale = sample_profile.max_damage_5prime / 0.1f;
-        sample_damage_scale = std::clamp(sample_damage_scale, 0.5f, 2.0f);
-        log_odds *= sample_damage_scale;
-    }
-
-    // FEATURE 5: Negative evidence
-    bool no_damage_signature = true;
-    for (size_t i = 0; i < std::min(size_t(3), len); ++i) {
-        if (fast_upper(seq[i]) == 'T') no_damage_signature = false;
-        if (fast_upper(seq[len - 1 - i]) == 'A') no_damage_signature = false;
-    }
-    if (no_damage_signature) log_odds -= 0.3f;
 
     float prob = 1.0f / (1.0f + std::exp(-log_odds));
 
