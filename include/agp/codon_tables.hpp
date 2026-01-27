@@ -53,13 +53,4 @@ float get_codon_freq_fast(char c1, char c2, char c3);
 char translate_codon_fast(char c1, char c2, char c3);
 float get_aa_freq_fast(char aa);
 
-
-// Legacy map-based functions (for compatibility)
-const std::unordered_map<std::string, float>& get_codon_frequencies();
-const std::unordered_map<char, float>& get_aa_frequencies();
-char codon_to_aa(const std::string& codon);
-std::vector<std::string> get_codons_for_aa(char aa);
-float get_aa_prior(char aa);
-float get_codon_usage_within_aa(const std::string& codon, char aa);
-
 } // namespace agp
