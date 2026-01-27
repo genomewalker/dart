@@ -289,7 +289,7 @@ struct FrameScore {
     int frame = 0;              // Frame offset (0, 1, 2)
     bool forward = true;        // Strand direction
 
-    float codon_score = 0.0f;           // Codon usage bias score
+    float log_likelihood = 0.0f;        // Log-likelihood from Bayesian frame selection
     float stop_codon_penalty = 0.0f;    // Penalty for internal stops
     float aa_composition_score = 0.0f;  // Amino acid composition score
     float damage_consistency = 0.0f;    // Damage pattern consistency
