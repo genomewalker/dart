@@ -695,7 +695,7 @@ FrameScore FrameSelector::score_frame(
     }
 
     // Extract individual scores for reporting (optional)
-    score.codon_score = 0.0f;  // Deprecated - codon scoring removed
+    score.log_likelihood = 0.0f;  // Only set in Bayesian mode
     score.stop_codon_penalty = calculate_stop_penalty(score.protein);
     score.aa_composition_score = calculate_aa_composition_score(score.protein);
 
@@ -754,7 +754,7 @@ FrameScore FrameSelector::select_best_frame(
             best.total_score = total;
             best.frame = frame;
             best.forward = true;
-            best.codon_score = 0.0f;  // Deprecated
+            best.log_likelihood = 0.0f;  // Only set in Bayesian mode
             best.stop_codon_penalty = calculate_stop_penalty(protein);
             best.aa_composition_score = calculate_aa_composition_score(protein);
             best.damage_consistency = 0.5f;
@@ -769,7 +769,7 @@ FrameScore FrameSelector::select_best_frame(
             best.total_score = total;
             best.frame = frame;
             best.forward = false;
-            best.codon_score = 0.0f;  // Deprecated
+            best.log_likelihood = 0.0f;  // Only set in Bayesian mode
             best.stop_codon_penalty = calculate_stop_penalty(protein);
             best.aa_composition_score = calculate_aa_composition_score(protein);
             best.damage_consistency = 0.5f;
@@ -1046,7 +1046,7 @@ std::pair<FrameScore, FrameScore> FrameSelector::select_best_per_strand(
             best_fwd.total_score = total;
             best_fwd.frame = frame;
             best_fwd.forward = true;
-            best_fwd.codon_score = 0.0f;  // Deprecated
+            best_fwd.log_likelihood = 0.0f;  // Only set in Bayesian mode
             best_fwd.stop_codon_penalty = calculate_stop_penalty(protein);
             best_fwd.aa_composition_score = calculate_aa_composition_score(protein);
             best_fwd.damage_consistency = 0.5f;
@@ -1063,7 +1063,7 @@ std::pair<FrameScore, FrameScore> FrameSelector::select_best_per_strand(
             best_rev.total_score = total;
             best_rev.frame = frame;
             best_rev.forward = false;
-            best_rev.codon_score = 0.0f;  // Deprecated
+            best_rev.log_likelihood = 0.0f;  // Only set in Bayesian mode
             best_rev.stop_codon_penalty = calculate_stop_penalty(protein);
             best_rev.aa_composition_score = calculate_aa_composition_score(protein);
             best_rev.damage_consistency = 0.5f;
@@ -1179,7 +1179,7 @@ std::pair<FrameScore, FrameScore> FrameSelector::select_best_per_strand(
             best_fwd.total_score = total;
             best_fwd.frame = frame;
             best_fwd.forward = true;
-            best_fwd.codon_score = 0.0f;  // Deprecated
+            best_fwd.log_likelihood = 0.0f;  // Only set in Bayesian mode
             best_fwd.stop_codon_penalty = calculate_stop_penalty(protein);
             best_fwd.aa_composition_score = calculate_aa_composition_score(protein);
             best_fwd.damage_consistency = 0.5f;
@@ -1196,7 +1196,7 @@ std::pair<FrameScore, FrameScore> FrameSelector::select_best_per_strand(
             best_rev.total_score = total;
             best_rev.frame = frame;
             best_rev.forward = false;
-            best_rev.codon_score = 0.0f;  // Deprecated
+            best_rev.log_likelihood = 0.0f;  // Only set in Bayesian mode
             best_rev.stop_codon_penalty = calculate_stop_penalty(protein);
             best_rev.aa_composition_score = calculate_aa_composition_score(protein);
             best_rev.damage_consistency = 0.5f;
@@ -1600,7 +1600,7 @@ std::vector<FrameScore> FrameSelector::score_all_frames_full(
         fwd.total_score = score_frame_fast(seq, frame, protein, &fwd_precomputed, &fwd_stops);
         fwd.protein = protein;
         if (fwd.total_score > -100.0f) {
-            fwd.codon_score = 0.0f;  // Deprecated - codon scoring removed
+            fwd.log_likelihood = 0.0f;  // Only set in Bayesian mode
             fwd.stop_codon_penalty = calculate_stop_penalty(protein);
             fwd.aa_composition_score = calculate_aa_composition_score(protein);
             fwd.damage_consistency = score_damage_frame_consistency(seq, frame);
@@ -1614,7 +1614,7 @@ std::vector<FrameScore> FrameSelector::score_all_frames_full(
         rev.total_score = score_frame_fast(rc_seq, frame, protein, &rev_precomputed, &rev_stops);
         rev.protein = protein;
         if (rev.total_score > -100.0f) {
-            rev.codon_score = 0.0f;  // Deprecated - codon scoring removed
+            rev.log_likelihood = 0.0f;  // Only set in Bayesian mode
             rev.stop_codon_penalty = calculate_stop_penalty(protein);
             rev.aa_composition_score = calculate_aa_composition_score(protein);
             rev.damage_consistency = score_damage_frame_consistency(rc_seq, frame);
@@ -1676,7 +1676,7 @@ std::pair<FrameScore, FrameScore> FrameSelector::select_best_per_strand_bayesian
     first.total_score = best.posterior;  // Use posterior as score (0-1)
     first.protein = best.protein;
     first.stop_codon_penalty = 0.0f;  // Not computed in Bayesian mode
-    first.codon_score = best.log_likelihood;
+    first.log_likelihood = best.log_likelihood;
     first.aa_composition_score = result.confidence;
 
     if (result.selected_frames.size() >= 2) {
@@ -1687,7 +1687,7 @@ std::pair<FrameScore, FrameScore> FrameSelector::select_best_per_strand_bayesian
         second_frame.forward = !second.is_reverse;
         second_frame.total_score = second.posterior;
         second_frame.protein = second.protein;
-        second_frame.codon_score = second.log_likelihood;
+        second_frame.log_likelihood = second.log_likelihood;
         return {first, second_frame};
     }
 
