@@ -1210,8 +1210,26 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
             fprintf(stderr, "  [D_MAX] ARTIFACT DETECTED by Channel B: setting d_max = 0\n");
         } else if (profile.damage_validated) {
             // Both channels agree: use Channel A's raw estimates
-            profile.d_max_5prime = raw_d_max_5prime;
-            profile.d_max_3prime = raw_d_max_3prime;
+            // BUT if raw values are 0 due to inverted pattern, use fit_amplitude instead
+            // This handles the case where position 0 is below baseline but the
+            // exponential fit and Channel B both confirm real damage
+            float effective_d_max_5prime = raw_d_max_5prime;
+            float effective_d_max_3prime = raw_d_max_3prime;
+
+            // If raw estimate is 0 but fit amplitude shows decay, use amplitude
+            if (raw_d_max_5prime < 0.001f && profile.fit_amplitude_5prime > 0.02f) {
+                effective_d_max_5prime = profile.fit_amplitude_5prime;
+                fprintf(stderr, "  [D_MAX] 5' raw=0 but fit_amplitude=%.1f%%, using amplitude\n",
+                        profile.fit_amplitude_5prime * 100);
+            }
+            if (raw_d_max_3prime < 0.001f && profile.fit_amplitude_3prime > 0.02f) {
+                effective_d_max_3prime = profile.fit_amplitude_3prime;
+                fprintf(stderr, "  [D_MAX] 3' raw=0 but fit_amplitude=%.1f%%, using amplitude\n",
+                        profile.fit_amplitude_3prime * 100);
+            }
+
+            profile.d_max_5prime = effective_d_max_5prime;
+            profile.d_max_3prime = effective_d_max_3prime;
 
             // Combine using asymmetry-aware logic
             if (profile.high_asymmetry) {
@@ -1266,16 +1284,19 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         }
 
         // Additional reliability check: if either end has inverted pattern, use the other
-        if (profile.inverted_pattern_5prime && !profile.inverted_pattern_3prime) {
-            profile.d_max_combined = profile.d_max_3prime;
-            profile.d_max_source = SampleDamageProfile::DmaxSource::THREE_PRIME_ONLY;
-        } else if (profile.inverted_pattern_3prime && !profile.inverted_pattern_5prime) {
-            profile.d_max_combined = profile.d_max_5prime;
-            profile.d_max_source = SampleDamageProfile::DmaxSource::FIVE_PRIME_ONLY;
-        } else if (profile.inverted_pattern_5prime && profile.inverted_pattern_3prime) {
-            // Both ends inverted - can't reliably estimate damage
-            profile.d_max_combined = 0.0f;
-            profile.d_max_source = SampleDamageProfile::DmaxSource::NONE;
+        // BUT skip this check if Channel B validated damage - Channel B is the ground truth
+        if (!profile.damage_validated) {
+            if (profile.inverted_pattern_5prime && !profile.inverted_pattern_3prime) {
+                profile.d_max_combined = profile.d_max_3prime;
+                profile.d_max_source = SampleDamageProfile::DmaxSource::THREE_PRIME_ONLY;
+            } else if (profile.inverted_pattern_3prime && !profile.inverted_pattern_5prime) {
+                profile.d_max_combined = profile.d_max_5prime;
+                profile.d_max_source = SampleDamageProfile::DmaxSource::FIVE_PRIME_ONLY;
+            } else if (profile.inverted_pattern_5prime && profile.inverted_pattern_3prime) {
+                // Both ends inverted - can't reliably estimate damage
+                profile.d_max_combined = 0.0f;
+                profile.d_max_source = SampleDamageProfile::DmaxSource::NONE;
+            }
         }
 
         fprintf(stderr, "  [D_MAX] Final: d_max_5p=%.2f%%, d_max_3p=%.2f%%, combined=%.2f%% (source=%s)\n",
