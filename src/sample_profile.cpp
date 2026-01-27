@@ -1,16 +1,13 @@
 // Sample-level damage profile management
 
 #include "agp/frame_selector.hpp"
+#include "agp/codon_tables.hpp"
 #include "agp/hexamer_tables.hpp"
 #include <algorithm>
 #include <cmath>
 #include <array>
 
 namespace agp {
-
-static inline char fast_upper(char c) {
-    return (c >= 'a' && c <= 'z') ? c - 32 : c;
-}
 
 // Compute binomial log-likelihood for a single observation
 // k = successes (e.g., T count), n = total trials (e.g., T+C count), p = probability

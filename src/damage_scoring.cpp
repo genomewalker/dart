@@ -1,15 +1,113 @@
 // Damage scoring and frame consistency for ancient DNA
 
 #include "agp/frame_selector.hpp"
+#include "agp/codon_tables.hpp"
 #include "agp/damage_likelihood.hpp"
+#include "agp/hexamer_tables.hpp"
 #include <algorithm>
 #include <cmath>
 #include <array>
 
 namespace agp {
 
-static inline char fast_upper(char c) {
-    return (c >= 'a' && c <= 'z') ? c - 32 : c;
+// ============================================================================
+// ADAPTIVE CALIBRATION FOR TERMINAL DAMAGE PROBABILITY
+//
+// Key insight: Raw scores cluster around ~0.65 regardless of actual damage rate.
+// We need to recalibrate so that:
+//   - Mean output ≈ sample's validated d_max
+//   - Scores spread appropriately around that mean
+//
+// Method: Sigmoid scaling based on sample d_max
+//   calibrated = d_max * sigmoid(k * (raw - threshold))
+// where threshold is chosen so mean output ≈ d_max
+// ============================================================================
+
+// ============================================================================
+// CHANNEL B ADJUSTMENT FACTOR
+//
+// Channel B (stop codon conversion) provides independent validation of damage.
+// This function computes a multiplier [0.0, 1.0] based on Channel B evidence:
+//   - damage_validated = true: factor = 1.0 (full confidence)
+//   - damage_artifact = true: factor = 0.1 (strongly suppress)
+//   - neither: factor = 0.5 (uncertain)
+//
+// The factor is applied to per-read damage scores to ensure consistency
+// between sample-level validation and per-read probabilities.
+// ============================================================================
+
+static float compute_channel_b_factor(const SampleDamageProfile& profile) {
+    if (!profile.is_valid()) {
+        return 0.5f;  // No sample info, neutral factor
+    }
+
+    // If Channel B validated real damage, full confidence
+    if (profile.damage_validated) {
+        return 1.0f;
+    }
+
+    // If Channel B identified artifact (false positive), strongly suppress
+    if (profile.damage_artifact) {
+        return 0.1f;
+    }
+
+    // Channel B has data but inconclusive - use stop LLR to modulate
+    if (profile.channel_b_valid) {
+        // stop_decay_llr > 0 means stop excess at terminals (supports damage)
+        // stop_decay_llr < 0 means no stop excess (contradicts damage)
+        if (profile.stop_decay_llr_5prime > 100.0f) {
+            return 0.8f;  // Mild support from Channel B
+        } else if (profile.stop_decay_llr_5prime < -100.0f) {
+            return 0.3f;  // Mild contradiction from Channel B
+        }
+        return 0.5f;  // Near-zero LLR, inconclusive
+    }
+
+    // Channel B has insufficient data - rely on Channel A only
+    // Apply modest discount since we can't validate
+    return 0.7f;
+}
+
+static float calibrate_damage_score_adaptive(float raw, float d_max) {
+    // For artifact samples (d_max=0), return very low scores
+    if (d_max < 0.01f) {
+        return raw * 0.1f;  // Heavily suppress
+    }
+
+    // Empirical: raw scores have mean ~0.65 and we want output mean ~d_max
+    // Use a shifted sigmoid to map raw to calibrated range
+    //
+    // The raw score distribution is roughly:
+    //   - Undamaged reads: ~0.64 mean
+    //   - Terminal damaged: ~0.77 mean
+    //   - Gap: ~0.13
+    //
+    // We want to map this to a range where:
+    //   - Mean output ≈ d_max (the sample's terminal damage rate)
+    //   - High raw scores → higher than d_max
+    //   - Low raw scores → lower than d_max
+
+    // Threshold: raw value that should map to d_max
+    // Since undamaged reads have raw ~0.64, use that as baseline
+    constexpr float RAW_BASELINE = 0.64f;
+    constexpr float RAW_GAP = 0.13f;  // Gap between undamaged and terminal damaged
+
+    // Scale factor: how much spread in output relative to d_max
+    // Higher d_max samples have more spread
+    float scale = std::max(0.5f, 2.0f * d_max);
+
+    // Compute calibrated score
+    // Below baseline → below d_max (scaled down)
+    // Above baseline → above d_max (scaled up based on gap)
+    float deviation = (raw - RAW_BASELINE) / RAW_GAP;
+
+    // Sigmoid-like mapping centered on d_max
+    // deviation of 0 → d_max
+    // deviation of +1 (i.e., raw at terminal mean) → higher
+    // deviation of -1 (i.e., raw well below baseline) → lower
+    float calibrated = d_max * (1.0f + scale * std::tanh(deviation));
+
+    return std::clamp(calibrated, 0.0f, 1.0f);
 }
 
 // Check if a codon could be a damaged stop codon
@@ -110,7 +208,7 @@ float FrameSelector::score_damage_frame_consistency(
     return std::clamp(score, 0.0f, 1.0f);
 }
 
-float FrameSelector::estimate_ancient_prob_codon_aware(
+float FrameSelector::estimate_damage_signal_codon_aware(
     const std::string& seq,
     int frame,
     const SampleDamageProfile& sample_profile) {
@@ -118,19 +216,18 @@ float FrameSelector::estimate_ancient_prob_codon_aware(
     if (seq.length() < 15) return 0.5f;
 
     // ==========================================================================
-    // CHANNEL B SAMPLE-LEVEL PRIOR
-    // If the sample was identified as having no real damage (artifact or no signal),
-    // individual reads shouldn't get high damage probabilities.
+    // CHANNEL B INTEGRATION
+    // Compute sample-level adjustment factor based on two-channel validation.
+    // This factor modulates the final per-read score to ensure consistency:
+    //   - Validated damage: factor = 1.0 (full confidence in per-read scores)
+    //   - Artifact identified: factor = 0.1 (suppress per-read scores)
+    //   - Inconclusive: factor = 0.3-0.7 (partial confidence)
     // ==========================================================================
-    if (sample_profile.damage_artifact) {
-        // Sample identified as compositional artifact by Channel B
-        // Return low probability - reads are very unlikely to be damaged
-        return 0.15f;
-    }
-    if (!sample_profile.damage_validated && sample_profile.channel_b_valid &&
-        sample_profile.stop_decay_llr_5prime < -100.0f) {
-        // Channel B strongly contradicts damage (no stop excess)
-        return 0.20f;
+    const float channel_b_factor = compute_channel_b_factor(sample_profile);
+
+    // Early exit for strong artifact samples (avoid expensive computation)
+    if (channel_b_factor < 0.15f) {
+        return 0.1f * channel_b_factor;  // Very low score for artifacts
     }
 
     // ==========================================================================
@@ -276,21 +373,106 @@ float FrameSelector::estimate_ancient_prob_codon_aware(
     }
 
     // ==========================================================================
-    // DAMAGED STOP CODON DETECTION
-    // Stop codons near 5' end that could be from C→T damage are strong signals:
-    //   TAA from CAA (Gln), TAG from CAG (Gln), TGA from CGA (Arg)
+    // MULTI-SIGNAL DAMAGE DETECTION
+    // Three signals: ORF extension, context hexamer, hexamer improvement
     // ==========================================================================
 
-    for (size_t i = static_cast<size_t>(frame); i + 2 < std::min(size_t(15), len); i += 3) {
-        char c1 = fast_upper(seq[i]);
-        char c2 = fast_upper(seq[i + 1]);
-        char c3 = fast_upper(seq[i + 2]);
+    int terminal_stop_pos = -1;
+    int terminal_stop_codon_idx = -1;
+    for (int codon_idx = 0; codon_idx < 4; ++codon_idx) {
+        size_t pos = static_cast<size_t>(frame) + codon_idx * 3;
+        if (pos + 3 > len) break;
 
-        int ds = is_damaged_stop_codon(c1, c2, c3);
-        if (ds > 0 && i < 12) {
-            // Weight by position: closer to 5' = more likely damage
-            float pos_weight = std::exp(-0.2f * static_cast<float>(i));
-            log_lr += ds * 0.5f * pos_weight;
+        int ds = is_damaged_stop_codon(fast_upper(seq[pos]),
+                                        fast_upper(seq[pos + 1]),
+                                        fast_upper(seq[pos + 2]));
+        if (ds == 2) {
+            terminal_stop_pos = static_cast<int>(pos);
+            terminal_stop_codon_idx = codon_idx;
+            break;
+        }
+    }
+
+    if (terminal_stop_pos >= 0) {
+        float damage_evidence = 0.0f;
+        float no_damage_evidence = 0.0f;
+        float pos_weight = (terminal_stop_codon_idx == 0) ? 1.0f :
+                          (terminal_stop_codon_idx == 1) ? 0.8f :
+                          (terminal_stop_codon_idx == 2) ? 0.6f : 0.4f;
+
+        // Signal 1: ORF extension
+        int next_stop_pos = -1;
+        for (size_t i = terminal_stop_pos + 3; i + 3 <= len; i += 3) {
+            char c1 = fast_upper(seq[i]);
+            char c2 = fast_upper(seq[i + 1]);
+            char c3 = fast_upper(seq[i + 2]);
+            if ((c1 == 'T' && c2 == 'A' && c3 == 'A') ||
+                (c1 == 'T' && c2 == 'A' && c3 == 'G') ||
+                (c1 == 'T' && c2 == 'G' && c3 == 'A')) {
+                next_stop_pos = static_cast<int>(i);
+                break;
+            }
+        }
+        int orf_extension = (next_stop_pos >= 0) ?
+            (next_stop_pos - terminal_stop_pos) : (static_cast<int>(len) - terminal_stop_pos);
+        if (orf_extension > 60) damage_evidence += 1.5f;
+        else if (orf_extension > 30) damage_evidence += 0.8f;
+        else if (orf_extension < 15) no_damage_evidence += 0.5f;
+
+        // Signal 2: Context hexamer
+        if (terminal_stop_pos >= 3 && len >= 6) {
+            size_t ctx_start = (terminal_stop_pos >= 6) ? terminal_stop_pos - 6 : 0;
+            if (ctx_start + 6 <= len) {
+                char hexbuf[7];
+                for (int i = 0; i < 6; i++) hexbuf[i] = fast_upper(seq[ctx_start + i]);
+                hexbuf[6] = '\0';
+                float ctx_freq = get_hexamer_freq(hexbuf);
+                if (ctx_freq > 0.001f) damage_evidence += 0.6f;
+                else if (ctx_freq < 0.0001f) no_damage_evidence += 0.3f;
+            }
+        }
+
+        // Signal 3: Hexamer improvement
+        if (len >= 6) {
+            std::string corrected = seq;
+            corrected[terminal_stop_pos] = 'C';
+            float improvement = calculate_hexamer_llr_score(corrected, frame) -
+                               calculate_hexamer_llr_score(seq, frame);
+            if (improvement > 1.0f) damage_evidence += 0.5f * (improvement - 1.0f);
+            else if (improvement < 0.3f) no_damage_evidence += 0.4f;
+        }
+
+        log_lr += std::clamp((damage_evidence - no_damage_evidence) * pos_weight, -1.5f, 3.0f);
+    }
+
+    // Non-stop T-first codons
+    if (terminal_stop_pos < 0) {
+        for (int codon_idx = 0; codon_idx < 3; ++codon_idx) {
+            size_t pos = static_cast<size_t>(frame) + codon_idx * 3;
+            if (pos + 6 > len) break;
+            if (fast_upper(seq[pos]) != 'T') continue;
+
+            std::string corrected = seq;
+            corrected[pos] = 'C';
+            float improvement = calculate_hexamer_llr_score(corrected, frame) -
+                               calculate_hexamer_llr_score(seq, frame);
+            float pos_weight = std::exp(-0.3f * static_cast<float>(codon_idx));
+            if (improvement > 0.3f) log_lr += std::min(0.8f, improvement * 0.5f) * pos_weight;
+            else if (improvement < -0.2f) log_lr += improvement * 0.3f * pos_weight;
+        }
+    }
+
+    // Surviving pre-stops
+    for (int codon_idx = 0; codon_idx < 3; ++codon_idx) {
+        size_t pos = static_cast<size_t>(frame) + codon_idx * 3;
+        if (pos + 3 > len) break;
+        char c1 = fast_upper(seq[pos]);
+        char c2 = fast_upper(seq[pos + 1]);
+        char c3 = fast_upper(seq[pos + 2]);
+        if ((c1 == 'C' && c2 == 'A' && c3 == 'A') ||
+            (c1 == 'C' && c2 == 'A' && c3 == 'G') ||
+            (c1 == 'C' && c2 == 'G' && c3 == 'A')) {
+            log_lr -= 0.2f * std::exp(-0.3f * static_cast<float>(codon_idx));
         }
     }
 
@@ -346,9 +528,35 @@ float FrameSelector::estimate_ancient_prob_codon_aware(
     float total_log_odds = log_lr + prior_log_odds;
 
     // Convert log-odds to probability
-    float prob = 1.0f / (1.0f + std::exp(-total_log_odds));
+    float raw_prob = 1.0f / (1.0f + std::exp(-total_log_odds));
+    raw_prob = std::clamp(raw_prob, 0.05f, 0.95f);
 
-    return std::clamp(prob, 0.05f, 0.95f);
+    // ==========================================================================
+    // FINAL CALIBRATION WITH CHANNEL B MODULATION
+    // Apply adaptive calibration using sample's validated d_max, then modulate
+    // by the Channel B factor to ensure sample-level validation affects per-read scores.
+    // ==========================================================================
+    float d_max = 0.0f;
+    if (sample_profile.is_valid()) {
+        // Use the combined d_max from Channel B validation
+        d_max = static_cast<float>(sample_profile.d_max_combined);
+    }
+
+    // For low/no damage samples, apply heavy suppression scaled by Channel B
+    if (d_max < 0.05f) {
+        return raw_prob * 0.2f * channel_b_factor;
+    }
+
+    // Apply adaptive calibration (maps raw score to d_max-centered distribution)
+    float calibrated = calibrate_damage_score_adaptive(raw_prob, d_max);
+
+    // Modulate by Channel B factor to ensure consistency:
+    // - Validated samples: full calibrated score
+    // - Artifact samples: heavily suppressed (factor already handled early exit)
+    // - Uncertain samples: partial confidence
+    calibrated *= channel_b_factor;
+
+    return std::clamp(calibrated, 0.0f, 1.0f);
 }
 
 // ============================================================================
@@ -482,25 +690,186 @@ float FrameSelector::compute_damage_log_likelihood(
     }
 
     // =========================================================================
-    // DAMAGED STOP CODON DETECTION
-    // TAA from CAA (Gln), TAG from CAG (Gln), TGA from CGA (Arg)
-    // These are strong signals when found near 5' end
+    // MULTI-SIGNAL DAMAGE DETECTION
+    //
+    // Three independent signals for terminal stop damage:
+    // 1. ORF EXTENSION TEST: Does correcting the stop extend the ORF significantly?
+    // 2. CONTEXT HEXAMER TEST: Do surrounding hexamers predict CAA/CAG/CGA context?
+    // 3. HEXAMER IMPROVEMENT: Does correction improve overall coding signal?
+    //
+    // These signals are combined - multiple concordant signals = strong evidence
     // =========================================================================
-    for (size_t i = frame; i + 2 < std::min(size_t(15), len); i += 3) {
-        char c1 = fast_upper(seq[i]);
-        char c2 = fast_upper(seq[i + 1]);
-        char c3 = fast_upper(seq[i + 2]);
 
-        // Check for damaged stop codons
-        bool is_damaged_stop = false;
-        if (c1 == 'T' && c2 == 'A' && c3 == 'A') is_damaged_stop = true;  // TAA from CAA
-        if (c1 == 'T' && c2 == 'A' && c3 == 'G') is_damaged_stop = true;  // TAG from CAG
-        if (c1 == 'T' && c2 == 'G' && c3 == 'A') is_damaged_stop = true;  // TGA from CGA
+    // Step 1: Find terminal stop (if any)
+    int terminal_stop_pos = -1;
+    int terminal_stop_codon_idx = -1;
 
-        if (is_damaged_stop && i < 12) {
-            // Weight by position (closer to 5' = more likely damage)
-            float pos_weight = std::exp(-0.3f * static_cast<float>(i));
-            log_lr += 0.8f * pos_weight;  // Strong signal
+    for (int codon_idx = 0; codon_idx < 4; ++codon_idx) {
+        size_t pos = static_cast<size_t>(frame) + codon_idx * 3;
+        if (pos + 3 > len) break;
+
+        char c1 = fast_upper(seq[pos]);
+        char c2 = fast_upper(seq[pos + 1]);
+        char c3 = fast_upper(seq[pos + 2]);
+
+        if ((c1 == 'T' && c2 == 'A' && c3 == 'A') ||
+            (c1 == 'T' && c2 == 'A' && c3 == 'G') ||
+            (c1 == 'T' && c2 == 'G' && c3 == 'A')) {
+            terminal_stop_pos = static_cast<int>(pos);
+            terminal_stop_codon_idx = codon_idx;
+            break;
+        }
+    }
+
+    if (terminal_stop_pos >= 0) {
+        float damage_evidence = 0.0f;
+        float no_damage_evidence = 0.0f;
+
+        // Position weight: earlier stop = more suspicious
+        float pos_weight = (terminal_stop_codon_idx == 0) ? 1.0f :
+                          (terminal_stop_codon_idx == 1) ? 0.8f :
+                          (terminal_stop_codon_idx == 2) ? 0.6f : 0.4f;
+
+        // =====================================================================
+        // SIGNAL 1: ORF EXTENSION TEST
+        // If correcting the terminal stop extends the ORF significantly,
+        // that's strong evidence the stop was damage-induced (interrupted a gene)
+        // =====================================================================
+        int next_stop_pos = -1;
+        for (size_t i = terminal_stop_pos + 3; i + 3 <= len; i += 3) {
+            char c1 = fast_upper(seq[i]);
+            char c2 = fast_upper(seq[i + 1]);
+            char c3 = fast_upper(seq[i + 2]);
+            if ((c1 == 'T' && c2 == 'A' && c3 == 'A') ||
+                (c1 == 'T' && c2 == 'A' && c3 == 'G') ||
+                (c1 == 'T' && c2 == 'G' && c3 == 'A')) {
+                next_stop_pos = static_cast<int>(i);
+                break;
+            }
+        }
+
+        // Calculate ORF extension
+        int orf_extension = (next_stop_pos >= 0) ?
+            (next_stop_pos - terminal_stop_pos) : (static_cast<int>(len) - terminal_stop_pos);
+
+        // In random sequence, expected distance to next stop is ~64/3 ≈ 21 codons = 63bp
+        // In coding sequence, no stops expected
+        // If extension > 60bp, likely was coding region interrupted by damage
+        if (orf_extension > 60) {
+            damage_evidence += 1.5f;  // Strong evidence
+        } else if (orf_extension > 30) {
+            damage_evidence += 0.8f;  // Moderate evidence
+        } else if (orf_extension < 15) {
+            no_damage_evidence += 0.5f;  // Short extension suggests random stop pattern
+        }
+
+        // =====================================================================
+        // SIGNAL 2: CONTEXT HEXAMER TEST
+        // Look at hexamer BEFORE the stop - does it predict a coding continuation?
+        // High-frequency coding hexamers before a stop suggest the stop is spurious
+        // =====================================================================
+        if (terminal_stop_pos >= 3 && len >= 6) {
+            // Get hexamer ending just before the stop
+            size_t ctx_start = (terminal_stop_pos >= 6) ? terminal_stop_pos - 6 : 0;
+            if (ctx_start + 6 <= len) {
+                char hexbuf[7];
+                for (int i = 0; i < 6; i++) {
+                    hexbuf[i] = fast_upper(seq[ctx_start + i]);
+                }
+                hexbuf[6] = '\0';
+
+                float ctx_freq = get_hexamer_freq(hexbuf);
+
+                // High-frequency context hexamer + stop = suspicious
+                // (coding regions have high-freq hexamers but no stops)
+                if (ctx_freq > 0.001f) {  // Above-average coding hexamer
+                    damage_evidence += 0.6f;
+                } else if (ctx_freq < 0.0001f) {  // Rare hexamer
+                    no_damage_evidence += 0.3f;  // Context doesn't look coding anyway
+                }
+            }
+        }
+
+        // =====================================================================
+        // SIGNAL 3: HEXAMER IMPROVEMENT (refined)
+        // Only count improvement if it's LARGE (baseline improvement is expected)
+        // =====================================================================
+        if (len >= 6) {
+            std::string corrected = seq;
+            corrected[terminal_stop_pos] = 'C';
+
+            float orig_score = calculate_hexamer_llr_score(seq, frame);
+            float corr_score = calculate_hexamer_llr_score(corrected, frame);
+            float improvement = corr_score - orig_score;
+
+            // Baseline improvement for stop→non-stop is ~0.5-1.0
+            // Only count if improvement is ABOVE baseline
+            if (improvement > 1.0f) {
+                damage_evidence += 0.5f * (improvement - 1.0f);
+            } else if (improvement < 0.3f) {
+                // Very small improvement despite stop→non-stop change
+                // Suggests context doesn't fit coding pattern
+                no_damage_evidence += 0.4f;
+            }
+        }
+
+        // =====================================================================
+        // COMBINE SIGNALS
+        // =====================================================================
+        float net_signal = (damage_evidence - no_damage_evidence) * pos_weight;
+        log_lr += std::clamp(net_signal, -1.5f, 3.0f);
+    }
+
+    // =========================================================================
+    // NON-STOP DAMAGE PATTERNS (T-first codons without terminal stop)
+    // Apply similar multi-signal approach
+    // =========================================================================
+    if (terminal_stop_pos < 0) {
+        for (int codon_idx = 0; codon_idx < 3; ++codon_idx) {
+            size_t pos = static_cast<size_t>(frame) + codon_idx * 3;
+            if (pos + 3 > len || pos + 6 > len) break;
+
+            char c1 = fast_upper(seq[pos]);
+            if (c1 != 'T') continue;
+
+            // Context check: is the hexamer at this position high-frequency with C?
+            std::string corrected = seq;
+            corrected[pos] = 'C';
+
+            float orig_score = calculate_hexamer_llr_score(seq, frame);
+            float corr_score = calculate_hexamer_llr_score(corrected, frame);
+            float improvement = corr_score - orig_score;
+
+            float pos_weight = std::exp(-0.3f * static_cast<float>(codon_idx));
+
+            // Only significant improvements matter
+            if (improvement > 0.3f) {
+                log_lr += std::min(0.8f, improvement * 0.5f) * pos_weight;
+            } else if (improvement < -0.2f) {
+                log_lr += improvement * 0.3f * pos_weight;
+            }
+        }
+    }
+
+    // =========================================================================
+    // SURVIVING PRE-STOP CODONS
+    // =========================================================================
+    for (int codon_idx = 0; codon_idx < 3; ++codon_idx) {
+        size_t pos = static_cast<size_t>(frame) + codon_idx * 3;
+        if (pos + 3 > len) break;
+
+        char c1 = fast_upper(seq[pos]);
+        char c2 = fast_upper(seq[pos + 1]);
+        char c3 = fast_upper(seq[pos + 2]);
+
+        bool is_pre_stop = (c1 == 'C' && c2 == 'A' && c3 == 'A') ||
+                           (c1 == 'C' && c2 == 'A' && c3 == 'G') ||
+                           (c1 == 'C' && c2 == 'G' && c3 == 'A');
+
+        if (is_pre_stop) {
+            // C survived at terminal - weak evidence against damage
+            float pos_weight = std::exp(-0.3f * static_cast<float>(codon_idx));
+            log_lr -= 0.2f * pos_weight;
         }
     }
 
@@ -625,7 +994,7 @@ float FrameSelector::compute_damage_log_likelihood(
 // QUALITY-AWARE DAMAGE DETECTION
 // ============================================================================
 
-float FrameSelector::estimate_ancient_prob_with_quality(
+float FrameSelector::estimate_damage_signal_with_quality(
     const std::string& seq,
     const std::string& quality,
     int frame,
@@ -634,15 +1003,14 @@ float FrameSelector::estimate_ancient_prob_with_quality(
     if (seq.length() < 15) return 0.5f;
 
     // ==========================================================================
-    // CHANNEL B SAMPLE-LEVEL PRIOR
-    // If the sample was identified as having no real damage, return low probability
+    // CHANNEL B INTEGRATION
+    // Use unified Channel B factor for sample-level modulation
     // ==========================================================================
-    if (sample_profile.damage_artifact) {
-        return 0.15f;  // Sample is compositional artifact
-    }
-    if (!sample_profile.damage_validated && sample_profile.channel_b_valid &&
-        sample_profile.stop_decay_llr_5prime < -100.0f) {
-        return 0.20f;  // Channel B strongly contradicts damage
+    const float channel_b_factor = compute_channel_b_factor(sample_profile);
+
+    // Early exit for strong artifact samples
+    if (channel_b_factor < 0.15f) {
+        return 0.1f * channel_b_factor;
     }
 
     // Use Bayesian log-likelihood
@@ -650,9 +1018,24 @@ float FrameSelector::estimate_ancient_prob_with_quality(
 
     // Convert log-likelihood ratio to probability
     // P(ancient|seq) = 1 / (1 + exp(-log_lr))
-    float prob = 1.0f / (1.0f + std::exp(-log_lr));
+    float raw_prob = 1.0f / (1.0f + std::exp(-log_lr));
+    raw_prob = std::clamp(raw_prob, 0.05f, 0.95f);
 
-    return std::clamp(prob, 0.05f, 0.95f);
+    // Apply adaptive calibration using sample's validated d_max
+    float d_max = 0.0f;
+    if (sample_profile.is_valid()) {
+        d_max = static_cast<float>(sample_profile.d_max_combined);
+    }
+
+    if (d_max < 0.05f) {
+        return raw_prob * 0.2f * channel_b_factor;
+    }
+
+    // Apply adaptive calibration and Channel B modulation
+    float calibrated = calibrate_damage_score_adaptive(raw_prob, d_max);
+    calibrated *= channel_b_factor;
+
+    return std::clamp(calibrated, 0.0f, 1.0f);
 }
 
 // ============================================================================
