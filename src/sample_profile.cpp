@@ -92,22 +92,16 @@ static std::array<float, 4> fit_exponential_decay(
     // Minimum coverage to include a position
     const double MIN_COVERAGE = 100.0;
 
-    // Count valid positions
-    int n_valid = 0;
-    for (int i = 0; i < 15; ++i) {
-        if (coverage[i] >= MIN_COVERAGE) n_valid++;
-    }
-    if (n_valid < 5) {
-        // Not enough data - return zeros
-        return {0.0f, 0.0f, 0.0f, 1.0f};
-    }
-
     // Use external baseline (middle-of-read) if provided, otherwise estimate from positions 10-14
     // CRITICAL: Middle-of-read baseline is more reliable because positions 10-14 may still
-    // have read-end composition artifacts that inflate the apparent "damage" signal
+    // have read-end composition artifacts that inflate the apparent "damage" signal.
+    //
+    // IMPORTANT: Even when coverage is low (e.g. small benchmarks), we still need a sane
+    // baseline for damage-rate computation. Returning b=0 here inflates damage to the raw
+    // T/(T+C) ratio and can cascade into 0-gene failure modes.
     float b;
     if (external_baseline >= 0.0f) {
-        b = external_baseline;
+        b = std::clamp(external_baseline, 0.001f, 0.999f);
     } else {
         // Fallback: estimate baseline from positions 10-14
         double baseline_sum = 0.0, baseline_weight = 0.0;
@@ -119,6 +113,13 @@ static std::array<float, 4> fit_exponential_decay(
         }
         b = (baseline_weight > 0) ?
             static_cast<float>(baseline_sum / baseline_weight) : 0.5f;
+        b = std::clamp(b, 0.001f, 0.999f);
+    }
+
+    // Count valid positions
+    int n_valid = 0;
+    for (int i = 0; i < 15; ++i) {
+        if (coverage[i] >= MIN_COVERAGE) n_valid++;
     }
 
     // CRITICAL: Estimate amplitude from position 1, NOT position 0
@@ -126,6 +127,12 @@ static std::array<float, 4> fit_exponential_decay(
     // that can arbitrarily bias the estimate. Position 1 is more reliable.
     float A = (coverage[1] >= MIN_COVERAGE) ?
               std::max(0.0f, static_cast<float>(freq[1]) - b) : 0.0f;
+
+    // If we don't have enough positions to fit a decay curve, return baseline + a
+    // conservative amplitude estimate and keep the initial lambda.
+    if (n_valid < 5) {
+        return {b, A, lambda_init, 1.0f};
+    }
 
     // Refine lambda using linear regression on log(p - b)
     // CRITICAL: Exclude position 0 from fit - it can have arbitrary bias
@@ -368,6 +375,105 @@ void FrameSelector::update_sample_profile(
     }
 
     // =========================================================================
+    // GC-STRATIFIED DAMAGE ACCUMULATION
+    // Bin reads by interior GC content (positions 5+ to avoid terminal damage)
+    // This handles metagenome heterogeneity where different organisms have
+    // different GC content and damage levels
+    // =========================================================================
+    if (len >= 30) {
+        // Compute interior GC from positions 5 to end-5 (avoid both terminal regions)
+        size_t interior_start = 5;
+        size_t interior_end = len > 10 ? len - 5 : len;
+        uint64_t gc_count = 0;
+        uint64_t at_count = 0;
+        for (size_t i = interior_start; i < interior_end; ++i) {
+            char base = fast_upper(seq[i]);
+            if (base == 'G' || base == 'C') gc_count++;
+            else if (base == 'A' || base == 'T') at_count++;
+        }
+
+        if (gc_count + at_count > 0) {
+            float gc_frac = static_cast<float>(gc_count) / (gc_count + at_count);
+            int bin_idx = std::min(static_cast<int>(gc_frac * SampleDamageProfile::N_GC_BINS),
+                                   SampleDamageProfile::N_GC_BINS - 1);
+            auto& bin = profile.gc_bins[bin_idx];
+
+            // Accumulate Channel A counts (T and C at terminal positions)
+            for (size_t i = 0; i < std::min(size_t(15), len); ++i) {
+                char base = fast_upper(seq[i]);
+                if (base == 'T') bin.t_counts[i]++;
+                else if (base == 'C') bin.c_counts[i]++;
+            }
+
+            // Accumulate Channel A interior baseline (middle third)
+            size_t mid_start = len / 3;
+            size_t mid_end = 2 * len / 3;
+            for (size_t i = mid_start; i < mid_end; ++i) {
+                char base = fast_upper(seq[i]);
+                if (base == 'T') bin.t_interior++;
+                else if (base == 'C') bin.c_interior++;
+            }
+
+            // Accumulate Channel B counts (stop codons at terminal positions)
+            for (int frame = 0; frame < 3; ++frame) {
+                for (size_t k = 0; ; ++k) {
+                    size_t codon_start = frame + 3 * k;
+                    if (codon_start + 3 > len || codon_start > 14) break;
+                    size_t p = codon_start;
+
+                    char b0 = fast_upper(seq[codon_start]);
+                    char b1 = fast_upper(seq[codon_start + 1]);
+                    char b2 = fast_upper(seq[codon_start + 2]);
+
+                    // CAA/TAA, CAG/TAG, CGA/TGA
+                    if (b1 == 'A' && b2 == 'A') {
+                        if (b0 == 'C') bin.pre_counts[p]++;
+                        else if (b0 == 'T') bin.stop_counts[p]++;
+                    }
+                    if (b1 == 'A' && b2 == 'G') {
+                        if (b0 == 'C') bin.pre_counts[p]++;
+                        else if (b0 == 'T') bin.stop_counts[p]++;
+                    }
+                    if (b1 == 'G' && b2 == 'A') {
+                        if (b0 == 'C') bin.pre_counts[p]++;
+                        else if (b0 == 'T') bin.stop_counts[p]++;
+                    }
+                }
+            }
+
+            // Accumulate Channel B interior baseline
+            for (int frame = 0; frame < 3; ++frame) {
+                for (size_t k = 0; ; ++k) {
+                    size_t codon_start = frame + 3 * k;
+                    if (codon_start < 30 || codon_start + 3 > len - 30) {
+                        if (codon_start + 3 > len - 30) break;
+                        continue;
+                    }
+
+                    char b0 = fast_upper(seq[codon_start]);
+                    char b1 = fast_upper(seq[codon_start + 1]);
+                    char b2 = fast_upper(seq[codon_start + 2]);
+
+                    if (b1 == 'A' && b2 == 'A') {
+                        if (b0 == 'C') bin.pre_interior++;
+                        else if (b0 == 'T') bin.stop_interior++;
+                    }
+                    if (b1 == 'A' && b2 == 'G') {
+                        if (b0 == 'C') bin.pre_interior++;
+                        else if (b0 == 'T') bin.stop_interior++;
+                    }
+                    if (b1 == 'G' && b2 == 'A') {
+                        if (b0 == 'C') bin.pre_interior++;
+                        else if (b0 == 'T') bin.stop_interior++;
+                    }
+                }
+            }
+
+            bin.n_reads++;
+        }
+    }
+
+    // =========================================================================
     // Hexamer-based damage detection
     // Collect hexamers from ALL reads - works regardless of sample composition
     // Using position 0 (standard); inversion correction handles unusual cases
@@ -441,16 +547,60 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         return std::pair<float, float>{static_cast<float>(p_term - p_base), static_cast<float>(z)};
     };
 
-    // Terminal enrichment/depletion statistics (position 0)
-    auto stats_5 = compute_terminal_stats(profile.t_freq_5prime[0], profile.c_freq_5prime[0],
-                                          profile.baseline_t_freq, profile.baseline_c_freq);
-    profile.terminal_shift_5prime = stats_5.first;
-    profile.terminal_z_5prime = stats_5.second;
+    // Terminal enrichment/depletion statistics
+    // Check for position-0 artifact: if pos0 shows depletion but pos1 shows enrichment,
+    // use pos1 instead (common adapter ligation bias pattern)
+    auto stats_5_pos0 = compute_terminal_stats(profile.t_freq_5prime[0], profile.c_freq_5prime[0],
+                                               profile.baseline_t_freq, profile.baseline_c_freq);
+    auto stats_5_pos1 = compute_terminal_stats(profile.t_freq_5prime[1], profile.c_freq_5prime[1],
+                                               profile.baseline_t_freq, profile.baseline_c_freq);
 
-    auto stats_3 = compute_terminal_stats(profile.a_freq_3prime[0], profile.g_freq_3prime[0],
-                                          profile.baseline_a_freq, profile.baseline_g_freq);
-    profile.terminal_shift_3prime = stats_3.first;
-    profile.terminal_z_3prime = stats_3.second;
+    // Detect position-0 artifact: two criteria
+    // 1. Classic: pos0 depleted but pos1 enriched (relative to baseline)
+    // 2. Jump pattern: Large pos0-to-pos1 difference (>3%) with pos1 enriched (>2%)
+    //    This catches cases where baseline elevation masks the pos0 depletion
+    bool pos0_artifact_5 = false;
+    if (stats_5_pos0.first < -0.005f && stats_5_pos1.first > 0.01f) {
+        // Classic pattern: pos0 below baseline, pos1 above
+        pos0_artifact_5 = true;
+    } else if (stats_5_pos1.first > 0.02f && (stats_5_pos1.first - stats_5_pos0.first) > 0.03f) {
+        // Large pos0-to-pos1 jump pattern: pos1 clearly elevated but pos0 isn't
+        // This indicates adapter artifact masking damage at pos0
+        pos0_artifact_5 = true;
+    }
+
+    if (pos0_artifact_5) {
+        profile.terminal_shift_5prime = stats_5_pos1.first;
+        profile.terminal_z_5prime = stats_5_pos1.second;
+        profile.position_0_artifact_5prime = true;
+    } else {
+        profile.terminal_shift_5prime = stats_5_pos0.first;
+        profile.terminal_z_5prime = stats_5_pos0.second;
+        profile.position_0_artifact_5prime = false;
+    }
+
+    auto stats_3_pos0 = compute_terminal_stats(profile.a_freq_3prime[0], profile.g_freq_3prime[0],
+                                               profile.baseline_a_freq, profile.baseline_g_freq);
+    auto stats_3_pos1 = compute_terminal_stats(profile.a_freq_3prime[1], profile.g_freq_3prime[1],
+                                               profile.baseline_a_freq, profile.baseline_g_freq);
+
+    // Same check for 3' end
+    bool pos0_artifact_3 = false;
+    if (stats_3_pos0.first < -0.005f && stats_3_pos1.first > 0.01f) {
+        pos0_artifact_3 = true;
+    } else if (stats_3_pos1.first > 0.02f && (stats_3_pos1.first - stats_3_pos0.first) > 0.03f) {
+        pos0_artifact_3 = true;
+    }
+
+    if (pos0_artifact_3) {
+        profile.terminal_shift_3prime = stats_3_pos1.first;
+        profile.terminal_z_3prime = stats_3_pos1.second;
+        profile.position_0_artifact_3prime = true;
+    } else {
+        profile.terminal_shift_3prime = stats_3_pos0.first;
+        profile.terminal_z_3prime = stats_3_pos0.second;
+        profile.position_0_artifact_3prime = false;
+    }
 
     // Negative control statistics (should NOT show enrichment if damage is real)
     // 5' control: A/(A+G) at 5' end vs interior
@@ -487,6 +637,94 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
     double baseline_ag = profile.baseline_a_freq /
                         (profile.baseline_a_freq + profile.baseline_g_freq + 0.001);
 
+    // =========================================================================
+    // JOINT PROBABILISTIC MODEL
+    // Fit unified model BEFORE normalization (need raw counts)
+    // =========================================================================
+    {
+        JointDamageSuffStats jstats;
+
+        // Channel A: T/(T+C) at 5' end (raw counts still in t_freq_5prime, c_freq_5prime)
+        for (int p = 0; p < 15; ++p) {
+            jstats.k_tc[p] = static_cast<uint64_t>(profile.t_freq_5prime[p]);
+            jstats.n_tc[p] = static_cast<uint64_t>(profile.t_freq_5prime[p] + profile.c_freq_5prime[p]);
+        }
+
+        // Control: A/(A+G) at 5' end
+        for (int p = 0; p < 15; ++p) {
+            jstats.k_ag[p] = static_cast<uint64_t>(profile.a_freq_5prime[p]);
+            jstats.n_ag[p] = static_cast<uint64_t>(profile.a_freq_5prime[p] + profile.g_freq_5prime[p]);
+        }
+
+        // Channel B: stop codon conversions (TAA+TAG+TGA) / (CAA+CAG+CGA + TAA+TAG+TGA)
+        for (int p = 0; p < 15; ++p) {
+            double stops = profile.convertible_taa_5prime[p] +
+                          profile.convertible_tag_5prime[p] +
+                          profile.convertible_tga_5prime[p];
+            double pre = profile.convertible_caa_5prime[p] +
+                        profile.convertible_cag_5prime[p] +
+                        profile.convertible_cga_5prime[p];
+            jstats.k_stop[p] = static_cast<uint64_t>(stops);
+            jstats.n_stop[p] = static_cast<uint64_t>(pre + stops);
+        }
+
+        // Interior baselines (from middle of reads)
+        jstats.k_tc_interior = static_cast<uint64_t>(base_tc_total * baseline_tc);
+        jstats.n_tc_interior = static_cast<uint64_t>(base_tc_total);
+        jstats.k_ag_interior = static_cast<uint64_t>(base_ag_total * baseline_ag);
+        jstats.n_ag_interior = static_cast<uint64_t>(base_ag_total);
+
+        // Channel B interior
+        double stop_int = profile.convertible_taa_interior +
+                         profile.convertible_tag_interior +
+                         profile.convertible_tga_interior;
+        double pre_int = profile.convertible_caa_interior +
+                        profile.convertible_cag_interior +
+                        profile.convertible_cga_interior;
+        jstats.k_stop_interior = static_cast<uint64_t>(stop_int);
+        jstats.n_stop_interior = static_cast<uint64_t>(pre_int + stop_int);
+
+        // Fit the joint model
+        JointDamageResult jresult = JointDamageModel::fit(jstats);
+
+        // Store results in profile
+        profile.joint_delta_max = jresult.delta_max;
+        profile.joint_lambda = jresult.lambda;
+        profile.joint_a_max = jresult.a_max;
+        profile.joint_log_lik_m1 = jresult.log_lik_m1;
+        profile.joint_log_lik_m0 = jresult.log_lik_m0;
+        profile.joint_delta_bic = jresult.delta_bic;
+        profile.joint_bayes_factor = jresult.bayes_factor;
+        profile.joint_p_damage = jresult.p_damage;
+        profile.joint_model_valid = jresult.valid;
+
+        // Use joint model for damage decision
+        if (jresult.valid) {
+            // Check for strong evidence of damage
+            // P(damage) > 0.95 OR ΔBIC > 10 (handles overflow when BF=inf)
+            bool strong_damage_evidence = jresult.p_damage > 0.95f ||
+                                          jresult.delta_bic > 10.0f ||
+                                          std::isinf(jresult.bayes_factor);
+
+            if (strong_damage_evidence) {
+                profile.damage_validated = true;
+                profile.damage_artifact = false;
+            } else if (jresult.p_damage < 0.05f && jresult.a_max > 0.02f) {
+                // Strong evidence for artifact (composition bias detected)
+                profile.damage_validated = false;
+                profile.damage_artifact = true;
+            } else if (jresult.delta_bic < -10.0f) {
+                // Strong evidence against damage (M0 fits much better)
+                profile.damage_validated = false;
+                profile.damage_artifact = (jresult.a_max > 0.02f);
+            } else {
+                // Uncertain - could go either way
+                profile.damage_validated = false;
+                profile.damage_artifact = false;
+            }
+        }
+    }
+
     // Step 1: Normalize position-specific frequencies (but don't compute damage rates yet)
     for (int i = 0; i < 15; ++i) {
         double tc_total = profile.t_freq_5prime[i] + profile.c_freq_5prime[i];
@@ -509,10 +747,6 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
                                         static_cast<float>(baseline_tc));
     profile.fit_baseline_5prime = fit_5p[0];
     profile.fit_amplitude_5prime = fit_5p[1];
-
-    // DEBUG: Verify baseline values match
-    fprintf(stderr, "  [DEBUG-BASELINE] baseline_tc=%.4f, fit_baseline_5prime=%.4f, t_freq[0]=%.4f\n",
-            baseline_tc, profile.fit_baseline_5prime, profile.t_freq_5prime[0]);
     float fit_lambda_5p = fit_5p[2];
     profile.fit_rmse_5prime = fit_5p[3];
 
@@ -594,9 +828,6 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
             profile.channel_b_valid = true;
         }
 
-        fprintf(stderr, "  [CHANNEL-B] Interior: pre=%.0f, stop=%.0f, baseline=%.4f\n",
-                total_pre_interior, total_stop_interior, profile.stop_conversion_rate_baseline);
-
         // Compute stop conversion rate at each terminal position
         std::array<double, 15> stop_rate = {};
         std::array<double, 15> stop_exposure = {};  // pre + stop
@@ -616,23 +847,33 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
             }
         }
 
-        // Debug: print stop rates at first few positions
-        fprintf(stderr, "  [CHANNEL-B] Terminal stop rates: p0=%.4f, p1=%.4f, p2=%.4f, p3=%.4f\n",
-                stop_rate[0], stop_rate[1], stop_rate[2], stop_rate[3]);
-        fprintf(stderr, "  [CHANNEL-B] Terminal exposure: p0=%.0f, p1=%.0f, p2=%.0f, p3=%.0f\n",
-                stop_exposure[0], stop_exposure[1], stop_exposure[2], stop_exposure[3]);
+        // Compute LOCAL baseline from positions 5-14 (same reads, past damage zone)
+        // This avoids bias from interior baseline which comes from longer reads only
+        double local_pre = 0.0, local_stop = 0.0;
+        for (int p = 5; p < 15; ++p) {
+            local_pre += profile.convertible_caa_5prime[p] +
+                        profile.convertible_cag_5prime[p] +
+                        profile.convertible_cga_5prime[p];
+            local_stop += profile.convertible_taa_5prime[p] +
+                         profile.convertible_tag_5prime[p] +
+                         profile.convertible_tga_5prime[p];
+        }
+        float local_baseline = (local_pre + local_stop > 100)
+            ? static_cast<float>(local_stop / (local_pre + local_stop))
+            : profile.stop_conversion_rate_baseline;
 
         // Compute stop decay LLR using same lambda from Channel A
         // If both channels have same decay shape, it confirms real damage
-        // BUG FIX: Use fit_lambda_5p directly since profile.lambda_5prime isn't updated yet
         if (profile.channel_b_valid) {
-            float baseline_b = profile.stop_conversion_rate_baseline;
+            // Use local baseline instead of interior baseline
+            float baseline_b = local_baseline;
             float lambda_b = fit_lambda_5p;  // Use fit lambda from Channel A (NOT profile.lambda_5prime which isn't set yet)
 
-            // Estimate amplitude from positions 1-4 (exclude pos 0 like Channel A does)
-            // BUG FIX: Exclude position 0 which has first-base artifacts
+            // Estimate amplitude from positions 0-4
+            // Include position 0 because for steep damage decay (AT-rich samples),
+            // the signal is concentrated at position 0 and excluding it causes false negatives
             double sum_excess = 0.0, sum_weight = 0.0;
-            for (int i = 1; i < 5; ++i) {  // Start from 1, not 0
+            for (int i = 0; i < 5; ++i) {
                 if (stop_exposure[i] > 50) {
                     double weight = std::exp(-lambda_b * i);
                     double excess = stop_rate[i] - baseline_b;
@@ -643,14 +884,10 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
             float amplitude_b = (sum_weight > 0) ? static_cast<float>(sum_excess / sum_weight) : 0.0f;
             profile.stop_amplitude_5prime = std::max(0.0f, amplitude_b);
 
-            fprintf(stderr, "  [CHANNEL-B] Fitted amplitude=%.4f (excess stops at terminal, lambda=%.3f)\n",
-                    profile.stop_amplitude_5prime, lambda_b);
-
             // Compute log-likelihood ratio for exponential decay vs constant
-            // BUG FIX: Use actual stop counts, not stop_rate * n
-            // BUG FIX: Exclude position 0 for consistency with Channel A
+            // Include position 0 for same reason as amplitude fitting above
             double ll_exp = 0.0, ll_const = 0.0;
-            for (int p = 1; p < 10; ++p) {  // Start from 1, not 0
+            for (int p = 0; p < 10; ++p) {
                 if (stop_exposure[p] < 50) continue;
 
                 double n = stop_exposure[p];
@@ -680,50 +917,95 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
                 profile.stop_decay_llr_5prime = -std::abs(profile.stop_decay_llr_5prime);
             }
 
-            fprintf(stderr, "  [CHANNEL-B] Stop decay LLR=%.2f (exponential vs constant)\n",
-                    profile.stop_decay_llr_5prime);
-
             // =========================================================================
-            // JOINT EVIDENCE DECISION
-            // Compare Channel A (nucleotide T/(T+C)) vs Channel B (stop conversion)
-            // Real damage: both channels show positive decay
-            // Compositional artifact: Channel A positive, Channel B flat/negative
+            // CHANNEL B STRUCTURAL QUANTIFICATION
+            // Compute d_max directly from stop codon conversion rate at position 0.
+            // Formula: d_max_B = stops_excess / convertible_original
             //
-            // BUG FIX: Use delta_llr (control-adjusted) instead of raw decay_llr
-            // This accounts for compositional variation in both channels
+            // This directly measures the C→T damage rate at terminal positions.
+            // Convertible codons (CAA, CAG, CGA) only become stops when their
+            // first-position C is damaged, giving us a direct damage measurement.
+            // Since d_max is a RATE (not a count), no multiplication factor needed.
             // =========================================================================
-            float channel_a_llr = profile.delta_llr_5prime;  // Control-adjusted Channel A
-            float channel_b_llr = profile.stop_decay_llr_5prime;
+            {
+                // =====================================================================
+                // JOINT WLS FIT FOR b0 AND d_max (corrects baseline contamination)
+                // Model: r_p = b0 + (1-b0) * d_max * x_p, where x_p = exp(-λp)
+                // Fit via weighted least squares: y_p = a + c*x_p
+                // Then: b0 = a, d_max = c / (1 - b0)
+                // Use per-sample fitted lambda from Channel A (NOT fixed 0.3)
+                // =====================================================================
+                const double lambda = std::clamp(static_cast<double>(fit_lambda_5p), 0.1, 0.5);
+                const int N_POSITIONS = 15;  // Use all available positions
 
-            fprintf(stderr, "  [JOINT] Channel A (delta_llr) = %.2f, Channel B (stop_llr) = %.2f\n",
-                    channel_a_llr, channel_b_llr);
+                // Weighted least squares accumulators
+                double S_w = 0, S_x = 0, S_xx = 0, S_y = 0, S_xy = 0;
+                double total_exposure = 0;
 
-            // Thresholds for deciding damage is real
-            // Use lower threshold for delta_llr since it's already control-adjusted
-            const float CHANNEL_A_THRESHOLD = 50.0f;    // Delta LLR threshold (lower than raw)
-            const float CHANNEL_B_THRESHOLD = 10.0f;    // Moderate stop decay (weaker signal)
+                for (int p = 0; p < N_POSITIONS; ++p) {
+                    double x_p = std::exp(-lambda * p);
 
-            // BUG FIX: Per spec, "Channel A fires but Channel B flat" should be ARTIFACT
-            // Previously only flagged when Channel B was actively negative
-            if (channel_a_llr > CHANNEL_A_THRESHOLD && channel_b_llr > CHANNEL_B_THRESHOLD) {
-                // Both channels agree: real damage
-                profile.damage_validated = true;
-                profile.damage_artifact = false;
-                fprintf(stderr, "  [JOINT] DECISION: REAL DAMAGE (both channels fire)\n");
-            } else if (channel_a_llr > CHANNEL_A_THRESHOLD && channel_b_llr <= CHANNEL_B_THRESHOLD) {
-                // Channel A fires but Channel B is flat or negative: artifact
-                // BUG FIX: Treat "flat" as artifact, not just "negative"
-                profile.damage_validated = false;
-                profile.damage_artifact = true;
-                fprintf(stderr, "  [JOINT] DECISION: COMPOSITIONAL ARTIFACT (Channel A only, B=%.2f)\n",
-                        channel_b_llr);
-            } else {
-                // No strong signal in Channel A
-                profile.damage_validated = false;
-                profile.damage_artifact = false;
-                fprintf(stderr, "  [JOINT] DECISION: NO/LOW DAMAGE SIGNAL (A=%.2f, B=%.2f)\n",
-                        channel_a_llr, channel_b_llr);
+                    double stops_p = profile.convertible_taa_5prime[p] +
+                                    profile.convertible_tag_5prime[p] +
+                                    profile.convertible_tga_5prime[p];
+                    double pre_p = profile.convertible_caa_5prime[p] +
+                                  profile.convertible_cag_5prime[p] +
+                                  profile.convertible_cga_5prime[p];
+                    double exposure_p = stops_p + pre_p;
+
+                    if (exposure_p < 100) continue;  // Skip low-coverage positions
+
+                    double y_p = stops_p / exposure_p;  // Stop fraction
+                    double w_p = exposure_p;            // Weight by exposure
+
+                    S_w  += w_p;
+                    S_x  += w_p * x_p;
+                    S_xx += w_p * x_p * x_p;
+                    S_y  += w_p * y_p;
+                    S_xy += w_p * x_p * y_p;
+                    total_exposure += exposure_p;
+                }
+
+                // Solve weighted least squares: y = a + c*x
+                double denom = S_w * S_xx - S_x * S_x;
+
+                if (total_exposure > 1000 && std::abs(denom) > 1e-10) {
+                    double c = (S_w * S_xy - S_x * S_y) / denom;  // Slope
+                    double a = (S_y - c * S_x) / S_w;             // Intercept
+
+                    // Store raw slope for diagnostics
+                    profile.channel_b_slope = static_cast<float>(c);
+
+                    // Slope sign is natural boundary: c > 0 = damage, c <= 0 = inverted
+                    if (c > 0) {
+                        double b0 = std::clamp(a, 0.01, 0.99);
+                        double d_max_b = std::clamp(c / (1.0 - b0), 0.0, 1.0);
+
+                        profile.d_max_from_channel_b = static_cast<float>(d_max_b);
+                        profile.channel_b_weight = static_cast<float>(S_w);
+                        profile.channel_b_quantifiable = true;
+                        profile.channel_b_inverted = false;
+                    } else {
+                        // Inverted pattern: terminal stops LOWER than baseline
+                        profile.d_max_from_channel_b = 0.0f;
+                        profile.channel_b_weight = 0.0f;
+                        profile.channel_b_quantifiable = false;
+                        profile.channel_b_inverted = true;
+                    }
+                } else {
+                    profile.d_max_from_channel_b = 0.0f;
+                    profile.channel_b_weight = 0.0f;
+                    profile.channel_b_quantifiable = false;
+                    profile.channel_b_slope = 0.0f;
+                }
             }
+
+            // =========================================================================
+            // LEGACY LLR DIAGNOSTICS (kept for debug output)
+            // Decision now made by joint probabilistic model earlier
+            // =========================================================================
+            (void)profile.delta_llr_5prime;  // Used in debug output
+            (void)profile.stop_decay_llr_5prime;
         }
     }
 
@@ -757,12 +1039,6 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
             profile.damage_rate_3prime[i] = 0.0f;
         }
     }
-
-    // DEBUG: Print damage_rate[0] calculation
-    fprintf(stderr, "  [DEBUG-DAMAGE] 5': t_freq[0]=%.4f, baseline=%.4f, c_frac=%.4f, rate[0]=%.4f\n",
-            profile.t_freq_5prime[0], profile.fit_baseline_5prime, fit_baseline_c_frac_5p, profile.damage_rate_5prime[0]);
-    fprintf(stderr, "  [DEBUG-DAMAGE] 3': a_freq[0]=%.4f, baseline=%.4f, g_frac=%.4f, rate[0]=%.4f\n",
-            profile.a_freq_3prime[0], profile.fit_baseline_3prime, fit_baseline_g_frac_3p, profile.damage_rate_3prime[0]);
 
     // =========================================================================
     // Inverted pattern detection
@@ -952,17 +1228,26 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
     }
 
     // Flag inversions: terminals depleted relative to interior with statistical support
-    const bool inversion_5 = (profile.terminal_shift_5prime < -0.01f && profile.terminal_z_5prime < -2.0f);
-    const bool inversion_3 = (profile.terminal_shift_3prime < -0.01f && profile.terminal_z_3prime < -2.0f);
+    // Use both shift threshold AND z-score override for very strong statistical signals
+    const bool inversion_5 = (profile.terminal_shift_5prime < -0.01f && profile.terminal_z_5prime < -2.0f)
+                           || profile.terminal_z_5prime < -10.0f;  // Very strong depletion signal
+    const bool inversion_3 = (profile.terminal_shift_3prime < -0.01f && profile.terminal_z_3prime < -2.0f)
+                           || profile.terminal_z_3prime < -10.0f;  // Very strong depletion signal
     profile.terminal_inversion = inversion_5 || inversion_3;
+
+    // Set individual inverted pattern flags (used for asymmetric pattern handling)
+    // Note: inverted_pattern_5prime may also be set later by hexamer-based detection
+    if (inversion_3) {
+        profile.inverted_pattern_3prime = true;
+    }
+    if (inversion_5) {
+        profile.inverted_pattern_5prime = true;
+    }
 
     // =========================================================================
     // Hexamer-based damage detection (reference-independent)
     // Compare hexamer frequencies at 5' terminal vs interior positions
     // =========================================================================
-    fprintf(stderr, "  [DEBUG] Hexamer collection (pos 1-6): 5' count=%zu, interior count=%zu\n",
-            profile.n_hexamers_5prime, profile.n_hexamers_interior);
-
     if (profile.n_hexamers_5prime >= 1000 && profile.n_hexamers_interior >= 1000) {
         double llr_sum = 0.0;
         double weight_sum = 0.0;
@@ -1004,10 +1289,7 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
             // Negative = C-starting hexamers enriched at terminal (AT-rich composition bias)
             profile.hexamer_damage_llr = raw_llr;
 
-            if (raw_llr < -0.01f && profile.terminal_inversion) {
-                fprintf(stderr, "  [DEBUG] Inverted hexamer pattern: raw_llr=%.4f (NOT using as damage proxy)\n",
-                        raw_llr);
-            }
+            (void)raw_llr;  // Used for hexamer_damage_llr
         }
 
         // Compute hexamer-based T/(T+C) ratios (more reliable than position 0 or 1 alone)
@@ -1029,23 +1311,13 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         profile.hexamer_interior_tc = static_cast<float>(int_t_ratio);
         profile.hexamer_excess_tc = static_cast<float>(term_t_ratio - int_t_ratio);
 
-        fprintf(stderr, "  [DEBUG] C-starting hexamers: terminal=%.0f, interior=%.0f\n",
-                total_term_c, total_int_c);
-        fprintf(stderr, "  [DEBUG] T-starting hexamers: terminal=%.0f, interior=%.0f\n",
-                total_term_t, total_int_t);
-        fprintf(stderr, "  [DEBUG] T/(T+C) from hexamers: terminal=%.1f%%, interior=%.1f%%, excess=%.2f%%\n",
-                term_t_ratio * 100, int_t_ratio * 100, (term_t_ratio - int_t_ratio) * 100);
-        fprintf(stderr, "  [DEBUG] Hexamer damage LLR (weighted): %.4f\n", profile.hexamer_damage_llr);
-
-        // CRITICAL: If hexamer analysis shows terminal T/(T+C) < interior,
-        // this overrides position-0 based detection.
-        // Position 0 often has sequencing artifacts (adapter ligation, first-base bias)
-        // that don't represent real damage. Hexamer analysis (positions 1-6) is more reliable.
-        if (profile.hexamer_damage_llr < -0.02f) {
+        // If hexamer analysis shows terminal T/(T+C) < interior AND we didn't detect
+        // a position-0 artifact, mark as inverted.
+        // When position-0 artifact is detected, the hexamer signal may be corrupted too
+        // since hexamers starting at position 0 include the artifact.
+        if (profile.hexamer_damage_llr < -0.02f && !profile.position_0_artifact_5prime) {
             // Terminal T/(T+C) is LOWER than interior - no damage signal at 5' end
             profile.inverted_pattern_5prime = true;
-            fprintf(stderr, "  [DEBUG] Hexamer inversion detected (LLR=%.4f < -0.02): setting inverted_pattern_5prime=true\n",
-                    profile.hexamer_damage_llr);
         }
     }
 
@@ -1062,8 +1334,6 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
     float threshold_5 = std::max(0.005f, 0.5f * std::abs(damage_shift_5));
     if (ctrl_shift_5 >= threshold_5 && damage_shift_5 > 0.01f) {
         profile.composition_bias_5prime = true;
-        fprintf(stderr, "  [DEBUG] 5' control shift (%.3f) >= threshold (%.3f): composition_bias_5prime=true\n",
-                ctrl_shift_5, threshold_5);
     }
 
     float damage_shift_3 = profile.terminal_shift_3prime;
@@ -1071,19 +1341,6 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
     float threshold_3 = std::max(0.005f, 0.5f * std::abs(damage_shift_3));
     if (ctrl_shift_3 >= threshold_3 && damage_shift_3 > 0.01f) {
         profile.composition_bias_3prime = true;
-        fprintf(stderr, "  [DEBUG] 3' control shift (%.3f) >= threshold (%.3f): composition_bias_3prime=true\n",
-                ctrl_shift_3, threshold_3);
-    }
-
-    // Composition bias flags unreliable detection, but does NOT set inverted pattern.
-    // Inverted pattern is reserved for hexamer-based inversion (terminal < interior).
-    // Composition bias just means the signal is confounded - we can still estimate d_max
-    // from the position-based analysis, but it's less reliable.
-    if (profile.composition_bias_5prime) {
-        fprintf(stderr, "  [DEBUG] Composition bias at 5': detection unreliable but estimate available\n");
-    }
-    if (profile.composition_bias_3prime) {
-        fprintf(stderr, "  [DEBUG] Composition bias at 3': detection unreliable but estimate available\n");
     }
 
     // Sample classification
@@ -1098,16 +1355,11 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
     if (profile.hexamer_damage_llr > 0.02f && !profile.terminal_inversion) {
         // Normal sample with clear hexamer signal
         hexamer_boost = profile.hexamer_damage_llr * 8.0f;
-        fprintf(stderr, "  [DEBUG] Using hexamer-based damage boost: %.1f%% (from LLR %.4f)\n",
-                hexamer_boost * 100, profile.hexamer_damage_llr);
     } else if (profile.terminal_inversion) {
         // Inverted sample: check z-score asymmetry to distinguish real damage from composition bias
         float z5_abs = std::abs(profile.terminal_z_5prime);
         float z3_abs = std::abs(profile.terminal_z_3prime);
         float z_ratio = (z3_abs > 0) ? z5_abs / z3_abs : 10.0f;
-
-        fprintf(stderr, "  [DEBUG] Inverted sample z-scores: 5'=%.1f, 3'=%.1f, ratio=%.2f\n",
-                profile.terminal_z_5prime, profile.terminal_z_3prime, z_ratio);
 
         // Use absolute hexamer LLR magnitude for inverted samples
         float abs_llr = std::abs(profile.hexamer_damage_llr);
@@ -1116,17 +1368,12 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
             // 3' signal is relatively strong → likely real G→A damage
             // Use hexamer estimate but with more conservative scaling
             hexamer_boost = abs_llr * 8.0f;
-            fprintf(stderr, "  [DEBUG] Inverted + asymmetric (z_ratio=%.2f < 1.2): likely REAL damage, hexamer boost=%.1f%%\n",
-                    z_ratio, hexamer_boost * 100);
         } else if (z_ratio > 1.5f) {
             // 5' signal dominates → likely composition bias, NOT damage
-            fprintf(stderr, "  [DEBUG] Inverted + 5'-dominant (z_ratio=%.2f > 1.5): likely COMPOSITION BIAS, no hexamer estimate\n",
-                    z_ratio);
+            // No boost applied
         } else {
             // Ambiguous case: use conservative estimate
             hexamer_boost = abs_llr * 4.0f;  // Half the normal scaling
-            fprintf(stderr, "  [DEBUG] Inverted + ambiguous (z_ratio=%.2f): conservative hexamer boost=%.1f%%\n",
-                    z_ratio, hexamer_boost * 100);
         }
 
         // Apply hexamer boost for inverted samples
@@ -1185,8 +1432,6 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         raw_d_max_5prime = std::clamp(raw_d_max_5prime, 0.0f, 1.0f);
         raw_d_max_3prime = std::clamp(raw_d_max_3prime, 0.0f, 1.0f);
 
-        fprintf(stderr, "  [D_MAX] Raw from Channel A: 5'=%.2f%%, 3'=%.2f%%\n",
-                raw_d_max_5prime * 100, raw_d_max_3prime * 100);
 
         // Compute asymmetry: |D_5p - D_3p| / ((D_5p + D_3p) / 2)
         float d_sum = raw_d_max_5prime + raw_d_max_3prime;
@@ -1198,89 +1443,327 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         profile.high_asymmetry = (profile.asymmetry > 0.5f);
 
         // =========================================================================
-        // JOINT EVIDENCE DECISION FOR D_MAX
+        // GC-STRATIFIED DAMAGE CALCULATION
+        // Calculate d_max for each GC bin, then aggregate
         // =========================================================================
+        {
+            const uint64_t MIN_C_SITES = 10000;  // Minimum C sites for valid estimate
+            float weighted_sum = 0.0f;
+            float weight_sum = 0.0f;
+            float peak_dmax = 0.0f;
+            int peak_bin = -1;
+
+            for (int bin = 0; bin < SampleDamageProfile::N_GC_BINS; ++bin) {
+                auto& b = profile.gc_bins[bin];
+
+                // Sum up C sites for this bin
+                b.c_sites = b.c_interior;
+                for (int p = 0; p < 15; ++p) {
+                    b.c_sites += b.c_counts[p];
+                }
+
+                if (b.n_reads < 1000 || b.c_sites < MIN_C_SITES) {
+                    continue;  // Skip bins with insufficient data
+                }
+
+                // Channel A: calculate d_max = (t_terminal - t_baseline) / c_baseline
+                double t_baseline = static_cast<double>(b.t_interior) /
+                                   (b.t_interior + b.c_interior + 1);
+                double c_baseline = 1.0 - t_baseline;
+                double t_terminal = static_cast<double>(b.t_counts[0]) /
+                                   (b.t_counts[0] + b.c_counts[0] + 1);
+
+                if (c_baseline > 0.1) {
+                    b.d_max = std::clamp(static_cast<float>((t_terminal - t_baseline) / c_baseline),
+                                         0.0f, 1.0f);
+                }
+
+                // Channel B: calculate d_max from stop codon conversion
+                double stop_baseline = static_cast<double>(b.stop_interior) /
+                                      (b.stop_interior + b.pre_interior + 1);
+                double stop_terminal = static_cast<double>(b.stop_counts[0]) /
+                                      (b.stop_counts[0] + b.pre_counts[0] + 1);
+
+                if (stop_baseline < 0.99) {
+                    b.d_max_channel_b = std::clamp(
+                        static_cast<float>((stop_terminal - stop_baseline) / (1.0 - stop_baseline)),
+                        0.0f, 1.0f);
+                }
+
+                b.valid = true;
+
+                // Use max of Channel A and B (they measure same thing)
+                float bin_dmax = std::max(b.d_max, b.d_max_channel_b);
+
+                // Weight by C sites (more C = more signal)
+                float weight = static_cast<float>(b.c_sites);
+                weighted_sum += bin_dmax * weight;
+                weight_sum += weight;
+
+                // Track peak
+                if (bin_dmax > peak_dmax) {
+                    peak_dmax = bin_dmax;
+                    peak_bin = bin;
+                }
+
+                int gc_low = bin * 10;
+                int gc_high = gc_low + 10;
+            }
+
+            if (weight_sum > 0) {
+                profile.gc_stratified_d_max_weighted = weighted_sum / weight_sum;
+                profile.gc_stratified_d_max_peak = peak_dmax;
+                profile.gc_peak_bin = peak_bin;
+                profile.gc_stratified_valid = true;
+
+
+                // =========================================================================
+                // GC-CONDITIONAL DAMAGE CLASSIFICATION
+                // Per-bin LLR classification and aggregate metrics (π_damaged, d_ancient)
+                // This is the principled approach recommended by OpenCode discussion
+                // =========================================================================
+                {
+                    constexpr float LLR_THRESHOLD = 10.0f;  // Log-likelihood ratio threshold for classification
+                    constexpr float MIN_DMAX_THRESHOLD = 0.01f;  // Minimum d_max to consider as damaged
+
+                    uint64_t total_obs = 0;      // Total terminal observations
+                    uint64_t damaged_obs = 0;    // Observations from damaged bins
+                    float damaged_weighted_d = 0.0f;
+                    uint64_t damaged_weight = 0;
+                    int n_damaged = 0;
+
+                    for (int bin = 0; bin < SampleDamageProfile::N_GC_BINS; ++bin) {
+                        auto& b = profile.gc_bins[bin];
+                        if (!b.valid) continue;
+
+                        // Compute per-bin baseline
+                        double baseline_tc = static_cast<double>(b.t_interior) /
+                                            std::max(1.0, static_cast<double>(b.t_interior + b.c_interior));
+                        b.baseline_tc = static_cast<float>(std::clamp(baseline_tc, 0.01, 0.99));
+
+                        // Compute terminal observation count
+                        uint64_t n_obs = b.n_terminal_obs();
+                        total_obs += n_obs;
+
+                        // Compute per-bin LLR: damaged vs undamaged model
+                        // LL(damaged) - LL(undamaged) at terminal positions
+                        float ll_damaged = 0.0f;
+                        float ll_undamaged = 0.0f;
+                        float lambda = profile.lambda_5prime;
+
+                        for (int p = 0; p < 15; ++p) {
+                            float decay = std::exp(-lambda * p);
+                            float delta_p = b.d_max * decay;
+
+                            // Undamaged model: P(T) = baseline_tc
+                            float pi_undamaged = b.baseline_tc;
+                            // Damaged model: P(T) = baseline + (1-baseline) * delta_p
+                            float pi_damaged = b.baseline_tc + (1.0f - b.baseline_tc) * delta_p;
+
+                            pi_undamaged = std::clamp(pi_undamaged, 0.001f, 0.999f);
+                            pi_damaged = std::clamp(pi_damaged, 0.001f, 0.999f);
+
+                            double k = static_cast<double>(b.t_counts[p]);
+                            double n = static_cast<double>(b.t_counts[p] + b.c_counts[p]);
+                            if (n > 0) {
+                                ll_damaged += static_cast<float>(k * std::log(pi_damaged) + (n - k) * std::log(1.0f - pi_damaged));
+                                ll_undamaged += static_cast<float>(k * std::log(pi_undamaged) + (n - k) * std::log(1.0f - pi_undamaged));
+                            }
+                        }
+
+                        b.llr = ll_damaged - ll_undamaged;
+
+                        // Classify bin as damaged if LLR > threshold AND d_max > minimum
+                        b.classified_damaged = (b.llr > LLR_THRESHOLD) && (b.d_max > MIN_DMAX_THRESHOLD);
+
+                        // Convert LLR to soft probability (logistic)
+                        // p_damaged = sigmoid(LLR - threshold) scaled to [0, 1]
+                        float llr_centered = b.llr - LLR_THRESHOLD;
+                        b.p_damaged = 1.0f / (1.0f + std::exp(-0.5f * llr_centered));
+
+                        // Require minimum d_max for non-trivial p_damaged
+                        if (b.d_max < MIN_DMAX_THRESHOLD) {
+                            b.p_damaged = 0.0f;
+                        }
+
+                        // Accumulate for aggregates
+                        if (b.classified_damaged) {
+                            damaged_obs += n_obs;
+                            damaged_weighted_d += b.d_max * static_cast<float>(n_obs);
+                            damaged_weight += n_obs;
+                            ++n_damaged;
+                        }
+                    }
+
+                    // Compute aggregate metrics
+                    if (total_obs > 0) {
+                        profile.pi_damaged = static_cast<float>(damaged_obs) / static_cast<float>(total_obs);
+                    }
+                    if (damaged_weight > 0) {
+                        profile.d_ancient = damaged_weighted_d / static_cast<float>(damaged_weight);
+                    }
+
+                    // d_population = E[δ] across all bins (weighted by observations)
+                    float pop_weighted_d = 0.0f;
+                    for (int bin = 0; bin < SampleDamageProfile::N_GC_BINS; ++bin) {
+                        const auto& b = profile.gc_bins[bin];
+                        if (!b.valid) continue;
+                        pop_weighted_d += b.d_max * static_cast<float>(b.n_terminal_obs());
+                    }
+                    if (total_obs > 0) {
+                        profile.d_population = pop_weighted_d / static_cast<float>(total_obs);
+                    }
+
+                    profile.n_damaged_bins = n_damaged;
+
+                }
+
+                // =========================================================================
+                // DURBIN-STYLE K-COMPONENT MIXTURE MODEL
+                // Models organism-class heterogeneity for principled damage quantification
+                // d_population = what we observe, d_reference = metaDMG proxy
+                // =========================================================================
+                double total_c_sites = static_cast<double>(weight_sum);
+                std::array<SuperRead, N_GC_BINS> super_reads;
+                for (int bin = 0; bin < N_GC_BINS; ++bin) {
+                    const auto& b = profile.gc_bins[bin];
+                    super_reads[bin].gc_bin = bin;
+                    super_reads[bin].c_sites = static_cast<double>(b.c_sites);
+
+                    // Channel A: T/(T+C) - use the GC bin's terminal counts
+                    for (int p = 0; p < N_POSITIONS; ++p) {
+                        super_reads[bin].k_tc[p] = static_cast<double>(b.t_counts[p]);
+                        super_reads[bin].n_tc[p] = static_cast<double>(b.t_counts[p] + b.c_counts[p]);
+                    }
+
+                    // Control: A/(A+G) at 5' - approximate from global profile scaled by bin weight
+                    // (We don't track A/G per GC bin, so use global proportionally)
+                    double bin_fraction = b.c_sites > 0 ? static_cast<double>(b.c_sites) / total_c_sites : 0.0;
+                    for (int p = 0; p < N_POSITIONS; ++p) {
+                        super_reads[bin].k_ag[p] = profile.a_freq_5prime[p] * bin_fraction * base_ag_total;
+                        super_reads[bin].n_ag[p] = (profile.a_freq_5prime[p] + profile.g_freq_5prime[p]) * bin_fraction * base_ag_total;
+                    }
+
+                    // Channel B: stop conversion
+                    for (int p = 0; p < N_POSITIONS; ++p) {
+                        super_reads[bin].k_stop[p] = static_cast<double>(b.stop_counts[p]);
+                        super_reads[bin].n_stop[p] = static_cast<double>(b.stop_counts[p] + b.pre_counts[p]);
+                    }
+
+                    // Interior baselines
+                    super_reads[bin].k_tc_int = static_cast<double>(b.t_interior);
+                    super_reads[bin].n_tc_int = static_cast<double>(b.t_interior + b.c_interior);
+                    super_reads[bin].k_stop_int = static_cast<double>(b.stop_interior);
+                    super_reads[bin].n_stop_int = static_cast<double>(b.stop_interior + b.pre_interior);
+
+                    // Control interior - approximate
+                    super_reads[bin].k_ag_int = profile.baseline_a_freq * bin_fraction * base_ag_total;
+                    super_reads[bin].n_ag_int = (profile.baseline_a_freq + profile.baseline_g_freq) * bin_fraction * base_ag_total;
+                }
+
+                auto mixture_result = MixtureDamageModel::fit(super_reads);
+                profile.mixture_K = mixture_result.K;
+                profile.mixture_d_population = mixture_result.d_population;
+                profile.mixture_d_ancient = mixture_result.d_ancient;
+                profile.mixture_d_reference = mixture_result.d_reference;
+                profile.mixture_pi_ancient = mixture_result.pi_ancient;
+                profile.mixture_bic = mixture_result.bic;
+                profile.mixture_converged = mixture_result.converged;
+
+                if (mixture_result.converged) {
+                    // Print per-class details
+                    for (int k = 0; k < mixture_result.K; ++k) {
+                    }
+                } else {
+                }
+            }
+        }
+
+        // =========================================================================
+        // JOINT MODEL FOR CLASSIFICATION + MIXTURE MODEL FOR QUANTIFICATION
+        // Joint model P(damage) for hypothesis testing
+        // Mixture model d_reference for metaDMG-comparable magnitude
+        // =========================================================================
+        profile.d_max_5prime = raw_d_max_5prime;  // Keep raw estimates for reference
+        profile.d_max_3prime = raw_d_max_3prime;
+
         if (profile.damage_artifact) {
-            // Channel A fires but Channel B identified it as compositional artifact
-            // This is the KEY FIX: set d_max to 0 for false positives
+            // Artifact detected (P(damage) < 0.05 with positive artifact term)
             profile.d_max_5prime = 0.0f;
             profile.d_max_3prime = 0.0f;
             profile.d_max_combined = 0.0f;
             profile.d_max_source = SampleDamageProfile::DmaxSource::NONE;
-            fprintf(stderr, "  [D_MAX] ARTIFACT DETECTED by Channel B: setting d_max = 0\n");
         } else if (profile.damage_validated) {
-            // Both channels agree: use Channel A's raw estimates
-            // BUT if raw values are 0 due to inverted pattern, use fit_amplitude instead
-            // This handles the case where position 0 is below baseline but the
-            // exponential fit and Channel B both confirm real damage
-            float effective_d_max_5prime = raw_d_max_5prime;
-            float effective_d_max_3prime = raw_d_max_3prime;
+            // Damage validated (P(damage) > 0.95)
+            // Check for inversion patterns or position-0 artifacts: Channel A may be unreliable
+            bool channel_a_unreliable = (profile.inverted_pattern_5prime && profile.inverted_pattern_3prime)
+                                      || profile.position_0_artifact_5prime
+                                      || profile.position_0_artifact_3prime;
 
-            // If raw estimate is 0 but fit amplitude shows decay, use amplitude
-            if (raw_d_max_5prime < 0.001f && profile.fit_amplitude_5prime > 0.02f) {
-                effective_d_max_5prime = profile.fit_amplitude_5prime;
-                fprintf(stderr, "  [D_MAX] 5' raw=0 but fit_amplitude=%.1f%%, using amplitude\n",
-                        profile.fit_amplitude_5prime * 100);
-            }
-            if (raw_d_max_3prime < 0.001f && profile.fit_amplitude_3prime > 0.02f) {
-                effective_d_max_3prime = profile.fit_amplitude_3prime;
-                fprintf(stderr, "  [D_MAX] 3' raw=0 but fit_amplitude=%.1f%%, using amplitude\n",
-                        profile.fit_amplitude_3prime * 100);
-            }
-
-            profile.d_max_5prime = effective_d_max_5prime;
-            profile.d_max_3prime = effective_d_max_3prime;
-
-            // Combine using asymmetry-aware logic
-            if (profile.high_asymmetry) {
-                profile.d_max_combined = std::min(profile.d_max_5prime, profile.d_max_3prime);
-                profile.d_max_source = SampleDamageProfile::DmaxSource::MIN_ASYMMETRY;
+            if (channel_a_unreliable && profile.channel_b_quantifiable && profile.d_max_from_channel_b > 0.01f) {
+                // Channel A corrupted by inversion or position-0 artifact - use Channel B
+                profile.d_max_combined = profile.d_max_from_channel_b;
+                profile.d_max_source = SampleDamageProfile::DmaxSource::CHANNEL_B_STRUCTURAL;
+            } else if (profile.inverted_pattern_3prime && !profile.inverted_pattern_5prime) {
+                // 3' inverted but 5' valid - use 5' raw estimate
+                profile.d_max_combined = raw_d_max_5prime;
+                profile.d_max_source = SampleDamageProfile::DmaxSource::FIVE_PRIME_ONLY;
+            } else if (profile.inverted_pattern_5prime && !profile.inverted_pattern_3prime) {
+                // 5' inverted but 3' valid - use 3' raw estimate
+                profile.d_max_combined = raw_d_max_3prime;
+                profile.d_max_source = SampleDamageProfile::DmaxSource::THREE_PRIME_ONLY;
+            } else if (profile.mixture_converged && profile.mixture_d_reference > 0.01f) {
+                // No inversion - use mixture model d_reference (metaDMG proxy: E[δ | GC > 50%])
+                profile.d_max_combined = profile.mixture_d_reference;
+                profile.d_max_source = SampleDamageProfile::DmaxSource::AVERAGE;
+            } else if (profile.gc_stratified_valid) {
+                // Fallback to GC-weighted average
+                profile.d_max_combined = profile.gc_stratified_d_max_weighted;
+                profile.d_max_source = SampleDamageProfile::DmaxSource::AVERAGE;
             } else {
-                profile.d_max_combined = (profile.d_max_5prime + profile.d_max_3prime) / 2.0f;
+                // Fallback to joint model
+                profile.d_max_combined = profile.joint_delta_max;
                 profile.d_max_source = SampleDamageProfile::DmaxSource::AVERAGE;
             }
-            fprintf(stderr, "  [D_MAX] VALIDATED by Channel B: d_max = %.2f%%\n",
-                    profile.d_max_combined * 100);
-        } else if (profile.channel_b_valid && profile.stop_amplitude_5prime > 0.005f) {
-            // Channel B has data and shows some stop excess
-            // Use Channel B's stop amplitude as a LOWER BOUND for d_max
-            // r(p) = r0 + (1-r0) * delta(p), so delta(p) = (r(p) - r0) / (1 - r0)
-            // At p=0: delta_max = stop_amplitude / (1 - baseline)
-            float channel_b_dmax = profile.stop_amplitude_5prime /
-                                  (1.0f - profile.stop_conversion_rate_baseline + 0.01f);
-            channel_b_dmax = std::clamp(channel_b_dmax, 0.0f, 1.0f);
-
-            // Use the MINIMUM of Channel A and Channel B estimates
-            // This is conservative: Channel A can overestimate due to composition
-            profile.d_max_5prime = std::min(raw_d_max_5prime, channel_b_dmax * 2.0f);
-            profile.d_max_3prime = std::min(raw_d_max_3prime, channel_b_dmax * 2.0f);
-
-            if (profile.high_asymmetry) {
-                profile.d_max_combined = std::min(profile.d_max_5prime, profile.d_max_3prime);
-                profile.d_max_source = SampleDamageProfile::DmaxSource::MIN_ASYMMETRY;
+        } else if (profile.joint_model_valid && profile.joint_p_damage > 0.5f) {
+            // Uncertain but leaning toward damage
+            if (profile.mixture_converged && profile.mixture_d_reference > 0.01f) {
+                profile.d_max_combined = profile.mixture_d_reference;
+                profile.d_max_source = SampleDamageProfile::DmaxSource::AVERAGE;
+            } else if (profile.gc_stratified_valid) {
+                profile.d_max_combined = profile.gc_stratified_d_max_weighted;
+                profile.d_max_source = SampleDamageProfile::DmaxSource::AVERAGE;
             } else {
-                profile.d_max_combined = (profile.d_max_5prime + profile.d_max_3prime) / 2.0f;
+                profile.d_max_combined = profile.joint_delta_max;
                 profile.d_max_source = SampleDamageProfile::DmaxSource::AVERAGE;
             }
-            fprintf(stderr, "  [D_MAX] Channel B estimate: %.2f%%, combined: %.2f%%\n",
-                    channel_b_dmax * 100, profile.d_max_combined * 100);
+        } else if (profile.joint_model_valid) {
+            // Joint model valid and does NOT support damage.
+            // Do not fall back to Channel A raw values here; that reintroduces the exact
+            // compositional false positives the joint model was designed to suppress.
+            profile.d_max_5prime = 0.0f;
+            profile.d_max_3prime = 0.0f;
+            profile.d_max_combined = 0.0f;
+            profile.d_max_source = SampleDamageProfile::DmaxSource::NONE;
+        } else if (profile.channel_b_quantifiable) {
+            // Channel B WLS fit succeeded - use its d_max directly
+            // This path is for samples with some stop signal but not validated
+            profile.d_max_5prime = raw_d_max_5prime;
+            profile.d_max_3prime = raw_d_max_3prime;
+            profile.d_max_combined = profile.d_max_from_channel_b;
+            profile.d_max_source = SampleDamageProfile::DmaxSource::CHANNEL_B_STRUCTURAL;
         } else {
-            // No strong evidence either way - use raw values but with caution
+            // No Channel B quantification - use Channel A raw values
             profile.d_max_5prime = raw_d_max_5prime;
             profile.d_max_3prime = raw_d_max_3prime;
 
             if (profile.high_asymmetry) {
                 profile.d_max_combined = std::min(profile.d_max_5prime, profile.d_max_3prime);
                 profile.d_max_source = SampleDamageProfile::DmaxSource::MIN_ASYMMETRY;
-            } else if (d_sum > 0.01f) {
+            } else {
                 profile.d_max_combined = (profile.d_max_5prime + profile.d_max_3prime) / 2.0f;
                 profile.d_max_source = SampleDamageProfile::DmaxSource::AVERAGE;
-            } else {
-                profile.d_max_combined = 0.0f;
-                profile.d_max_source = SampleDamageProfile::DmaxSource::NONE;
             }
-            fprintf(stderr, "  [D_MAX] No Channel B validation: d_max = %.2f%% (use with caution)\n",
-                    profile.d_max_combined * 100);
         }
 
         // Additional reliability check: if either end has inverted pattern, use the other
@@ -1294,14 +1777,111 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
                 profile.d_max_source = SampleDamageProfile::DmaxSource::FIVE_PRIME_ONLY;
             } else if (profile.inverted_pattern_5prime && profile.inverted_pattern_3prime) {
                 // Both ends inverted - can't reliably estimate damage
+                profile.d_max_5prime = 0.0f;
+                profile.d_max_3prime = 0.0f;
                 profile.d_max_combined = 0.0f;
                 profile.d_max_source = SampleDamageProfile::DmaxSource::NONE;
             }
         }
 
-        fprintf(stderr, "  [D_MAX] Final: d_max_5p=%.2f%%, d_max_3p=%.2f%%, combined=%.2f%% (source=%s)\n",
-                profile.d_max_5prime * 100, profile.d_max_3prime * 100,
-                profile.d_max_combined * 100, profile.d_max_source_str());
+    }
+
+    // =========================================================================
+    // D_METAMATCH CALCULATION: Channel B-anchored damage estimate
+    //
+    // metaDMG uses aligned reads (selection bias toward well-preserved sequences).
+    // AGP's d_global uses ALL reads. The gap arises because alignable reads
+    // tend to show cleaner damage signal.
+    //
+    // APPROACH: Use Channel B (stop codon conversion) as the primary anchor.
+    // Channel B directly measures C→T damage via CAA→TAA, CAG→TAG, CGA→TGA
+    // conversions, which is biologically equivalent to what metaDMG measures.
+    //
+    // Formula:
+    //   d_metamatch = d_global + γ × (d_channel_b - d_global)
+    //
+    // Where γ is based on Channel B confidence (higher LLR = more trust in
+    // Channel B estimate). For highly damaged, validated samples, this pulls
+    // d_global toward the Channel B structural estimate.
+    // =========================================================================
+    {
+        // Step 1: Compute GC-weighted d_max for diagnostics (kept for reporting)
+        double weighted_sum = 0.0;
+        double weight_sum = 0.0;
+
+        for (int bin = 0; bin < SampleDamageProfile::N_GC_BINS; ++bin) {
+            const auto& b = profile.gc_bins[bin];
+            if (!b.valid || b.n_reads < 100) continue;
+
+            float gc_center = (bin + 0.5f) / static_cast<float>(SampleDamageProfile::N_GC_BINS);
+            float gc_deviation = gc_center - 0.50f;
+            float alignability_weight = std::exp(-gc_deviation * gc_deviation / (2.0f * 0.15f * 0.15f));
+            double read_weight = std::sqrt(static_cast<double>(b.n_reads));
+            double total_weight = alignability_weight * read_weight;
+
+            weighted_sum += b.d_max * total_weight;
+            weight_sum += total_weight;
+        }
+
+        if (weight_sum > 0) {
+            profile.d_alignability_weighted = static_cast<float>(weighted_sum / weight_sum);
+        } else {
+            profile.d_alignability_weighted = profile.d_max_combined;
+        }
+
+        // Step 2: Compute confidence coefficient (γ) for Channel B blending
+        // High LLR = confident damage → trust Channel B estimate
+        // Low/negative LLR = uncertain → stay close to d_global
+        float channel_b_llr = profile.stop_decay_llr_5prime;
+
+        // Sigmoid scaling: γ ranges from 0 to 1
+        // LLR = 0 → γ = 0.5, LLR = 50000 → γ ≈ 0.92, LLR = 100000 → γ ≈ 0.99
+        float gamma_raw = 1.0f / (1.0f + std::exp(-channel_b_llr / 50000.0f));
+
+        // Step 3: Determine blending strategy based on validation state
+        float d_global = profile.d_max_combined;
+        float d_channel_b = profile.d_max_from_channel_b;
+
+        if (!profile.damage_validated || profile.damage_artifact) {
+            // No damage or artifact: d_metamatch = d_global (typically 0)
+            profile.metamatch_gamma = 0.0f;
+            profile.d_metamatch = d_global;
+        } else if (profile.channel_b_quantifiable && d_channel_b > 0.01f) {
+            // Channel B is quantifiable: blend toward it
+            // Apply asymmetric blending:
+            // - If Channel B > d_global: use γ to pull UP (metaDMG usually higher)
+            // - If Channel B < d_global: use weaker pull to avoid under-estimation
+            if (d_channel_b > d_global) {
+                profile.metamatch_gamma = gamma_raw;
+            } else {
+                // More conservative when Channel B suggests LOWER damage
+                profile.metamatch_gamma = 0.3f * gamma_raw;
+            }
+            profile.d_metamatch = d_global + profile.metamatch_gamma * (d_channel_b - d_global);
+        } else {
+            // Channel B not quantifiable: use GC-weighted estimate with softer blending
+            profile.metamatch_gamma = 0.5f * gamma_raw;
+            profile.d_metamatch = d_global + profile.metamatch_gamma * (profile.d_alignability_weighted - d_global);
+        }
+
+        // Ensure d_metamatch is non-negative and bounded
+        profile.d_metamatch = std::clamp(profile.d_metamatch, 0.0f, 1.0f);
+
+        // Compute mean alignability for diagnostics
+        double alignability_total = 0.0;
+        double n_total = 0.0;
+        for (int bin = 0; bin < SampleDamageProfile::N_GC_BINS; ++bin) {
+            const auto& b = profile.gc_bins[bin];
+            if (b.n_reads == 0) continue;
+
+            float gc_center = (bin + 0.5f) / static_cast<float>(SampleDamageProfile::N_GC_BINS);
+            float gc_deviation = gc_center - 0.50f;
+            float alignability = std::exp(-gc_deviation * gc_deviation / (2.0f * 0.15f * 0.15f));
+
+            alignability_total += alignability * b.n_reads;
+            n_total += b.n_reads;
+        }
+        profile.mean_alignability = (n_total > 0) ? static_cast<float>(alignability_total / n_total) : 0.5f;
     }
 }
 
@@ -1367,6 +1947,23 @@ void FrameSelector::merge_sample_profiles(SampleDamageProfile& dst, const Sample
     dst.convertible_cga_interior += src.convertible_cga_interior;
     dst.convertible_tga_interior += src.convertible_tga_interior;
     dst.total_codons_interior += src.total_codons_interior;
+
+    // Merge GC-stratified bin counts
+    for (int bin = 0; bin < SampleDamageProfile::N_GC_BINS; ++bin) {
+        auto& db = dst.gc_bins[bin];
+        const auto& sb = src.gc_bins[bin];
+        for (int p = 0; p < 15; ++p) {
+            db.t_counts[p] += sb.t_counts[p];
+            db.c_counts[p] += sb.c_counts[p];
+            db.stop_counts[p] += sb.stop_counts[p];
+            db.pre_counts[p] += sb.pre_counts[p];
+        }
+        db.t_interior += sb.t_interior;
+        db.c_interior += sb.c_interior;
+        db.stop_interior += sb.stop_interior;
+        db.pre_interior += sb.pre_interior;
+        db.n_reads += sb.n_reads;
+    }
 
     // Merge read count
     dst.n_reads += src.n_reads;
@@ -1537,6 +2134,26 @@ void FrameSelector::reset_sample_profile(SampleDamageProfile& profile) {
     profile.channel_b_valid = false;
     profile.damage_validated = false;
     profile.damage_artifact = false;
+
+    // Joint probabilistic model
+    profile.joint_delta_max = 0.0f;
+    profile.joint_lambda = 0.0f;
+    profile.joint_a_max = 0.0f;
+    profile.joint_log_lik_m1 = 0.0f;
+    profile.joint_log_lik_m0 = 0.0f;
+    profile.joint_delta_bic = 0.0f;
+    profile.joint_bayes_factor = 0.0f;
+    profile.joint_p_damage = 0.0f;
+    profile.joint_model_valid = false;
+
+    // Durbin-style mixture model
+    profile.mixture_K = 0;
+    profile.mixture_d_population = 0.0f;
+    profile.mixture_d_ancient = 0.0f;
+    profile.mixture_d_reference = 0.0f;
+    profile.mixture_pi_ancient = 0.0f;
+    profile.mixture_bic = 0.0f;
+    profile.mixture_converged = false;
 
     profile.n_reads = 0;
 }
