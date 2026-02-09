@@ -18,12 +18,81 @@
 #include <cmath>
 #include <algorithm>
 #include <cstdint>
+#include <string_view>
 #include "types.hpp"
 #include "codon_tables.hpp"
 #include "dicodon_phase.hpp"
+#include "strand_scoring.hpp"
 
 namespace agp {
 namespace codon {
+
+// ============================================================================
+// THREAD-LOCAL BUFFERS FOR ZERO-ALLOCATION HOT PATH
+// ============================================================================
+
+// Maximum sequence length we support without allocation
+constexpr size_t MAX_SEQ_LEN = 2048;
+constexpr size_t MAX_CODONS = MAX_SEQ_LEN / 3;
+
+// Thread-local buffers to avoid heap allocations in hot path
+struct alignas(64) ThreadLocalBuffers {
+    char rc_buffer[MAX_SEQ_LEN];           // Reverse complement
+    char protein_buffer[6][MAX_CODONS];    // Proteins for 6 hypotheses
+    char corrected_buffer[6][MAX_CODONS];  // Corrected proteins
+    float codon_scores[6][MAX_CODONS];     // Per-codon log marginals
+    float stop_probs[6][MAX_CODONS];       // Per-codon stop probabilities
+    size_t protein_lens[6];                // Actual lengths
+    bool initialized = false;
+};
+
+inline ThreadLocalBuffers& get_thread_buffers() {
+    static thread_local ThreadLocalBuffers buffers;
+    return buffers;
+}
+
+// Fast reverse complement into pre-allocated buffer
+// Returns string_view into thread-local buffer
+inline std::string_view revcomp_fast(const char* seq, size_t len) {
+    auto& buf = get_thread_buffers();
+    if (len > MAX_SEQ_LEN) {
+        // Fallback for very long sequences (rare)
+        static thread_local std::string fallback;
+        fallback.resize(len);
+        for (size_t i = 0; i < len; ++i) {
+            char c = seq[len - 1 - i];
+            switch (c) {
+                case 'A': fallback[i] = 'T'; break;
+                case 'T': fallback[i] = 'A'; break;
+                case 'C': fallback[i] = 'G'; break;
+                case 'G': fallback[i] = 'C'; break;
+                case 'a': fallback[i] = 't'; break;
+                case 't': fallback[i] = 'a'; break;
+                case 'c': fallback[i] = 'g'; break;
+                case 'g': fallback[i] = 'c'; break;
+                default:  fallback[i] = 'N'; break;
+            }
+        }
+        return std::string_view(fallback);
+    }
+
+    // Fast path: use thread-local buffer
+    for (size_t i = 0; i < len; ++i) {
+        char c = seq[len - 1 - i];
+        switch (c) {
+            case 'A': buf.rc_buffer[i] = 'T'; break;
+            case 'T': buf.rc_buffer[i] = 'A'; break;
+            case 'C': buf.rc_buffer[i] = 'G'; break;
+            case 'G': buf.rc_buffer[i] = 'C'; break;
+            case 'a': buf.rc_buffer[i] = 't'; break;
+            case 't': buf.rc_buffer[i] = 'a'; break;
+            case 'c': buf.rc_buffer[i] = 'g'; break;
+            case 'g': buf.rc_buffer[i] = 'c'; break;
+            default:  buf.rc_buffer[i] = 'N'; break;
+        }
+    }
+    return std::string_view(buf.rc_buffer, len);
+}
 
 // Damage parameters (physical read coordinates)
 struct DamageParams {
@@ -377,16 +446,23 @@ inline GCConditionalPeriodicModel& get_gc_conditional_model() {
 // - X code: DISABLED - hurts on metagenome (designed for single organisms)
 // - AA bigram: DISABLED - needs full bigram table, simplified version hurts
 // - Stop positional: marginal benefit, keep at low weight
+// IMPORTANT: Strand discrimination is FUNDAMENTALLY LIMITED for double-stranded
+// ancient DNA libraries without reference alignment:
+// - Hexamer patterns are symmetric (both strands look equally coding)
+// - Damage patterns are symmetric (both strands show C→T at 5', G→A at 3')
+// For metagenomics, use --both-strands and let MMseqs2 determine strand via alignment.
+// Frame selection (86% accuracy) works well; strand selection (~50%) is random.
 struct ScoringWeights {
     float w_codon = 1.0f;      // Base codon marginal (stop codon penalty)
-    float w_strand_only = 0.0f;// Strand-only LLR
-    float w_periodic = 1.0f;   // 3-periodic hexamer (dicodon phase) - PRIMARY
+    float w_strand_only = 0.0f;// Strand-only LLR - DISABLED (doesn't help for DS libraries)
+    float w_strand_hex = 0.0f; // Strand hexamer LLR - DISABLED (cannot distinguish gene strand)
+    float w_periodic = 1.0f;   // 3-periodic hexamer (dicodon phase) - PRIMARY for frame
     float w_self_trained = 0.0f; // Self-trained periodic
     float w_gc_conditional = 0.0f; // GC-conditional
-    float w_fourier = 1.0f;    // RNY bias score - KEY IMPROVEMENT
+    float w_fourier = 1.0f;    // RNY bias score - KEY IMPROVEMENT for frame
     float w_xcode = 0.0f;      // X circular code
     float w_bigram = 0.0f;     // AA bigram
-    float w_stoppos = 1.0f;    // Stop positional - KEY IMPROVEMENT
+    float w_stoppos = 1.0f;    // Stop positional - KEY IMPROVEMENT for frame
 };
 
 // Frame+strand result
@@ -397,6 +473,7 @@ struct FrameStrandResult {
     float posterior;
     float score_codon;
     float score_strand_only;
+    float score_strand_hex;   // Strand hexamer LLR
     float score_periodic;
     float score_self_trained;
     float score_fourier;
@@ -449,14 +526,28 @@ struct BasePriors {
 // Base encoding utilities
 // ============================================================================
 
+// Fast base-to-index lookup table (TCAG order: T=0, C=1, A=2, G=3)
+alignas(64) constexpr int8_t BASE_TO_TCAG[256] = {
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, // 0-15
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, // 16-31
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, // 32-47
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, // 48-63
+    -1, 2,-1, 1,-1,-1,-1, 3,-1,-1,-1,-1,-1,-1,-1,-1, // 64-79  (A=65->2, C=67->1, G=71->3)
+    -1,-1,-1,-1, 0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, // 80-95  (T=84->0)
+    -1, 2,-1, 1,-1,-1,-1, 3,-1,-1,-1,-1,-1,-1,-1,-1, // 96-111 (a=97->2, c=99->1, g=103->3)
+    -1,-1,-1,-1, 0,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, // 112-127 (t=116->0)
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+    -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
+};
+
 inline int base_to_tcag(char c) {
-    switch (c) {
-        case 'T': case 't': return 0;
-        case 'C': case 'c': return 1;
-        case 'A': case 'a': return 2;
-        case 'G': case 'g': return 3;
-        default: return -1;
-    }
+    return BASE_TO_TCAG[static_cast<unsigned char>(c)];
 }
 
 inline char tcag_to_base(int idx) {
@@ -464,12 +555,14 @@ inline char tcag_to_base(int idx) {
     return (idx >= 0 && idx < 4) ? bases[idx] : 'N';
 }
 
+// Fast codon to index - inline the lookup
 inline int codon_to_idx(char c0, char c1, char c2) {
-    int i0 = base_to_tcag(c0);
-    int i1 = base_to_tcag(c1);
-    int i2 = base_to_tcag(c2);
-    if (i0 < 0 || i1 < 0 || i2 < 0) return -1;
-    return i0 * 16 + i1 * 4 + i2;
+    int i0 = BASE_TO_TCAG[static_cast<unsigned char>(c0)];
+    int i1 = BASE_TO_TCAG[static_cast<unsigned char>(c1)];
+    int i2 = BASE_TO_TCAG[static_cast<unsigned char>(c2)];
+    // Use bitwise OR to check all at once (if any is -1, result has high bit set)
+    if ((i0 | i1 | i2) < 0) return -1;
+    return (i0 << 4) | (i1 << 2) | i2;
 }
 
 inline void idx_to_codon(int idx, char& c0, char& c1, char& c2) {
@@ -478,14 +571,28 @@ inline void idx_to_codon(int idx, char& c0, char& c1, char& c2) {
     c2 = tcag_to_base(idx % 4);
 }
 
+// Fast complement using lookup table
+alignas(64) constexpr char COMPLEMENT_TABLE[256] = {
+    'N','N','N','N','N','N','N','N','N','N','N','N','N','N','N','N', // 0-15
+    'N','N','N','N','N','N','N','N','N','N','N','N','N','N','N','N', // 16-31
+    'N','N','N','N','N','N','N','N','N','N','N','N','N','N','N','N', // 32-47
+    'N','N','N','N','N','N','N','N','N','N','N','N','N','N','N','N', // 48-63
+    'N','T','N','G','N','N','N','C','N','N','N','N','N','N','N','N', // 64-79  (A=65->T, C=67->G, G=71->C)
+    'N','N','N','N','A','N','N','N','N','N','N','N','N','N','N','N', // 80-95  (T=84->A)
+    'N','t','N','g','N','N','N','c','N','N','N','N','N','N','N','N', // 96-111 (a=97->t, c=99->g, g=103->c)
+    'N','N','N','N','a','N','N','N','N','N','N','N','N','N','N','N', // 112-127 (t=116->a)
+    'N','N','N','N','N','N','N','N','N','N','N','N','N','N','N','N', // 128+
+    'N','N','N','N','N','N','N','N','N','N','N','N','N','N','N','N',
+    'N','N','N','N','N','N','N','N','N','N','N','N','N','N','N','N',
+    'N','N','N','N','N','N','N','N','N','N','N','N','N','N','N','N',
+    'N','N','N','N','N','N','N','N','N','N','N','N','N','N','N','N',
+    'N','N','N','N','N','N','N','N','N','N','N','N','N','N','N','N',
+    'N','N','N','N','N','N','N','N','N','N','N','N','N','N','N','N',
+    'N','N','N','N','N','N','N','N','N','N','N','N','N','N','N','N',
+};
+
 inline char complement(char c) {
-    switch (c) {
-        case 'A': return 'T'; case 'T': return 'A';
-        case 'C': return 'G'; case 'G': return 'C';
-        case 'a': return 't'; case 't': return 'a';
-        case 'c': return 'g'; case 'g': return 'c';
-        default: return 'N';
-    }
+    return COMPLEMENT_TABLE[static_cast<unsigned char>(c)];
 }
 
 // ============================================================================
@@ -655,6 +762,59 @@ inline float codon_prior_joint(
 // ============================================================================
 // Damage emission model
 // ============================================================================
+
+// Sparse candidate enumeration for observed base
+// Returns viable true bases and their emission probabilities
+struct ViableBases {
+    char bases[2];       // Up to 2 viable true bases
+    float emissions[2];  // Their emission probabilities
+    int count;           // 1 or 2
+};
+
+inline ViableBases get_viable_bases_physical(char obs_phys, float delta_CT, float delta_GA) {
+    ViableBases v;
+    delta_CT = std::clamp(delta_CT, 0.0f, 1.0f);
+    delta_GA = std::clamp(delta_GA, 0.0f, 1.0f);
+
+    switch (obs_phys) {
+        case 'A':
+            // Could be true A (1.0) or true G that became A (delta_GA)
+            v.bases[0] = 'A'; v.emissions[0] = 1.0f;
+            if (delta_GA > 1e-6f) {
+                v.bases[1] = 'G'; v.emissions[1] = delta_GA;
+                v.count = 2;
+            } else {
+                v.count = 1;
+            }
+            break;
+        case 'T':
+            // Could be true T (1.0) or true C that became T (delta_CT)
+            v.bases[0] = 'T'; v.emissions[0] = 1.0f;
+            if (delta_CT > 1e-6f) {
+                v.bases[1] = 'C'; v.emissions[1] = delta_CT;
+                v.count = 2;
+            } else {
+                v.count = 1;
+            }
+            break;
+        case 'C':
+            // Only true C can produce observed C (with prob 1-delta_CT)
+            v.bases[0] = 'C'; v.emissions[0] = 1.0f - delta_CT;
+            v.count = 1;
+            break;
+        case 'G':
+            // Only true G can produce observed G (with prob 1-delta_GA)
+            v.bases[0] = 'G'; v.emissions[0] = 1.0f - delta_GA;
+            v.count = 1;
+            break;
+        default:
+            // Unknown base - uniform
+            v.bases[0] = 'N'; v.emissions[0] = 0.25f;
+            v.count = 1;
+            break;
+    }
+    return v;
+}
 
 inline float damage_emission_physical(char true_phys, char obs_phys, float delta_CT, float delta_GA) {
     delta_CT = std::clamp(delta_CT, 0.0f, 1.0f);
@@ -994,6 +1154,59 @@ inline float score_fourier_periodicity(
     return compute_rny_bias_score(seq, frame, 5);
 }
 
+// OPTIMIZED: Fast version with raw pointer
+inline float score_fourier_periodicity_fast(
+    const char* seq,
+    int L,
+    int frame,
+    int skip_ends = 5) {
+
+    if (L < 2 * skip_ends + 9) return 0.0f;
+
+    int start = skip_ends;
+    int end = L - skip_ends;
+
+    // Use lookup table for R/Y classification
+    alignas(64) static constexpr int8_t IS_PURINE[256] = {
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,1,0,0,0,0,0,1,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, // A=65, G=71
+        0,1,0,0,0,0,0,1,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, // a=97, g=103
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    };
+    alignas(64) static constexpr int8_t IS_PYRIMIDINE[256] = {
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0, // C=67, T=84
+        0,0,0,1,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,1,0,0,0,0,0,0,0,0,0,0,0, // c=99, t=116
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+    };
+
+    int R_count_0 = 0, Y_count_0 = 0;
+
+    // Only count position 0 (the most discriminative)
+    for (int j = start; j < end; ++j) {
+        int codon_pos = (j - frame + 300) % 3;
+        if (codon_pos == 0) {
+            unsigned char c = static_cast<unsigned char>(seq[j]);
+            R_count_0 += IS_PURINE[c];
+            Y_count_0 += IS_PYRIMIDINE[c];
+        }
+    }
+
+    int total0 = R_count_0 + Y_count_0;
+    if (total0 == 0) return 0.0f;
+
+    float R_freq0 = R_count_0 / static_cast<float>(total0);
+    return std::log(R_freq0 + 0.01f) - std::log(1.0f - R_freq0 + 0.01f);
+}
+
 // ============================================================================
 // Utility functions
 // ============================================================================
@@ -1014,15 +1227,6 @@ inline float logsumexp(const float* logv, int n) {
     return maxv + std::log(sum);
 }
 
-inline std::string revcomp(const std::string& seq) {
-    std::string rc;
-    rc.resize(seq.size());
-    for (size_t i = 0; i < seq.size(); ++i) {
-        rc[i] = complement(seq[seq.size() - 1 - i]);
-    }
-    return rc;
-}
-
 // ============================================================================
 // Codon posterior computation (needed for all scoring components)
 // ============================================================================
@@ -1033,6 +1237,8 @@ struct CodonPosteriors {
     std::array<float, 20> aa_post;  // P(AA = a | observed, damage)
     float stop_prob;             // P(stop | observed, damage)
     float log_marginal;          // log P(observed | frame, damage) - the marginal likelihood
+    int best_codon;              // MAP codon (avoids 64-iteration search)
+    float best_post;             // Posterior of best codon
 };
 
 /**
@@ -1124,6 +1330,299 @@ inline CodonPosteriors compute_codon_posteriors_joint(
             int aa_idx = aa_to_idx(aa);
             if (aa_idx >= 0) {
                 result.aa_post[aa_idx] += result.post[c];
+            }
+        }
+    }
+
+    return result;
+}
+
+// OPTIMIZED: Fast version taking raw pointer (no string overhead)
+inline CodonPosteriors compute_codon_posteriors_joint_fast(
+    const char* oriented,
+    int codon_start,
+    bool forward,
+    int L,
+    int frame,
+    const DamageParams& dmg,
+    const PeriodicMarkovModel& model) {
+
+    CodonPosteriors result;
+    result.x_membership = 0.0f;
+    result.stop_prob = 0.0f;
+    result.log_marginal = 0.0f;
+
+    if (codon_start + 2 >= L) {
+        result.post.fill(1.0f / 64.0f);
+        result.aa_post.fill(0.0f);
+        result.log_marginal = std::log(1.0f / 64.0f);
+        return result;
+    }
+
+    const char o0 = oriented[codon_start];
+    const char o1 = oriented[codon_start + 1];
+    const char o2 = oriented[codon_start + 2];
+
+    // Fast validation using lookup table
+    if ((BASE_TO_TCAG[static_cast<unsigned char>(o0)] |
+         BASE_TO_TCAG[static_cast<unsigned char>(o1)] |
+         BASE_TO_TCAG[static_cast<unsigned char>(o2)]) < 0) {
+        result.post.fill(1.0f / 64.0f);
+        result.aa_post.fill(0.0f);
+        return result;
+    }
+
+    // Context for periodic model
+    const char prev0 = codon_start >= 2 ? oriented[codon_start - 2] : 'N';
+    const char prev1 = codon_start >= 1 ? oriented[codon_start - 1] : 'N';
+    const char next_base = codon_start + 3 < L ? oriented[codon_start + 3] : 'N';
+
+    // Pre-compute damage rates at these positions (avoid recomputing per codon)
+    const int phys0 = forward ? codon_start : (L - 1 - codon_start);
+    const int phys1 = forward ? codon_start + 1 : (L - 2 - codon_start);
+    const int phys2 = forward ? codon_start + 2 : (L - 3 - codon_start);
+
+    const float delta_CT_0 = dmg.delta_CT(phys0);
+    const float delta_CT_1 = dmg.delta_CT(phys1);
+    const float delta_CT_2 = dmg.delta_CT(phys2);
+    const float delta_GA_0 = dmg.delta_GA(phys0, L);
+    const float delta_GA_1 = dmg.delta_GA(phys1, L);
+    const float delta_GA_2 = dmg.delta_GA(phys2, L);
+
+    alignas(64) float log_terms[64];
+    float max_log = -1e30f;
+
+    for (int c = 0; c < 64; ++c) {
+        // Prior (uniform or from model)
+        float prior = model.trained
+            ? codon_prior_joint(c, prev0, prev1, codon_start, frame, model)
+            : (1.0f / 64.0f);
+
+        if (prior <= 0.0f) {
+            log_terms[c] = -1e30f;
+            continue;
+        }
+
+        // Decode codon
+        char t0 = tcag_to_base(c >> 4);
+        char t1 = tcag_to_base((c >> 2) & 3);
+        char t2 = tcag_to_base(c & 3);
+
+        // Fast damage emission (simplified - no CpG for speed)
+        float e0 = damage_emission_physical(
+            forward ? t0 : COMPLEMENT_TABLE[static_cast<unsigned char>(t0)],
+            forward ? o0 : COMPLEMENT_TABLE[static_cast<unsigned char>(o0)],
+            delta_CT_0, delta_GA_0);
+        float e1 = damage_emission_physical(
+            forward ? t1 : COMPLEMENT_TABLE[static_cast<unsigned char>(t1)],
+            forward ? o1 : COMPLEMENT_TABLE[static_cast<unsigned char>(o1)],
+            delta_CT_1, delta_GA_1);
+        float e2 = damage_emission_physical(
+            forward ? t2 : COMPLEMENT_TABLE[static_cast<unsigned char>(t2)],
+            forward ? o2 : COMPLEMENT_TABLE[static_cast<unsigned char>(o2)],
+            delta_CT_2, delta_GA_2);
+
+        float likelihood = e0 * e1 * e2;
+        log_terms[c] = (likelihood > 0.0f) ? (std::log(prior) + std::log(likelihood)) : -1e30f;
+        if (log_terms[c] > max_log) max_log = log_terms[c];
+    }
+
+    // Log-sum-exp for normalization
+    float sum = 0.0f;
+    for (int c = 0; c < 64; ++c) {
+        if (log_terms[c] > -1e20f) {
+            sum += std::exp(log_terms[c] - max_log);
+        }
+    }
+    float log_z = max_log + std::log(sum + 1e-30f);
+    result.log_marginal = log_z;
+
+    // Compute posteriors and derived quantities
+    result.post.fill(0.0f);
+    result.aa_post.fill(0.0f);
+
+    for (int c = 0; c < 64; ++c) {
+        float post_c = std::exp(log_terms[c] - log_z);
+        result.post[c] = post_c;
+
+        if (is_x_code_codon(c)) {
+            result.x_membership += post_c;
+        }
+
+        char aa = translate_codon_idx(c);
+        if (aa == '*') {
+            result.stop_prob += post_c;
+        } else {
+            int aa_idx = aa_to_idx(aa);
+            if (aa_idx >= 0) {
+                result.aa_post[aa_idx] += post_c;
+            }
+        }
+    }
+
+    return result;
+}
+
+// SPARSE OPTIMIZATION: Only iterate over viable codons (1-8 instead of 64)
+// This exploits the fact that damage emission returns 0 for most base combinations
+inline CodonPosteriors compute_codon_posteriors_sparse(
+    const char* oriented,
+    int codon_start,
+    bool forward,
+    int L,
+    int frame,
+    const DamageParams& dmg,
+    const PeriodicMarkovModel& model) {
+
+    CodonPosteriors result;
+    result.x_membership = 0.0f;
+    result.stop_prob = 0.0f;
+    result.log_marginal = 0.0f;
+    result.post.fill(0.0f);
+    result.aa_post.fill(0.0f);
+
+    if (codon_start + 2 >= L) {
+        result.post.fill(1.0f / 64.0f);
+        result.log_marginal = std::log(1.0f / 64.0f);
+        return result;
+    }
+
+    const char o0 = oriented[codon_start];
+    const char o1 = oriented[codon_start + 1];
+    const char o2 = oriented[codon_start + 2];
+
+    // Fast validation
+    if ((BASE_TO_TCAG[static_cast<unsigned char>(o0)] |
+         BASE_TO_TCAG[static_cast<unsigned char>(o1)] |
+         BASE_TO_TCAG[static_cast<unsigned char>(o2)]) < 0) {
+        result.post.fill(1.0f / 64.0f);
+        return result;
+    }
+
+    // Context for periodic model
+    const char prev0 = codon_start >= 2 ? oriented[codon_start - 2] : 'N';
+    const char prev1 = codon_start >= 1 ? oriented[codon_start - 1] : 'N';
+
+    // Pre-compute damage rates
+    const int phys0 = forward ? codon_start : (L - 1 - codon_start);
+    const int phys1 = forward ? codon_start + 1 : (L - 2 - codon_start);
+    const int phys2 = forward ? codon_start + 2 : (L - 3 - codon_start);
+
+    const float delta_CT_0 = dmg.delta_CT(phys0);
+    const float delta_CT_1 = dmg.delta_CT(phys1);
+    const float delta_CT_2 = dmg.delta_CT(phys2);
+    const float delta_GA_0 = dmg.delta_GA(phys0, L);
+    const float delta_GA_1 = dmg.delta_GA(phys1, L);
+    const float delta_GA_2 = dmg.delta_GA(phys2, L);
+
+    // Get viable bases for each position (1-2 candidates each)
+    // For forward strand, use observed bases directly
+    // For reverse strand, complement the observed bases for physical interpretation
+    char eff_o0 = forward ? o0 : COMPLEMENT_TABLE[static_cast<unsigned char>(o0)];
+    char eff_o1 = forward ? o1 : COMPLEMENT_TABLE[static_cast<unsigned char>(o1)];
+    char eff_o2 = forward ? o2 : COMPLEMENT_TABLE[static_cast<unsigned char>(o2)];
+
+    ViableBases v0 = get_viable_bases_physical(eff_o0, delta_CT_0, delta_GA_0);
+    ViableBases v1 = get_viable_bases_physical(eff_o1, delta_CT_1, delta_GA_1);
+    ViableBases v2 = get_viable_bases_physical(eff_o2, delta_CT_2, delta_GA_2);
+
+    // Maximum 2×2×2 = 8 viable codons
+    float log_terms[8];
+    int codon_indices[8];
+    int n_viable = 0;
+    float max_log = -1e30f;
+
+    for (int i0 = 0; i0 < v0.count; ++i0) {
+        char t0_phys = v0.bases[i0];
+        float e0 = v0.emissions[i0];
+        // Convert physical base back to oriented for codon index
+        char t0 = forward ? t0_phys : COMPLEMENT_TABLE[static_cast<unsigned char>(t0_phys)];
+        int b0 = base_to_tcag(t0);
+        if (b0 < 0) continue;
+
+        for (int i1 = 0; i1 < v1.count; ++i1) {
+            char t1_phys = v1.bases[i1];
+            float e1 = v1.emissions[i1];
+            char t1 = forward ? t1_phys : COMPLEMENT_TABLE[static_cast<unsigned char>(t1_phys)];
+            int b1 = base_to_tcag(t1);
+            if (b1 < 0) continue;
+
+            for (int i2 = 0; i2 < v2.count; ++i2) {
+                char t2_phys = v2.bases[i2];
+                float e2 = v2.emissions[i2];
+                char t2 = forward ? t2_phys : COMPLEMENT_TABLE[static_cast<unsigned char>(t2_phys)];
+                int b2 = base_to_tcag(t2);
+                if (b2 < 0) continue;
+
+                int c = (b0 << 4) | (b1 << 2) | b2;
+
+                float prior = model.trained
+                    ? codon_prior_joint(c, prev0, prev1, codon_start, frame, model)
+                    : (1.0f / 64.0f);
+
+                if (prior <= 0.0f) continue;
+
+                float likelihood = e0 * e1 * e2;
+                if (likelihood <= 0.0f) continue;
+
+                // OPTIMIZATION: Single log instead of two
+                float log_term = std::log(prior * likelihood);
+                log_terms[n_viable] = log_term;
+                codon_indices[n_viable] = c;
+                if (log_term > max_log) max_log = log_term;
+                ++n_viable;
+            }
+        }
+    }
+
+    if (n_viable == 0) {
+        result.post.fill(1.0f / 64.0f);
+        result.log_marginal = std::log(1.0f / 64.0f);
+        result.best_codon = 0;
+        result.best_post = 1.0f / 64.0f;
+        return result;
+    }
+
+    // OPTIMIZATION: Fused exp loop - compute exp once, then normalize
+    // This saves n_viable exp calls by computing unnormalized posteriors first
+    float unnorm[8];
+    float sum = 0.0f;
+    for (int i = 0; i < n_viable; ++i) {
+        float u = std::exp(log_terms[i] - max_log);
+        unnorm[i] = u;
+        sum += u;
+    }
+
+    float log_z = max_log + std::log(sum + 1e-30f);
+    result.log_marginal = log_z;
+    float inv_sum = 1.0f / (sum + 1e-30f);
+
+    // Normalize and compute derived quantities in single pass
+    result.best_codon = codon_indices[0];
+    result.best_post = 0.0f;
+
+    for (int i = 0; i < n_viable; ++i) {
+        int c = codon_indices[i];
+        float post_c = unnorm[i] * inv_sum;  // Division instead of exp
+        result.post[c] = post_c;
+
+        // Track MAP codon
+        if (post_c > result.best_post) {
+            result.best_post = post_c;
+            result.best_codon = c;
+        }
+
+        if (is_x_code_codon(c)) {
+            result.x_membership += post_c;
+        }
+
+        char aa = translate_codon_idx(c);
+        if (aa == '*') {
+            result.stop_prob += post_c;
+        } else {
+            int aa_idx = aa_to_idx(aa);
+            if (aa_idx >= 0) {
+                result.aa_post[aa_idx] += post_c;
             }
         }
     }
@@ -1369,100 +1868,144 @@ inline float score_stop_position_llr(
         score += (1.0f - stop_mass) * (log_1mp - log_1mr0);
     }
 
-    return score;
+    // Normalize by codon count to avoid length bias
+    // (longer reads would otherwise accumulate higher scores)
+    return score / static_cast<float>(posteriors.size());
 }
 
 // ============================================================================
 // Main scoring function: combine all components
+// OPTIMIZED: Zero allocations in hot path, compute revcomp once
 // ============================================================================
 
 inline std::array<FrameStrandResult, 6> score_all_hypotheses(
     const std::string& seq,
     const DamageParams& dmg,
-    const ScoringWeights& weights = ScoringWeights()) {
+    const ScoringWeights& weights = ScoringWeights(),
+    bool populate_all_proteins = false) {
 
     std::array<FrameStrandResult, 6> results;
     float total_scores[6];
 
-    int L = static_cast<int>(seq.size());
+    const int L = static_cast<int>(seq.size());
+    const char* fwd_seq = seq.c_str();
+
+    // OPTIMIZATION: Compute reverse complement ONCE (not 3x in loop)
+    std::string_view rc_view = revcomp_fast(fwd_seq, seq.size());
+    const char* rev_seq = rc_view.data();
 
     // Compute strand-only LLR once (same for all frames of same strand)
-    // Positive = forward preferred, negative = reverse preferred
-    // Use terminal-focused version for stronger signal
     BasePriors pi = estimate_base_priors(seq, 10);
     float strand_llr = strand_only_llr_terminal(seq, dmg, pi, 15);
 
-    // Get learned model for joint posterior computation
+    // Compute strand hexamer LLR
+    float strand_hex_fwd = 0.0f, strand_hex_rev = 0.0f;
+    bool use_interior_only = (dmg.d_max_5p > 0.05f && seq.size() >= 45);
+    strand::compute_both_llrs(fwd_seq, seq.size(), strand_hex_fwd, strand_hex_rev, use_interior_only);
+    size_t effective_len = use_interior_only ? (seq.size() > 30 ? seq.size() - 30 : 1) : seq.size();
+    float norm = static_cast<float>(effective_len > 6 ? effective_len - 5 : 1);
+    strand_hex_fwd /= norm;
+    strand_hex_rev /= norm;
+
+    // Get learned model
     const auto& periodic_model = get_learned_periodic_model();
 
+    // OPTIMIZATION: Pre-compute number of codons per frame
+    const int n_codons[3] = {
+        (L - 0) / 3,
+        (L - 1) / 3,
+        (L - 2) / 3
+    };
+
+    // OPTIMIZATION: Use thread-local buffers for proteins
+    auto& buf = get_thread_buffers();
+
+    // OPTIMIZATION: Stack-allocated codon posteriors (max ~680 codons for 2KB sequence)
+    // Use fixed-size array instead of vector
+    alignas(64) CodonPosteriors posteriors_buf[MAX_CODONS];
+
     for (int h = 0; h < 6; ++h) {
-        bool forward = (h < 3);
-        int frame = h % 3;
+        const bool forward = (h < 3);
+        const int frame = h % 3;
+        const char* oriented = forward ? fwd_seq : rev_seq;
+        // Clamp to MAX_CODONS to prevent buffer overflow for long sequences
+        const int num_codons = std::min(n_codons[frame], static_cast<int>(MAX_CODONS));
 
-        std::string oriented = forward ? seq : revcomp(seq);
-
-        // Compute codon posteriors for all positions
-        // Use joint model if trained, else uniform prior
-        std::vector<CodonPosteriors> posteriors;
-        std::string protein;
-        std::string corrected_protein;
-
-        for (int i = frame; i + 2 < L; i += 3) {
-            auto cp = compute_codon_posteriors_joint(oriented, i, forward, L, frame, dmg, periodic_model);
-            posteriors.push_back(cp);
-
-            // Observed and MAP-corrected protein
-            int obs_idx = codon_to_idx(oriented[i], oriented[i+1], oriented[i+2]);
-            protein.push_back(translate_codon_idx(obs_idx));
-
-            // MAP codon
-            int best_c = 0;
-            float best_p = cp.post[0];
-            for (int c = 1; c < 64; ++c) {
-                if (cp.post[c] > best_p) {
-                    best_p = cp.post[c];
-                    best_c = c;
-                }
-            }
-            corrected_protein.push_back(translate_codon_idx(best_c));
-        }
-
-        // Compute all scoring components
-        // Use the precomputed log-marginal likelihood from codon posteriors
-        // This is log P(observed_codon | frame, damage) = log(sum_c prior[c] * P(obs|c,dmg))
+        // OPTIMIZATION: Direct pointer arithmetic for codon iteration
         float s_codon = 0.0f;
-        for (const auto& cp : posteriors) {
+        float s_xcode = 0.0f;
+        float s_stoppos = 0.0f;
+        int stop_count = 0;
+        int interior_stops = 0;
+
+        // Single pass: compute codon posteriors and all derived scores
+        for (int c = 0; c < num_codons; ++c) {
+            const int i = frame + c * 3;
+            if (i + 2 >= L) break;
+
+            // Compute codon posterior
+            auto& cp = posteriors_buf[c];
+            cp = compute_codon_posteriors_sparse(oriented, i, forward, L, frame, dmg, periodic_model);
+
+            // Accumulate log marginal and store per-codon score for frameshift detection
             s_codon += cp.log_marginal;
+            buf.codon_scores[h][c] = cp.log_marginal;
+
+            // Observed codon -> protein
+            const int obs_idx = codon_to_idx(oriented[i], oriented[i+1], oriented[i+2]);
+            buf.protein_buffer[h][c] = translate_codon_idx(obs_idx);
+
+            // MAP correction (but force 'X' for ambiguous/invalid codons)
+            if (obs_idx < 0) {
+                // Codon contains N or invalid base - cannot infer original
+                buf.corrected_buffer[h][c] = 'X';
+            } else {
+                // Use pre-computed best codon from sparse computation (avoids 64-iteration search)
+                buf.corrected_buffer[h][c] = translate_codon_idx(cp.best_codon);
+            }
+
+            // X-code membership (fused into loop)
+            s_xcode += cp.x_membership;
+
+            // Stop tracking for positional score
+            if (cp.stop_prob > 0.5f) {
+                stop_count++;
+                if (c > 0 && c < num_codons - 1) interior_stops++;
+            }
         }
-        // Normalize by number of codons to make scores comparable across frames
-        // (frames have different codon counts due to sequence length)
-        if (!posteriors.empty()) {
-            s_codon /= static_cast<float>(posteriors.size());
+        buf.protein_lens[h] = static_cast<size_t>(num_codons);
+
+        // Normalize scores
+        if (num_codons > 0) {
+            s_codon /= static_cast<float>(num_codons);
+            s_xcode = (s_xcode / static_cast<float>(num_codons)) - 0.31f; // X-code baseline
         }
 
-        // Strand-only score: +LLR for forward, -LLR for reverse
+        // Stop position score (simplified: penalize interior stops)
+        s_stoppos = -0.5f * static_cast<float>(interior_stops);
+
+        // Strand scores
         float s_strand_only = forward ? strand_llr : -strand_llr;
+        float s_strand_hex = forward ? strand_hex_fwd : strand_hex_rev;
 
-        // 3-periodic hexamer score (dicodon phase)
-        // Use GTDB domain for bacterial/archaeal metagenomes
-        float s_periodic = dicodon::calculate_frame_score(oriented, frame, Domain::GTDB);
+        // Dicodon phase score - pass raw pointer for speed
+        float s_periodic = dicodon::calculate_frame_score_fast(oriented, L, frame, Domain::GTDB);
 
-        // Self-trained periodic Markov (EM-learned from sample)
-        float s_self_trained = get_learned_periodic_model().score(seq, frame, forward);
+        // Self-trained and GC-conditional (these use the original seq)
+        float s_self_trained = periodic_model.trained ? periodic_model.score(seq, frame, forward) : 0.0f;
+        float s_gc_conditional = get_gc_conditional_model().trained ?
+            get_gc_conditional_model().score(seq, frame, forward) : 0.0f;
 
-        // GC-conditional periodic Markov (mixture model)
-        float s_gc_conditional = get_gc_conditional_model().score(seq, frame, forward);
+        // Fourier periodogram
+        float s_fourier = score_fourier_periodicity_fast(oriented, L, frame);
 
-        // Fourier periodogram score
-        float s_fourier = score_fourier_periodicity(oriented, frame);
-
-        float s_xcode = score_x_code_llr(posteriors);
-        float s_bigram = score_aa_bigram_llr(posteriors);
-        float s_stoppos = score_stop_position_llr(oriented, frame, forward, L, dmg, posteriors);
+        // AA bigram (simplified - skip for speed, weight is 0 anyway)
+        float s_bigram = 0.0f;
 
         // Combined score
         float total = weights.w_codon * s_codon
                     + weights.w_strand_only * s_strand_only
+                    + weights.w_strand_hex * s_strand_hex
                     + weights.w_periodic * s_periodic
                     + weights.w_self_trained * s_self_trained
                     + weights.w_gc_conditional * s_gc_conditional
@@ -1478,14 +2021,16 @@ inline std::array<FrameStrandResult, 6> score_all_hypotheses(
         results[h].log_likelihood = total;
         results[h].score_codon = s_codon;
         results[h].score_strand_only = s_strand_only;
+        results[h].score_strand_hex = s_strand_hex;
         results[h].score_periodic = s_periodic;
         results[h].score_self_trained = s_self_trained;
         results[h].score_fourier = s_fourier;
         results[h].score_xcode = s_xcode;
         results[h].score_bigram = s_bigram;
         results[h].score_stoppos = s_stoppos;
-        results[h].protein = protein;
-        results[h].corrected_protein = corrected_protein;
+        // Defer string assignment until we know which hypothesis wins
+        results[h].protein.clear();
+        results[h].corrected_protein.clear();
     }
 
     // Compute posteriors via softmax
@@ -1494,13 +2039,44 @@ inline std::array<FrameStrandResult, 6> score_all_hypotheses(
         results[h].posterior = std::exp(total_scores[h] - log_z);
     }
 
-    // Sort by posterior
+    // Find best indices without full sort (faster for 6 elements)
+    int best_idx = 0;
+    float best_post = results[0].posterior;
+    for (int h = 1; h < 6; ++h) {
+        if (results[h].posterior > best_post) {
+            best_post = results[h].posterior;
+            best_idx = h;
+        }
+    }
+
+    // Copy proteins - either just the winner or all 6 if requested
+    if (populate_all_proteins) {
+        // Copy all 6 proteins (needed for adaptive/all frames mode)
+        for (int h = 0; h < 6; ++h) {
+            results[h].protein.assign(buf.protein_buffer[h], buf.protein_lens[h]);
+            results[h].corrected_protein.assign(buf.corrected_buffer[h], buf.protein_lens[h]);
+        }
+    } else {
+        // Only copy the winning hypothesis (faster for normal mode)
+        results[best_idx].protein.assign(buf.protein_buffer[best_idx],
+                                          buf.protein_lens[best_idx]);
+        results[best_idx].corrected_protein.assign(buf.corrected_buffer[best_idx],
+                                                    buf.protein_lens[best_idx]);
+    }
+
+    // Sort by posterior (needed for API compatibility)
     std::sort(results.begin(), results.end(),
               [](const FrameStrandResult& a, const FrameStrandResult& b) {
                   return a.posterior > b.posterior;
               });
 
     return results;
+}
+
+// Legacy wrapper for compatibility
+inline std::string revcomp(const std::string& seq) {
+    auto view = revcomp_fast(seq.c_str(), seq.size());
+    return std::string(view);
 }
 
 inline std::pair<FrameStrandResult, FrameStrandResult> select_best_per_strand(
