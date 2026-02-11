@@ -41,13 +41,16 @@ int cmd_sample_damage(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             verbose = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            std::cerr << "Usage: agp sample-damage <input.fq> [options]\n\n";
+            std::cerr << "Ancient Gene Predictor v" << AGP_VERSION << "\n\n";
+            std::cerr << "Usage: agp sample-damage <input> [options]\n\n";
             std::cerr << "Quick sample-level damage profiling (Pass 1 only).\n\n";
             std::cerr << "Options:\n";
-            std::cerr << "  -o, --output FILE     Output JSON file (default: stdout)\n";
-            std::cerr << "  -d, --domain DOMAIN   Domain for hexamer scoring (default: gtdb)\n";
-            std::cerr << "  -t, --threads N       Number of threads (default: auto)\n";
+            std::cerr << "  -o, --output <file>   Output JSON file (default: stdout)\n";
+            std::cerr << "  -d, --domain <name>   Domain for hexamer scoring (default: gtdb)\n";
+            std::cerr << "                        Options: gtdb, fungi, plant, protozoa, invertebrate, viral\n";
+            std::cerr << "  -t, --threads <int>   Number of threads (default: auto)\n";
             std::cerr << "  -v, --verbose         Verbose output\n";
+            std::cerr << "  -h, --help            Show this help\n";
             return 0;
         } else if (argv[i][0] != '-') {
             input_file = argv[i];
@@ -267,16 +270,16 @@ int cmd_sample_damage(int argc, char* argv[]) {
                 std::cerr << "Warning: Pass 2 failed: " << e.what() << "\n";
             }
             // Fall back to Pass 1 d_metamatch
-            d_metamatch_filtered = profile.d_metamatch;
+            d_metamatch_filtered = profile.metamatch.d_metamatch;
         }
 
         // Update profile's d_metamatch with the filtered estimate
-        profile.d_metamatch = d_metamatch_filtered;
+        profile.metamatch.d_metamatch = d_metamatch_filtered;
     } else if (verbose && profile.damage_validated && profile.d_max_combined > 0.05f) {
         // Explain why Pass 2 was skipped
         std::cerr << "\nPass 2 skipped: d_max and Channel B are within 5%\n";
         std::cerr << "Using Channel B-anchored d_metamatch: " << std::fixed
-                  << std::setprecision(1) << (profile.d_metamatch * 100.0f) << "%\n";
+                  << std::setprecision(1) << (profile.metamatch.d_metamatch * 100.0f) << "%\n";
     }
 
     // Determine damage level string
@@ -324,7 +327,7 @@ int cmd_sample_damage(int argc, char* argv[]) {
     *out << "    \"inverted_pattern_5prime\": " << (profile.inverted_pattern_5prime ? "true" : "false") << ",\n";
     *out << "    \"inverted_pattern_3prime\": " << (profile.inverted_pattern_3prime ? "true" : "false") << ",\n";
     *out << "    \"d_max_from_channel_b\": " << std::fixed << std::setprecision(2) << (profile.d_max_from_channel_b * 100.0f) << ",\n";
-    *out << "    \"d_metamatch\": " << std::fixed << std::setprecision(2) << (profile.d_metamatch * 100.0f) << ",\n";
+    *out << "    \"d_metamatch\": " << std::fixed << std::setprecision(2) << (profile.metamatch.d_metamatch * 100.0f) << ",\n";
     *out << "    \"metamatch_high_damage_reads\": " << n_high_damage_reads << ",\n";
     *out << "    \"metamatch_high_damage_pct\": " << std::fixed << std::setprecision(2)
          << (total_reads > 0 ? 100.0f * n_high_damage_reads / total_reads : 0.0f) << ",\n";

@@ -1,29 +1,27 @@
-name: ancient-gene-predictor
+name: agp
 channels:
   - conda-forge
   - bioconda
   - defaults
 
 dependencies:
-  # C++ compiler and build tools
-  - gcc_linux-64>=10.0
-  - gxx_linux-64>=10.0
+  # Build tools (C++20 required)
+  - gcc>=10.0
+  - gxx>=10.0
   - cmake>=3.18
   - make
 
   # Required libraries
   - zlib
+  - libgomp  # OpenMP runtime
 
-  # Optional: for parallelization
-  - openmp
+  # Recommended workflow tools
+  - pigz      # Fast parallel gzip (used for .gz input)
+  - mmseqs2   # Protein search (use with VTML20 matrix)
 
-  # Python for testing/analysis (optional)
-  - python>=3.8
+  # Python for analysis scripts
+  - python>=3.9
   - numpy
-  - scipy
+  - pandas
   - matplotlib
-  - biopython
-
-  # Development tools
-  - gdb
-  - valgrind
+  - scikit-learn  # For ROC analysis

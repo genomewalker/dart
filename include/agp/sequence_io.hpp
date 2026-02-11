@@ -163,43 +163,27 @@ public:
     void write_genes_protein(const std::string& sequence_id,
                             const std::vector<Gene>& genes);
 
-    void close();
-
-private:
-    class Impl;
-    std::unique_ptr<Impl> impl_;
-};
-
-/**
- * Statistics writer for damage model and codon usage
- */
-class StatsWriter {
-public:
-    explicit StatsWriter(const std::string& filename);
-    ~StatsWriter();
+    /**
+     * Write genes as corrected amino acid FASTA (for benchmarking)
+     * Outputs corrected_protein instead of original protein
+     */
+    void write_genes_protein_corrected(const std::string& sequence_id,
+                                       const std::vector<Gene>& genes);
 
     /**
-     * Write codon frequency statistics
+     * Write genes as corrected nucleotide FASTA (for benchmarking)
+     * Outputs corrected_sequence instead of original sequence
      */
-    void write_codon_frequencies(const std::map<std::string, float>& frequencies);
+    void write_genes_nucleotide_corrected(const std::string& sequence_id,
+                                          const std::vector<Gene>& genes);
 
     /**
-     * Write damage model parameters
+     * Write genes as search-optimized amino acid FASTA
+     * Terminal damage-convertible stops are masked as X (unknown AA)
+     * This improves MMseqs2 alignment sensitivity without making false AA claims
      */
-    void write_damage_parameters(float lambda_5p, float lambda_3p,
-                                 float delta_max, float delta_bg);
-
-    /**
-     * Write damage profile (position-specific rates)
-     */
-    void write_damage_profile(const std::vector<float>& ct_profile,
-                             const std::vector<float>& ga_profile);
-
-    /**
-     * Write organism statistics (GC content, ENC, etc.)
-     */
-    void write_organism_stats(float gc_content, float enc,
-                             const std::map<std::string, float>& rscu);
+    void write_genes_protein_search(const std::string& sequence_id,
+                                    const std::vector<Gene>& genes);
 
     void close();
 

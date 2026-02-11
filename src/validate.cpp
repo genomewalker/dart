@@ -15,6 +15,11 @@
  * - True protein: intersect_seq_inframe_aa (undamaged translation)
  */
 
+#ifndef AGP_STANDALONE_VALIDATE
+#include "cli/subcommand.hpp"
+#endif
+#include "agp/codon_tables.hpp"
+#include "agp/version.h"
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -22,7 +27,6 @@
 #include <unordered_set>
 #include <vector>
 #include <array>
-#include <sstream>
 #include <tuple>
 #include <zlib.h>
 #include <iomanip>
@@ -33,6 +37,27 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+
+namespace {
+
+// Manual tab-split: returns field count and populates starts/ends arrays
+size_t split_tabs(const std::string& line, size_t* starts, size_t* ends, size_t max_fields) {
+    size_t n = 0;
+    size_t pos = 0;
+    size_t len = line.size();
+    while (pos <= len && n < max_fields) {
+        starts[n] = pos;
+        size_t tab = line.find('\t', pos);
+        ends[n] = (tab != std::string::npos) ? tab : len;
+        n++;
+        pos = (tab != std::string::npos) ? tab + 1 : len + 1;
+    }
+    return n;
+}
+
+std::string field_str(const std::string& line, size_t start, size_t end) {
+    return line.substr(start, end - start);
+}
 
 // Ground truth for a single read
 struct GroundTruth {
@@ -72,8 +97,10 @@ struct Prediction {
     char strand = '+';        // Predicted strand
     int frame = 0;            // Predicted frame (0, 1, 2)
     std::string protein;      // Predicted protein sequence
-    float ancient_prob = 0.5f;
+    float damage_signal = 0.5f;
     float coding_prob = 0.0f;
+    float score = 0.0f;       // Prediction score
+    float damage_pct = 0.0f;  // Per-read damage percentage
 };
 
 // Validation metrics
@@ -105,7 +132,7 @@ struct Metrics {
     size_t both_correct = 0;
     size_t both_total = 0;
 
-    // Sequence identity (only for correct strand predictions)
+    // Sequence identity (all predictions)
     double total_identity = 0.0;
     size_t identity_count = 0;
     size_t exact_matches = 0;
@@ -113,8 +140,22 @@ struct Metrics {
     size_t medium_identity = 0; // 50-90%
     size_t low_identity = 0;   // <50%
 
+    // Identity stratified by correctness (to assess damage correction)
+    double identity_correct_both = 0.0;   // Both frame AND strand correct
+    size_t count_correct_both = 0;
+    double identity_wrong_frame = 0.0;    // Wrong frame (regardless of strand)
+    size_t count_wrong_frame = 0;
+    double identity_wrong_strand = 0.0;   // Wrong strand (regardless of frame)
+    size_t count_wrong_strand = 0;
+
+    // Corrected protein identity (if --fasta-corrected provided)
+    double total_corrected_identity = 0.0;
+    size_t corrected_identity_count = 0;
+    double corrected_identity_correct_both = 0.0;
+    size_t corrected_count_correct_both = 0;
+
     // Damage detection
-    size_t damage_tp = 0;  // Has damage and detected (ancient_prob > 0.5)
+    size_t damage_tp = 0;  // Has damage and detected (damage_signal > 0.5)
     size_t damage_fp = 0;  // No damage but detected
     size_t damage_tn = 0;  // No damage and not detected
     size_t damage_fn = 0;  // Has damage but not detected
@@ -131,16 +172,20 @@ std::vector<int> parse_damage_positions(const std::string& damage_str) {
     std::vector<int> positions;
     if (damage_str.empty() || damage_str == "None") return positions;
 
-    std::istringstream iss(damage_str);
-    std::string token;
-    while (std::getline(iss, token, ',')) {
-        try {
-            token.erase(0, token.find_first_not_of(" \t"));
-            token.erase(token.find_last_not_of(" \t") + 1);
-            if (!token.empty()) {
-                positions.push_back(std::stoi(token));
-            }
-        } catch (...) {}
+    size_t pos = 0;
+    while (pos < damage_str.size()) {
+        size_t comma = damage_str.find(',', pos);
+        size_t end = (comma != std::string::npos) ? comma : damage_str.size();
+        size_t start = pos;
+        // Trim whitespace
+        while (start < end && (damage_str[start] == ' ' || damage_str[start] == '\t')) start++;
+        while (end > start && (damage_str[end-1] == ' ' || damage_str[end-1] == '\t')) end--;
+        if (start < end) {
+            try {
+                positions.push_back(std::stoi(damage_str.substr(start, end - start)));
+            } catch (...) {}
+        }
+        pos = (comma != std::string::npos) ? comma + 1 : damage_str.size();
     }
     return positions;
 }
@@ -171,23 +216,6 @@ size_t count_internal_stops(const std::string& protein) {
     return stops;
 }
 
-// Reverse complement a DNA sequence
-std::string reverse_complement(const std::string& seq) {
-    std::string rc;
-    rc.reserve(seq.size());
-    for (auto it = seq.rbegin(); it != seq.rend(); ++it) {
-        char c = std::toupper(*it);
-        switch (c) {
-            case 'A': rc += 'T'; break;
-            case 'T': rc += 'A'; break;
-            case 'G': rc += 'C'; break;
-            case 'C': rc += 'G'; break;
-            default: rc += 'N'; break;
-        }
-    }
-    return rc;
-}
-
 // Determine true frame by matching damaged_seq against damaged_seq_inframe_nt
 // Returns frame (0, 1, or 2) or -1 if cannot determine
 int determine_true_frame(const std::string& damaged_seq,
@@ -196,7 +224,7 @@ int determine_true_frame(const std::string& damaged_seq,
     if (damaged_seq.empty() || inframe_nt.empty()) return -1;
 
     // Get the sequence to search in (forward or reverse complement)
-    std::string seq = same_strand ? damaged_seq : reverse_complement(damaged_seq);
+    std::string seq = same_strand ? damaged_seq : agp::reverse_complement(damaged_seq);
 
     // Convert to uppercase for comparison
     std::string seq_upper, inframe_upper;
@@ -253,73 +281,69 @@ std::unordered_map<std::string, GroundTruth> load_ground_truth(const std::string
     int col_damaged_seq = -1;       // Full damaged read sequence
     int col_damaged_seq_inframe_nt = -1;  // In-frame portion of damaged sequence
 
+    constexpr size_t MAX_FIELDS = 32;
+    size_t starts[MAX_FIELDS], ends[MAX_FIELDS];
+
     while (gzgets(file, buffer, sizeof(buffer)) != NULL) {
         std::string line(buffer);
         while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
             line.pop_back();
         }
 
-        std::vector<std::string> fields;
-        std::istringstream iss(line);
-        std::string field;
-        while (std::getline(iss, field, '\t')) {
-            fields.push_back(field);
-        }
+        size_t nfields = split_tabs(line, starts, ends, MAX_FIELDS);
 
         if (first_line) {
             first_line = false;
             // Find column indices from header
-            for (size_t i = 0; i < fields.size(); i++) {
-                if (fields[i] == "read_name") col_read_name = i;
-                else if (fields[i] == "Strand_read") col_strand_read = i;
-                else if (fields[i] == "Strand_gene") col_strand_gene = i;
-                else if (fields[i] == "Start_read") col_start_read = i;
-                else if (fields[i] == "End_read") col_end_read = i;
-                else if (fields[i] == "Start_gene") col_start_gene = i;
-                else if (fields[i] == "End_gene") col_end_gene = i;
-                else if (fields[i] == "read_length") col_read_length = i;
-                else if (fields[i] == "intersect_seq_inframe_aa") col_true_protein = i;
-                else if (fields[i] == "damaged_seq_inframe_aa") col_damaged_protein = i;
-                else if (fields[i] == "damaged_seq") col_damaged_seq = i;
-                else if (fields[i] == "damaged_seq_inframe_nt") col_damaged_seq_inframe_nt = i;
+            for (size_t i = 0; i < nfields; i++) {
+                std::string f = field_str(line, starts[i], ends[i]);
+                if (f == "read_name") col_read_name = i;
+                else if (f == "Strand_read") col_strand_read = i;
+                else if (f == "Strand_gene") col_strand_gene = i;
+                else if (f == "Start_read") col_start_read = i;
+                else if (f == "End_read") col_end_read = i;
+                else if (f == "Start_gene") col_start_gene = i;
+                else if (f == "End_gene") col_end_gene = i;
+                else if (f == "read_length") col_read_length = i;
+                else if (f == "intersect_seq_inframe_aa") col_true_protein = i;
+                else if (f == "damaged_seq_inframe_aa") col_damaged_protein = i;
+                else if (f == "damaged_seq") col_damaged_seq = i;
+                else if (f == "damaged_seq_inframe_nt") col_damaged_seq_inframe_nt = i;
             }
             continue;
         }
 
-        if (col_read_name < 0 || static_cast<size_t>(col_read_name) >= fields.size()) continue;
+        if (col_read_name < 0 || static_cast<size_t>(col_read_name) >= nfields) continue;
+
+        // Helper lambda to get field as string
+        auto get_field = [&](int col) -> std::string {
+            if (col >= 0 && static_cast<size_t>(col) < nfields)
+                return field_str(line, starts[col], ends[col]);
+            return {};
+        };
 
         GroundTruth gt;
-        gt.read_id = fields[col_read_name];
+        gt.read_id = get_field(col_read_name);
 
         // Parse coordinates
-        if (col_start_read >= 0 && static_cast<size_t>(col_start_read) < fields.size())
-            gt.read_start = std::atoi(fields[col_start_read].c_str());
-        if (col_end_read >= 0 && static_cast<size_t>(col_end_read) < fields.size())
-            gt.read_end = std::atoi(fields[col_end_read].c_str());
-        if (col_start_gene >= 0 && static_cast<size_t>(col_start_gene) < fields.size())
-            gt.gene_start = std::atoi(fields[col_start_gene].c_str());
-        if (col_end_gene >= 0 && static_cast<size_t>(col_end_gene) < fields.size())
-            gt.gene_end = std::atoi(fields[col_end_gene].c_str());
-        if (col_read_length >= 0 && static_cast<size_t>(col_read_length) < fields.size())
-            gt.read_length = std::atoi(fields[col_read_length].c_str());
+        std::string s;
+        if (!(s = get_field(col_start_read)).empty()) gt.read_start = std::atoi(s.c_str());
+        if (!(s = get_field(col_end_read)).empty()) gt.read_end = std::atoi(s.c_str());
+        if (!(s = get_field(col_start_gene)).empty()) gt.gene_start = std::atoi(s.c_str());
+        if (!(s = get_field(col_end_gene)).empty()) gt.gene_end = std::atoi(s.c_str());
+        if (!(s = get_field(col_read_length)).empty()) gt.read_length = std::atoi(s.c_str());
 
         // Parse strands
-        if (col_strand_read >= 0 && static_cast<size_t>(col_strand_read) < fields.size() && !fields[col_strand_read].empty())
-            gt.strand_read = fields[col_strand_read][0];
-        if (col_strand_gene >= 0 && static_cast<size_t>(col_strand_gene) < fields.size() && !fields[col_strand_gene].empty())
-            gt.strand_gene = fields[col_strand_gene][0];
+        if (!(s = get_field(col_strand_read)).empty()) gt.strand_read = s[0];
+        if (!(s = get_field(col_strand_gene)).empty()) gt.strand_gene = s[0];
 
         // Parse proteins
-        if (col_true_protein >= 0 && static_cast<size_t>(col_true_protein) < fields.size())
-            gt.true_protein = fields[col_true_protein];
-        if (col_damaged_protein >= 0 && static_cast<size_t>(col_damaged_protein) < fields.size())
-            gt.damaged_protein = fields[col_damaged_protein];
+        gt.true_protein = get_field(col_true_protein);
+        gt.damaged_protein = get_field(col_damaged_protein);
 
         // Parse nucleotide sequences for frame determination
-        if (col_damaged_seq >= 0 && static_cast<size_t>(col_damaged_seq) < fields.size())
-            gt.damaged_seq = fields[col_damaged_seq];
-        if (col_damaged_seq_inframe_nt >= 0 && static_cast<size_t>(col_damaged_seq_inframe_nt) < fields.size())
-            gt.damaged_seq_inframe_nt = fields[col_damaged_seq_inframe_nt];
+        gt.damaged_seq = get_field(col_damaged_seq);
+        gt.damaged_seq_inframe_nt = get_field(col_damaged_seq_inframe_nt);
 
         // Compute TRUE STRAND prediction
         // If read strand matches gene strand: AGP should predict FORWARD (use sequence as-is)
@@ -394,8 +418,12 @@ std::unordered_map<std::string, GroundTruth> load_ground_truth(const std::string
         // Has terminal damage if any window has damage
         gt.has_terminal_damage = (max_5prime_window > 0 || max_3prime_window > 0);
 
-        // Only include if we have protein sequence
-        if (!gt.true_protein.empty()) {
+        // Only include reads with COMPLETE ground truth information:
+        // 1. Must have protein sequence
+        // 2. Must have in-frame nucleotide sequence (for accurate frame determination)
+        // Without damaged_seq_inframe_nt, frame is determined by coordinate fallback which
+        // may be inaccurate. Skip these reads to ensure validation quality.
+        if (!gt.true_protein.empty() && !gt.damaged_seq_inframe_nt.empty()) {
             gt_map[gt.read_id] = gt;
         }
     }
@@ -407,11 +435,18 @@ std::unordered_map<std::string, GroundTruth> load_ground_truth(const std::string
 // Parse a GFF line and return a Prediction (supports both AGP and FGS formats)
 Prediction parse_gff_line(const std::string& seqid, const std::string& source,
                           const std::string& start_s, const std::string& end_s,
-                          const std::string& strand_s, const std::string& phase,
-                          const std::string& attrs) {
+                          const std::string& score_s, const std::string& strand_s,
+                          const std::string& phase, const std::string& attrs) {
     Prediction pred;
     pred.read_id = seqid;
     pred.strand = strand_s[0];
+
+    // Parse score from GFF column 6
+    try {
+        pred.score = std::stof(score_s);
+    } catch (...) {
+        pred.score = 0.0f;
+    }
 
     // Detect format: FGS uses "FGS" as source, AGP uses "AGP"
     bool is_fgs = (source == "FGS" || source == "FragGeneScan" || source == "FragGeneScanRs");
@@ -420,16 +455,19 @@ Prediction parse_gff_line(const std::string& seqid, const std::string& source,
         // FGS format: frame is (START - 1) % 3 where START is 1-based
         int start = std::atoi(start_s.c_str());
         pred.frame = (start - 1) % 3;
-        // FGS doesn't have ancient_prob
-        pred.ancient_prob = 0.5f;
+        // FGS doesn't have damage_signal
+        pred.damage_signal = 0.5f;
     } else {
         // AGP format: parse frame= attribute
         size_t pos;
         if ((pos = attrs.find("frame=")) != std::string::npos) {
             pred.frame = std::atoi(attrs.c_str() + pos + 6);
         }
-        if ((pos = attrs.find("ancient_prob=")) != std::string::npos) {
-            pred.ancient_prob = std::stof(attrs.substr(pos + 13));
+        if ((pos = attrs.find("damage_signal=")) != std::string::npos) {
+            pred.damage_signal = std::stof(attrs.substr(pos + 14));  // "damage_signal=" is 14 chars
+        }
+        if ((pos = attrs.find("damage_pct=")) != std::string::npos) {
+            pred.damage_pct = std::stof(attrs.substr(pos + 11));
         }
     }
 
@@ -449,32 +487,48 @@ std::unordered_map<std::string, std::vector<Prediction>> load_predictions_gff(co
             return pred_map;
         }
 
+        size_t gff_starts[16], gff_ends[16];
         std::string line;
         while (std::getline(plain, line)) {
             if (line.empty() || line[0] == '#') continue;
 
-            std::istringstream iss(line);
-            std::string seqid, source, type, start_s, end_s, score_s, strand_s, phase, attrs;
-            if (!(iss >> seqid >> source >> type >> start_s >> end_s >> score_s >> strand_s >> phase)) continue;
-            std::getline(iss, attrs);
+            size_t nf = split_tabs(line, gff_starts, gff_ends, 16);
+            if (nf < 9) continue;
 
-            Prediction pred = parse_gff_line(seqid, source, start_s, end_s, strand_s, phase, attrs);
+            std::string seqid = field_str(line, gff_starts[0], gff_ends[0]);
+            std::string source = field_str(line, gff_starts[1], gff_ends[1]);
+            std::string start_s = field_str(line, gff_starts[3], gff_ends[3]);
+            std::string end_s = field_str(line, gff_starts[4], gff_ends[4]);
+            std::string score_s = field_str(line, gff_starts[5], gff_ends[5]);
+            std::string strand_s = field_str(line, gff_starts[6], gff_ends[6]);
+            std::string phase = field_str(line, gff_starts[7], gff_ends[7]);
+            std::string attrs = field_str(line, gff_starts[8], gff_ends[8]);
+
+            Prediction pred = parse_gff_line(seqid, source, start_s, end_s, score_s, strand_s, phase, attrs);
             pred_map[seqid].push_back(pred);
         }
         return pred_map;
     }
 
+    size_t gff_starts[16], gff_ends[16];
     char buffer[65536];
     while (gzgets(file, buffer, sizeof(buffer)) != NULL) {
         if (buffer[0] == '#' || buffer[0] == '\n') continue;
 
         std::string line(buffer);
-        std::istringstream iss(line);
-        std::string seqid, source, type, start_s, end_s, score_s, strand_s, phase, attrs;
-        if (!(iss >> seqid >> source >> type >> start_s >> end_s >> score_s >> strand_s >> phase)) continue;
-        std::getline(iss, attrs);
+        size_t nf = split_tabs(line, gff_starts, gff_ends, 16);
+        if (nf < 9) continue;
 
-        Prediction pred = parse_gff_line(seqid, source, start_s, end_s, strand_s, phase, attrs);
+        std::string seqid = field_str(line, gff_starts[0], gff_ends[0]);
+        std::string source = field_str(line, gff_starts[1], gff_ends[1]);
+        std::string start_s = field_str(line, gff_starts[3], gff_ends[3]);
+        std::string end_s = field_str(line, gff_starts[4], gff_ends[4]);
+        std::string score_s = field_str(line, gff_starts[5], gff_ends[5]);
+        std::string strand_s = field_str(line, gff_starts[6], gff_ends[6]);
+        std::string phase = field_str(line, gff_starts[7], gff_ends[7]);
+        std::string attrs = field_str(line, gff_starts[8], gff_ends[8]);
+
+        Prediction pred = parse_gff_line(seqid, source, start_s, end_s, score_s, strand_s, phase, attrs);
         pred_map[seqid].push_back(pred);
     }
 
@@ -555,12 +609,33 @@ std::unordered_map<std::string, std::vector<std::pair<char, std::string>>> load_
 
             std::string header = line.substr(1);
 
-            // Detect format: AGP starts with "protein_N ", FGS is just the full ID
-            if (header.substr(0, 8) == "protein_") {
-                // AGP format: >protein_N READ_ID_gene_N STRAND ...
-                std::istringstream iss(header);
-                std::string protein_name, read_id_gene, strand_s;
-                iss >> protein_name >> read_id_gene >> strand_s;
+            // Detect format:
+            // - AGP new: READ_NAME_+_N or READ_NAME_-_N (strand embedded in ID)
+            // - AGP old: protein_N READ_ID_gene_N STRAND ...
+            // - FGS: READ_ID_START_END_STRAND
+
+            // First extract the sequence ID (everything before space)
+            size_t space_pos = header.find(' ');
+            std::string seq_id = (space_pos != std::string::npos) ? header.substr(0, space_pos) : header;
+
+            // Check for AGP new format: ends with _+_N or _-_N
+            size_t plus_pos = seq_id.rfind("_+_");
+            size_t minus_pos = seq_id.rfind("_-_");
+
+            if (plus_pos != std::string::npos || minus_pos != std::string::npos) {
+                // AGP new format: READ_NAME_+_N or READ_NAME_-_N
+                size_t strand_pos = (plus_pos != std::string::npos) ? plus_pos : minus_pos;
+                current_id = seq_id.substr(0, strand_pos);
+                current_strand = (plus_pos != std::string::npos) ? '+' : '-';
+            } else if (header.substr(0, 8) == "protein_" || header.substr(0, 10) == "corrected_") {
+                // AGP old format: >protein_N READ_ID_gene_N STRAND ...
+                // Manual whitespace parsing
+                size_t p1 = header.find(' ');
+                size_t p2 = (p1 != std::string::npos) ? header.find(' ', p1 + 1) : std::string::npos;
+                std::string read_id_gene = (p1 != std::string::npos && p2 != std::string::npos) ?
+                    header.substr(p1 + 1, p2 - p1 - 1) : "";
+                std::string strand_s = (p2 != std::string::npos) ?
+                    header.substr(p2 + 1, header.find(' ', p2 + 1) - p2 - 1) : "";
 
                 // Extract read ID (remove _gene_N suffix)
                 size_t gene_pos = read_id_gene.find("_gene_");
@@ -747,8 +822,45 @@ void print_report(const Metrics& m) {
                   << " (" << std::setw(5) << 100.0 * m.medium_identity / m.identity_count << "%)                   │\n";
         std::cout << "│  Low identity (<50%):      " << std::setw(8) << m.low_identity
                   << " (" << std::setw(5) << 100.0 * m.low_identity / m.identity_count << "%)                   │\n";
+        std::cout << "│                                                                     │\n";
+        std::cout << "│  Identity by prediction correctness:                                │\n";
+        if (m.count_correct_both > 0) {
+            double id_correct = 100.0 * m.identity_correct_both / m.count_correct_both;
+            std::cout << "│    Frame+Strand correct: " << std::setw(6) << std::setprecision(1) << id_correct << "% (n=" << std::setw(8) << m.count_correct_both << ")               │\n";
+        }
+        if (m.count_wrong_frame > 0) {
+            double id_wrong_f = 100.0 * m.identity_wrong_frame / m.count_wrong_frame;
+            std::cout << "│    Wrong frame:          " << std::setw(6) << std::setprecision(1) << id_wrong_f << "% (n=" << std::setw(8) << m.count_wrong_frame << ")               │\n";
+        }
+        if (m.count_wrong_strand > 0) {
+            double id_wrong_s = 100.0 * m.identity_wrong_strand / m.count_wrong_strand;
+            std::cout << "│    Wrong strand:         " << std::setw(6) << std::setprecision(1) << id_wrong_s << "% (n=" << std::setw(8) << m.count_wrong_strand << ")               │\n";
+        }
     }
     std::cout << "└─────────────────────────────────────────────────────────────────────┘\n\n";
+
+    // Corrected protein identity (if available)
+    if (m.corrected_identity_count > 0) {
+        std::cout << "┌─────────────────────────────────────────────────────────────────────┐\n";
+        std::cout << "│ 5b. DAMAGE-CORRECTED PROTEIN IDENTITY                               │\n";
+        std::cout << "├─────────────────────────────────────────────────────────────────────┤\n";
+        double avg_corr = 100.0 * m.total_corrected_identity / m.corrected_identity_count;
+        double avg_orig = 100.0 * m.total_identity / m.identity_count;
+        double improvement = avg_corr - avg_orig;
+        std::cout << "│  Sequences compared: " << std::setw(10) << m.corrected_identity_count << "                               │\n";
+        std::cout << "│  Average corrected:  " << std::setw(10) << std::setprecision(1) << avg_corr << "%                              │\n";
+        std::cout << "│  Average original:   " << std::setw(10) << std::setprecision(1) << avg_orig << "%                              │\n";
+        std::cout << "│  Improvement:        " << std::setw(10) << std::showpos << improvement << "%" << std::noshowpos << "                              │\n";
+        if (m.corrected_count_correct_both > 0 && m.count_correct_both > 0) {
+            double corr_correct = 100.0 * m.corrected_identity_correct_both / m.corrected_count_correct_both;
+            double orig_correct = 100.0 * m.identity_correct_both / m.count_correct_both;
+            double improve_correct = corr_correct - orig_correct;
+            std::cout << "│                                                                     │\n";
+            std::cout << "│  For correct frame+strand predictions:                              │\n";
+            std::cout << "│    Corrected: " << std::setw(6) << std::setprecision(1) << corr_correct << "%  Original: " << std::setw(6) << orig_correct << "%  Δ: " << std::showpos << std::setw(6) << improve_correct << "%" << std::noshowpos << "      │\n";
+        }
+        std::cout << "└─────────────────────────────────────────────────────────────────────┘\n\n";
+    }
 
     // Damage detection
     std::cout << "┌───────────────────────────────────────────────────────────────────────────────────────┐\n";
@@ -849,28 +961,56 @@ void print_report(const Metrics& m) {
     std::cout << "╚══════════════════════════════════════════════════════════════════════╝\n";
 }
 
-void print_usage(const char* prog) {
-    std::cerr << "AGP Unified Validator\n\n";
-    std::cerr << "Usage: " << prog << " <fastq.gz> <aa-damage.tsv.gz> <predictions.gff> [proteins.faa]\n\n";
-    std::cerr << "Arguments:\n";
-    std::cerr << "  fastq.gz          Input FASTQ file (gzipped)\n";
-    std::cerr << "  aa-damage.tsv.gz  Ground truth from aMGSIM\n";
-    std::cerr << "  predictions.gff   AGP GFF3 output\n";
-    std::cerr << "  proteins.faa      AGP protein FASTA (optional, for sequence identity)\n\n";
+static void validate_print_usage([[maybe_unused]] const char* prog) {
+    std::cerr << "Ancient Gene Predictor v" << AGP_VERSION << "\n\n";
+    std::cerr << "Usage: agp validate <fastq> <ground-truth> <predictions> [options]\n\n";
+    std::cerr << "Validate predictions against aMGSIM ground truth.\n\n";
+    std::cerr << "Required:\n";
+    std::cerr << "  <fastq>               Input FASTQ file (.gz supported)\n";
+    std::cerr << "  <ground-truth>        Ground truth TSV from aMGSIM (.gz)\n";
+    std::cerr << "  <predictions>         AGP/FGS GFF3 predictions\n\n";
+    std::cerr << "Options:\n";
+    std::cerr << "  <proteins.faa>        Protein FASTA (for sequence identity)\n";
+    std::cerr << "  <corrected.faa>       Damage-corrected protein FASTA\n";
+    std::cerr << "  --csv <file>          Output per-read details to CSV\n";
+    std::cerr << "  -h, --help            Show this help\n\n";
+    std::cerr << "Supports both AGP and FragGeneScan GFF formats.\n\n";
     std::cerr << "Example:\n";
-    std::cerr << "  " << prog << " reads.fq.gz ground_truth.tsv.gz agp_output.gff agp_output.faa\n";
+    std::cerr << "  agp validate reads.fq.gz truth.tsv.gz pred.gff pred.faa --csv details.csv\n";
 }
 
-int main(int argc, char* argv[]) {
+static int validate_main(int argc, char* argv[]) {
+    // Handle help flag
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            validate_print_usage(argv[0]);
+            return 0;
+        }
+    }
+
     if (argc < 4) {
-        print_usage(argv[0]);
+        validate_print_usage(argv[0]);
         return 1;
     }
 
     std::string fastq_path = argv[1];
     std::string truth_path = argv[2];
     std::string gff_path = argv[3];
-    std::string protein_path = (argc > 4) ? argv[4] : "";
+    std::string protein_path;
+    std::string corrected_path;
+    std::string csv_path;
+
+    // Parse optional arguments
+    for (int i = 4; i < argc; i++) {
+        std::string arg = argv[i];
+        if (arg == "--csv" && i + 1 < argc) {
+            csv_path = argv[++i];
+        } else if (protein_path.empty()) {
+            protein_path = arg;
+        } else if (corrected_path.empty()) {
+            corrected_path = arg;
+        }
+    }
 
     Metrics m;
 
@@ -892,6 +1032,13 @@ int main(int argc, char* argv[]) {
         std::cerr << "  Loaded proteins for " << proteins.size() << " reads\n";
     }
 
+    std::unordered_map<std::string, std::vector<std::pair<char, std::string>>> corrected_proteins;
+    if (!corrected_path.empty()) {
+        std::cerr << "Loading corrected proteins..." << std::endl;
+        corrected_proteins = load_proteins(corrected_path);
+        std::cerr << "  Loaded corrected proteins for " << corrected_proteins.size() << " reads\n";
+    }
+
     std::cerr << "Counting total reads..." << std::endl;
     m.total_reads = count_fastq_reads(fastq_path);
     std::cerr << "  Total reads: " << m.total_reads << "\n";
@@ -902,6 +1049,19 @@ int main(int argc, char* argv[]) {
     std::unordered_set<std::string> predicted_ids;
     for (const auto& [id, _] : predictions) {
         predicted_ids.insert(id);
+    }
+
+    // Open CSV file if requested
+    std::ofstream csv_file;
+    if (!csv_path.empty()) {
+        csv_file.open(csv_path);
+        if (!csv_file.is_open()) {
+            std::cerr << "Error: Cannot open CSV file: " << csv_path << std::endl;
+            return 1;
+        }
+        // Write header
+        csv_file << "read_id\tlength\tpred_strand\tpred_frame\ttrue_strand\ttrue_frame\t"
+                 << "score\tdamage_pct\tdamage_signal\tstrand_correct\tframe_correct\tboth_correct\tidentity\n";
     }
 
     for (const auto& [read_id, gt] : ground_truth) {
@@ -922,7 +1082,7 @@ int main(int argc, char* argv[]) {
         // For evaluation, we check if ANY prediction matches ground truth
         bool frame_match = false;
         bool strand_match = false;
-        float best_ancient_prob = 0.0f;
+        float best_damage_signal = 0.0f;
 
         for (const auto& pred : preds) {
             bool pred_forward = (pred.strand == '+');
@@ -937,7 +1097,7 @@ int main(int argc, char* argv[]) {
                 frame_match = true;
             }
 
-            best_ancient_prob = std::max(best_ancient_prob, pred.ancient_prob);
+            best_damage_signal = std::max(best_damage_signal, pred.damage_signal);
         }
 
         // Frame accuracy
@@ -969,8 +1129,8 @@ int main(int argc, char* argv[]) {
         }
 
         // Damage detection
-        m.damage_scores.push_back({best_ancient_prob, gt.has_terminal_damage});
-        bool detected_damage = (best_ancient_prob > 0.5f);
+        m.damage_scores.push_back({best_damage_signal, gt.has_terminal_damage});
+        bool detected_damage = (best_damage_signal > 0.5f);
         if (gt.has_terminal_damage) {
             if (detected_damage) m.damage_tp++;
             else m.damage_fn++;
@@ -1012,6 +1172,20 @@ int main(int argc, char* argv[]) {
                     m.low_identity++;
                 }
 
+                // Stratified identity by correctness
+                if (frame_match && strand_match) {
+                    m.identity_correct_both += best_identity;
+                    m.count_correct_both++;
+                }
+                if (!frame_match) {
+                    m.identity_wrong_frame += best_identity;
+                    m.count_wrong_frame++;
+                }
+                if (!strand_match) {
+                    m.identity_wrong_strand += best_identity;
+                    m.count_wrong_strand++;
+                }
+
                 // Stop codon analysis
                 if (has_stops) {
                     m.predictions_with_stops++;
@@ -1023,6 +1197,66 @@ int main(int argc, char* argv[]) {
                 }
             }
         }
+
+        // Corrected protein identity (if available)
+        if (!corrected_proteins.empty() && !gt.true_protein.empty()) {
+            auto corr_it = corrected_proteins.find(read_id);
+            if (corr_it != corrected_proteins.end()) {
+                double best_corr_identity = 0.0;
+                for (const auto& [strand, seq] : corr_it->second) {
+                    double id = calculate_identity(seq, gt.true_protein);
+                    if (id > best_corr_identity) {
+                        best_corr_identity = id;
+                    }
+                }
+
+                m.corrected_identity_count++;
+                m.total_corrected_identity += best_corr_identity;
+
+                if (frame_match && strand_match) {
+                    m.corrected_identity_correct_both += best_corr_identity;
+                    m.corrected_count_correct_both++;
+                }
+            }
+        }
+
+        // Write CSV output if requested
+        if (csv_file.is_open() && !preds.empty()) {
+            const auto& pred = preds[0];  // Use first (best) prediction
+            char true_strand = gt.true_forward ? '+' : '-';
+
+            // Get identity if available
+            double identity = 0.0;
+            if (!proteins.empty() && !gt.true_protein.empty()) {
+                auto prot_it = proteins.find(read_id);
+                if (prot_it != proteins.end()) {
+                    for (const auto& [strand, seq] : prot_it->second) {
+                        double id = calculate_identity(seq, gt.true_protein);
+                        if (id > identity) identity = id;
+                    }
+                }
+            }
+
+            csv_file << read_id << "\t"
+                     << gt.read_length << "\t"
+                     << pred.strand << "\t"
+                     << pred.frame << "\t"
+                     << true_strand << "\t"
+                     << gt.true_frame << "\t"
+                     << pred.score << "\t"
+                     << pred.damage_pct << "\t"
+                     << pred.damage_signal << "\t"
+                     << (strand_match ? 1 : 0) << "\t"
+                     << (frame_match ? 1 : 0) << "\t"
+                     << ((frame_match && strand_match) ? 1 : 0) << "\t"
+                     << identity << "\n";
+        }
+    }
+
+    // Close CSV file
+    if (csv_file.is_open()) {
+        csv_file.close();
+        std::cerr << "Wrote per-read details to: " << csv_path << std::endl;
     }
 
     // Count false positives (predicted but not in ground truth)
@@ -1040,3 +1274,35 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
+
+}  // anonymous namespace
+
+#ifdef AGP_STANDALONE_VALIDATE
+// Standalone mode: provide main() directly
+int main(int argc, char* argv[]) {
+    return validate_main(argc, argv);
+}
+#else
+// Subcommand mode: register with dispatcher
+namespace agp {
+namespace cli {
+
+int cmd_validate(int argc, char* argv[]) {
+    return validate_main(argc, argv);
+}
+
+// Register the validate subcommand
+namespace {
+    struct ValidateRegistrar {
+        ValidateRegistrar() {
+            SubcommandRegistry::instance().register_command(
+                "validate",
+                "Validate predictions against aMGSIM ground truth",
+                cmd_validate, 50);
+        }
+    } validate_registrar;
+}
+
+}  // namespace cli
+}  // namespace agp
+#endif
