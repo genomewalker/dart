@@ -416,7 +416,7 @@ The strong correlation (r = 0.807) demonstrates that AGP's reference-free estima
 
 **Limitations**: Channel B validation requires sufficient convertible codon coverage (typically >10,000 reads containing CAA, CAG, or CGA at terminal positions). Very short reads (<60 bp) may lack enough interior sequence to establish reliable baseline frequencies. AT-rich organisms can show inverted terminal patterns (lower T at termini than interior), which confounds Channel A; in these cases, Channel B becomes the primary signal.
 
-## Algorithms
+## Methods
 
 ### Damage model
 
@@ -471,6 +471,28 @@ score = 0.80 \cdot p_{read} + 0.40 \cdot I_{nonsyn} + 0.05 \cdot I_{syn}
 ```
 
 Where p_read is the Bayesian damage posterior from terminal nucleotide patterns, and I_nonsyn/I_syn indicate non-synonymous/synonymous damage-consistent substitutions in the alignment.
+
+### Domain-specific models
+
+AGP includes pre-trained hexamer frequency tables for different taxonomic groups, enabling accurate frame selection across diverse organisms:
+
+| Domain | Source | CDS sequences | Description |
+|--------|--------|---------------|-------------|
+| gtdb | GTDB r220 | 405M | Bacteria and archaea (default) |
+| fungi | RefSeq | 6.8M | Fungal eukaryotes |
+| plant | RefSeq | 9.2M | Land plants |
+| protozoa | RefSeq | 1.2M | Single-celled eukaryotes |
+| invertebrate | RefSeq | 12.9M | Invertebrate animals |
+| vertebrate_mammalian | RefSeq | 12.9M | Mammals |
+| vertebrate_other | RefSeq | 21.3M | Non-mammalian vertebrates |
+| viral | RefSeq | 0.7M | Viruses |
+
+Each domain has three types of hexamer tables:
+- **Overall frequencies**: Codon-pair (dicodon) patterns for coding potential scoring
+- **Positional frequencies**: Position-specific patterns for start/internal/end regions
+- **Damage likelihood ratios**: Log-likelihood ratios for damage-consistent patterns
+
+For ancient environmental metagenomes, the default `gtdb` domain works well since bacterial sequences typically dominate. Use `--domain` to specify a different taxonomic group when analyzing samples with known composition.
 
 ## Citation
 
