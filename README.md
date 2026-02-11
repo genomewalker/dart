@@ -227,6 +227,9 @@ AGP solves this with two independent signals:
 
 **Channel B (Stop codon conversion)**: Tracks CAA→TAA, CAG→TAG, CGA→TGA conversions. These can ONLY be elevated by real C→T damage. Interior reads provide baseline; terminal excess indicates authentic damage.
 
+![Damage Profile](docs/damage_profile_combined.png)
+*Terminal damage profiles showing characteristic "smiley" pattern: elevated T/(T+C) at 5' end (left) and A/(A+G) at 3' end (right), decaying exponentially toward interior.*
+
 Decision logic:
 - Channel A fires AND Channel B fires → **Real damage** (report d_max)
 - Channel A fires BUT Channel B flat → **Compositional artifact** (d_max = 0)
@@ -300,6 +303,9 @@ Where `has_nonsyn` indicates whether the alignment contains non-synonymous subst
 | 69_B2...-37 | 148,617 | 0.795 |
 | **Weighted mean** | **3,148,845** | **0.78** |
 
+![Read-Level Damage Classification](docs/protein_damage_classification.png)
+*Read-level damage classification performance across 10 KapK samples. Left: score distributions for damaged vs undamaged reads. Center: ROC curves per sample. Right: per-sample AUC values.*
+
 **Classification metrics**: At a threshold of 0.7, this achieves 92% precision and 81% recall for identifying damaged reads. Post-mapping protein-level evaluation yields precision 73% for any damage detection and 67% for AA-changing damage, with 86% recall.
 
 **Information-theoretic constraints**: A single read carries fundamentally limited damage signal because C→T deamination produces thymine indistinguishable from natural thymine without a reference sequence. Consider a single terminal position with d=30% damage rate:
@@ -330,6 +336,9 @@ Authenticating ancient DNA requires estimating the sample-wide damage rate to es
 | 69_34 | 39.50 | 39.00 | +5,332,371 | Validated |
 | 119_48 | 44.98 | 44.00 | +3,818,288 | Validated |
 | 75_205D | 55.82 | 42.00 | +1,481,034 | Validated |
+
+![AGP vs metaDMG](docs/damage_validation_scatter.png)
+*AGP damage estimates vs metaDMG reference-based estimates for 31 archaeological samples. Green points: Channel B validated. Red squares: rejected as compositional artifacts. r = 0.89.*
 
 **Key metrics**:
 
