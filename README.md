@@ -353,13 +353,7 @@ Our validation uses two complementary data sources. The **synthetic community** 
 
 Beyond sample-level estimation, AGP assigns a per-read damage probability (p_read) reflecting the extent to which each read's terminal nucleotide patterns are consistent with ancient DNA deamination. After database search, the `damage-annotate` command combines p_read with alignment-derived evidence—specifically, amino acid substitutions characteristic of C→T and G→A damage—to classify each protein as ancient or modern. This combined score is validated against synthetic ground truth where each read has a known damage status from aMGSIM simulation.
 
-**Methodology**: The evaluation pipeline runs AGP predict with `--adaptive --damage-index` to create a binary damage index containing p_read for each predicted protein. Proteins are then searched against the KEGG database using MMseqs2 with the VTML20 substitution matrix (optimized for damaged sequences). The `damage-annotate` command computes a combined score:
-
-```math
-score = 0.80 \cdot p_{read} + 0.40 \cdot I_{nonsyn} + 0.05 \cdot I_{syn}
-```
-
-Where `I_nonsyn` indicates whether the alignment contains non-synonymous substitutions consistent with damage (D→N, E→K, H→Y, etc.) and `has_syn` indicates synonymous damage patterns. The combined score is evaluated against binary ground truth (read contains any C→T or G→A event) using AUC-ROC.
+**Methodology**: The evaluation pipeline runs AGP predict with `--adaptive --damage-index` to create a binary damage index containing p_read for each predicted protein. Proteins are then searched against the KEGG database using MMseqs2 with the VTML20 substitution matrix (optimized for damaged sequences). The `damage-annotate` command computes the combined score (see Performance section). The score is evaluated against binary ground truth (read contains any C→T or G→A event) using AUC-ROC.
 
 **Per-sample results** (10 synthetic samples, 3.1M reads total):
 
@@ -481,16 +475,6 @@ Frame selection combines multiple signals with learned weights:
 | Damage-frame consistency | variable |
 
 In damage-aware mode, stop penalties are weighted by (1 - P_damage), reducing penalties for likely damage-induced stops.
-
-### Combined damage score
-
-The per-protein damage score integrates pre-mapping and post-mapping evidence:
-
-```math
-score = 0.80 \cdot p_{read} + 0.40 \cdot I_{nonsyn} + 0.05 \cdot I_{syn}
-```
-
-Where p_read is the Bayesian damage posterior from terminal nucleotide patterns, and I_nonsyn/I_syn indicate non-synonymous/synonymous damage-consistent substitutions in the alignment.
 
 ### Domain-specific models
 
