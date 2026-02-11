@@ -46,6 +46,21 @@ This produces:
 
 ### Functional profiling pipeline
 
+```mermaid
+flowchart LR
+    A[reads.fq.gz] --> B[agp predict]
+    B --> C[proteins.faa]
+    B --> D[index.agd]
+    C --> E[MMseqs2 search]
+    E --> F[hits.tsv]
+    F --> G[agp damage-annotate]
+    D --> G
+    G --> H[annotated_hits.tsv]
+
+    style B fill:#bbdefb
+    style G fill:#bbdefb
+```
+
 Search predicted proteins against KEGG for pathway analysis:
 
 ```bash
@@ -207,6 +222,32 @@ Per-read output from `damage-annotate`:
 
 ### Two-pass architecture
 
+```mermaid
+flowchart TB
+    subgraph Pass1["Pass 1: Damage estimation"]
+        A[FASTQ input] --> B[Scan terminal nucleotides]
+        B --> C[Compute T/T+C at 5']
+        B --> D[Compute A/A+G at 3']
+        C --> E[Fit exponential decay]
+        D --> E
+        E --> F[Estimate d_max, λ]
+        F --> G[Channel B validation]
+        G --> H[SampleDamageProfile]
+    end
+
+    subgraph Pass2["Pass 2: Gene prediction"]
+        H --> I[Per-read frame selection]
+        A --> I
+        I --> J[Six-frame translation]
+        J --> K[Damage-aware scoring]
+        K --> L[Stop codon rescue]
+        L --> M[GFF + proteins]
+    end
+
+    style Pass1 fill:#e1f5fe
+    style Pass2 fill:#f3e5f5
+```
+
 **Pass 1** scans all reads to estimate sample-wide damage:
 - Terminal nucleotide frequencies: T/(T+C) at 5', A/(A+G) at 3'
 - Exponential decay fitting: δ(p) = δ_max · e^(-λp)
@@ -231,10 +272,19 @@ AGP solves this with two independent signals:
 
 *Terminal damage profiles showing characteristic "smiley" pattern: elevated T/(T+C) at 5' end and A/(A+G) at 3' end, decaying exponentially toward interior.*
 
-Decision logic:
-- Channel A fires AND Channel B fires → **Real damage** (report d_max)
-- Channel A fires BUT Channel B flat → **Compositional artifact** (d_max = 0)
-- Neither fires → **No damage** (d_max = 0)
+**Decision logic:**
+
+```mermaid
+flowchart LR
+    A{Channel A<br/>T/T+C elevated?} -->|Yes| B{Channel B<br/>stop excess?}
+    A -->|No| C[No damage<br/>d_max = 0]
+    B -->|Yes| D[Real damage<br/>report d_max]
+    B -->|No| E[Artifact<br/>d_max = 0]
+
+    style D fill:#c8e6c9
+    style C fill:#ffcdd2
+    style E fill:#ffcdd2
+```
 
 ### Per-protein damage scoring
 
