@@ -1,4 +1,5 @@
 #include "agp/sequence_io.hpp"
+#include "agp/codon_tables.hpp"
 #include <fstream>
 #include <sstream>
 #include <algorithm>
@@ -7,12 +8,27 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <stdexcept>
 #include <zlib.h>
 
 namespace agp {
 
 // Large I/O buffer for better throughput (4MB like fastq-rmdup)
 constexpr size_t GZBUF_SIZE = 4 * 1024 * 1024;
+
+// Shell-escape a filename for use with popen
+static std::string shell_escape(const std::string& arg) {
+    std::string escaped = "'";
+    for (char c : arg) {
+        if (c == '\'') {
+            escaped += "'\\''";
+        } else {
+            escaped += c;
+        }
+    }
+    escaped += "'";
+    return escaped;
+}
 
 // Check if a command exists in PATH
 static bool command_exists(const char* cmd) {
@@ -46,7 +62,7 @@ public:
                 const char* pigz_threads_env = std::getenv("AGP_PIGZ_THREADS");
                 int pigz_threads = pigz_threads_env ? std::atoi(pigz_threads_env) : 4;
                 if (pigz_threads < 1) pigz_threads = 4;
-                std::string cmd = "pigz -dc -p " + std::to_string(pigz_threads) + " \"" + filename + "\"";
+                std::string cmd = "pigz -dc -p " + std::to_string(pigz_threads) + " " + shell_escape(filename);
                 pipe_file_ = popen(cmd.c_str(), "r");
                 if (pipe_file_) {
                     use_pigz_ = true;
@@ -96,23 +112,25 @@ public:
 
     // Read line into existing string (avoids allocation if string has capacity)
     bool getline(std::string& line) {
+        line.clear();
         if (is_gzipped_) {
+            auto read_chunk = [&](auto getter) -> bool {
+                while (true) {
+                    if (!getter()) return !line.empty();
+                    size_t raw_len = strlen(buffer_);
+                    size_t chunk_len = strcspn(buffer_, "\n");
+                    line.append(buffer_, chunk_len);
+                    bool has_newline = (chunk_len < raw_len) && buffer_[chunk_len] == '\n';
+                    if (has_newline || raw_len < sizeof(buffer_) - 1) return true;
+                }
+            };
+
             if (use_pigz_) {
-                if (fgets(buffer_, sizeof(buffer_), pipe_file_)) {
-                    size_t len = strlen(buffer_);
-                    if (len > 0 && buffer_[len-1] == '\n') len--;
-                    line.assign(buffer_, len);
-                    return true;
-                }
-                return false;
+                auto getter = [&]() -> bool { return fgets(buffer_, sizeof(buffer_), pipe_file_) != nullptr; };
+                return read_chunk(getter);
             } else {
-                if (gzgets(gz_file_, buffer_, sizeof(buffer_))) {
-                    size_t len = strlen(buffer_);
-                    if (len > 0 && buffer_[len-1] == '\n') len--;
-                    line.assign(buffer_, len);
-                    return true;
-                }
-                return false;
+                auto getter = [&]() -> bool { return gzgets(gz_file_, buffer_, sizeof(buffer_)) != nullptr; };
+                return read_chunk(getter);
             }
         } else {
             return static_cast<bool>(std::getline(file_, line));
@@ -121,17 +139,50 @@ public:
 
     // Fast path: read directly into buffer, return pointer and length (no string copy)
     const char* getline_fast(size_t& len) {
+        static thread_local std::string dyn_buffer;
+
         if (is_gzipped_) {
-            char* result = use_pigz_ ?
-                fgets(buffer_, sizeof(buffer_), pipe_file_) :
-                gzgets(gz_file_, buffer_, sizeof(buffer_));
-            if (result) {
-                len = strlen(buffer_);
-                if (len > 0 && buffer_[len-1] == '\n') len--;
-                return buffer_;
+            auto read_into_dyn = [&](auto getter) -> const char* {
+                dyn_buffer.clear();
+                while (true) {
+                    if (!getter()) break;
+                    size_t raw_len = strlen(buffer_);
+                    size_t chunk_len = strcspn(buffer_, "\n");
+                    dyn_buffer.append(buffer_, chunk_len);
+                    bool has_newline = (chunk_len < raw_len) && buffer_[chunk_len] == '\n';
+                    if (has_newline || raw_len < sizeof(buffer_) - 1) break;
+                }
+                if (dyn_buffer.empty()) {
+                    len = 0;
+                    return nullptr;
+                }
+                len = dyn_buffer.size();
+                return dyn_buffer.c_str();
+            };
+
+            auto getter_once = [&](auto getter) -> const char* {
+                if (!getter()) {
+                    len = 0;
+                    return nullptr;
+                }
+                size_t raw_len = strlen(buffer_);
+                size_t chunk_len = strcspn(buffer_, "\n");
+                bool has_newline = (chunk_len < raw_len) && buffer_[chunk_len] == '\n';
+                if (has_newline || raw_len < sizeof(buffer_) - 1) {
+                    len = chunk_len;
+                    return buffer_;
+                }
+                // Overflow: accumulate dynamically
+                return read_into_dyn(getter);
+            };
+
+            if (use_pigz_) {
+                auto getter = [&]() -> bool { return fgets(buffer_, sizeof(buffer_), pipe_file_) != nullptr; };
+                return getter_once(getter);
+            } else {
+                auto getter = [&]() -> bool { return gzgets(gz_file_, buffer_, sizeof(buffer_)) != nullptr; };
+                return getter_once(getter);
             }
-            len = 0;
-            return nullptr;
         }
         // For uncompressed, fall back to regular getline
         len = 0;
@@ -354,7 +405,7 @@ GeneWriter::GeneWriter(const std::string& filename)
                       filename.substr(filename.size() - 3) == ".gz");
 
     if (want_gzip && command_exists("pigz")) {
-        std::string cmd = "pigz -c > \"" + filename + "\"";
+        std::string cmd = "pigz -c > " + shell_escape(filename);
         impl_->pipe_file_ = popen(cmd.c_str(), "w");
         if (impl_->pipe_file_) {
             impl_->use_pigz_ = true;
@@ -380,7 +431,11 @@ GeneWriter::GeneWriter(const std::string& filename)
     impl_->write_header();
 }
 
-GeneWriter::~GeneWriter() = default;
+GeneWriter::~GeneWriter() {
+    if (impl_) {
+        close();
+    }
+}
 
 void GeneWriter::write_genes(const std::string& sequence_id,
                              const std::vector<Gene>& genes,
@@ -397,11 +452,18 @@ void GeneWriter::write_gene(const std::string& sequence_id,
                             const std::string& source) {
     // Use snprintf to avoid ostringstream allocation overhead
     // Include frame= attribute for validation tools
-    // Include correction stats if present
+    // frame_pmax = best 6-way posterior, frame_margin = confidence gap (p_max - p_second)
+    // log_lr and dmg_info for downstream aggregation across BLAST hits
     int len;
-    if (gene.dna_corrections > 0) {
+
+    // Check if this is an ORF mode output (has ORF-specific fields set)
+    bool is_orf_mode = (gene.orf_length_score > 0.0f || gene.passed_stops > 0 || gene.x_count > 0);
+
+    if (is_orf_mode) {
+        // ORF mode: include orf_rank, passed_stops, x_count, orf_length_score, per_read_damage
+        // Also include aa_corr and stop_fix for consistency with FASTA headers
         len = snprintf(impl_->fmt_buffer_, sizeof(impl_->fmt_buffer_),
-            "%s\t%s\tgene\t%u\t%u\t%g\t%c\t.\tID=gene%d;frame=%d;ancient_prob=%g;damage_pct=%g;strand_conf=%g;dna_corr=%zu;aa_corr=%zu\n",
+            "%s\t%s\tgene\t%u\t%u\t%g\t%c\t.\tID=gene%d;frame=%d;orf_rank=%zu;orf_len=%g;aa_corr=%zu;stop_fix=%zu;passed_stops=%zu;x_count=%zu;damage_signal=%g;damage_pct=%g;damage_evidence=%g;p_damaged=%g\n",
             sequence_id.c_str(),
             source.c_str(),
             gene.start + 1,  // GFF is 1-based
@@ -410,14 +472,23 @@ void GeneWriter::write_gene(const std::string& sequence_id,
             gene.is_forward ? '+' : '-',
             gene_num,
             gene.frame,
-            gene.ancient_prob,
+            gene.orf_rank,
+            gene.orf_length_score,
+            gene.aa_corrections,
+            gene.stop_restorations,
+            gene.passed_stops,
+            gene.x_count,
+            gene.damage_signal,
             gene.damage_score,
-            gene.strand_conf,
-            gene.dna_corrections,
-            gene.aa_corrections);
+            gene.per_read_damage_evidence,
+            gene.p_read_damaged);
     } else {
+        // Standard mode
+        // Calculate confidence score from protein length
+        float confidence = calculate_confidence(gene.protein.length(), gene.coding_prob);
+
         len = snprintf(impl_->fmt_buffer_, sizeof(impl_->fmt_buffer_),
-            "%s\t%s\tgene\t%u\t%u\t%g\t%c\t.\tID=gene%d;frame=%d;ancient_prob=%g;damage_pct=%g;strand_conf=%g\n",
+            "%s\t%s\tgene\t%u\t%u\t%g\t%c\t.\tID=gene%d;frame=%d;conf=%g;frame_pmax=%g;frame_margin=%g;damage_signal=%g;damage_pct=%g;damage_pctile=%g;p_damaged=%g;log_lr=%g;dmg_info=%g;dna_corr=%zu;aa_corr=%zu;stop_fix=%zu;int_stops=%zu;corr_score=%g\n",
             sequence_id.c_str(),
             source.c_str(),
             gene.start + 1,  // GFF is 1-based
@@ -426,9 +497,24 @@ void GeneWriter::write_gene(const std::string& sequence_id,
             gene.is_forward ? '+' : '-',
             gene_num,
             gene.frame,
-            gene.ancient_prob,
+            confidence,
+            gene.frame_pmax,
+            gene.frame_margin,
+            gene.damage_signal,
             gene.damage_score,
-            gene.strand_conf);
+            gene.damage_pctile,
+            gene.p_read_damaged,
+            gene.damage_log_lr,
+            gene.damage_info,
+            gene.dna_corrections,
+            gene.aa_corrections,
+            gene.stop_restorations,
+            gene.internal_stops,
+            gene.corrected_coding_prob);
+    }
+    // Clamp len to buffer size to prevent read past buffer
+    if (len > 0 && static_cast<size_t>(len) >= sizeof(impl_->fmt_buffer_)) {
+        len = sizeof(impl_->fmt_buffer_) - 1;
     }
     impl_->write(impl_->fmt_buffer_, len);
 }
@@ -442,28 +528,9 @@ void GeneWriter::close() {
     }
 }
 
-// SequenceUtils implementation
+// SequenceUtils implementation - delegates to canonical reverse_complement
 std::string SequenceUtils::reverse_complement(const std::string& seq) {
-    std::string rc = seq;
-    std::reverse(rc.begin(), rc.end());
-    for (char& c : rc) {
-        c = complement(c);
-    }
-    return rc;
-}
-
-char SequenceUtils::complement(char nt) {
-    switch(nt) {
-        case 'A': return 'T';
-        case 'T': return 'A';
-        case 'C': return 'G';
-        case 'G': return 'C';
-        case 'a': return 't';
-        case 't': return 'a';
-        case 'c': return 'g';
-        case 'g': return 'c';
-        default: return nt;
-    }
+    return agp::reverse_complement(seq);
 }
 
 std::string SequenceUtils::translate(const std::string& seq, int frame) {
@@ -503,7 +570,7 @@ std::vector<Gene> SequenceUtils::find_orfs(const std::string& seq,
                     gene.sequence = seq.substr(start, end - start);
                     gene.protein = translate(gene.sequence, 0);
                     gene.score = 0.0f;
-                    gene.ancient_prob = 0.5f;
+                    gene.damage_signal = 0.5f;
                     orfs.push_back(gene);
                 }
             }
@@ -535,7 +602,7 @@ std::vector<Gene> SequenceUtils::find_orfs(const std::string& seq,
                     gene.sequence = seq.substr(gene.start, gene.end - gene.start);
                     gene.protein = translate(rc.substr(start, end - start), 0);
                     gene.score = 0.0f;
-                    gene.ancient_prob = 0.5f;
+                    gene.damage_signal = 0.5f;
                     orfs.push_back(gene);
                 }
             }
@@ -662,7 +729,7 @@ FastaWriter::FastaWriter(const std::string& filename)
                       filename.substr(filename.size() - 3) == ".gz");
 
     if (want_gzip && command_exists("pigz")) {
-        std::string cmd = "pigz -c > \"" + filename + "\"";
+        std::string cmd = "pigz -c > " + shell_escape(filename);
         impl_->pipe_file_ = popen(cmd.c_str(), "w");
         if (impl_->pipe_file_) {
             impl_->use_pigz_ = true;
@@ -687,11 +754,7 @@ FastaWriter::FastaWriter(const std::string& filename)
 
 FastaWriter::~FastaWriter() {
     if (impl_) {
-        if (impl_->use_pigz_ && impl_->pipe_file_) {
-            pclose(impl_->pipe_file_);
-        } else if (impl_->file_.is_open()) {
-            impl_->file_.close();
-        }
+        close();
     }
 }
 
@@ -721,11 +784,15 @@ void FastaWriter::write_genes_nucleotide(const std::string& sequence_id,
                                          const std::vector<Gene>& genes) {
     for (size_t i = 0; i < genes.size(); ++i) {
         const auto& gene = genes[i];
-        impl_->gene_counter_++;
 
-        // Use corrected sequence if available, otherwise original
-        const std::string& output_seq = !gene.corrected_sequence.empty() ?
-            gene.corrected_sequence : gene.sequence;
+        // Always output original (uncorrected) sequence
+        // Use write_genes_nucleotide_corrected() for damage-corrected nucleotides
+        const std::string& output_seq = gene.sequence;
+
+        // Skip genes with empty sequences (no valid ORF found)
+        if (output_seq.empty()) continue;
+
+        impl_->gene_counter_++;
 
         // Use snprintf to avoid ostringstream allocation
         char id_buf[64];
@@ -734,55 +801,190 @@ void FastaWriter::write_genes_nucleotide(const std::string& sequence_id,
         int desc_len;
         if (gene.dna_corrections > 0) {
             desc_len = snprintf(impl_->fmt_buffer_, sizeof(impl_->fmt_buffer_),
-                "%s_gene_%zu %c %u..%u score=%g ancient_prob=%g damage_pct=%g dna_corr=%zu",
+                "%s_gene_%zu %c %u..%u score=%g damage_signal=%g damage_pct=%g p_damaged=%g log_lr=%g dmg_info=%g dna_corr=%zu stop_fix=%zu corr_score=%g",
                 sequence_id.c_str(), i + 1,
                 gene.is_forward ? '+' : '-',
                 gene.start, gene.end,
-                gene.score, gene.ancient_prob, gene.damage_score,
-                gene.dna_corrections);
+                gene.score, gene.damage_signal, gene.damage_score, gene.p_read_damaged,
+                gene.damage_log_lr, gene.damage_info,
+                gene.dna_corrections, gene.stop_restorations, gene.corrected_coding_prob);
         } else {
             desc_len = snprintf(impl_->fmt_buffer_, sizeof(impl_->fmt_buffer_),
-                "%s_gene_%zu %c %u..%u score=%g ancient_prob=%g damage_pct=%g",
+                "%s_gene_%zu %c %u..%u score=%g damage_signal=%g damage_pct=%g p_damaged=%g log_lr=%g dmg_info=%g stop_fix=%zu",
                 sequence_id.c_str(), i + 1,
                 gene.is_forward ? '+' : '-',
                 gene.start, gene.end,
-                gene.score, gene.ancient_prob, gene.damage_score);
+                gene.score, gene.damage_signal, gene.damage_score, gene.p_read_damaged,
+                gene.damage_log_lr, gene.damage_info, gene.stop_restorations);
         }
 
         write_sequence(id_buf, std::string(impl_->fmt_buffer_, desc_len), output_seq);
     }
 }
 
+// Extract the longest ORF (before first stop codon) from a protein sequence
+static std::string extract_longest_orf(const std::string& protein) {
+    // Find first stop codon - output only the ORF before it
+    // This is standard behavior for protein FASTA output (MMseqs2, BLAST compatibility)
+    size_t stop_pos = protein.find('*');
+    if (stop_pos == std::string::npos) {
+        return protein;  // No stops, return full sequence
+    }
+    return protein.substr(0, stop_pos);
+}
+
 void FastaWriter::write_genes_protein(const std::string& sequence_id,
                                       const std::vector<Gene>& genes) {
     for (size_t i = 0; i < genes.size(); ++i) {
         const auto& gene = genes[i];
+
+        // Extract longest ORF (before first stop) for MMseqs2/BLAST compatibility
+        // Internal stops indicate wrong frame or damage - output clean ORF
+        const std::string output_protein = extract_longest_orf(gene.protein);
+
+        // Skip genes with empty proteins (no valid ORF found)
+        if (output_protein.empty()) continue;
+
         impl_->gene_counter_++;
 
-        // Always output the original protein (what's actually in the DNA)
-        // Corrected protein is metadata, not the biological sequence
-        const std::string& output_protein = gene.protein;
-
-        char id_buf[64];
-        snprintf(id_buf, sizeof(id_buf), "protein_%d", impl_->gene_counter_);
+        // Use read name + strand + gene index as ID for MMseqs2 compatibility
+        // Format: READNAME_+_1 or READNAME_-_1 (allows extracting read name by splitting on _+_ or _-_)
+        char id_buf[1024];
+        snprintf(id_buf, sizeof(id_buf), "%s_%c_%zu",
+            sequence_id.c_str(),
+            gene.is_forward ? '+' : '-',
+            i + 1);
 
         int desc_len;
-        if (gene.aa_corrections > 0) {
-            desc_len = snprintf(impl_->fmt_buffer_, sizeof(impl_->fmt_buffer_),
-                "%s_gene_%zu %c %u..%u length=%zuaa damage_pct=%g aa_corr=%zu",
-                sequence_id.c_str(), i + 1,
-                gene.is_forward ? '+' : '-',
-                gene.start, gene.end,
-                output_protein.length(), gene.damage_score,
-                gene.aa_corrections);
-        } else {
-            desc_len = snprintf(impl_->fmt_buffer_, sizeof(impl_->fmt_buffer_),
-                "%s_gene_%zu %c %u..%u length=%zuaa damage_pct=%g",
-                sequence_id.c_str(), i + 1,
-                gene.is_forward ? '+' : '-',
-                gene.start, gene.end,
-                output_protein.length(), gene.damage_score);
+        desc_len = snprintf(impl_->fmt_buffer_, sizeof(impl_->fmt_buffer_),
+            "%u..%u length=%zuaa damage_pct=%g p_damaged=%g log_lr=%g dmg_info=%g aa_corr=%zu stop_fix=%zu corr_score=%g",
+            gene.start, gene.end,
+            output_protein.length(), gene.damage_score, gene.p_read_damaged,
+            gene.damage_log_lr, gene.damage_info,
+            gene.aa_corrections, gene.stop_restorations, gene.corrected_coding_prob);
+
+        write_sequence(id_buf, std::string(impl_->fmt_buffer_, desc_len), output_protein);
+    }
+}
+
+void FastaWriter::write_genes_protein_corrected(const std::string& sequence_id,
+                                                const std::vector<Gene>& genes) {
+    for (size_t i = 0; i < genes.size(); ++i) {
+        const auto& gene = genes[i];
+
+        // Output the corrected protein (for benchmarking damage correction)
+        // Falls back to original if no correction was made
+        // Extract longest ORF (before first stop) for MMseqs2/BLAST compatibility
+        const std::string output_protein = extract_longest_orf(
+            gene.corrected_protein.empty() ? gene.protein : gene.corrected_protein);
+
+        // Skip genes with empty proteins (no valid ORF found)
+        if (output_protein.empty()) continue;
+
+        impl_->gene_counter_++;
+
+        // Use read name + strand + gene index as ID for MMseqs2 compatibility
+        char id_buf[1024];
+        snprintf(id_buf, sizeof(id_buf), "%s_%c_%zu",
+            sequence_id.c_str(),
+            gene.is_forward ? '+' : '-',
+            i + 1);
+
+        // Calculate confidence score from protein length and coding probability
+        float confidence = calculate_confidence(output_protein.length(), gene.coding_prob);
+
+        int desc_len;
+        desc_len = snprintf(impl_->fmt_buffer_, sizeof(impl_->fmt_buffer_),
+            "%u..%u length=%zuaa conf=%.3f damage_pct=%g aa_corr=%zu stop_fix=%zu",
+            gene.start, gene.end,
+            output_protein.length(), confidence, gene.damage_score,
+            gene.aa_corrections, gene.stop_restorations);
+
+        write_sequence(id_buf, std::string(impl_->fmt_buffer_, desc_len), output_protein);
+    }
+}
+
+void FastaWriter::write_genes_nucleotide_corrected(const std::string& sequence_id,
+                                                    const std::vector<Gene>& genes) {
+    for (size_t i = 0; i < genes.size(); ++i) {
+        const auto& gene = genes[i];
+
+        // Output the corrected nucleotide sequence (for benchmarking damage correction)
+        // Falls back to original if no correction was made
+        const std::string& output_seq = gene.corrected_sequence.empty() ?
+            gene.sequence : gene.corrected_sequence;
+
+        // Skip genes with empty sequences (no valid ORF found)
+        if (output_seq.empty()) continue;
+
+        impl_->gene_counter_++;
+
+        char id_buf[64];
+        snprintf(id_buf, sizeof(id_buf), "corrected_nt_%d", impl_->gene_counter_);
+
+        int desc_len;
+        desc_len = snprintf(impl_->fmt_buffer_, sizeof(impl_->fmt_buffer_),
+            "%s_gene_%zu %c %u..%u length=%zubp damage_pct=%g dna_corr=%zu stop_fix=%zu",
+            sequence_id.c_str(), i + 1,
+            gene.is_forward ? '+' : '-',
+            gene.start, gene.end,
+            output_seq.length(), gene.damage_score,
+            gene.dna_corrections, gene.stop_restorations);
+
+        write_sequence(id_buf, std::string(impl_->fmt_buffer_, desc_len), output_seq);
+    }
+}
+
+void FastaWriter::write_genes_protein_search(const std::string& sequence_id,
+                                             const std::vector<Gene>& genes) {
+    // Search-optimized protein output:
+    // - Early damage-convertible stops are extended with 'X' instead of truncating
+    // - This allows MMseqs2 to align through these positions without penalty
+    // - X is interpreted as "unknown amino acid" and gets neutral scoring
+    // - Better than correction (which makes false claims) or truncation (which loses signal)
+    for (size_t i = 0; i < genes.size(); ++i) {
+        const auto& gene = genes[i];
+
+        // Use pre-computed search_protein from frame_selector (has extension logic)
+        // Falls back to original protein if search_protein is empty
+        const std::string& source_protein = gene.search_protein.empty() ?
+            gene.protein : gene.search_protein;
+
+        // Extract longest ORF (before first real stop) for output
+        // X characters are preserved, only real stops (*) truncate
+        std::string output_protein;
+        for (char c : source_protein) {
+            if (c == '*') break;  // Real stop terminates ORF
+            output_protein += c;   // X characters pass through
         }
+
+        // Skip genes with empty proteins (no valid ORF found)
+        if (output_protein.empty()) continue;
+
+        impl_->gene_counter_++;
+
+        // Use read name + strand + gene index as ID for MMseqs2 compatibility
+        char id_buf[1024];
+        snprintf(id_buf, sizeof(id_buf), "%s_%c_%zu",
+            sequence_id.c_str(),
+            gene.is_forward ? '+' : '-',
+            i + 1);
+
+        // Count X characters for header metadata
+        size_t x_count = 0;
+        for (char c : output_protein) {
+            if (c == 'X') x_count++;
+        }
+
+        // Calculate confidence score from protein length and coding probability
+        float confidence = calculate_confidence(output_protein.length(), gene.coding_prob);
+
+        int desc_len;
+        desc_len = snprintf(impl_->fmt_buffer_, sizeof(impl_->fmt_buffer_),
+            "%u..%u length=%zuaa conf=%.3f x_count=%zu damage_pct=%g p_damaged=%g",
+            gene.start, gene.end,
+            output_protein.length(), confidence, x_count,
+            gene.damage_score, gene.p_read_damaged);
 
         write_sequence(id_buf, std::string(impl_->fmt_buffer_, desc_len), output_protein);
     }
@@ -793,94 +995,6 @@ void FastaWriter::close() {
         pclose(impl_->pipe_file_);
         impl_->pipe_file_ = nullptr;
     } else if (impl_->file_.is_open()) {
-        impl_->file_.close();
-    }
-}
-
-// StatsWriter implementation
-class StatsWriter::Impl {
-public:
-    std::ofstream file_;
-};
-
-StatsWriter::StatsWriter(const std::string& filename)
-    : impl_(std::make_unique<Impl>()) {
-    impl_->file_.open(filename);
-    if (!impl_->file_) {
-        throw std::runtime_error("Failed to open stats file: " + filename);
-    }
-    // Write header
-    impl_->file_ << "# AGP Statistics Output\n";
-    impl_->file_ << "# Generated by Ancient Gene Predictor\n\n";
-}
-
-StatsWriter::~StatsWriter() {
-    if (impl_ && impl_->file_.is_open()) {
-        impl_->file_.close();
-    }
-}
-
-void StatsWriter::write_codon_frequencies(const std::map<std::string, float>& frequencies) {
-    impl_->file_ << "## Codon Frequencies\n";
-    impl_->file_ << "# Codon\tFrequency\n";
-
-    for (const auto& [codon, freq] : frequencies) {
-        impl_->file_ << codon << "\t" << freq << "\n";
-    }
-    impl_->file_ << "\n";
-}
-
-void StatsWriter::write_damage_parameters(float lambda_5p, float lambda_3p,
-                                          float delta_max, float delta_bg) {
-    impl_->file_ << "## Damage Model Parameters\n";
-    impl_->file_ << "lambda_5prime\t" << lambda_5p << "\n";
-    impl_->file_ << "lambda_3prime\t" << lambda_3p << "\n";
-    impl_->file_ << "delta_max\t" << delta_max << "\n";
-    impl_->file_ << "delta_background\t" << delta_bg << "\n";
-    impl_->file_ << "\n";
-}
-
-void StatsWriter::write_damage_profile(const std::vector<float>& ct_profile,
-                                       const std::vector<float>& ga_profile) {
-    impl_->file_ << "## Position-Specific Damage Rates\n";
-    impl_->file_ << "# Position\tC->T_Rate\tG->A_Rate\n";
-
-    size_t max_len = std::max(ct_profile.size(), ga_profile.size());
-    for (size_t i = 0; i < max_len; ++i) {
-        impl_->file_ << i << "\t";
-        if (i < ct_profile.size()) {
-            impl_->file_ << ct_profile[i];
-        } else {
-            impl_->file_ << "NA";
-        }
-        impl_->file_ << "\t";
-        if (i < ga_profile.size()) {
-            impl_->file_ << ga_profile[i];
-        } else {
-            impl_->file_ << "NA";
-        }
-        impl_->file_ << "\n";
-    }
-    impl_->file_ << "\n";
-}
-
-void StatsWriter::write_organism_stats(float gc_content, float enc,
-                                       const std::map<std::string, float>& rscu) {
-    impl_->file_ << "## Organism Statistics\n";
-    impl_->file_ << "GC_content\t" << gc_content << "\n";
-    impl_->file_ << "ENC\t" << enc << "\n";
-    impl_->file_ << "\n";
-
-    impl_->file_ << "## Relative Synonymous Codon Usage (RSCU)\n";
-    impl_->file_ << "# Codon\tRSCU\n";
-    for (const auto& [codon, value] : rscu) {
-        impl_->file_ << codon << "\t" << value << "\n";
-    }
-    impl_->file_ << "\n";
-}
-
-void StatsWriter::close() {
-    if (impl_->file_.is_open()) {
         impl_->file_.close();
     }
 }

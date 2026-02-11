@@ -8,6 +8,9 @@
 
 namespace agp {
 
+// Forward declaration
+class AdaptiveDamageCalibrator;
+
 /**
  * Terminal region damage detection result
  * Focuses on first/last 15bp where damage signal is strongest
@@ -106,14 +109,6 @@ public:
     void update_from_sample_profile(const struct SampleDamageProfile& profile);
 
     /**
-     * Create damage model by estimating from sequences
-     * This infers damage patterns from codon frequency anomalies
-     */
-    static DamageModel estimate_from_sequences(
-        const std::vector<std::string>& sequences,
-        const std::vector<std::vector<State>>& state_paths);
-
-    /**
      * Create a damage profile for a specific sequence
      */
     DamageProfile create_profile(size_t seq_len) const;
@@ -203,19 +198,20 @@ public:
      * Sample-profile-aware damage correction
      *
      * Uses the sample-wide damage profile from Phase 1 to make better correction
-     * decisions, and scales the correction threshold by the per-read ancient_prob.
+     * decisions, and scales the correction threshold by the per-read damage_signal.
      *
      * @param seq DNA sequence to correct
      * @param sample_profile Sample-wide damage profile from Phase 1
-     * @param ancient_prob Per-read damage probability (0-1)
+     * @param damage_signal Per-read damage probability (0-1)
      * @param frame Reading frame offset (0, 1, or 2), or -1 if unknown
      * @return Pair of (corrected sequence, number of corrections made)
      */
     std::pair<std::string, size_t> correct_damage_with_profile(
         const std::string& seq,
         const SampleDamageProfile& sample_profile,
-        float ancient_prob,
-        int frame) const;
+        float damage_signal,
+        int frame,
+        bool allow_hexamer_correction = true) const;
 
     /**
      * Bayesian stop codon correction
@@ -276,6 +272,15 @@ public:
         size_t seq_len) const;
 
     /**
+     * Calculate amino acid probability distribution (allocation-free overload)
+     * Takes 3 chars directly instead of string to avoid substr allocation in hot loops.
+     */
+    std::array<float, 21> calculate_aa_probabilities(
+        char c0, char c1, char c2,
+        size_t codon_start,
+        size_t seq_len) const;
+
+    /**
      * Translate DNA with damage-aware probability distribution
      * Returns the most likely protein and per-position confidence
      *
@@ -323,6 +328,59 @@ public:
         const std::string& codon,
         size_t codon_start,
         const std::string& seq) const;
+
+    /**
+     * Adaptive damage correction using calibrator
+     *
+     * Uses the AdaptiveDamageCalibrator to make smarter correction decisions:
+     * - Per-read damage LLR gating (skip low-signal reads)
+     * - Correction validation (reject corrections that worsen quality)
+     * - Adaptive thresholds based on batch statistics
+     * - Maximum corrections per end limit
+     *
+     * IMPORTANT: For reverse-strand genes, the damage profile is inverted because
+     * gene.sequence is the reverse complement of the original read. The damage
+     * patterns are:
+     * - Forward strand: C→T at 5' end, G→A at 3' end of gene.sequence
+     * - Reverse strand: G→A at 5' end, C→T at 3' end of gene.sequence
+     *   (because the 5' end of gene.sequence is the 3' end of the original read)
+     *
+     * @param seq DNA sequence to correct
+     * @param sample_profile Sample-wide damage profile from Phase 1
+     * @param damage_signal Per-read damage probability (0-1)
+     * @param frame Reading frame offset (0, 1, or 2), or -1 if unknown
+     * @param calibrator Adaptive damage calibrator with per-sample settings
+     * @param is_forward True for forward-strand genes, false for reverse-strand
+     * @return Pair of (corrected sequence, number of corrections made)
+     */
+    std::pair<std::string, size_t> correct_damage_adaptive(
+        const std::string& seq,
+        const SampleDamageProfile& sample_profile,
+        float damage_signal,
+        int frame,
+        const AdaptiveDamageCalibrator& calibrator,
+        bool is_forward = true) const;
+
+    /**
+     * Pre-frame-selection damage correction
+     *
+     * Applies conservative damage correction BEFORE frame selection to restore
+     * the hexamer signal. This is simpler than full correction:
+     * - Does not require frame knowledge
+     * - Uses only position-based damage probability
+     * - Applies stricter Bayesian posterior threshold
+     * - Corrects C→T at 5' end and G→A at 3' end only
+     *
+     * The goal is to improve frame selection accuracy by restoring damaged
+     * hexamers, not to achieve perfect correction.
+     *
+     * @param seq Input DNA sequence (may be damaged)
+     * @param sample_profile Sample-wide damage statistics
+     * @return Pair of (corrected sequence, number of corrections made)
+     */
+    static std::pair<std::string, size_t> correct_damage_preframe(
+        const std::string& seq,
+        const SampleDamageProfile& sample_profile);
 
     // Getters
     float lambda_5prime() const { return lambda_5prime_; }

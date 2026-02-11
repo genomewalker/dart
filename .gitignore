@@ -1,5 +1,6 @@
 # Build
 build/
+build_*/
 *.o
 *.a
 
@@ -25,9 +26,32 @@ __pycache__/
 *.tmp
 *.log
 
+# SLURM output
+*.err
+*.out
+slurm-*.out
+
+# Claude Code
+.claude/
+.memory/
+claude-progress.json
+session-*.md
+
+# Test files
+test_*.fa
+tiny_test.fa
+
 # Large model files (keep in models/ but ignore if regenerated)
 # models/*.pt
 # models/*.npz
 
 # Intermediate hexamer extraction files
 include/agp/*_hexamers.json
+
+# Notebook data (too large for git)
+notebooks/data/*.tsv.gz
+
+# Development/analysis scripts (local only)
+.scripts/
+*.test
+test_*[!.cpp]

@@ -53,4 +53,32 @@ float get_codon_freq_fast(char c1, char c2, char c3);
 char translate_codon_fast(char c1, char c2, char c3);
 float get_aa_freq_fast(char aa);
 
+/**
+ * Canonical reverse complement functions
+ * Use these instead of reimplementing in each file.
+ */
+
+// Thread-local buffer for cached reverse complement
+inline thread_local std::string g_rc_buffer;
+
+// Allocating version - for one-off uses
+inline std::string reverse_complement(const std::string& seq) {
+    std::string rc;
+    rc.reserve(seq.length());
+    for (auto it = seq.rbegin(); it != seq.rend(); ++it) {
+        rc += fast_complement(*it);
+    }
+    return rc;
+}
+
+// Cached version - for hot paths (returns reference to thread-local buffer)
+// WARNING: Only one cached result is valid at a time per thread
+inline const std::string& reverse_complement_cached(const std::string& seq) {
+    g_rc_buffer.resize(seq.length());
+    for (size_t i = 0; i < seq.length(); ++i) {
+        g_rc_buffer[i] = fast_complement(seq[seq.length() - 1 - i]);
+    }
+    return g_rc_buffer;
+}
+
 } // namespace agp

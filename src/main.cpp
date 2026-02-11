@@ -8,6 +8,7 @@
 #include "agp/codon_tables.hpp"
 #include "agp/bdamage_reader.hpp"
 #include "agp/unified_codon_scorer.hpp"
+#include "agp/damage_index_writer.hpp"
 #include "agp/version.h"
 #include <iostream>
 #include <fstream>
@@ -252,7 +253,7 @@ int cmd_predict(int argc, char* argv[]) {
                     std::cerr << "  d_metamatch: " << std::fixed << std::setprecision(1)
                               << (d_metamatch * 100.0f) << "% (was "
                               << (sample_profile.d_max_combined * 100.0f) << "%)\n";
-                    sample_profile.d_metamatch = d_metamatch;
+                    sample_profile.metamatch.d_metamatch = d_metamatch;
                     sample_profile.d_max_combined = d_metamatch;  // Use for prediction
                 }
             }
@@ -310,6 +311,13 @@ int cmd_predict(int argc, char* argv[]) {
         std::atomic<size_t> total_seqs{0};
         std::atomic<size_t> total_genes{0};
         std::mutex write_mutex;
+
+        // Optional damage index writer for post-mapping annotation
+        std::unique_ptr<agp::DamageIndexWriter> damage_index_writer;
+        if (!opts.damage_index.empty()) {
+            damage_index_writer = std::make_unique<agp::DamageIndexWriter>(
+                opts.damage_index, sample_profile);
+        }
 
         while (true) {
             batch.clear();
@@ -425,6 +433,11 @@ int cmd_predict(int argc, char* argv[]) {
                     if (fasta_nt_writer) fasta_nt_writer->write_genes_nucleotide(id, genes);
                     if (fasta_aa_writer) fasta_aa_writer->write_genes_protein(id, genes);
                     if (fasta_aa_masked_writer) fasta_aa_masked_writer->write_genes_protein_search(id, genes);
+                    if (damage_index_writer) {
+                        for (const auto& gene : genes) {
+                            damage_index_writer->add_record(id, gene, gene.sequence);
+                        }
+                    }
                     total_genes += genes.size();
                 }
             }
@@ -433,6 +446,12 @@ int cmd_predict(int argc, char* argv[]) {
             if (total_seqs % 1000000 < BATCH_SIZE) {
                 std::cerr << "  Processed " << total_seqs / 1000000 << "M sequences...\n";
             }
+        }
+
+        // Finalize damage index if enabled
+        if (damage_index_writer) {
+            damage_index_writer->finalize();
+            std::cerr << "  Damage index: " << damage_index_writer->record_count() << " records\n";
         }
 
         auto pass2_end = std::chrono::high_resolution_clock::now();

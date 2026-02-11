@@ -1,29 +1,34 @@
 #!/usr/bin/env python3
 """
-Train a small neural network for frame selection.
+Train frame classifier on real aMGSIM ground truth data.
 
-This NN takes features from all 6 frames and predicts which frame is correct.
-Features per frame:
-- AA composition (20 values)
-- Dipeptide frequencies (top 50 dipeptides)
-- Stop codon count
-- GC3 content
-- Sequence length
+This uses labeled ancient DNA data where we know the true reading frame.
+The model learns to distinguish correct from incorrect frames on damaged sequences.
 
-Input: 6 frames x ~75 features = ~450 features
-Output: 6-way softmax (which frame is correct)
+Usage:
+    python train_frame_selector.py --train data1.tsv.gz data2.tsv.gz --test test.tsv.gz --output model
 """
 
-import gzip
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from collections import defaultdict
 import sys
 import os
+import gzip
+import argparse
+import numpy as np
+from collections import defaultdict
 
-# Codon table
+try:
+    from sklearn.neural_network import MLPClassifier
+    from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.model_selection import train_test_split
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
+    print("Error: sklearn required", file=sys.stderr)
+    sys.exit(1)
+
+# Constants
 CODON_TABLE = {
     'TTT': 'F', 'TTC': 'F', 'TTA': 'L', 'TTG': 'L',
     'TCT': 'S', 'TCC': 'S', 'TCA': 'S', 'TCG': 'S',
@@ -42,15 +47,14 @@ CODON_TABLE = {
     'GAT': 'D', 'GAC': 'D', 'GAA': 'E', 'GAG': 'E',
     'GGT': 'G', 'GGC': 'G', 'GGA': 'G', 'GGG': 'G'
 }
+STOP_CODONS = {'TAA', 'TAG', 'TGA'}
+NUM_FEATURES = 30
 
-AA_ORDER = 'ACDEFGHIKLMNPQRSTVWY'
-TOP_DIPEPTIDES = ['LL', 'AA', 'AL', 'LA', 'LS', 'VL', 'LG', 'EL', 'GL', 'SL',
-                  'LE', 'LV', 'AG', 'VA', 'AV', 'SS', 'GG', 'LK', 'EA', 'EE',
-                  'GA', 'LR', 'AE', 'RL', 'TL', 'DL', 'LD', 'KL', 'IL', 'LT']
 
 def reverse_complement(seq):
     comp = {'A': 'T', 'T': 'A', 'G': 'C', 'C': 'G', 'N': 'N'}
     return ''.join(comp.get(b, 'N') for b in reversed(seq.upper()))
+
 
 def translate(seq, frame):
     protein = ''
@@ -59,238 +63,427 @@ def translate(seq, frame):
         protein += CODON_TABLE.get(codon, 'X')
     return protein
 
-def extract_features(seq):
-    """Extract features for all 6 frames."""
+
+def extract_features(seq, frame):
+    """Extract 30 features for frame scoring."""
+    seq = seq.upper()
     features = []
+    
+    # Get codons
+    codons = []
+    for i in range(frame, len(seq) - 2, 3):
+        codon = seq[i:i+3]
+        if all(c in 'ACGT' for c in codon):
+            codons.append(codon)
+    
+    n_codons = len(codons)
+    if n_codons < 2:
+        return [0.0] * NUM_FEATURES
+    
+    # 1. Internal stop count (1)
+    internal_stops = sum(1 for c in codons[:-1] if c in STOP_CODONS)
+    features.append(min(internal_stops, 5) / 5.0)
+    
+    # 2. Has any internal stop (1)
+    features.append(1.0 if internal_stops > 0 else 0.0)
+    
+    # 3. First stop position normalized (1)
+    first_stop = next((i for i, c in enumerate(codons[:-1]) if c in STOP_CODONS), -1)
+    features.append(first_stop / n_codons if first_stop >= 0 else 1.0)
+    
+    # 4. GC content per codon position (3)
+    gc_pos = [0, 0, 0]
+    total_pos = [0, 0, 0]
+    for i in range(frame, len(seq)):
+        pos = (i - frame) % 3
+        c = seq[i]
+        if c in 'ACGT':
+            total_pos[pos] += 1
+            if c in 'GC':
+                gc_pos[pos] += 1
+    for p in range(3):
+        features.append(gc_pos[p] / max(1, total_pos[p]))
+    
+    # 5. Nucleotide freq per position (12)
+    nt_freq = [[0]*4 for _ in range(3)]
+    nt_map = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+    for i in range(frame, len(seq)):
+        pos = (i - frame) % 3
+        c = seq[i]
+        if c in nt_map:
+            nt_freq[pos][nt_map[c]] += 1
+    for pos in range(3):
+        total = sum(nt_freq[pos]) or 1
+        for nt in range(4):
+            features.append(nt_freq[pos][nt] / total)
+    
+    # 6. RNY compliance (1)
+    rny = sum(1 for i in range(frame, len(seq)-2, 3) 
+              if seq[i] in 'AG' and seq[i+2] in 'CT')
+    features.append(rny / n_codons)
+    
+    # 7. Dipeptide entropy (1)
+    protein = translate(seq, frame)
+    if len(protein) >= 2:
+        dp_counts = defaultdict(int)
+        for i in range(len(protein)-1):
+            dp_counts[protein[i:i+2]] += 1
+        total = sum(dp_counts.values())
+        entropy = -sum((c/total) * np.log2(c/total) for c in dp_counts.values() if c > 0)
+        features.append(entropy / 8.64)  # Normalized
+    else:
+        features.append(0.5)
+    
+    # 8. Length normalized (1)
+    features.append(min(1.0, n_codons / 50.0))
+    
+    # 9. Has start codon (1)
+    features.append(1.0 if codons and codons[0] == 'ATG' else 0.0)
+    
+    # 10. Has terminal stop (1)
+    features.append(1.0 if codons and codons[-1] in STOP_CODONS else 0.0)
+    
+    # 11. Pyrimidine at wobble position (1)
+    pyr_wobble = sum(1 for i in range(frame+2, len(seq), 3) if seq[i] in 'CT')
+    features.append(pyr_wobble / max(1, n_codons))
+    
+    # 12-14. Dinucleotide features (3)
+    seq_len = len(seq)
+    features.append(seq.count('CG') / max(1, seq_len//2) * 4)
+    features.append(seq.count('TA') / max(1, seq_len//2) * 4)
+    features.append((seq.count('AA') + seq.count('TT')) / max(1, seq_len//2) * 2)
+    
+    # 15. GC content overall (1)
+    features.append((seq.count('G') + seq.count('C')) / len(seq))
+    
+    # 16. Purine at position 1 (1)
+    pur_pos1 = sum(1 for i in range(frame, len(seq), 3) if seq[i] in 'AG')
+    features.append(pur_pos1 / max(1, n_codons))
+    
+    # 17. A/T content at position 2 (1) - wobble position tends to be A/T rich
+    at_pos2 = sum(1 for i in range(frame+1, len(seq), 3) if seq[i] in 'AT')
+    features.append(at_pos2 / max(1, n_codons))
+    
+    assert len(features) == NUM_FEATURES, f"Expected {NUM_FEATURES}, got {len(features)}"
+    return features
 
-    # Forward and reverse complement
-    seqs = [seq, reverse_complement(seq)]
 
-    for strand_idx, s in enumerate(seqs):
-        for frame in range(3):
-            frame_features = []
-
-            # Translate
-            protein = translate(s, frame)
-
-            if len(protein) < 3:
-                # Pad with zeros for short sequences
-                frame_features = [0.0] * 53
-                features.extend(frame_features)
+def load_ground_truth(tsv_paths, max_per_file=50000):
+    """Load ground truth from aMGSIM TSV files."""
+    all_data = []
+    
+    for tsv_path in tsv_paths:
+        print(f"Loading {os.path.basename(tsv_path)}...", file=sys.stderr)
+        
+        opener = gzip.open if tsv_path.endswith('.gz') else open
+        mode = 'rt' if tsv_path.endswith('.gz') else 'r'
+        count = 0
+        
+        with opener(tsv_path, mode) as f:
+            header = f.readline().strip().split('\t')
+            cols = {name: i for i, name in enumerate(header)}
+            
+            required = ['damaged_seq', 'damaged_seq_inframe_nt', 'Strand_read', 'Strand_gene']
+            if not all(c in cols for c in required):
+                print(f"  Skipping - missing columns", file=sys.stderr)
                 continue
+            
+            for line in f:
+                if count >= max_per_file:
+                    break
+                
+                parts = line.strip().split('\t')
+                if len(parts) <= max(cols.values()):
+                    continue
+                
+                damaged_seq = parts[cols['damaged_seq']].upper()
+                inframe_nt = parts[cols['damaged_seq_inframe_nt']].upper()
+                strand_read = parts[cols['Strand_read']]
+                strand_gene = parts[cols['Strand_gene']]
+                
+                if len(damaged_seq) < 30:
+                    continue
+                
+                # Determine orientation
+                is_forward = (strand_read == strand_gene)
+                if not is_forward:
+                    damaged_seq = reverse_complement(damaged_seq)
+                
+                if not inframe_nt or len(inframe_nt) < 6:
+                    continue
+                
+                # Find true frame
+                true_frame = None
+                for frame in range(3):
+                    test_seq = damaged_seq[frame:]
+                    if inframe_nt in test_seq:
+                        pos = test_seq.find(inframe_nt)
+                        if pos % 3 == 0:
+                            true_frame = frame
+                            break
+                
+                if true_frame is not None:
+                    all_data.append((damaged_seq, true_frame))
+                    count += 1
+        
+        print(f"  Loaded {count} samples", file=sys.stderr)
+    
+    return all_data
 
-            # AA composition (20 features)
-            aa_counts = defaultdict(int)
-            for aa in protein:
-                if aa in AA_ORDER:
-                    aa_counts[aa] += 1
-            total_aa = sum(aa_counts.values()) or 1
-            for aa in AA_ORDER:
-                frame_features.append(aa_counts[aa] / total_aa)
 
-            # Dipeptide frequencies (30 features)
-            dp_counts = defaultdict(int)
-            for i in range(len(protein) - 1):
-                dp = protein[i:i+2]
-                if all(c in AA_ORDER for c in dp):
-                    dp_counts[dp] += 1
-            total_dp = sum(dp_counts.values()) or 1
-            for dp in TOP_DIPEPTIDES:
-                frame_features.append(dp_counts[dp] / total_dp)
-
-            # Stop codon count (1 feature)
-            internal_stops = protein[:-1].count('*') if len(protein) > 1 else 0
-            frame_features.append(internal_stops / (len(protein) or 1))
-
-            # GC3 content (1 feature)
-            gc3_count = sum(1 for i in range(frame + 2, len(s), 3) if s[i].upper() in 'GC')
-            total_pos3 = len(range(frame + 2, len(s), 3)) or 1
-            frame_features.append(gc3_count / total_pos3)
-
-            # Length (1 feature, normalized)
-            frame_features.append(min(1.0, len(protein) / 50.0))
-
-            features.extend(frame_features)
-
-    return np.array(features, dtype=np.float32)
-
-class FrameSelectorNN(nn.Module):
-    """Small MLP for frame selection."""
-    def __init__(self, input_size=318, hidden_size=64):
-        super().__init__()
-        self.model = nn.Sequential(
-            nn.Linear(input_size, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden_size // 2, 6),  # 6 frames
-        )
-
-    def forward(self, x):
-        return self.model(x)
-
-def load_training_data(tsv_path, fastq_path, max_samples=100000):
-    """Load training data from ground truth TSV and FASTQ."""
-    print(f"Loading training data from {tsv_path}...", file=sys.stderr)
-
-    # Read ground truth
-    ground_truth = {}
-    with gzip.open(tsv_path, 'rt') as f:
-        header = f.readline().strip().split('\t')
-        strand_idx = header.index('Strand_read')
-        read_name_idx = header.index('read_name')
-
-        for line in f:
-            parts = line.strip().split('\t')
-            if len(parts) <= max(strand_idx, read_name_idx):
-                continue
-
-            read_name = parts[read_name_idx]
-            strand = parts[strand_idx]
-
-            # Extract frame from read name (format: ...:frame_X_Y_Z)
-            # The frame info is in the read name pattern
-            # For now, we'll use the strand info
-            ground_truth[read_name.split(':')[0]] = strand
-
-    print(f"Loaded {len(ground_truth)} ground truth entries", file=sys.stderr)
-
-    # Read sequences and create training data
+def create_dataset(data):
+    """Create X, y arrays for training."""
     X = []
     y = []
+    
+    for seq, true_frame in data:
+        for frame in range(3):
+            features = extract_features(seq, frame)
+            X.append(features)
+            y.append(1 if frame == true_frame else 0)
+    
+    return np.array(X, dtype=np.float32), np.array(y, dtype=np.int32)
 
-    with gzip.open(fastq_path, 'rt') as f:
-        count = 0
-        for line in f:
-            if count >= max_samples * 4:
-                break
 
-            if count % 4 == 0:
-                read_id = line.strip().split()[0][1:]  # Remove @
-                base_id = read_id.split(':')[0]
-            elif count % 4 == 1:
-                seq = line.strip()
+def evaluate_frame_accuracy(model, scaler, data):
+    """Evaluate frame selection accuracy."""
+    correct = 0
+    for seq, true_frame in data:
+        features = np.array([extract_features(seq, f) for f in range(3)])
+        features_scaled = scaler.transform(features)
+        
+        if hasattr(model, 'predict_proba'):
+            probs = model.predict_proba(features_scaled)[:, 1]
+        else:
+            probs = model.decision_function(features_scaled)
+        
+        predicted = np.argmax(probs)
+        if predicted == true_frame:
+            correct += 1
+    
+    return correct / len(data)
 
-                if base_id in ground_truth and len(seq) >= 30:
-                    strand = ground_truth[base_id]
 
-                    # Determine correct frame
-                    # For simplicity: forward = frames 0,1,2; reverse = frames 3,4,5
-                    # The exact frame within strand needs more info from ground truth
-                    correct_frame = 0 if strand == '+' else 3  # Default to frame 0
+def export_mlp_to_cpp(model, scaler, output_path):
+    """Export MLP to C++ header."""
+    W1 = model.coefs_[0]
+    b1 = model.intercepts_[0]
+    W2 = model.coefs_[1]
+    b2 = model.intercepts_[1]
+    
+    input_size = W1.shape[0]
+    hidden_size = W1.shape[1]
+    output_size = W2.shape[1]  # Usually 1 for binary classification
+    
+    with open(output_path, 'w') as f:
+        f.write("#pragma once\n\n")
+        f.write("/**\n")
+        f.write(" * Frame classifier trained on aMGSIM ground truth.\n")
+        f.write(" * Generated by train_frame_selector.py\n")
+        f.write(f" * Architecture: {input_size} -> {hidden_size} (ReLU) -> {output_size} (sigmoid)\n")
+        f.write(" */\n\n")
+        f.write("#include <array>\n")
+        f.write("#include <cmath>\n")
+        f.write("#include <algorithm>\n\n")
+        f.write("namespace agp {\n")
+        f.write("namespace frame_nn {\n\n")
+        
+        f.write(f"constexpr int INPUT_SIZE = {input_size};\n")
+        f.write(f"constexpr int HIDDEN_SIZE = {hidden_size};\n\n")
+        
+        # Scaler
+        f.write("constexpr std::array<float, INPUT_SIZE> INPUT_MEAN = {{\n    ")
+        f.write(",\n    ".join(f"{x:.8f}f" for x in scaler.mean_))
+        f.write("\n}};\n\n")
+        
+        f.write("constexpr std::array<float, INPUT_SIZE> INPUT_STD = {{\n    ")
+        f.write(",\n    ".join(f"{max(x, 1e-8):.8f}f" for x in scaler.scale_))
+        f.write("\n}};\n\n")
+        
+        # W1
+        f.write("constexpr std::array<std::array<float, HIDDEN_SIZE>, INPUT_SIZE> W1 = {{\n")
+        for i, row in enumerate(W1):
+            f.write("    {{" + ", ".join(f"{x:.8f}f" for x in row) + "}}")
+            f.write(",\n" if i < len(W1)-1 else "\n")
+        f.write("}};\n\n")
+        
+        f.write("constexpr std::array<float, HIDDEN_SIZE> B1 = {{\n    ")
+        f.write(", ".join(f"{x:.8f}f" for x in b1))
+        f.write("\n}};\n\n")
+        
+        # W2 - flatten if output_size is 1
+        f.write("constexpr std::array<float, HIDDEN_SIZE> W2 = {{\n    ")
+        f.write(", ".join(f"{x:.8f}f" for x in W2.flatten()))
+        f.write("\n}};\n\n")
+        
+        f.write(f"constexpr float B2 = {b2[0]:.8f}f;\n\n")
+        
+        # Forward function (binary sigmoid output)
+        f.write("inline float score_frame(const std::array<float, INPUT_SIZE>& features) {\n")
+        f.write("    std::array<float, INPUT_SIZE> x;\n")
+        f.write("    for (int i = 0; i < INPUT_SIZE; i++)\n")
+        f.write("        x[i] = (features[i] - INPUT_MEAN[i]) / INPUT_STD[i];\n\n")
+        f.write("    std::array<float, HIDDEN_SIZE> h;\n")
+        f.write("    for (int j = 0; j < HIDDEN_SIZE; j++) {\n")
+        f.write("        float sum = B1[j];\n")
+        f.write("        for (int i = 0; i < INPUT_SIZE; i++)\n")
+        f.write("            sum += x[i] * W1[i][j];\n")
+        f.write("        h[j] = std::max(0.0f, sum);\n")
+        f.write("    }\n\n")
+        f.write("    // Binary output with sigmoid\n")
+        f.write("    float z = B2;\n")
+        f.write("    for (int j = 0; j < HIDDEN_SIZE; j++)\n")
+        f.write("        z += h[j] * W2[j];\n")
+        f.write("    return 1.0f / (1.0f + std::exp(-std::clamp(z, -20.0f, 20.0f)));\n")
+        f.write("}\n\n")
+        
+        f.write("} // namespace frame_nn\n")
+        f.write("} // namespace agp\n")
 
-                    features = extract_features(seq)
-                    X.append(features)
-                    y.append(correct_frame)
 
-            count += 1
+def export_logistic_to_cpp(model, scaler, output_path):
+    """Export logistic regression to C++ header."""
+    coef = model.coef_[0]
+    intercept = model.intercept_[0]
+    
+    with open(output_path, 'w') as f:
+        f.write("#pragma once\n\n")
+        f.write("/**\n")
+        f.write(" * Frame classifier (logistic regression) trained on aMGSIM.\n")
+        f.write(" * Generated by train_frame_selector.py\n")
+        f.write(" */\n\n")
+        f.write("#include <array>\n")
+        f.write("#include <cmath>\n\n")
+        f.write("namespace agp {\n")
+        f.write("namespace frame_nn {\n\n")
+        
+        f.write(f"constexpr int INPUT_SIZE = {len(coef)};\n\n")
+        
+        f.write("constexpr std::array<float, INPUT_SIZE> INPUT_MEAN = {{\n    ")
+        f.write(",\n    ".join(f"{x:.8f}f" for x in scaler.mean_))
+        f.write("\n}};\n\n")
+        
+        f.write("constexpr std::array<float, INPUT_SIZE> INPUT_STD = {{\n    ")
+        f.write(",\n    ".join(f"{max(x, 1e-8):.8f}f" for x in scaler.scale_))
+        f.write("\n}};\n\n")
+        
+        f.write("constexpr std::array<float, INPUT_SIZE> WEIGHTS = {{\n    ")
+        f.write(",\n    ".join(f"{x:.8f}f" for x in coef))
+        f.write("\n}};\n\n")
+        
+        f.write(f"constexpr float INTERCEPT = {intercept:.8f}f;\n\n")
+        
+        f.write("inline float score_frame(const std::array<float, INPUT_SIZE>& features) {\n")
+        f.write("    float z = INTERCEPT;\n")
+        f.write("    for (int i = 0; i < INPUT_SIZE; i++) {\n")
+        f.write("        float x = (features[i] - INPUT_MEAN[i]) / INPUT_STD[i];\n")
+        f.write("        z += WEIGHTS[i] * x;\n")
+        f.write("    }\n")
+        f.write("    return 1.0f / (1.0f + std::exp(-std::clamp(z, -20.0f, 20.0f)));\n")
+        f.write("}\n\n")
+        
+        f.write("} // namespace frame_nn\n")
+        f.write("} // namespace agp\n")
 
-    print(f"Created {len(X)} training samples", file=sys.stderr)
-    return np.array(X), np.array(y)
 
-def train_model(X, y, epochs=50, batch_size=256):
-    """Train the frame selector model."""
-    # Convert to tensors
-    X_tensor = torch.tensor(X, dtype=torch.float32)
-    y_tensor = torch.tensor(y, dtype=torch.long)
+def main():
+    parser = argparse.ArgumentParser(description='Train frame classifier on aMGSIM data')
+    parser.add_argument('--train', nargs='+', required=True, help='Training TSV files')
+    parser.add_argument('--test', nargs='*', help='Test TSV files (optional)')
+    parser.add_argument('--output', default='frame_classifier', help='Output base name')
+    parser.add_argument('--model', choices=['mlp', 'logistic', 'gbdt'], default='mlp')
+    parser.add_argument('--hidden-size', type=int, default=32)
+    parser.add_argument('--max-samples', type=int, default=100000)
+    args = parser.parse_args()
+    
+    # Load training data
+    print("=== Loading Training Data ===", file=sys.stderr)
+    train_data = load_ground_truth(args.train, max_per_file=args.max_samples)
+    print(f"Total training samples: {len(train_data)}", file=sys.stderr)
+    
+    if len(train_data) < 1000:
+        print("Error: Not enough training data", file=sys.stderr)
+        sys.exit(1)
+    
+    # Split for validation
+    np.random.shuffle(train_data)
+    val_size = min(10000, len(train_data) // 10)
+    val_data = train_data[-val_size:]
+    train_data = train_data[:-val_size]
+    
+    # Create datasets
+    print("\n=== Creating Datasets ===", file=sys.stderr)
+    X_train, y_train = create_dataset(train_data)
+    X_val, y_val = create_dataset(val_data)
+    
+    print(f"Training: {len(X_train)} samples", file=sys.stderr)
+    print(f"Validation: {len(X_val)} samples", file=sys.stderr)
+    
+    # Scale
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_val_scaled = scaler.transform(X_val)
+    
+    # Train
+    print(f"\n=== Training {args.model.upper()} ===", file=sys.stderr)
+    
+    if args.model == 'mlp':
+        model = MLPClassifier(
+            hidden_layer_sizes=(args.hidden_size,),
+            activation='relu',
+            max_iter=300,
+            early_stopping=True,
+            validation_fraction=0.1,
+            random_state=42,
+            verbose=True
+        )
+    elif args.model == 'logistic':
+        model = LogisticRegression(max_iter=1000, random_state=42, verbose=1)
+    else:
+        model = GradientBoostingClassifier(
+            n_estimators=100,
+            max_depth=5,
+            random_state=42,
+            verbose=1
+        )
+    
+    model.fit(X_train_scaled, y_train)
+    
+    # Evaluate
+    print("\n=== Results ===", file=sys.stderr)
+    train_acc = model.score(X_train_scaled, y_train)
+    val_acc = model.score(X_val_scaled, y_val)
+    print(f"Per-sample accuracy (train): {train_acc:.4f}", file=sys.stderr)
+    print(f"Per-sample accuracy (val): {val_acc:.4f}", file=sys.stderr)
+    
+    # Frame selection accuracy
+    train_frame_acc = evaluate_frame_accuracy(model, scaler, train_data[:5000])
+    val_frame_acc = evaluate_frame_accuracy(model, scaler, val_data)
+    print(f"Frame selection (train): {train_frame_acc:.4f}", file=sys.stderr)
+    print(f"Frame selection (val): {val_frame_acc:.4f}", file=sys.stderr)
+    
+    # Test on held-out files
+    if args.test:
+        print("\n=== Test Set Results ===", file=sys.stderr)
+        test_data = load_ground_truth(args.test, max_per_file=10000)
+        if test_data:
+            test_frame_acc = evaluate_frame_accuracy(model, scaler, test_data)
+            print(f"Frame selection (test): {test_frame_acc:.4f}", file=sys.stderr)
+    
+    # Export
+    print(f"\n=== Exporting ===", file=sys.stderr)
+    if args.model == 'mlp':
+        export_mlp_to_cpp(model, scaler, f"{args.output}.hpp")
+    elif args.model == 'logistic':
+        export_logistic_to_cpp(model, scaler, f"{args.output}.hpp")
+    else:
+        print("Note: GBDT export not supported, saving sklearn model", file=sys.stderr)
+        import pickle
+        with open(f"{args.output}.pkl", 'wb') as f:
+            pickle.dump({'model': model, 'scaler': scaler}, f)
+    
+    print("\nDone!", file=sys.stderr)
 
-    # Split train/val
-    n = len(X)
-    perm = np.random.permutation(n)
-    train_idx = perm[:int(0.8 * n)]
-    val_idx = perm[int(0.8 * n):]
-
-    X_train, y_train = X_tensor[train_idx], y_tensor[train_idx]
-    X_val, y_val = X_tensor[val_idx], y_tensor[val_idx]
-
-    # Create model
-    model = FrameSelectorNN(input_size=X.shape[1])
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-
-    print(f"Training model with {len(X_train)} samples...", file=sys.stderr)
-
-    for epoch in range(epochs):
-        model.train()
-        total_loss = 0
-
-        # Mini-batch training
-        perm = torch.randperm(len(X_train))
-        for i in range(0, len(X_train), batch_size):
-            idx = perm[i:i+batch_size]
-            batch_x, batch_y = X_train[idx], y_train[idx]
-
-            optimizer.zero_grad()
-            outputs = model(batch_x)
-            loss = criterion(outputs, batch_y)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-
-        # Validation
-        model.eval()
-        with torch.no_grad():
-            val_outputs = model(X_val)
-            val_preds = val_outputs.argmax(dim=1)
-            val_acc = (val_preds == y_val).float().mean().item()
-
-            # Also check strand accuracy (frames 0-2 vs 3-5)
-            pred_strand = (val_preds >= 3).long()
-            true_strand = (y_val >= 3).long()
-            strand_acc = (pred_strand == true_strand).float().mean().item()
-
-        if (epoch + 1) % 10 == 0:
-            print(f"Epoch {epoch+1}: loss={total_loss:.4f}, val_acc={val_acc:.4f}, strand_acc={strand_acc:.4f}",
-                  file=sys.stderr)
-
-    return model
-
-def export_model_weights(model, output_path):
-    """Export model weights to a format that can be loaded in C++."""
-    weights = {}
-    for name, param in model.named_parameters():
-        weights[name] = param.detach().numpy()
-
-    np.savez(output_path, **weights)
-    print(f"Saved model weights to {output_path}", file=sys.stderr)
-
-    # Also save as simple text format for C++ loading
-    txt_path = output_path.replace('.npz', '.txt')
-    with open(txt_path, 'w') as f:
-        for name, arr in weights.items():
-            f.write(f"# {name} shape: {arr.shape}\n")
-            if arr.ndim == 1:
-                f.write(' '.join(f'{x:.6f}' for x in arr) + '\n')
-            else:
-                for row in arr:
-                    f.write(' '.join(f'{x:.6f}' for x in row) + '\n')
-    print(f"Saved weights as text to {txt_path}", file=sys.stderr)
 
 if __name__ == '__main__':
-    import argparse
-    parser = argparse.ArgumentParser(description='Train frame selector NN')
-    parser.add_argument('--tsv', required=True, help='Ground truth TSV.gz file')
-    parser.add_argument('--fastq', required=True, help='FASTQ.gz file')
-    parser.add_argument('--output', default='frame_selector_model.npz', help='Output model path')
-    parser.add_argument('--epochs', type=int, default=50, help='Training epochs')
-    parser.add_argument('--max-samples', type=int, default=100000, help='Max training samples')
-    args = parser.parse_args()
-
-    # Load data
-    X, y = load_training_data(args.tsv, args.fastq, args.max_samples)
-
-    if len(X) < 100:
-        print("Not enough training data!", file=sys.stderr)
-        sys.exit(1)
-
-    # Train
-    model = train_model(X, y, epochs=args.epochs)
-
-    # Export
-    export_model_weights(model, args.output)
-
-    # Save full model
-    torch.save(model.state_dict(), args.output.replace('.npz', '.pt'))
-    print(f"Saved PyTorch model to {args.output.replace('.npz', '.pt')}", file=sys.stderr)
+    main()

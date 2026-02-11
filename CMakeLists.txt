@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(AncientGenePredictor VERSION 0.2.1 LANGUAGES CXX)
+project(AncientGenePredictor VERSION 0.3.0 LANGUAGES CXX)
 
 # Git-based version detection
 find_package(Git QUIET)
@@ -49,15 +49,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -mtune=native -DNDEBUG -ffast-math -funroll-loops")
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -Wall -Wextra -Wpedantic")
 
-# Enable AVX2/AVX512 if available
+# Enable AVX2 for SIMD optimizations
+# Note: AVX512 code in simd_utils.hpp requires VBMI which many CPUs don't support
+# AVX2 is more portable and provides sufficient performance
 include(CheckCXXCompilerFlag)
 check_cxx_compiler_flag("-mavx2" COMPILER_SUPPORTS_AVX2)
-check_cxx_compiler_flag("-mavx512f" COMPILER_SUPPORTS_AVX512)
 
-if(COMPILER_SUPPORTS_AVX512)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx512f -mavx512bw")
-    add_compile_definitions(USE_AVX512)
-elseif(COMPILER_SUPPORTS_AVX2)
+if(COMPILER_SUPPORTS_AVX2)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx2")
     add_compile_definitions(USE_AVX2)
 endif()
@@ -92,32 +90,56 @@ find_package(ZLIB REQUIRED)
 # Include directories
 include_directories(
     ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/src
     ${ZLIB_INCLUDE_DIRS}
 )
 
 # Source files
-set(AGP_SOURCES
-    src/main.cpp
+# Hexamer data is header-only (constexpr arrays in include/agp/*_hexamer_table.hpp)
+
+# Core library sources (shared between subcommands)
+set(AGP_CORE_SOURCES
+    src/cli/args.cpp
+    src/cli/subcommand.cpp
+    src/damage/profile.cpp
+    src/damage/probability.cpp
+    src/damage/analyzer.cpp
     src/types.cpp
-    src/damage_model.cpp
     src/sequence_io.cpp
     src/codon_tables.cpp
     src/scoring.cpp
-    src/damage_detection.cpp
+    src/sample_profile.cpp
+    src/damage_probability.cpp
+    src/damage_scoring.cpp
     src/frame_selector.cpp
+    src/adaptive_damage.cpp
+    src/bdamage_reader.cpp
+    src/damage_index_writer.cpp
+    src/damage_index_reader.cpp
 )
 
-# Main executable
-add_executable(agp ${AGP_SOURCES})
+# Subcommand sources
+set(AGP_SUBCOMMAND_SOURCES
+    src/cli/dispatcher.cpp
+    src/main.cpp                      # cmd_predict
+    src/validate.cpp                  # cmd_validate
+    src/cli/cmd_sample_damage.cpp     # cmd_sample_damage
+    src/cli/cmd_damage_annotate.cpp   # cmd_damage_annotate
+    src/cli/cmd_damage_profile.cpp    # cmd_damage_profile
+)
+
+# Main executable with subcommands
+add_executable(agp ${AGP_CORE_SOURCES} ${AGP_SUBCOMMAND_SOURCES})
 target_link_libraries(agp ${ZLIB_LIBRARIES})
 
 if(OpenMP_CXX_FOUND)
     target_link_libraries(agp OpenMP::OpenMP_CXX)
 endif()
 
-# Unified validation tool
-add_executable(agp-validate src/validate.cpp)
-target_link_libraries(agp-validate ${ZLIB_LIBRARIES})
+# Legacy standalone validation tool (for backwards compatibility)
+add_executable(agp-validate-standalone src/validate.cpp ${AGP_CORE_SOURCES})
+target_link_libraries(agp-validate-standalone ${ZLIB_LIBRARIES})
+target_compile_definitions(agp-validate-standalone PRIVATE AGP_STANDALONE_VALIDATE)
 
 # Hexamer extraction tool
 add_executable(extract-hexamers scripts/extract_refseq_hexamers.cpp)
@@ -133,5 +155,45 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(extract-positional-hexamers OpenMP::OpenMP_CXX)
 endif()
 
+# Unified hexamer training tool (generates all hexamer tables for a domain)
+add_executable(agp-train-hexamers scripts/agp_train_hexamers.cpp)
+target_link_libraries(agp-train-hexamers ${ZLIB_LIBRARIES})
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(agp-train-hexamers OpenMP::OpenMP_CXX)
+endif()
+
+# Dicodon phase hexamer extraction tool (frame-discriminative hexamers)
+add_executable(extract-dicodon-phase-hexamers scripts/extract_dicodon_phase_hexamers.cpp)
+target_link_libraries(extract-dicodon-phase-hexamers ${ZLIB_LIBRARIES})
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(extract-dicodon-phase-hexamers OpenMP::OpenMP_CXX)
+endif()
+
+# Codon bigram extraction tool (for damage correction context)
+add_executable(extract-codon-bigrams scripts/extract_codon_bigrams.cpp)
+target_link_libraries(extract-codon-bigrams ${ZLIB_LIBRARIES})
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(extract-codon-bigrams OpenMP::OpenMP_CXX)
+endif()
+
+# Hamming distance benchmark tool
+add_executable(benchmark-hamming scripts/benchmark_hamming.cpp)
+target_link_libraries(benchmark-hamming ${ZLIB_LIBRARIES})
+
+# Error analysis tool
+add_executable(agp-analyze-errors src/cli/analyze_errors.cpp)
+target_link_libraries(agp-analyze-errors ${ZLIB_LIBRARIES})
+
+# Damage prediction benchmark
+add_executable(agp-benchmark-damage src/cli/benchmark_damage.cpp)
+target_link_libraries(agp-benchmark-damage ${ZLIB_LIBRARIES})
+
+# Tripeptide extraction tool (rare patterns for damage correction)
+add_executable(extract-tripeptides scripts/extract_tripeptides.cpp)
+target_link_libraries(extract-tripeptides ${ZLIB_LIBRARIES})
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(extract-tripeptides OpenMP::OpenMP_CXX)
+endif()
+
 # Install
-install(TARGETS agp agp-validate extract-hexamers extract-positional-hexamers DESTINATION bin)
+install(TARGETS agp agp-train-hexamers extract-hexamers extract-positional-hexamers extract-dicodon-phase-hexamers DESTINATION bin)
