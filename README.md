@@ -7,9 +7,9 @@ AGP translates ancient DNA (aDNA) reads into proteins for functional annotation.
 Ancient DNA reads are too short and fragmented for genome assembly. AGP translates them directly into proteins that can be searched against functional databases (KEGG, CAZy, viral protein databases) to identify metabolic pathways, enzyme functions, and viral content in ancient samples.
 
 **Primary use cases:**
-- Functional profiling of ancient metagenomes (KEGG pathway analysis)
-- Carbohydrate-active enzyme (CAZyme) discovery in paleofeces and dental calculus
-- Viral detection in archaeological material
+- Functional profiling of ancient environmental metagenomes (KEGG pathway analysis)
+- Carbohydrate-active enzyme (CAZyme) discovery in permafrost and sediments
+- Viral detection in ancient environmental samples
 - Authentication of ancient proteins via damage patterns
 
 ## Features
@@ -209,7 +209,7 @@ Per-read output from `damage-annotate`:
 
 **Pass 1** scans all reads to estimate sample-wide damage:
 - Terminal nucleotide frequencies: T/(T+C) at 5', A/(A+G) at 3'
-- Exponential decay fitting: $\delta(p) = \delta_{max} \cdot e^{-\lambda p}$
+- Exponential decay fitting: δ(p) = δ_max · e^(-λp)
 - Stop codon conversion rates for validation
 
 **Pass 2** predicts genes using the calibrated damage model:
@@ -263,17 +263,18 @@ Benchmarked on synthetic ancient DNA with known damage patterns (KapK dataset, 3
 | Throughput | ~20,000 reads/second |
 
 Combined scoring formula:
-```
-$$score = 0.80 \cdot p_{read} + 0.40 \cdot I_{nonsyn} + 0.05 \cdot I_{syn}$$
+
+```math
+score = 0.80 \cdot p_{read} + 0.40 \cdot I_{nonsyn} + 0.05 \cdot I_{syn}
 ```
 
 ## Validation
 
-Validating ancient DNA gene prediction is challenging because there is no single gold standard. Different benchmarks test different capabilities, and real archaeological samples lack complete ground truth. We therefore use a combination of synthetic data with known provenance and real samples validated against established reference-based methods.
+Validating ancient DNA gene prediction is challenging because there is no single gold standard. Different benchmarks test different capabilities, and real ancient environmental samples lack complete ground truth. We therefore use a combination of synthetic data with known provenance and real samples validated against established reference-based methods.
 
 AGP performs three distinct tasks that require independent validation: (1) gene prediction—selecting the correct reading frame and strand from six possibilities; (2) sample-wide damage estimation—quantifying the overall deamination rate for quality control and downstream filtering; and (3) per-read damage classification—identifying which individual proteins carry authentic ancient damage signatures. Each task has different success criteria and is evaluated against appropriate ground truth.
 
-Our validation uses two complementary data sources. The **KapK synthetic community** consists of gargammel-simulated ancient DNA reads from 58 ancient and 42 modern reference genomes, with damage rates ranging from 0% to 35%. Each read has a known gene assignment, true reading frame, true strand orientation, and per-position damage annotation—enabling precise evaluation of both gene prediction accuracy and damage detection. For sample-level damage estimation, we validate against **31 real archaeological metagenomes** with reference-based damage estimates from metaDMG, the current standard for ancient DNA authentication.
+Our validation uses two complementary data sources. The **KapK synthetic community** consists of gargammel-simulated ancient DNA reads from 58 ancient and 42 modern reference genomes, with damage rates ranging from 0% to 35%. Each read has a known gene assignment, true reading frame, true strand orientation, and per-position damage annotation—enabling precise evaluation of both gene prediction accuracy and damage detection. For sample-level damage estimation, we validate against **31 real ancient environmental metagenomes** with reference-based damage estimates from metaDMG, the current standard for ancient DNA authentication.
 
 ### Read-Level Damage Classification
 
@@ -281,11 +282,11 @@ Beyond sample-level estimation, AGP assigns a per-read damage probability (p_rea
 
 **Methodology**: The evaluation pipeline runs AGP predict with `--adaptive --damage-index` to create a binary damage index containing p_read for each predicted protein. Proteins are then searched against the KEGG database using MMseqs2 with the VTML20 substitution matrix (optimized for damaged sequences). The `damage-annotate` command computes a combined score:
 
-```
-$$score = 0.80 \cdot p_{read} + 0.40 \cdot I_{nonsyn} + 0.05 \cdot I_{syn}$$
+```math
+score = 0.80 \cdot p_{read} + 0.40 \cdot I_{nonsyn} + 0.05 \cdot I_{syn}
 ```
 
-Where `has_nonsyn` indicates whether the alignment contains non-synonymous substitutions consistent with damage (D→N, E→K, H→Y, etc.) and `has_syn` indicates synonymous damage patterns. The combined score is evaluated against binary ground truth (read contains any C→T or G→A event) using AUC-ROC.
+Where `I_nonsyn` indicates whether the alignment contains non-synonymous substitutions consistent with damage (D→N, E→K, H→Y, etc.) and `has_syn` indicates synonymous damage patterns. The combined score is evaluated against binary ground truth (read contains any C→T or G→A event) using AUC-ROC.
 
 **Per-sample results** (10 KapK synthetic samples, 3.1M reads total):
 
@@ -310,20 +311,20 @@ Where `has_nonsyn` indicates whether the alignment contains non-synonymous subst
 
 **Information-theoretic constraints**: A single read carries fundamentally limited damage signal because C→T deamination produces thymine indistinguishable from natural thymine without a reference sequence. Consider a single terminal position with d=30% damage rate:
 
-- $P(T \mid damaged) = 0.25 + 0.75 \times 0.30 = 0.475$
-- $P(T \mid undamaged) = 0.25$
+- P(T | damaged) = 0.25 + 0.75 × 0.30 = 0.475
+- P(T | undamaged) = 0.25
 
 The best achievable single-site AUC is approximately 0.61. The achievable multi-site AUC is bounded by the number of informative terminal positions (typically 5-10 per read end) and the fact that 68% of damaged reads contain exactly one C→T event—a single thymine that could plausibly be natural.
 
 AGP achieves AUC 0.78 by aggregating evidence across all terminal positions on both read ends and applying Bayesian posterior inference with per-read composition baselines. This result approaches the information-theoretic ceiling for reference-free single-read classification. Higher discrimination requires either reference alignment (which metaDMG provides for sample-level estimation) or multi-read aggregation across proteins (which `damage-annotate` provides through the combined score).
 
-**Limitations**: KapK defines "damaged" as any C→T or G→A event; a read with a single synonymous substitution in a non-terminal position is technically damaged but may be indistinguishable from an undamaged read at the protein level. Reads without database hits rely entirely on p_read (lower single-read AUC approximately 0.60). These results derive from synthetic ground truth with controlled damage parameters; real archaeological samples have variable damage base rates and may contain damage patterns not captured by the gargammel model.
+**Limitations**: KapK defines "damaged" as any C→T or G→A event; a read with a single synonymous substitution in a non-terminal position is technically damaged but may be indistinguishable from an undamaged read at the protein level. Reads without database hits rely entirely on p_read (lower single-read AUC approximately 0.60). These results derive from synthetic ground truth with controlled damage parameters; real ancient environmental samples have variable damage base rates and may contain damage patterns not captured by the gargammel model.
 
 ### Sample-Wide Damage Validation
 
 Authenticating ancient DNA requires estimating the sample-wide damage rate to establish that a specimen is genuinely ancient rather than modern contamination. AGP performs this estimation without reference genome alignment using two-channel validation: nucleotide decay patterns (Channel A) combined with stop codon conversion rates (Channel B). To validate these reference-free estimates, we compare AGP against metaDMG, the current standard for ancient DNA damage quantification that aligns reads to reference genomes and counts C→T mismatches at each position.
 
-**Validation dataset**: 31 real ancient metagenomes from the KapK archaeological project, spanning a wide range of preservation states. The samples include 4 low-damage specimens (<2% metaDMG estimate), 5 moderate-damage (8-32%), and 22 high-damage samples (37-56%). metaDMG serves as ground truth: it aligns reads to reference genomes, identifies C→T mismatches, and fits an exponential decay model to estimate the maximum damage rate. AGP's reference-free approach measures T/(T+C) terminal frequencies (Channel A) and tracks CAA→TAA, CAG→TAG, CGA→TGA stop codon conversions (Channel B) to distinguish real deamination from compositional T enrichment.
+**Validation dataset**: 31 real ancient metagenomes from the KapK ancient environmental project, spanning a wide range of preservation states. The samples include 4 low-damage specimens (<2% metaDMG estimate), 5 moderate-damage (8-32%), and 22 high-damage samples (37-56%). metaDMG serves as ground truth: it aligns reads to reference genomes, identifies C→T mismatches, and fits an exponential decay model to estimate the maximum damage rate. AGP's reference-free approach measures T/(T+C) terminal frequencies (Channel A) and tracks CAA→TAA, CAG→TAG, CGA→TGA stop codon conversions (Channel B) to distinguish real deamination from compositional T enrichment.
 
 **Representative samples across damage range**:
 
@@ -338,7 +339,7 @@ Authenticating ancient DNA requires estimating the sample-wide damage rate to es
 | 75_205D | 55.82 | 42.00 | +1,481,034 | Validated |
 
 ![AGP vs metaDMG](docs/damage_validation_scatter.png)
-*AGP damage estimates vs metaDMG reference-based estimates for 31 archaeological samples. Green points: Channel B validated. Red squares: rejected as compositional artifacts. r = 0.89.*
+*AGP damage estimates vs metaDMG reference-based estimates for 31 ancient environmental samples. Green points: Channel B validated. Red squares: rejected as compositional artifacts. r = 0.89.*
 
 **Key metrics**:
 
@@ -362,26 +363,30 @@ The strong correlation (r = 0.807) demonstrates that AGP's reference-free estima
 
 Post-mortem deamination follows exponential decay from fragment termini:
 
-$$\delta(p) = \delta_{max} \cdot e^{-\lambda p} + \delta_{background}$$
+```math
+\delta(p) = \delta_{max} \cdot e^{-\lambda p} + \delta_{background}
+```
 
 Where:
-- $\delta(p)$ = damage rate at position $p$ from terminus
-- $\delta_{max}$ = maximum damage rate (typically 0.1–0.5 for ancient samples)
-- $\lambda$ = decay constant (typically 0.2–0.4)
-- $p$ = position in nucleotides from terminus
+- δ(p) = damage rate at position p from terminus
+- δ_max = maximum damage rate (typically 0.1–0.5 for ancient samples)
+- λ = decay constant (typically 0.2–0.4)
+- p = position in nucleotides from terminus
 
 ### Stop Codon Rescue
 
-For a stop codon at position $p$ from 5' terminus, the probability it arose from damage:
+For a stop codon at position p from 5' terminus, the probability it arose from damage:
 
-$$P(damage \mid stop) = \frac{P(stop \mid damage) \cdot P(damage)}{P(stop)}$$
+```math
+P(damage \mid stop) = \frac{P(stop \mid damage) \cdot P(damage)}{P(stop)}
+```
 
 Where:
-- $P(stop \mid damage)$ = probability of convertible precursor (CAA, CAG, CGA)
-- $P(damage) = \delta(p)$ from the damage model
-- $P(stop)$ = observed stop frequency at that position
+- P(stop | damage) = probability of convertible precursor (CAA, CAG, CGA)
+- P(damage) = δ(p) from the damage model
+- P(stop) = observed stop frequency at that position
 
-High $P(damage \mid stop)$ triggers X-masking in `--fasta-aa-masked` output.
+High P(damage | stop) triggers X-masking in `--fasta-aa-masked` output.
 
 ### Frame Scoring
 
@@ -396,15 +401,17 @@ Frame selection combines multiple signals with learned weights:
 | GC3 content | 0.05 |
 | Damage-frame consistency | variable |
 
-In damage-aware mode, stop penalties are weighted by $(1 - P_{damage})$, reducing penalties for likely damage-induced stops.
+In damage-aware mode, stop penalties are weighted by (1 - P_damage), reducing penalties for likely damage-induced stops.
 
 ### Combined Damage Score
 
 The per-protein damage score integrates pre-mapping and post-mapping evidence:
 
-$$score = 0.80 \cdot p_{read} + 0.40 \cdot I_{nonsyn} + 0.05 \cdot I_{syn}$$
+```math
+score = 0.80 \cdot p_{read} + 0.40 \cdot I_{nonsyn} + 0.05 \cdot I_{syn}
+```
 
-Where $p_{read}$ is the Bayesian damage posterior from terminal nucleotide patterns, and $I_{nonsyn}$/$I_{syn}$ indicate non-synonymous/synonymous damage-consistent substitutions in the alignment.
+Where p_read is the Bayesian damage posterior from terminal nucleotide patterns, and I_nonsyn/I_syn indicate non-synonymous/synonymous damage-consistent substitutions in the alignment.
 
 ## Citation
 
