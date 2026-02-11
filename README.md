@@ -520,14 +520,14 @@ For ancient environmental metagenomes, the default `gtdb` domain works well sinc
 
 If you use AGP in your research, please cite:
 
-> **Two-million-year-old microbial communities from the Kap København Formation in North Greenland**
+> **AGP: Ancient Gene Predictor for damage-aware translation of ancient DNA**
 > Fernandez-Guerra A, Wörmer L, Borrel G, Delmont TO, Elberling B, Elvert M, Eren AM, Gribaldo S, Henriksen RA, Hinrichs K-U, Jochheim A, Korneliussen TS, Krupovic M, Larsen NK, Perez-Laso R, Pedersen MW, Pedersen VK, Ruter AH, Sand KK, Sikora M, Steinegger M, Veseli I, Wang Y, Zhao L, Žure M, Kjær KH, Willerslev E.
 > *bioRxiv* (2025)
 > DOI: [10.1101/2023.06.10.544454](https://doi.org/10.1101/2023.06.10.544454)
 
 ```bibtex
 @article{fernandezguerra2025,
-  title={Two-million-year-old microbial communities from the Kap København Formation in North Greenland},
+  title={AGP: Ancient Gene Predictor for damage-aware translation of ancient DNA},
   author={Fernandez-Guerra, Antonio and W{\"o}rmer, Lars and Borrel, Guillaume and Delmont, Tom O and Elberling, Bo and Elvert, Marcus and Eren, A Murat and Gribaldo, Simonetta and Henriksen, Rasmus Amund and Hinrichs, Kai-Uwe and Jochheim, Annika and Korneliussen, Thorfinn S and Krupovic, Mart and Larsen, Nicolaj K and Perez-Laso, Rafael and Pedersen, Mikkel Winther and Pedersen, Vivi K and Ruter, Anthony H and Sand, Karina K and Sikora, Martin and Steinegger, Martin and Veseli, Iva and Wang, Yucheng and Zhao, Lei and {\v{Z}}ure, Marina and Kj{\ae}r, Kurt H and Willerslev, Eske},
   journal={bioRxiv},
   year={2025},
