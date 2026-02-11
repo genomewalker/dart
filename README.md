@@ -2,7 +2,7 @@
 
 AGP translates ancient DNA (aDNA) reads into proteins for functional annotation. It predicts protein-coding genes from short, degraded metagenomic sequences while accounting for post-mortem C→T and G→A deamination that corrupts standard translation.
 
-## What AGP Does
+## What AGP does
 
 Ancient DNA reads are too short and fragmented for genome assembly. AGP translates them directly into proteins that can be searched against functional databases (KEGG, CAZy, viral protein databases) to identify metabolic pathways, enzyme functions, and viral content in ancient samples.
 
@@ -32,9 +32,9 @@ cmake -DCMAKE_BUILD_TYPE=Release ..
 make -j$(nproc)
 ```
 
-## Quick Start
+## Quick start
 
-### Basic Gene Prediction
+### Basic gene prediction
 
 ```bash
 agp predict -i reads.fq.gz -o predictions.gff --fasta-aa proteins.faa --adaptive
@@ -44,7 +44,7 @@ This produces:
 - `predictions.gff`: Gene coordinates with damage scores
 - `proteins.faa`: Translated proteins for database search
 
-### Functional Profiling Pipeline
+### Functional profiling pipeline
 
 Search predicted proteins against KEGG for pathway analysis:
 
@@ -66,7 +66,7 @@ agp damage-annotate -i hits.tsv --damage-index out.agd -o annotated_hits.tsv
 
 The `--fasta-aa-masked` output replaces damage-induced stop codons with X for better database matching.
 
-### Sample Damage Assessment
+### Sample damage assessment
 
 Check if a sample shows authentic ancient damage:
 
@@ -171,7 +171,7 @@ Compares predictions against ground truth for benchmarking.
 Usage: agp validate <predictions.gff> <reference.gff>
 ```
 
-## Output Formats
+## Output formats
 
 ### GFF3
 
@@ -203,9 +203,9 @@ Per-read output from `damage-annotate`:
 | syn_5prime | Synonymous C→T at 5' terminus (from damage index) |
 | syn_3prime | Synonymous G→A at 3' terminus (from damage index) |
 
-## How It Works
+## How it works
 
-### Two-Pass Architecture
+### Two-pass architecture
 
 **Pass 1** scans all reads to estimate sample-wide damage:
 - Terminal nucleotide frequencies: T/(T+C) at 5', A/(A+G) at 3'
@@ -217,7 +217,7 @@ Per-read output from `damage-annotate`:
 - Bayesian stop codon probability based on position
 - Frame selection weighted by codon usage, hexamer patterns, and damage consistency
 
-### Two-Channel Damage Validation
+### Two-channel damage validation
 
 Reference-free damage detection has a fundamental limitation: elevated T/(T+C) at read termini could be real C→T damage OR natural sequence composition.
 
@@ -227,15 +227,16 @@ AGP solves this with two independent signals:
 
 **Channel B (Stop codon conversion)**: Tracks CAA→TAA, CAG→TAG, CGA→TGA conversions. These can ONLY be elevated by real C→T damage. Interior reads provide baseline; terminal excess indicates authentic damage.
 
-![Damage Profile](docs/damage_profile_combined.png)
-*Terminal damage profiles showing characteristic "smiley" pattern: elevated T/(T+C) at 5' end (left) and A/(A+G) at 3' end (right), decaying exponentially toward interior.*
+<img src="docs/damage_profile_combined.png" width="700" alt="Damage Profile">
+
+*Terminal damage profiles showing characteristic "smiley" pattern: elevated T/(T+C) at 5' end and A/(A+G) at 3' end, decaying exponentially toward interior.*
 
 Decision logic:
 - Channel A fires AND Channel B fires → **Real damage** (report d_max)
 - Channel A fires BUT Channel B flat → **Compositional artifact** (d_max = 0)
 - Neither fires → **No damage** (d_max = 0)
 
-### Per-Protein Damage Scoring
+### Per-protein damage scoring
 
 After database search, `damage-annotate` identifies damage-consistent amino acid substitutions by comparing query (observed) to target (reference) proteins:
 
@@ -276,7 +277,7 @@ AGP performs three distinct tasks that require independent validation: (1) gene 
 
 Our validation uses two complementary data sources. The **KapK synthetic community** consists of gargammel-simulated ancient DNA reads from 58 ancient and 42 modern reference genomes, with damage rates ranging from 0% to 35%. Each read has a known gene assignment, true reading frame, true strand orientation, and per-position damage annotation—enabling precise evaluation of both gene prediction accuracy and damage detection. For sample-level damage estimation, we validate against **31 real ancient environmental metagenomes** with reference-based damage estimates from metaDMG, the current standard for ancient DNA authentication.
 
-### Read-Level Damage Classification
+### Read-level damage classification
 
 Beyond sample-level estimation, AGP assigns a per-read damage probability (p_read) reflecting the extent to which each read's terminal nucleotide patterns are consistent with ancient DNA deamination. After database search, the `damage-annotate` command combines p_read with alignment-derived evidence—specifically, amino acid substitutions characteristic of C→T and G→A damage—to classify each protein as ancient or modern. This combined score is validated against KapK ground truth where each read has a known damage status from gargammel simulation.
 
@@ -304,8 +305,9 @@ Where `I_nonsyn` indicates whether the alignment contains non-synonymous substit
 | 69_B2...-37 | 148,617 | 0.795 |
 | **Weighted mean** | **3,148,845** | **0.78** |
 
-![Read-Level Damage Classification](docs/protein_damage_classification.png)
-*Read-level damage classification performance across 10 KapK samples. Left: score distributions for damaged vs undamaged reads. Center: ROC curves per sample. Right: per-sample AUC values.*
+<img src="docs/protein_damage_classification.png" width="700" alt="Read-level damage classification">
+
+*Read-level damage classification performance across 10 KapK samples. Left: score distributions. Center: ROC curves. Right: per-sample AUC.*
 
 **Classification metrics**: At a threshold of 0.7, this achieves 92% precision and 81% recall for identifying damaged reads. Post-mapping protein-level evaluation yields precision 73% for any damage detection and 67% for AA-changing damage, with 86% recall.
 
@@ -320,7 +322,7 @@ AGP achieves AUC 0.78 by aggregating evidence across all terminal positions on b
 
 **Limitations**: KapK defines "damaged" as any C→T or G→A event; a read with a single synonymous substitution in a non-terminal position is technically damaged but may be indistinguishable from an undamaged read at the protein level. Reads without database hits rely entirely on p_read (lower single-read AUC approximately 0.60). These results derive from synthetic ground truth with controlled damage parameters; real ancient environmental samples have variable damage base rates and may contain damage patterns not captured by the gargammel model.
 
-### Sample-Wide Damage Validation
+### Sample-wide damage validation
 
 Authenticating ancient DNA requires estimating the sample-wide damage rate to establish that a specimen is genuinely ancient rather than modern contamination. AGP performs this estimation without reference genome alignment using two-channel validation: nucleotide decay patterns (Channel A) combined with stop codon conversion rates (Channel B). To validate these reference-free estimates, we compare AGP against metaDMG, the current standard for ancient DNA damage quantification that aligns reads to reference genomes and counts C→T mismatches at each position.
 
@@ -338,8 +340,9 @@ Authenticating ancient DNA requires estimating the sample-wide damage rate to es
 | 119_48 | 44.98 | 44.00 | +3,818,288 | Validated |
 | 75_205D | 55.82 | 42.00 | +1,481,034 | Validated |
 
-![AGP vs metaDMG](docs/damage_validation_scatter.png)
-*AGP damage estimates vs metaDMG reference-based estimates for 31 ancient environmental samples. Green points: Channel B validated. Red squares: rejected as compositional artifacts. r = 0.89.*
+<img src="docs/damage_validation_scatter.png" width="500" alt="AGP vs metaDMG">
+
+*AGP damage estimates vs metaDMG reference-based estimates for 31 ancient environmental samples. Green: Channel B validated. Red: rejected as artifacts. r = 0.89.*
 
 **Key metrics**:
 
@@ -357,9 +360,9 @@ The strong correlation (r = 0.807) demonstrates that AGP's reference-free estima
 
 **Limitations**: Channel B validation requires sufficient convertible codon coverage (typically >10,000 reads containing CAA, CAG, or CGA at terminal positions). Very short reads (<60 bp) may lack enough interior sequence to establish reliable baseline frequencies. AT-rich organisms can show inverted terminal patterns (lower T at termini than interior), which confounds Channel A; in these cases, Channel B becomes the primary signal.
 
-## Mathematical Foundations
+## Mathematical foundations
 
-### Damage Model
+### Damage model
 
 Post-mortem deamination follows exponential decay from fragment termini:
 
@@ -373,7 +376,7 @@ Where:
 - λ = decay constant (typically 0.2–0.4)
 - p = position in nucleotides from terminus
 
-### Stop Codon Rescue
+### Stop codon rescue
 
 For a stop codon at position p from 5' terminus, the probability it arose from damage:
 
@@ -388,7 +391,7 @@ Where:
 
 High P(damage | stop) triggers X-masking in `--fasta-aa-masked` output.
 
-### Frame Scoring
+### Frame scoring
 
 Frame selection combines multiple signals with learned weights:
 
@@ -403,7 +406,7 @@ Frame selection combines multiple signals with learned weights:
 
 In damage-aware mode, stop penalties are weighted by (1 - P_damage), reducing penalties for likely damage-induced stops.
 
-### Combined Damage Score
+### Combined damage score
 
 The per-protein damage score integrates pre-mapping and post-mapping evidence:
 
