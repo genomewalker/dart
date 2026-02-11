@@ -305,17 +305,28 @@ Positional probability weights these substitutions: sites near termini (where da
 
 ## Performance
 
-Benchmarked on synthetic ancient DNA with known damage patterns (3.1M reads):
+Benchmarked on synthetic ancient DNA with known damage patterns (3.1M reads).
+
+### Protein damage annotation
+
+The primary use case for AGP is identifying which proteins carry authentic ancient damage after database search. The `damage-annotate` command combines pre-mapping damage probability with post-mapping amino acid substitution evidence:
+
+```math
+score = 0.80 \cdot p_{read} + 0.40 \cdot I_{nonsyn} + 0.05 \cdot I_{syn}
+```
 
 | Metric | Value |
 |--------|-------|
-| Read-level damage detection AUC | 0.78 |
-| Per-protein damage precision | 73% (any damage), 67% (AA-changing) |
+| Read-level AUC-ROC | 0.78 |
+| Per-protein precision (any damage) | 73% |
+| Per-protein precision (AA-changing) | 67% |
+| Per-protein recall | 86% |
 | Classification precision at threshold 0.7 | 92% |
 | Classification recall at threshold 0.7 | 81% |
-| Throughput | ~20,000 reads/second |
 
-**Comparison with other methods** (gene prediction accuracy on synthetic aDNA):
+### Gene prediction
+
+Comparison with other methods for frame selection accuracy:
 
 | Method | Recall | Precision | F1 |
 |--------|--------|-----------|-----|
@@ -324,13 +335,11 @@ Benchmarked on synthetic ancient DNA with known damage patterns (3.1M reads):
 | AGP (6-frame) | 74.2% | 100% | 85.2% |
 | FGS-rs | 29.8% | 100% | 45.9% |
 
-FGS-rs (FragGeneScan) performs poorly on ancient DNA because it treats damage-induced stop codons as real stops, truncating most predictions. AGP's damage-aware frame selection recovers these reads.
+FGS-rs (FragGeneScan) performs poorly on ancient DNA because it treats damage-induced stop codons as real stops. AGP's damage-aware frame selection recovers these reads.
 
-Combined scoring formula:
+### Throughput
 
-```math
-score = 0.80 \cdot p_{read} + 0.40 \cdot I_{nonsyn} + 0.05 \cdot I_{syn}
-```
+~20,000 reads/second with SIMD optimization.
 
 ## Validation
 
