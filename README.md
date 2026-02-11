@@ -268,7 +268,9 @@ AGP solves this with two independent signals:
 
 **Channel B (Stop codon conversion)**: Tracks CAA→TAA, CAG→TAG, CGA→TGA conversions. These can ONLY be elevated by real C→T damage. Interior reads provide baseline; terminal excess indicates authentic damage.
 
-<img src="docs/damage_profile_combined.png" width="700" alt="Damage Profile">
+<p align="center">
+<img src="docs/damage_profile_combined.png" width="750" alt="Terminal damage profile">
+</p>
 
 *Terminal damage profiles showing characteristic "smiley" pattern: elevated T/(T+C) at 5' end and A/(A+G) at 3' end, decaying exponentially toward interior.*
 
@@ -355,7 +357,9 @@ Where `I_nonsyn` indicates whether the alignment contains non-synonymous substit
 | 69_B2...-37 | 148,617 | 0.795 |
 | **Weighted mean** | **3,148,845** | **0.78** |
 
-<img src="docs/protein_damage_classification.png" width="700" alt="Read-level damage classification">
+<p align="center">
+<img src="docs/protein_damage_classification.png" width="800" alt="Read-level damage classification">
+</p>
 
 *Read-level damage classification performance across 10 KapK samples. Left: score distributions. Center: ROC curves. Right: per-sample AUC.*
 
@@ -390,9 +394,11 @@ Authenticating ancient DNA requires estimating the sample-wide damage rate to es
 | 119_48 | 44.98 | 44.00 | +3,818,288 | Validated |
 | 75_205D | 55.82 | 42.00 | +1,481,034 | Validated |
 
-<img src="docs/damage_validation_scatter.png" width="500" alt="AGP vs metaDMG">
+<p align="center">
+<img src="docs/damage_validation_scatter.png" width="600" alt="AGP vs metaDMG validation">
+</p>
 
-*AGP damage estimates vs metaDMG reference-based estimates for 31 ancient environmental samples. Green: Channel B validated. Red: rejected as artifacts. r = 0.89.*
+*AGP damage estimates vs metaDMG reference-based estimates for 31 ancient environmental samples. Green: channel B validated. Red: rejected as artifacts. r = 0.89.*
 
 **Key metrics**:
 
@@ -410,7 +416,7 @@ The strong correlation (r = 0.807) demonstrates that AGP's reference-free estima
 
 **Limitations**: Channel B validation requires sufficient convertible codon coverage (typically >10,000 reads containing CAA, CAG, or CGA at terminal positions). Very short reads (<60 bp) may lack enough interior sequence to establish reliable baseline frequencies. AT-rich organisms can show inverted terminal patterns (lower T at termini than interior), which confounds Channel A; in these cases, Channel B becomes the primary signal.
 
-## Mathematical foundations
+## Algorithms
 
 ### Damage model
 
