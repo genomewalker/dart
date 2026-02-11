@@ -315,6 +315,17 @@ Benchmarked on synthetic ancient DNA with known damage patterns (3.1M reads):
 | Classification recall at threshold 0.7 | 81% |
 | Throughput | ~20,000 reads/second |
 
+**Comparison with other methods** (gene prediction accuracy on synthetic aDNA):
+
+| Method | Recall | Precision | F1 |
+|--------|--------|-----------|-----|
+| AGP (adaptive) | 76.4% | 100% | 86.6% |
+| MMseqs2 blastx | 76.2% | 99.8% | 86.4% |
+| AGP (6-frame) | 74.2% | 100% | 85.2% |
+| FGS-rs | 29.8% | 100% | 45.9% |
+
+FGS-rs (FragGeneScan) performs poorly on ancient DNA because it treats damage-induced stop codons as real stops, truncating most predictions. AGP's damage-aware frame selection recovers these reads.
+
 Combined scoring formula:
 
 ```math
