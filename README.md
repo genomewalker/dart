@@ -209,7 +209,7 @@ Per-read output from `damage-annotate`:
 
 **Pass 1** scans all reads to estimate sample-wide damage:
 - Terminal nucleotide frequencies: T/(T+C) at 5', A/(A+G) at 3'
-- Exponential decay fitting: δ(p) = δ_max × e^(-λp)
+- Exponential decay fitting: $\delta(p) = \delta_{max} \cdot e^{-\lambda p}$
 - Stop codon conversion rates for validation
 
 **Pass 2** predicts genes using the calibrated damage model:
@@ -264,7 +264,7 @@ Benchmarked on synthetic ancient DNA with known damage patterns (KapK dataset, 3
 
 Combined scoring formula:
 ```
-combined_score = 0.80 × p_read + 0.40 × has_nonsyn + 0.05 × has_syn
+$$score = 0.80 \cdot p_{read} + 0.40 \cdot I_{nonsyn} + 0.05 \cdot I_{syn}$$
 ```
 
 ## Validation
@@ -282,7 +282,7 @@ Beyond sample-level estimation, AGP assigns a per-read damage probability (p_rea
 **Methodology**: The evaluation pipeline runs AGP predict with `--adaptive --damage-index` to create a binary damage index containing p_read for each predicted protein. Proteins are then searched against the KEGG database using MMseqs2 with the VTML20 substitution matrix (optimized for damaged sequences). The `damage-annotate` command computes a combined score:
 
 ```
-combined_score = 0.80 × p_read + 0.40 × has_nonsyn + 0.05 × has_syn
+$$score = 0.80 \cdot p_{read} + 0.40 \cdot I_{nonsyn} + 0.05 \cdot I_{syn}$$
 ```
 
 Where `has_nonsyn` indicates whether the alignment contains non-synonymous substitutions consistent with damage (D→N, E→K, H→Y, etc.) and `has_syn` indicates synonymous damage patterns. The combined score is evaluated against binary ground truth (read contains any C→T or G→A event) using AUC-ROC.
@@ -310,8 +310,8 @@ Where `has_nonsyn` indicates whether the alignment contains non-synonymous subst
 
 **Information-theoretic constraints**: A single read carries fundamentally limited damage signal because C→T deamination produces thymine indistinguishable from natural thymine without a reference sequence. Consider a single terminal position with d=30% damage rate:
 
-- P(T | damaged read) = 0.25 + 0.75 × 0.30 = 0.475
-- P(T | undamaged read) = 0.25
+- $P(T \mid damaged) = 0.25 + 0.75 \times 0.30 = 0.475$
+- $P(T \mid undamaged) = 0.25$
 
 The best achievable single-site AUC is approximately 0.61. The achievable multi-site AUC is bounded by the number of informative terminal positions (typically 5-10 per read end) and the fact that 68% of damaged reads contain exactly one C→T event—a single thymine that could plausibly be natural.
 
@@ -362,49 +362,67 @@ The strong correlation (r = 0.807) demonstrates that AGP's reference-free estima
 
 Post-mortem deamination follows exponential decay from fragment termini:
 
-```
-δ(p) = δ_max × e^(-λp) + δ_background
-```
+$$\delta(p) = \delta_{max} \cdot e^{-\lambda p} + \delta_{background}$$
 
 Where:
-- δ(p) = damage rate at position p from terminus
-- δ_max = maximum damage rate (typically 0.1-0.5 for ancient samples)
-- λ = decay constant (typically 0.2-0.4)
-- p = position in nucleotides from terminus
+- $\delta(p)$ = damage rate at position $p$ from terminus
+- $\delta_{max}$ = maximum damage rate (typically 0.1–0.5 for ancient samples)
+- $\lambda$ = decay constant (typically 0.2–0.4)
+- $p$ = position in nucleotides from terminus
 
 ### Stop Codon Rescue
 
-For a stop codon at position p from 5' terminus, the probability it arose from damage:
+For a stop codon at position $p$ from 5' terminus, the probability it arose from damage:
 
-```
-P(damage | stop) = P(stop | damage) × P(damage) / P(stop)
-```
+$$P(damage \mid stop) = \frac{P(stop \mid damage) \cdot P(damage)}{P(stop)}$$
 
 Where:
-- P(stop | damage) = probability of convertible precursor (CAA, CAG, CGA)
-- P(damage) = δ(p) from the damage model
-- P(stop) = observed stop frequency at that position
+- $P(stop \mid damage)$ = probability of convertible precursor (CAA, CAG, CGA)
+- $P(damage) = \delta(p)$ from the damage model
+- $P(stop)$ = observed stop frequency at that position
 
-High P(damage | stop) triggers X-masking in `--fasta-aa-masked` output.
+High $P(damage \mid stop)$ triggers X-masking in `--fasta-aa-masked` output.
 
 ### Frame Scoring
 
-Frame selection combines multiple signals:
-- Codon usage bias (weight 0.15)
-- Stop codon penalty (weight 0.28)
-- Dicodon/hexamer patterns (weight 0.13)
-- Amino acid composition (weight 0.10)
-- GC3 content (weight 0.05)
-- Damage-frame consistency (variable)
+Frame selection combines multiple signals with learned weights:
 
-In damage-aware mode, stop penalties are weighted by (1 - damage_probability), reducing penalties for likely damage-induced stops.
+| Signal | Weight |
+|--------|--------|
+| Codon usage bias | 0.15 |
+| Stop codon penalty | 0.28 |
+| Dicodon/hexamer patterns | 0.13 |
+| Amino acid composition | 0.10 |
+| GC3 content | 0.05 |
+| Damage-frame consistency | variable |
+
+In damage-aware mode, stop penalties are weighted by $(1 - P_{damage})$, reducing penalties for likely damage-induced stops.
+
+### Combined Damage Score
+
+The per-protein damage score integrates pre-mapping and post-mapping evidence:
+
+$$score = 0.80 \cdot p_{read} + 0.40 \cdot I_{nonsyn} + 0.05 \cdot I_{syn}$$
+
+Where $p_{read}$ is the Bayesian damage posterior from terminal nucleotide patterns, and $I_{nonsyn}$/$I_{syn}$ indicate non-synonymous/synonymous damage-consistent substitutions in the alignment.
 
 ## Citation
 
 If you use AGP in your research, please cite:
 
-```
-[Citation pending publication]
+> **AGP: Ancient Gene Predictor for damage-aware translation of ancient DNA**
+> Fernandez-Guerra A, et al. (2026)
+> *bioRxiv* (preprint)
+> DOI: [pending]
+
+```bibtex
+@article{agp2026,
+  title={AGP: Ancient Gene Predictor for damage-aware translation of ancient DNA},
+  author={Fernandez-Guerra, Antonio and others},
+  journal={bioRxiv},
+  year={2026},
+  note={Preprint}
+}
 ```
 
 ## License
