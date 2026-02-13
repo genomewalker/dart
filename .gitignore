@@ -47,6 +47,13 @@ tiny_test.fa
 
 # Intermediate hexamer extraction files
 include/agp/*_hexamers.json
+include/agp/*_hexamer_manifest.json
+
+# Calibration scripts (cluster-specific)
+scripts/run_calibration_pipeline.slurm.sh
+
+# Workflows (keep in separate repos)
+workflows/
 
 # Notebook data (too large for git)
 notebooks/data/*.tsv.gz
