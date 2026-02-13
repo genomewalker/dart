@@ -316,9 +316,7 @@ The `damage-annotate` command scores each protein hit by combining:
 - **I_nonsyn**: Post-mapping damage-consistent AA substitutions (0 or 1)
 - **I_syn**: Post-mapping synonymous damage patterns (0 or 1)
 
-```math
-score = 0.80 \cdot p_{read} + 0.40 \cdot I_{nonsyn} + 0.05 \cdot I_{syn}
-```
+$$\text{score} = 0.80 \cdot p_{\text{read}} + 0.40 \cdot I_{\text{nonsyn}} + 0.05 \cdot I_{\text{syn}}$$
 
 > **Note**: Scores range 0-1.25 (not normalized). Threshold 0.7 is recommended for classification.
 
@@ -347,9 +345,17 @@ FGS-rs (FragGeneScan) performs poorly on ancient DNA because it treats damage-in
 
 ## Validation
 
+AGP validation uses two complementary datasets: (1) synthetic reads from the KapK community with known per-read damage status, and (2) 31 real ancient metagenomes with metaDMG reference-based damage estimates.
+
 ### Read-level damage classification
 
-Each protein hit receives a damage score combining pre-mapping terminal patterns with post-mapping amino acid substitutions. Validated on 3.4M synthetic reads (aMGSIM) with known damage status.
+After database search, the `damage-annotate` command computes a combined score for each protein hit:
+
+$$\text{score} = 0.80 \times p_{\text{read}} + 0.40 \times I_{\text{nonsyn}} + 0.05 \times I_{\text{syn}}$$
+
+Where *p_read* is the Bayesian damage probability from terminal patterns, *I_nonsyn* indicates damage-consistent amino acid substitutions (R→W, H→Y, Q→*, etc.), and *I_syn* indicates synonymous damage patterns. The score ranges from 0 to 1.25.
+
+We validated this score on 3.4M synthetic reads where each read has known damage status:
 
 | Metric | Value |
 |--------|-------|
@@ -361,13 +367,17 @@ Each protein hit receives a damage score combining pre-mapping terminal patterns
 <img src="docs/protein_damage_classification.png" width="800" alt="Read-level damage classification">
 </p>
 
-AUC 0.78 approaches the information-theoretic limit for reference-free classification—C→T damage produces thymine indistinguishable from natural T, and 68% of damaged reads contain only one C→T event. Score distributions show three peaks due to GC content variation: AT-rich samples show stronger terminal signal than GC-rich samples.
+**Why AUC 0.78?** This approaches the information-theoretic limit for reference-free classification. C→T damage produces thymine indistinguishable from natural T without a reference:
+
+$$P(T \mid \text{damage}) = 0.25 + 0.75 \times d = 0.475 \quad \text{(at } d=30\%)$$
+
+$$P(T \mid \text{no damage}) = 0.25$$
+
+A single terminal position yields AUC ~0.61. AGP achieves 0.78 by aggregating evidence across multiple terminal positions with per-read composition baselines.
 
 ### Sample-wide damage validation
 
-AGP estimates sample-wide damage rate without reference alignment using two-channel validation: terminal T/(T+C) elevation (Channel A) combined with stop codon conversion rates (Channel B). We validate against metaDMG (reference-based) on 31 real ancient metagenomes.
-
-**Comparison with metaDMG**:
+AGP estimates sample-wide damage without reference alignment using two-channel validation: terminal T/(T+C) elevation (Channel A) combined with stop codon conversion rates (Channel B). We validated against metaDMG on 31 real ancient metagenomes:
 
 | Sample | metaDMG (%) | AGP d_max (%) | Channel B LLR | Decision |
 |--------|-------------|---------------|---------------|----------|
@@ -383,7 +393,7 @@ AGP estimates sample-wide damage rate without reference alignment using two-chan
 <img src="docs/damage_validation_scatter.png" width="600" alt="AGP vs metaDMG validation">
 </p>
 
-Correlation r = 0.81 across 31 samples spanning 0–55% damage. The +4.4% bias reflects different estimands: metaDMG only analyzes aligned reads, while AGP analyzes all reads. Channel B prevents false positives—samples with elevated terminal T/(T+C) but negative Channel B LLR are correctly rejected as compositional artifacts (d_max = 0).
+Correlation r = 0.81 across the full 0–55% damage range. The +4.4% bias reflects different estimands: metaDMG analyzes only aligned reads, while AGP analyzes all reads. Channel B prevents false positives—samples low_001–low_004 show elevated terminal T/(T+C) but negative Channel B LLR, correctly rejected as compositional artifacts.
 
 ## Methods
 
@@ -391,9 +401,7 @@ Correlation r = 0.81 across 31 samples spanning 0–55% damage. The +4.4% bias r
 
 Post-mortem deamination follows exponential decay from fragment termini:
 
-```math
-\delta(p) = \delta_{max} \cdot e^{-\lambda p} + \delta_{background}
-```
+$$\delta(p) = \delta_{\text{max}} \cdot e^{-\lambda p} + \delta_{\text{background}}$$
 
 Where:
 - δ(p) = damage rate at position p from terminus
@@ -405,9 +413,7 @@ Where:
 
 For a stop codon at position p from 5' terminus, the probability it arose from damage:
 
-```math
-P(damage \mid stop) = \frac{P(stop \mid damage) \cdot P(damage)}{P(stop)}
-```
+$$P(\text{damage} \mid \text{stop}) = \frac{P(\text{stop} \mid \text{damage}) \cdot P(\text{damage})}{P(\text{stop})}$$
 
 Where:
 - P(stop | damage) = probability of convertible precursor (CAA, CAG, CGA)
@@ -435,11 +441,9 @@ In damage-aware mode, stop penalties are weighted by (1 - P_damage), reducing pe
 
 The per-protein damage score integrates pre-mapping and post-mapping evidence:
 
-```math
-score = 0.80 \cdot p_{read} + 0.40 \cdot I_{nonsyn} + 0.05 \cdot I_{syn}
-```
+$$\text{score} = 0.80 \cdot p_{\text{read}} + 0.40 \cdot I_{\text{nonsyn}} + 0.05 \cdot I_{\text{syn}}$$
 
-Where p_read is the Bayesian damage posterior from terminal nucleotide patterns, and I_nonsyn/I_syn indicate non-synonymous/synonymous damage-consistent substitutions in the alignment.
+Where *p_read* is the Bayesian damage posterior from terminal nucleotide patterns, and I_nonsyn/I_syn indicate non-synonymous/synonymous damage-consistent substitutions in the alignment.
 
 ### Domain-specific models
 
