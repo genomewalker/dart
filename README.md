@@ -216,8 +216,8 @@ Per-read output from `damage-annotate`:
 | p_read | Per-read damage probability from AGP predict |
 | ct_sites | C→T substitution count at protein level |
 | ga_sites | G→A substitution count at protein level |
-| combined_score | Weighted damage score for classification |
-| is_damaged | 1 if combined_score >= threshold |
+| posterior | Bayesian posterior probability of damage |
+| is_damaged | 1 if posterior >= threshold |
 | syn_5prime | Synonymous C→T at 5' terminus (from damage index) |
 | syn_3prime | Synonymous G→A at 3' terminus (from damage index) |
 
@@ -492,13 +492,18 @@ Frame selection combines multiple signals with learned weights:
 
 In damage-aware mode, stop penalties are weighted by (1 - P_damage), reducing penalties for likely damage-induced stops.
 
-### Combined damage score
+### Bayesian damage score
 
-The per-protein damage score integrates pre-mapping and post-mapping evidence:
+The per-protein damage score uses Bayesian log-odds fusion to integrate pre-mapping and post-mapping evidence:
 
-$$\text{score} = 0.80 \cdot p_{\text{read}} + 4.0 \cdot \frac{n_{\text{damage}}}{L_{\text{aln}}} + 0.05 \cdot I_{\text{syn}}$$
+$$\text{logit}(P_{\text{posterior}}) = \text{logit}(\pi) + \log BF_{\text{terminal}} + \log BF_{\text{sites}}$$
 
-Where *p_read* is the Bayesian damage posterior from terminal nucleotide patterns, and I_nonsyn/I_syn indicate non-synonymous/synonymous damage-consistent substitutions in the alignment.
+Where:
+- $\pi$ is the prior probability of damage (from sample-level estimate)
+- $BF_{\text{terminal}}$ is the Bayes factor from terminal nucleotide patterns (p_read)
+- $BF_{\text{sites}}$ is the Bayes factor from damage-consistent amino acid substitutions (R→W, H→Y, Q→*, etc.)
+
+This principled approach provides calibrated uncertainty quantification and enables 3-state classification (damaged/uncertain/non-damaged).
 
 ### Domain-specific models
 
