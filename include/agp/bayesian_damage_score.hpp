@@ -287,18 +287,22 @@ inline BayesianScoreOutput compute_bayesian_score(
 
     // Terminal evidence: convert p_read posterior to Bayes factor
     // BF = P(data|A)/P(data|M) = [p_read/(1-p_read)] / [pi0/(1-pi0)]
-    const double logBF_terminal = logit(pr) - logit(pi0);
+    // When p_read is very low (no terminal signal detected), treat as no evidence (BF=1, logBF=0)
+    // rather than strong evidence against damage (which would overwhelm site evidence)
+    double logBF_terminal = 0.0;
+    if (p_read > 0.01f) {  // Only use terminal evidence if meaningful signal
+        logBF_terminal = logit(pr) - logit(pi0);
+    }
 
     // Site evidence with tempering and gating
     double logBF_sites = 0.0;
     double q_eff_clamped = 0.0;
 
     // Only use site evidence if:
-    // 1. Channel B validates sample-level damage
-    // 2. Enough opportunities (m >= min_opportunities)
-    // 3. Either we have hits OR w0 > 0 (to allow absence evidence)
-    const bool use_site_evidence = params.channel_b_valid &&
-                                   ev.m >= params.min_opportunities;
+    // 1. Enough opportunities (m >= min_opportunities)
+    // 2. Either we have hits OR (Channel B valid AND w0 > 0 for absence evidence)
+    // Note: Always use positive site evidence (hits), only gate negative evidence
+    const bool use_site_evidence = ev.m >= params.min_opportunities;
 
     if (use_site_evidence && ev.m > 0) {
         q_eff_clamped = clamp01(ev.q_eff, eps);
@@ -316,7 +320,8 @@ inline BayesianScoreOutput compute_bayesian_score(
         }
 
         // Tempered negative evidence (absence of damage where expected)
-        if (w0 > 0.0 && ev.m > ev.k) {
+        // Only apply if Channel B validates sample-level damage (otherwise no expected damage)
+        if (params.channel_b_valid && w0 > 0.0 && ev.m > ev.k) {
             // Average ancient rate over all susceptible positions
             double q_ancient_avg = clamp01(ev.sum_qA / m + qm, eps);
             double log_ratio_no_damage = std::log((1.0 - q_ancient_avg) / (1.0 - qm));
