@@ -363,6 +363,8 @@ We validated this score on 3.4M synthetic reads where each read has known damage
 | Precision @ threshold 0.7 | 92% |
 | Recall @ threshold 0.7 | 81% |
 
+The figure below shows score distributions across samples. Three peaks arise from GC content variation: AT-rich samples show stronger terminal signal than GC-rich samples.
+
 <p align="center">
 <img src="docs/protein_damage_classification.png" width="800" alt="Read-level damage classification">
 </p>
@@ -388,6 +390,8 @@ AGP estimates sample-wide damage without reference alignment using two-channel v
 | 69_34 | 39.50 | 39.00 | +5,332,371 | Validated |
 | 119_48 | 44.98 | 44.00 | +3,818,288 | Validated |
 | 75_205D | 55.82 | 42.00 | +1,481,034 | Validated |
+
+The scatter plot below shows the correlation between AGP and metaDMG estimates across all 31 samples:
 
 <p align="center">
 <img src="docs/damage_validation_scatter.png" width="600" alt="AGP vs metaDMG validation">
