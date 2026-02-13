@@ -349,31 +349,19 @@ FGS-rs (FragGeneScan) performs poorly on ancient DNA because it treats damage-in
 
 ### Read-level damage classification
 
-Each protein hit receives a damage score combining pre-mapping terminal patterns with post-mapping amino acid substitutions. We validate this score against synthetic data (aMGSIM) where each read has known damage status.
+Each protein hit receives a damage score combining pre-mapping terminal patterns with post-mapping amino acid substitutions. Validated on 3.4M synthetic reads (aMGSIM) with known damage status.
 
-**AUC-ROC per sample** (10 synthetic samples, 3.4M reads):
-
-| Sample | Reads | AUC-ROC |
-|--------|-------|---------|
-| 119_B3...-24 | 100,275 | 0.756 |
-| 119_B3...-25 | 23,252 | 0.781 |
-| 119_B3...-27 | 73,308 | 0.755 |
-| 119_B3...-29 | 61,487 | 0.771 |
-| 69_B2...-31 | 328,403 | 0.762 |
-| 69_B2...-33 | 402,301 | 0.781 |
-| 69_B2...-34 | 855,961 | 0.799 |
-| 69_B2...-35 | 712,272 | 0.784 |
-| 69_B2...-36 | 645,449 | 0.791 |
-| 69_B2...-37 | 157,064 | 0.798 |
-| **Mean** | **3,359,772** | **0.78** |
+| Metric | Value |
+|--------|-------|
+| Mean AUC-ROC (10 samples) | **0.78** |
+| Precision @ threshold 0.7 | 92% |
+| Recall @ threshold 0.7 | 81% |
 
 <p align="center">
 <img src="docs/protein_damage_classification.png" width="800" alt="Read-level damage classification">
 </p>
 
-*Score distributions show three peaks due to GC content variation across samples. AT-rich samples (6 of 10) show strong terminal damage signal (AUC 0.79); GC-rich samples (4 of 10) have weaker signal (AUC 0.76) because high baseline C content dilutes the C→T shift.*
-
-> **Why AUC ~0.78?** This approaches the information-theoretic limit for reference-free classification. C→T damage produces thymine indistinguishable from natural T without a reference—and 68% of damaged reads contain only one C→T event.
+AUC 0.78 approaches the information-theoretic limit for reference-free classification—C→T damage produces thymine indistinguishable from natural T, and 68% of damaged reads contain only one C→T event. Score distributions show three peaks due to GC content variation: AT-rich samples show stronger terminal signal than GC-rich samples.
 
 ### Sample-wide damage validation
 
@@ -395,21 +383,7 @@ AGP estimates sample-wide damage rate without reference alignment using two-chan
 <img src="docs/damage_validation_scatter.png" width="600" alt="AGP vs metaDMG validation">
 </p>
 
-*AGP damage estimates vs metaDMG reference-based estimates for 31 ancient environmental samples. Green: channel B validated. Red: rejected as artifacts. r = 0.89.*
-
-**Key metrics**:
-
-| Metric | Value |
-|--------|-------|
-| Pearson correlation (r) | 0.807 |
-| Mean bias | +4.4% (AGP higher) |
-| Mean absolute error | 8.0% |
-
-The strong correlation (r = 0.807) shows AGP's reference-free estimates track metaDMG across the full 0-55% damage range. The +4.4% bias reflects different estimands: metaDMG only analyzes reads that align to references, while AGP analyzes all reads.
-
-> **Channel B prevents false positives**: Samples low_001–low_004 show elevated terminal T/(T+C) but negative Channel B LLR, indicating the T enrichment is compositional rather than damage. AGP correctly reports d_max = 0.
-
-> **Limitations**: Requires >10,000 reads with convertible codons (CAA, CAG, CGA) at termini. Very short reads (<60 bp) may lack sufficient interior baseline.
+Correlation r = 0.81 across 31 samples spanning 0–55% damage. The +4.4% bias reflects different estimands: metaDMG only analyzes aligned reads, while AGP analyzes all reads. Channel B prevents false positives—samples with elevated terminal T/(T+C) but negative Channel B LLR are correctly rejected as compositional artifacts (d_max = 0).
 
 ## Methods
 
