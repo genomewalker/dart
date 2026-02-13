@@ -401,13 +401,53 @@ Correlation r = 0.81 across the full 0–55% damage range. The +4.4% bias reflec
 
 Post-mortem deamination follows exponential decay from fragment termini:
 
-$$\delta(p) = \delta_{\text{max}} \cdot e^{-\lambda p} + \delta_{\text{background}}$$
+$$\delta(p) = d_{\text{max}} \cdot e^{-\lambda p}$$
 
-Where:
-- δ(p) = damage rate at position p from terminus
-- δ_max = maximum damage rate (typically 0.1–0.5 for ancient samples)
-- λ = decay constant (typically 0.2–0.4)
-- p = position in nucleotides from terminus
+Where $d_{\text{max}}$ is maximum damage at terminus, $\lambda$ is decay constant (0.2–0.5), and $p$ is position from terminus. Half-life: $t_{1/2} = \ln(2) / \lambda \approx 1.4\text{–}3.5$ positions.
+
+### Channel A: Nucleotide frequencies
+
+Measures thymine enrichment at 5' terminal positions:
+
+$$r_A(p) = \frac{T_p}{T_p + C_p}$$
+
+Expected ratio under damage:
+
+$$\mathbb{E}[r_A(p)] = b_T + (1 - b_T) \cdot d_{\text{max}} \cdot e^{-\lambda p}$$
+
+Where $b_T$ is baseline T/(T+C) from interior positions. Log-likelihood ratio for decay vs. constant:
+
+$$\text{LLR}_A = \sum_{p=0}^{P} \left[ \log \mathcal{L}(k_p | n_p, r_{\text{exp}}(p)) - \log \mathcal{L}(k_p | n_p, b_T) \right]$$
+
+### Channel B: Stop codon conversion
+
+Real C→T damage converts CAA→TAA, CAG→TAG, CGA→TGA. Stop conversion rate:
+
+$$r_B(p) = \frac{\text{stops}_p}{\text{stops}_p + \text{preimage}_p}$$
+
+Fit via weighted least squares: $y_p = a + c \cdot e^{-\lambda p}$
+
+Decision: If $c > 0$ and $\text{LLR}_B > 0$ → **VALIDATED**
+
+### Per-read damage scoring
+
+Posterior probability for each read using Bayes' rule. At terminal position $i$ with observed base $B$:
+
+$$P(B=T | \text{damage}) = b_{TC} + (1 - b_{TC}) \cdot d_{\text{max}} \cdot e^{-\lambda i}$$
+
+$$P(B=T | \text{no damage}) = b_{TC}$$
+
+Log-likelihood ratio accumulation across terminal positions:
+
+$$\text{LLR} = \sum_{i \in \text{terminal}} \log \frac{P(B_i | \text{damage})}{P(B_i | \text{no damage})}$$
+
+Base posterior via logistic transform:
+
+$$P_{\text{base}}(\text{damage}) = \sigma\left(\text{logit}(\pi_0) + \text{LLR}\right)$$
+
+Reported read-level score with Channel B modulation ($\gamma_B \in \{0, 0.5, 1\}$):
+
+$$p_{\text{read}} = \gamma_B \cdot P_{\text{base}}(\text{damage})$$
 
 ### Stop codon rescue
 
