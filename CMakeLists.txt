@@ -115,6 +115,8 @@ set(AGP_CORE_SOURCES
     src/adaptive_damage.cpp
     src/damage_index_writer.cpp
     src/damage_index_reader.cpp
+    src/reference_stats.cpp
+    src/em_reassign.cpp
 )
 
 # Subcommand sources

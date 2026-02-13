@@ -11,6 +11,9 @@
 #include "agp/damage_stats.hpp"
 #include "agp/damage_index_reader.hpp"
 #include "agp/bayesian_damage_score.hpp"
+#include "agp/em_reassign.hpp"
+#include "agp/mmap_array.hpp"
+#include "agp/reference_stats.hpp"
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -539,6 +542,16 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     bool use_identity = true;         // Identity evidence enabled by default (+7.6% AUC)
     bool verbose = false;
 
+    // EM reassignment options
+    bool use_em = false;
+    uint32_t em_max_iters = 100;
+    double em_lambda_b = 3.0;
+    double em_tol = 1e-4;
+    std::string gene_summary_file;
+    float min_breadth = 0.10f;
+    float min_depth = 0.5f;
+    uint32_t min_reads = 3;
+
     for (int i = 1; i < argc; ++i) {
         if ((strcmp(argv[i], "--hits") == 0 || strcmp(argv[i], "-i") == 0) && i + 1 < argc) {
             hits_file = argv[++i];
@@ -568,6 +581,22 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             use_identity = true;
         } else if (strcmp(argv[i], "--no-identity") == 0) {
             use_identity = false;
+        } else if (strcmp(argv[i], "--em") == 0) {
+            use_em = true;
+        } else if (strcmp(argv[i], "--em-iters") == 0 && i + 1 < argc) {
+            em_max_iters = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (strcmp(argv[i], "--em-lambda") == 0 && i + 1 < argc) {
+            em_lambda_b = std::stod(argv[++i]);
+        } else if (strcmp(argv[i], "--em-tol") == 0 && i + 1 < argc) {
+            em_tol = std::stod(argv[++i]);
+        } else if (strcmp(argv[i], "--gene-summary") == 0 && i + 1 < argc) {
+            gene_summary_file = argv[++i];
+        } else if (strcmp(argv[i], "--min-breadth") == 0 && i + 1 < argc) {
+            min_breadth = std::stof(argv[++i]);
+        } else if (strcmp(argv[i], "--min-depth") == 0 && i + 1 < argc) {
+            min_depth = std::stof(argv[++i]);
+        } else if (strcmp(argv[i], "--min-reads") == 0 && i + 1 < argc) {
+            min_reads = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             std::cerr << "Usage: agp damage-annotate --hits <results.tsv> [options]\n\n";
             std::cerr << "Post-mapping damage annotation using MMseqs2 alignments.\n";
@@ -590,6 +619,15 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cerr << "                       Adds is_damaged column (1 if combined_score >= threshold)\n";
             std::cerr << "  --no-identity     Disable identity evidence (enabled by default)\n";
             std::cerr << "  -v                Verbose output\n\n";
+            std::cerr << "EM reassignment (multi-mapping resolution):\n";
+            std::cerr << "  --em              Enable EM multi-mapping resolution\n";
+            std::cerr << "  --em-iters INT    Max EM iterations (default: 100)\n";
+            std::cerr << "  --em-lambda FLOAT Temperature parameter (default: 3.0)\n";
+            std::cerr << "  --em-tol FLOAT    Convergence tolerance (default: 1e-4)\n";
+            std::cerr << "  --gene-summary FILE  Per-gene EM-weighted statistics TSV\n";
+            std::cerr << "  --min-breadth FLOAT  Minimum breadth filter (default: 0.1)\n";
+            std::cerr << "  --min-depth FLOAT    Minimum depth filter (default: 0.5)\n";
+            std::cerr << "  --min-reads INT      Minimum read count (default: 3)\n\n";
             std::cerr << "MMseqs2 format (16 columns with qaln/taln):\n";
             std::cerr << "  --format-output \"query,target,fident,alnlen,mismatch,gapopen,\n";
             std::cerr << "                   qstart,qend,tstart,tend,evalue,bits,qlen,tlen,qaln,taln\"\n";
@@ -686,6 +724,15 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     std::string line;
     size_t starts[16], ends[16];
 
+    // EM mode: also collect CompactAlignment records for all hits
+    agp::StringTable read_names, ref_names;
+    agp::MmapArray<agp::CompactAlignment> em_alignments;
+    size_t em_aln_count = 0;
+    if (use_em) {
+        em_alignments.resize(1024 * 1024);  // pre-allocate 1M, grows as needed
+        em_aln_count = 0;
+    }
+
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') continue;
 
@@ -693,7 +740,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         if (nf < 16) continue;
 
         std::string query_id = field_str(line, starts[0], ends[0]);
-        if (seen_queries.count(query_id)) continue;
+        // In EM mode, keep all hits per read; otherwise dedup to first hit
+        if (!use_em && seen_queries.count(query_id)) continue;
+        bool is_first_hit = (seen_queries.count(query_id) == 0);
         seen_queries.insert(query_id);
 
         std::string target_id = field_str(line, starts[1], ends[1]);
@@ -710,6 +759,39 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
         size_t qstart_0 = (qstart > 0) ? qstart - 1 : 0;
         size_t tstart_0 = (tstart > 0) ? tstart - 1 : 0;
+        size_t tlen = static_cast<size_t>(std::stoul(field_str(line, starts[13], ends[13])));
+
+        // EM mode: collect CompactAlignment for every hit
+        if (use_em) {
+            uint32_t ridx = read_names.insert(query_id);
+            uint32_t tidx = ref_names.insert(target_id);
+
+            // Look up damage score from AGD index
+            float ds = 0.0f;
+            if (damage_index) {
+                if (const AgdRecord* rec = damage_index->find(query_id)) {
+                    ds = static_cast<float>(rec->p_damaged_q) / 255.0f;
+                }
+            }
+
+            // Grow if needed
+            if (em_aln_count >= em_alignments.size()) {
+                em_alignments.resize(em_alignments.size() * 2);
+            }
+
+            agp::CompactAlignment& ca = em_alignments[em_aln_count++];
+            ca.read_idx = ridx;
+            ca.ref_idx = tidx;
+            ca.bit_score = bits;
+            ca.damage_score = ds;
+            ca.aln_start = static_cast<uint16_t>(std::min(tstart_0, size_t(65535)));
+            ca.aln_end = static_cast<uint16_t>(std::min(tstart_0 + taln.size(), size_t(65535)));
+            ca.identity_q = static_cast<uint16_t>(fident * 65535.0f);
+            ca.flags = 0;
+        }
+
+        // Summaries: only for first hit per read (dedup for annotation output)
+        if (!is_first_hit) continue;
 
         auto summary = annotate_alignment(
             query_id, target_id, qaln, taln,
@@ -740,6 +822,147 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         }
     }
     in.close();
+
+    // EM reassignment
+    agp::EMState em_state;
+    agp::ReferenceStatsCollector stats_collector;
+    // Per-read EM results: query_id -> (gamma, gamma_ancient, best_hit)
+    std::unordered_map<std::string, std::tuple<float, float, bool>> em_read_results;
+
+    if (use_em && em_aln_count > 0) {
+        uint32_t n_reads = static_cast<uint32_t>(read_names.size());
+        uint32_t n_refs = static_cast<uint32_t>(ref_names.size());
+
+        if (verbose) {
+            std::cerr << "\nEM reassignment:\n";
+            std::cerr << "  Alignments: " << em_aln_count << "\n";
+            std::cerr << "  Reads: " << n_reads << "\n";
+            std::cerr << "  References: " << n_refs << "\n";
+            std::cerr << "  Lambda_b: " << em_lambda_b << "\n";
+            std::cerr << "  Max iters: " << em_max_iters << "\n";
+            std::cerr << "  Tolerance: " << em_tol << "\n";
+        }
+
+        // Build CSR-format alignment data
+        auto aln_data = agp::build_alignment_data(
+            em_alignments.data(), em_aln_count, n_reads, n_refs);
+
+        // Set up EM parameters
+        agp::EMParams em_params;
+        em_params.lambda_b = em_lambda_b;
+        em_params.max_iters = em_max_iters;
+        em_params.tol = em_tol;
+        em_params.use_squarem = true;
+        em_params.use_damage = (damage_index != nullptr);
+
+        // Run EM with SQUAREM acceleration
+        em_state = agp::squarem_em(aln_data, em_params, &stats_collector);
+
+        if (verbose) {
+            std::cerr << "  Converged in " << em_state.iterations << " iterations\n";
+            std::cerr << "  Log-likelihood: " << std::fixed << std::setprecision(2)
+                      << em_state.log_likelihood << "\n";
+            if (em_params.use_damage) {
+                std::cerr << "  Estimated pi (ancient fraction): "
+                          << std::fixed << std::setprecision(4) << em_state.pi << "\n";
+            }
+        }
+
+        // Extract best assignments and build per-read lookup
+        auto best = agp::reassign_reads(aln_data, em_state, 0.01);
+
+        // Build per-read lookup: for each read, find its gamma for the best (first) hit
+        // The summaries use first-hit-per-read, so we map read_idx -> gamma of best assignment
+        for (uint32_t r = 0; r < n_reads; ++r) {
+            std::string_view rname = read_names.get(r);
+            std::string rname_str(rname);
+
+            uint32_t start = aln_data.read_offsets[r];
+            uint32_t end = aln_data.read_offsets[r + 1];
+
+            // Find best gamma and whether this read's first hit is the best
+            float best_gamma = 0.0f;
+            float best_gamma_ancient = 0.0f;
+            uint32_t best_ref = best[r].first;
+            bool first_is_best = false;
+
+            for (uint32_t j = start; j < end; ++j) {
+                if (aln_data.alignments[j].ref_idx == best_ref) {
+                    best_gamma = static_cast<float>(em_state.gamma[j]);
+                    if (em_params.use_damage && !em_state.gamma_ancient.empty()) {
+                        best_gamma_ancient = static_cast<float>(em_state.gamma_ancient[j]);
+                    }
+                    break;
+                }
+            }
+
+            // Check if first alignment for this read is the best ref
+            if (end > start && aln_data.alignments[start].ref_idx == best_ref) {
+                first_is_best = true;
+            }
+
+            em_read_results[rname_str] = {best_gamma, best_gamma_ancient, first_is_best};
+        }
+
+        // Write gene summary
+        if (!gene_summary_file.empty()) {
+            agp::FilterThresholds thresh;
+            thresh.min_reads = min_reads;
+            thresh.min_breadth = min_breadth;
+            thresh.min_depth = min_depth;
+
+            auto ref_stats = stats_collector.finalize_filtered(
+                static_cast<float>(em_state.pi), thresh);
+
+            // Replace numeric ref_idx IDs with actual names
+            for (auto& s : ref_stats) {
+                uint32_t idx = static_cast<uint32_t>(std::stoul(s.ref_id));
+                if (idx < ref_names.size()) {
+                    s.ref_id = std::string(ref_names.get(idx));
+                }
+            }
+
+            std::ofstream gf(gene_summary_file);
+            if (!gf.is_open()) {
+                std::cerr << "Error: Cannot open gene summary file: " << gene_summary_file << "\n";
+                return 1;
+            }
+
+            gf << "gene_id\tn_reads\tn_effective\tn_ancient\tn_modern\t"
+                  "breadth\tdepth_mean\tavg_identity\tenrichment\tis_ancient\n";
+
+            for (const auto& s : ref_stats) {
+                bool is_ancient = s.damage_enrichment > 0.0f;
+                gf << s.ref_id
+                   << '\t' << s.n_reads
+                   << '\t' << std::fixed << std::setprecision(2) << s.n_effective
+                   << '\t' << std::setprecision(2) << s.n_ancient
+                   << '\t' << std::setprecision(2) << s.n_modern
+                   << '\t' << std::setprecision(4) << s.breadth
+                   << '\t' << std::setprecision(2) << s.depth_mean
+                   << '\t' << std::setprecision(4) << s.avg_identity
+                   << '\t' << std::setprecision(4) << s.damage_enrichment
+                   << '\t' << (is_ancient ? 1 : 0) << '\n';
+            }
+
+            if (verbose) {
+                std::cerr << "Gene summary written to: " << gene_summary_file
+                          << " (" << ref_stats.size() << " genes after filtering)\n";
+            }
+        }
+
+        if (verbose) {
+            // Filtering stats
+            size_t multi = 0, unique = 0;
+            for (uint32_t r = 0; r < n_reads; ++r) {
+                uint32_t deg = aln_data.read_offsets[r + 1] - aln_data.read_offsets[r];
+                if (deg > 1) multi++;
+                else unique++;
+            }
+            std::cerr << "  Unique mappers: " << unique << "\n";
+            std::cerr << "  Multi-mappers: " << multi << "\n\n";
+        }
+    }
 
     // Statistics
     size_t total_sites = 0, total_ct = 0, total_ga = 0, total_high = 0;
@@ -880,7 +1103,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             "max_p_damage\tp_damaged\tp_read\tposterior\t"
             "is_damaged\tlogBF_terminal\tlogBF_sites\tlogBF_identity\t"
             "m_opportunities\tk_hits\tq_eff\ttier\tdamage_class\t"
-            "syn_5prime\tsyn_3prime\n";
+            "syn_5prime\tsyn_3prime";
+    if (use_em) {
+        *out << "\tgamma\tgamma_ancient\tbest_hit";
+    }
+    *out << "\n";
 
     for (const auto& s : summaries) {
         // Compute Bayesian score with decomposition
@@ -932,7 +1159,20 @@ int cmd_damage_annotate(int argc, char* argv[]) {
              << agp::tier_name(bayes_out.tier) << "\t"
              << agp::damage_class_name(bayes_out.damage_class) << "\t"
              << (s.has_syn_data ? std::to_string(s.syn_5prime) : ".") << "\t"
-             << (s.has_syn_data ? std::to_string(s.syn_3prime) : ".") << "\n";
+             << (s.has_syn_data ? std::to_string(s.syn_3prime) : ".");
+
+        if (use_em) {
+            auto it = em_read_results.find(s.query_id);
+            if (it != em_read_results.end()) {
+                auto& [gamma, gamma_anc, best] = it->second;
+                *out << "\t" << std::fixed << std::setprecision(4) << gamma
+                     << "\t" << std::fixed << std::setprecision(4) << gamma_anc
+                     << "\t" << (best ? 1 : 0);
+            } else {
+                *out << "\t.\t.\t.";
+            }
+        }
+        *out << "\n";
     }
 
     // Write per-protein aggregated summary (aggregates across all reads per target)
