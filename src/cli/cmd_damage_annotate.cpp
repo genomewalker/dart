@@ -770,20 +770,28 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
     agp::ModernBaseline modern_est = agp::estimate_modern_baseline(modern_proxy);
 
-    // Set up scoring parameters
+    // Set up scoring parameters with empirical Bayes approach
     agp::BayesianScoreParams score_params;
-    score_params.pi = 0.10f;           // Prior P(ancient) - conservative
-    score_params.pi0 = 0.10f;          // Prior used in p_read calculation
+    score_params.pi = 0.10f;             // Prior P(ancient) - conservative
+    score_params.pi0 = 0.10f;            // Prior used in p_read calculation
     score_params.q_modern = modern_est.q_modern;
+    score_params.w0 = 0.3f;              // Temper absence evidence (robustness)
     score_params.terminal_threshold = 0.50f;
+    score_params.site_cap = 3.0f;        // Cap site contribution
+    score_params.min_opportunities = 3;  // Minimum m to trust site evidence
+    score_params.channel_b_valid = (d_max > 0.0f);  // Trust site evidence if damage detected
+    score_params.ancient_threshold = 0.60f;
+    score_params.modern_threshold = 0.25f;
 
     if (verbose) {
-        std::cerr << "\nBayesian scoring:\n";
+        std::cerr << "\nBayesian scoring (empirical Bayes):\n";
         std::cerr << "  Modern proxy reads: " << modern_est.n_reads << "\n";
         std::cerr << "  Pooled opportunities: " << modern_est.M0 << "\n";
         std::cerr << "  Pooled hits: " << modern_est.K0 << "\n";
         std::cerr << "  Estimated q_modern: " << std::fixed << std::setprecision(5)
                   << modern_est.q_modern << "\n";
+        std::cerr << "  Tempering w0: " << score_params.w0 << "\n";
+        std::cerr << "  Channel B valid: " << (score_params.channel_b_valid ? "yes" : "no") << "\n";
     }
 
     // Write per-site output
@@ -861,7 +869,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             "ct_sites\tga_sites\thigh_conf\tdamage_fraction\t"
             "max_p_damage\tp_damaged\tp_read\tposterior\t"
             "is_damaged\tlogBF_terminal\tlogBF_sites\t"
-            "m_opportunities\tk_hits\tq_eff\ttier\t"
+            "m_opportunities\tk_hits\tq_eff\ttier\tdamage_class\t"
             "syn_5prime\tsyn_3prime\n";
 
     for (const auto& s : summaries) {
@@ -898,6 +906,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
              << bayes_out.m << "\t" << bayes_out.k << "\t"
              << std::fixed << std::setprecision(5) << bayes_out.q_eff << "\t"
              << agp::tier_name(bayes_out.tier) << "\t"
+             << agp::damage_class_name(bayes_out.damage_class) << "\t"
              << (s.has_syn_data ? std::to_string(s.syn_5prime) : ".") << "\t"
              << (s.has_syn_data ? std::to_string(s.syn_3prime) : ".") << "\n";
     }
