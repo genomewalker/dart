@@ -311,20 +311,22 @@ Benchmarked on synthetic ancient DNA with known damage patterns (3.4M reads).
 
 ### Protein damage annotation
 
-The primary use case for AGP is identifying which proteins carry authentic ancient damage after database search. The `damage-annotate` command combines pre-mapping damage probability with post-mapping amino acid substitution evidence:
+The `damage-annotate` command scores each protein hit by combining:
+- **p_read**: Pre-mapping terminal nucleotide damage signal (0-1)
+- **I_nonsyn**: Post-mapping damage-consistent AA substitutions (0 or 1)
+- **I_syn**: Post-mapping synonymous damage patterns (0 or 1)
 
 ```math
 score = 0.80 \cdot p_{read} + 0.40 \cdot I_{nonsyn} + 0.05 \cdot I_{syn}
 ```
 
+> **Note**: Scores range 0-1.25 (not normalized). Threshold 0.7 is recommended for classification.
+
 | Metric | Value |
 |--------|-------|
-| Read-level AUC-ROC | 0.78 |
-| Per-protein precision (any damage) | 73% |
-| Per-protein precision (AA-changing) | 67% |
-| Per-protein recall | 86% |
-| Classification precision at threshold 0.7 | 92% |
-| Classification recall at threshold 0.7 | 81% |
+| Read-level AUC-ROC | **0.78** |
+| Precision @ threshold 0.7 | 92% |
+| Recall @ threshold 0.7 | 81% |
 
 ### Gene prediction
 
@@ -345,23 +347,18 @@ FGS-rs (FragGeneScan) performs poorly on ancient DNA because it treats damage-in
 
 ## Validation
 
-Validating ancient DNA gene prediction is challenging because there is no single gold standard. Different benchmarks test different capabilities, and real ancient environmental samples lack complete ground truth. We therefore use a combination of synthetic data with known provenance and real samples validated against established reference-based methods.
+AGP is validated using two complementary datasets:
 
-AGP performs three distinct tasks that require independent validation: (1) gene prediction—selecting the correct reading frame and strand from six possibilities; (2) sample-wide damage estimation—quantifying the overall deamination rate for quality control and downstream filtering; and (3) per-read damage classification—identifying which individual proteins carry authentic ancient damage signatures. Each task has different success criteria and is evaluated against appropriate ground truth.
+| Dataset | Purpose | Ground truth |
+|---------|---------|--------------|
+| **Synthetic community** | Gene prediction, per-read damage | aMGSIM-simulated reads (58 ancient + 42 modern genomes) |
+| **Real metagenomes** | Sample-level damage | 31 samples with metaDMG estimates |
 
-Our validation uses two complementary data sources. The **synthetic community** consists of aMGSIM-simulated ancient DNA reads from 58 ancient and 42 modern reference genomes, with damage rates ranging from 0% to 35%. Each read has a known gene assignment, true reading frame, true strand orientation, and per-position damage annotation—enabling precise evaluation of both gene prediction accuracy and damage detection. For sample-level damage estimation, we validate against **31 real ancient environmental metagenomes** with reference-based damage estimates from metaDMG, the current standard for ancient DNA authentication.
+---
 
 ### Read-level damage classification
 
-Beyond sample-level estimation, AGP assigns a per-read damage probability (p_read) reflecting the extent to which each read's terminal nucleotide patterns are consistent with ancient DNA deamination. After database search, the `damage-annotate` command combines p_read with alignment-derived evidence—specifically, amino acid substitutions characteristic of C→T and G→A damage—to classify each protein as ancient or modern. This combined score is validated against synthetic ground truth where each read has a known damage status from aMGSIM simulation.
-
-**Methodology**: The evaluation pipeline runs AGP predict with `--adaptive --damage-index` to create a binary damage index containing p_read for each predicted protein. Proteins are then searched against the KEGG database using MMseqs2 with the VTML20 substitution matrix (optimized for damaged sequences). The `damage-annotate` command computes a combined score:
-
-```math
-score = 0.80 \cdot p_{read} + 0.40 \cdot I_{nonsyn} + 0.05 \cdot I_{syn}
-```
-
-Where `I_nonsyn` indicates whether the alignment contains non-synonymous substitutions consistent with damage (D→N, E→K, H→Y, etc.) and `has_syn` indicates synonymous damage patterns. The combined score is evaluated against binary ground truth (read contains any C→T or G→A event) using AUC-ROC.
+Evaluated on synthetic data where each read has known damage status from aMGSIM simulation.
 
 **Per-sample results** (10 synthetic samples, 3.4M reads total):
 
@@ -383,28 +380,21 @@ Where `I_nonsyn` indicates whether the alignment contains non-synonymous substit
 <img src="docs/protein_damage_classification.png" width="800" alt="Read-level damage classification">
 </p>
 
-*Read-level damage classification performance across 10 synthetic samples. Left: score distributions. Center: ROC curves. Right: per-sample AUC.*
+*Score distributions show three peaks due to GC content variation across samples. AT-rich samples (6 of 10) show strong terminal damage signal (AUC 0.79); GC-rich samples (4 of 10) have weaker signal (AUC 0.76) because high baseline C content dilutes the C→T shift.*
 
-**Classification metrics**: At a threshold of 0.7, this achieves 92% precision and 81% recall for identifying damaged reads. Post-mapping protein-level evaluation yields precision 73% for any damage detection and 67% for AA-changing damage, with 86% recall.
+> **Why AUC ~0.78?** This approaches the information-theoretic ceiling for reference-free single-read classification. C→T damage produces thymine indistinguishable from natural T without a reference. AGP aggregates evidence across terminal positions using Bayesian inference, but 68% of damaged reads contain only one C→T event.
 
-**Information-theoretic constraints**: A single read carries fundamentally limited damage signal because C→T deamination produces thymine indistinguishable from natural thymine without a reference sequence. Consider a single terminal position with d=30% damage rate:
-
-- P(T | damaged) = 0.25 + 0.75 × 0.30 = 0.475
-- P(T | undamaged) = 0.25
-
-The best achievable single-site AUC is approximately 0.61. The achievable multi-site AUC is bounded by the number of informative terminal positions (typically 5-10 per read end) and the fact that 68% of damaged reads contain exactly one C→T event—a single thymine that could plausibly be natural.
-
-AGP achieves AUC 0.78 by aggregating evidence across all terminal positions on both read ends and applying Bayesian posterior inference with per-read composition baselines. This result approaches the information-theoretic ceiling for reference-free single-read classification. Higher discrimination requires either reference alignment (which metaDMG provides for sample-level estimation) or multi-read aggregation across proteins (which `damage-annotate` provides through the combined score).
-
-**Limitations**: The synthetic ground truth (generated by aMGSIM) labels a read as "damaged" if it contains any C→T or G→A substitution. This means a read with a single synonymous substitution in a non-terminal position is technically damaged but may be indistinguishable from an undamaged read at the protein level. Reads without database hits rely entirely on p_read (lower single-read AUC approximately 0.60). These results derive from synthetic data with controlled damage parameters; real ancient environmental samples have variable damage rates and may contain patterns not captured by the aMGSIM model.
+---
 
 ### Sample-wide damage validation
 
-Authenticating ancient DNA requires estimating the sample-wide damage rate to establish that a specimen is genuinely ancient rather than modern contamination. AGP performs this estimation without reference genome alignment using two-channel validation: nucleotide decay patterns (Channel A) combined with stop codon conversion rates (Channel B). To validate these reference-free estimates, we compare AGP against metaDMG, the current standard for ancient DNA damage quantification that aligns reads to reference genomes and counts C→T mismatches at each position.
+Validated against **metaDMG** (reference-based) on 31 real ancient metagenomes.
 
-**Validation dataset**: 31 real ancient environmental metagenomes spanning a wide range of preservation states. The samples include 4 low-damage specimens (<2% metaDMG estimate), 5 moderate-damage (8-32%), and 22 high-damage samples (37-56%). metaDMG serves as ground truth: it aligns reads to reference genomes, identifies C→T mismatches, and fits an exponential decay model to estimate the maximum damage rate. AGP's reference-free approach measures T/(T+C) terminal frequencies (Channel A) and tracks CAA→TAA, CAG→TAG, CGA→TGA stop codon conversions (Channel B) to distinguish real deamination from compositional T enrichment.
+AGP uses two-channel validation:
+- **Channel A**: T/(T+C) terminal frequency elevation
+- **Channel B**: Stop codon conversion rates (CAA→TAA, CAG→TAG, CGA→TGA)
 
-**Representative samples across damage range**:
+**Representative samples**:
 
 | Sample | metaDMG (%) | AGP d_max (%) | Channel B LLR | Decision |
 |--------|-------------|---------------|---------------|----------|
