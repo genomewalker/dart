@@ -536,7 +536,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     int max_dist = -1;
     std::string lib_type = "auto";    // ss, ds, or auto-detect
     float threshold = 0.7f;           // Classification threshold for is_damaged
-    bool use_identity = false;        // Enable identity evidence (hybrid scoring)
+    bool use_identity = true;         // Identity evidence enabled by default (+7.6% AUC)
     bool verbose = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -566,6 +566,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             verbose = true;
         } else if (strcmp(argv[i], "--use-identity") == 0) {
             use_identity = true;
+        } else if (strcmp(argv[i], "--no-identity") == 0) {
+            use_identity = false;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             std::cerr << "Usage: agp damage-annotate --hits <results.tsv> [options]\n\n";
             std::cerr << "Post-mapping damage annotation using MMseqs2 alignments.\n";
@@ -586,7 +588,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cerr << "                       Enables synonymous damage detection\n";
             std::cerr << "  --threshold FLOAT Damage classification threshold (default: 0.7)\n";
             std::cerr << "                       Adds is_damaged column (1 if combined_score >= threshold)\n";
-            std::cerr << "  --use-identity    Enable identity evidence (hybrid scoring, +7% AUC)\n";
+            std::cerr << "  --no-identity     Disable identity evidence (enabled by default)\n";
             std::cerr << "  -v                Verbose output\n\n";
             std::cerr << "MMseqs2 format (16 columns with qaln/taln):\n";
             std::cerr << "  --format-output \"query,target,fident,alnlen,mismatch,gapopen,\n";
