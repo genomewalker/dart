@@ -256,7 +256,7 @@ flowchart TB
 - Exponential decay fitting: δ(p) = δ_max · e^(-λp)
 - Stop codon conversion rates for validation
 
-**Pass 2** predicts genes using the calibrated damage model:
+**Pass 2** predicts genes using the damage model:
 - Six-frame translation with damage-aware scoring
 - Bayesian stop codon probability based on position
 - Frame selection weighted by codon usage, hexamer patterns, and damage consistency
@@ -316,7 +316,7 @@ The `damage-annotate` command computes a Bayesian posterior probability for each
 - **Terminal evidence**: Pre-mapping T/(T+C) damage signal from read termini
 - **Site evidence**: Damage-consistent amino acid substitutions from alignment (R→W, H→Y, Q→*, etc.)
 
-The Bayesian scoring combines both signals in log-odds space, providing principled uncertainty quantification and 3-state classification (ancient/uncertain/modern).
+The Bayesian scoring combines both signals in log-odds space for 3-state classification (damaged/uncertain/non-damaged).
 
 | Metric | Value |
 |--------|-------|
@@ -503,7 +503,7 @@ Where:
 - $BF_{\text{terminal}}$ is the Bayes factor from terminal nucleotide patterns (p_read)
 - $BF_{\text{sites}}$ is the Bayes factor from damage-consistent amino acid substitutions (R→W, H→Y, Q→*, etc.)
 
-This principled approach provides calibrated uncertainty quantification and enables 3-state classification (damaged/uncertain/non-damaged).
+The output is a posterior probability that supports 3-state classification (damaged/uncertain/non-damaged).
 
 ### Domain-specific models
 
