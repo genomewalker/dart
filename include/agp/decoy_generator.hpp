@@ -131,7 +131,7 @@ private:
         for (size_t i = 0; i + 2 < seq.length(); i += 3) {
             std::string codon = seq.substr(i, 3);
             // Convert to uppercase
-            for (char& c : codon) c = std::toupper(c);
+            for (char& c : codon) c = std::toupper(static_cast<unsigned char>(c));
 
             char aa = codon_to_aa(codon);
 
@@ -193,8 +193,8 @@ private:
         // Build dinucleotide transition graph
         std::unordered_map<char, std::vector<char>> transitions;
         for (size_t i = 0; i + 1 < seq.length(); ++i) {
-            char from = std::toupper(seq[i]);
-            char to = std::toupper(seq[i + 1]);
+            char from = std::toupper(static_cast<unsigned char>(seq[i]));
+            char to = std::toupper(static_cast<unsigned char>(seq[i + 1]));
             if (from == 'A' || from == 'C' || from == 'G' || from == 'T') {
                 transitions[from].push_back(to);
             }
@@ -208,7 +208,7 @@ private:
         // Generate shuffled sequence
         std::string result;
         result.reserve(seq.length());
-        result += std::toupper(seq[0]);
+        result += std::toupper(static_cast<unsigned char>(seq[0]));
 
         std::unordered_map<char, size_t> indices = {{'A', 0}, {'C', 0}, {'G', 0}, {'T', 0}};
 

@@ -58,18 +58,17 @@ static std::string extract_read_name(const std::string& query_id) {
     return query_id;
 }
 
-static void print_usage([[maybe_unused]] const char* prog) {
-    std::cerr << "Ancient Gene Predictor v" << AGP_VERSION << "\n\n"
-              << "Usage: agp damage-profile -i <input> --hits <hits> -o <output>\n\n"
+static void print_usage(const char* prog) {
+    std::cerr << "Usage: " << prog << " [options]\n\n"
               << "Compute terminal nucleotide damage profiles for protein-mapped reads.\n\n"
               << "Required:\n"
-              << "  -i, --input <file>     Input FASTQ file (gzipped supported)\n"
-              << "  --hits <file>          MMseqs2 hits file (query_id in first column)\n"
-              << "  -o, --output <file>    Output file (.tsv.gz)\n\n"
+              << "  -i, --input FILE       Input FASTQ file (gzipped supported)\n"
+              << "  --hits FILE            MMseqs2 hits file (query_id in first column)\n"
+              << "  -o, --output FILE      Output file (.tsv.gz)\n\n"
               << "Options:\n"
               << "  --aggregate            Output aggregate profile instead of per-protein\n"
-              << "  --min-reads <int>      Min reads per protein (default: 10)\n"
-              << "  --max-pos <int>        Max positions to track (default: 20)\n"
+              << "  --min-reads N          Min reads per protein (default: 10)\n"
+              << "  --max-pos N            Max positions to track (default: 20)\n"
               << "  -h, --help             Show this help\n\n"
               << "Output columns (per-protein mode):\n"
               << "  target, n_reads, TC_ratio_0..N, AG_ratio_0..N\n\n"
@@ -195,11 +194,11 @@ int cmd_damage_profile(int argc, char* argv[]) {
         size_t seq_len = seq.size();
 
         for (int pos = 0; pos < max_pos && pos < (int)seq_len; ++pos) {
-            char base = std::toupper(seq[pos]);
+            char base = std::toupper(static_cast<unsigned char>(seq[pos]));
             if (base == 'T') counts.T_5prime[pos]++;
             else if (base == 'C') counts.C_5prime[pos]++;
 
-            char base3 = std::toupper(seq[seq_len - 1 - pos]);
+            char base3 = std::toupper(static_cast<unsigned char>(seq[seq_len - 1 - pos]));
             if (base3 == 'A') counts.A_3prime[pos]++;
             else if (base3 == 'G') counts.G_3prime[pos]++;
         }

@@ -17,20 +17,6 @@ class DamageModel;
 struct UnifiedDamageContext;
 
 /**
- * Mixture model results for organism-class heterogeneity
- * Summarizes the Durbin-style K-component model output
- */
-struct MixtureResult {
-    bool converged = false;        // Did EM converge?
-    int K = 0;                     // Number of classes selected by BIC
-    float d_population = 0.0f;     // E[δ] over all C-sites
-    float d_ancient = 0.0f;        // E[δ | δ > 5%] (ancient tail)
-    float d_reference = 0.0f;      // E[δ | GC > 50%] (metaDMG proxy)
-    float pi_ancient = 0.0f;       // Fraction of C-sites in high-damage classes
-    float bic = 0.0f;              // BIC for model selection
-};
-
-/**
  * Sample-level damage profile computed from aggregate statistics
  */
 struct SampleDamageProfile {
@@ -222,7 +208,15 @@ struct SampleDamageProfile {
     float channel_divergence_5prime = 0.0f;  // |damage_shift - control_shift| at 5'
     float channel_divergence_3prime = 0.0f;  // |damage_shift - control_shift| at 3'
 
-    // Channel B: Convertible stop codon tracking (CAA→TAA, CAG→TAG, CGA→TGA)
+    // =========================================================================
+    // CHANNEL B: Convertible stop codon tracking (translation disruption signal)
+    // Independent detector for real C→T damage vs compositional variation
+    //
+    // Tracks CAA→TAA, CAG→TAG, CGA→TGA conversions by nucleotide position
+    // Real damage: should show exponential decay matching Channel A
+    // Compositional variation: should be flat (no position dependence)
+    // =========================================================================
+
     // Convertible codon pair counts at 5' end by nucleotide position (0-14)
     // Position = nucleotide position of the C/T in the codon (from read start)
     // For CAA/TAA: position of the first base (C or T)
@@ -260,7 +254,11 @@ struct SampleDamageProfile {
     bool channel_b_quantifiable = false; // True if Channel B can provide d_max estimate
     bool channel_b_inverted = false;     // True if slope <= 0 (terminal stops LOWER than baseline)
 
-    // GC-stratified damage estimation (per-bin to handle metagenome heterogeneity)
+    // =========================================================================
+    // GC-STRATIFIED DAMAGE ESTIMATION
+    // Separate damage calculation per GC bin to handle metagenome heterogeneity
+    // GC computed from interior positions (5+) to avoid damage bias
+    // =========================================================================
     static constexpr int N_GC_BINS = 10;  // 0-10%, 10-20%, ..., 90-100%
 
     struct GCBinStats {
@@ -307,7 +305,10 @@ struct SampleDamageProfile {
     int gc_peak_bin = -1;                        // Which bin has peak damage
     bool gc_stratified_valid = false;            // At least one bin has valid estimate
 
-    // GC-conditional damage summary
+    // =========================================================================
+    // GC-CONDITIONAL DAMAGE SUMMARY
+    // Key metrics for reference-free damage quantification
+    // =========================================================================
     float pi_damaged = 0.0f;          // Fraction of terminal obs from damaged bins
     float d_ancient = 0.0f;           // E[δ | damaged bins] - severity among damaged
     float d_population = 0.0f;        // E[δ] over all bins - average across all DNA
@@ -317,7 +318,11 @@ struct SampleDamageProfile {
     bool damage_validated = false;  // True if both channels agree on damage
     bool damage_artifact = false;   // True if Channel A fires but Channel B doesn't
 
-    // Joint probabilistic model results (Bayesian Channel A + Control + Channel B)
+    // =========================================================================
+    // JOINT PROBABILISTIC MODEL RESULTS
+    // Unified Bayesian model combining Channel A, Control, and Channel B
+    // Replaces ad-hoc two-channel thresholds with principled BIC comparison
+    // =========================================================================
     float joint_delta_max = 0.0f;      // MLE estimate of damage rate
     float joint_lambda = 0.0f;         // Decay constant
     float joint_a_max = 0.0f;          // Artifact amplitude (signed)
@@ -328,22 +333,63 @@ struct SampleDamageProfile {
     float joint_p_damage = 0.0f;       // P(damage | data)
     bool joint_model_valid = false;    // Sufficient data for joint model
 
-    // Durbin-style mixture model results (K-component over organism classes)
-    MixtureResult mixture;
+    // =========================================================================
+    // DURBIN-STYLE MIXTURE MODEL RESULTS
+    // K-component mixture over organism classes for principled quantification
+    // d_population = what we observe, d_reference = metaDMG proxy
+    // =========================================================================
+    int mixture_K = 0;                 // Number of classes selected by BIC
+    float mixture_d_population = 0.0f; // E[δ] over all C-sites
+    float mixture_d_ancient = 0.0f;    // E[δ | δ > 5%] (ancient tail)
+    float mixture_d_reference = 0.0f;  // E[δ | GC > 50%] (metaDMG proxy)
+    float mixture_pi_ancient = 0.0f;   // Fraction of C-sites in high-damage classes
+    float mixture_bic = 0.0f;          // BIC for model selection
+    bool mixture_converged = false;    // Did EM converge?
 
-    // d_metamatch: Channel B-anchored estimate for metaDMG comparability
-    // Formula: d_metamatch = d_global + γ × (d_channel_b - d_global)
-    struct MetamatchEstimate {
-        float d_metamatch = 0.0f;              // Calibrated metaDMG-comparable estimate
-        float d_alignability_weighted = 0.0f;  // Raw alignability-weighted d_max
-        float gamma = 0.0f;                    // Blending coefficient (0 = use d_global, 1 = use weighted)
-        float mean_alignability = 0.0f;        // Mean alignability score across reads
-        float alignability_damage_corr = 0.0f; // Correlation between alignability and per-read damage
-    };
-    MetamatchEstimate metamatch;
+    // =========================================================================
+    // D_METAMATCH: ALIGNABILITY-WEIGHTED DAMAGE ESTIMATE (metaDMG-comparable)
+    // Reference-free proxy for what metaDMG would report
+    //
+    // metaDMG uses aligned reads (selection bias toward high-quality sequences).
+    // AGP's d_global uses ALL reads. The gap arises because alignable reads
+    // tend to show cleaner damage signal.
+    //
+    // Solution: Weight damage contribution by "alignability proxy" using:
+    // - Hexamer LLR (coding signal strength)
+    // - Stop codon density (ORF intactness)
+    // - GC content (closer to reference-typical)
+    //
+    // Formula: d_metamatch = d_global + γ × (d_weighted - d_global)
+    // where γ is confidence based on Channel B LLR strength
+    // =========================================================================
+    float d_metamatch = 0.0f;              // Calibrated metaDMG-comparable estimate
+    float d_alignability_weighted = 0.0f;  // Raw alignability-weighted d_max
+    float metamatch_gamma = 0.0f;          // Blending coefficient (0 = use d_global, 1 = use weighted)
+    float mean_alignability = 0.0f;        // Mean alignability score across reads
+    float alignability_damage_corr = 0.0f; // Correlation between alignability and per-read damage
+
+    // Alignability-weighted accumulators (for incremental computation)
+    double alignability_weighted_t_sum = 0.0;  // Σ(alignability × T_terminal)
+    double alignability_weighted_c_sum = 0.0;  // Σ(alignability × C_terminal)
+    double alignability_sum = 0.0;             // Σ(alignability)
+    double alignability_sq_sum = 0.0;          // Σ(alignability²) for variance
 
     // Compute adaptive GC threshold from histogram
-    float compute_adaptive_gc_threshold(float target_percentile = 0.70f);
+    float compute_adaptive_gc_threshold(float target_percentile = 0.70f) {
+        size_t total = 0;
+        for (auto c : gc_histogram) total += c;
+        if (total < 1000) return 0.40f;  // Default if insufficient data
+
+        size_t target_count = static_cast<size_t>(total * target_percentile);
+        size_t cumulative = 0;
+        for (int i = 0; i < 100; ++i) {
+            cumulative += gc_histogram[i];
+            if (cumulative >= target_count) {
+                return static_cast<float>(i) / 100.0f;
+            }
+        }
+        return 0.50f;  // Fallback
+    }
 
     bool is_valid() const { return n_reads >= 1000; }  // Need enough reads
 
@@ -363,9 +409,31 @@ struct SampleDamageProfile {
         }
     }
 
-    // GC-conditional per-read damage helpers
+    // =========================================================================
+    // GC-CONDITIONAL PER-READ DAMAGE HELPERS
+    // =========================================================================
+
     // Get GC bin index (0-9) for a sequence based on interior GC content
-    static int get_gc_bin(const std::string& seq);
+    static int get_gc_bin(const std::string& seq) {
+        if (seq.length() < 20) return 4;  // Default to middle bin for short seqs
+
+        // Compute GC from interior positions (5+) to avoid terminal damage bias
+        size_t gc = 0, total = 0;
+        size_t start = std::min(size_t(5), seq.length() / 4);
+        size_t end = seq.length() - start;
+
+        for (size_t i = start; i < end; ++i) {
+            char c = seq[i];
+            if (c == 'G' || c == 'g' || c == 'C' || c == 'c') ++gc;
+            if (c == 'A' || c == 'a' || c == 'T' || c == 't' ||
+                c == 'G' || c == 'g' || c == 'C' || c == 'c') ++total;
+        }
+
+        if (total == 0) return 4;
+        float gc_frac = static_cast<float>(gc) / static_cast<float>(total);
+        int bin = static_cast<int>(gc_frac * 10.0f);
+        return std::clamp(bin, 0, N_GC_BINS - 1);
+    }
 
     // Get GC-conditional damage parameters for a read
     struct GCDamageParams {
@@ -376,14 +444,36 @@ struct SampleDamageProfile {
         bool bin_valid;      // Whether this bin has valid estimates
     };
 
-    GCDamageParams get_gc_params(const std::string& seq) const;
+    GCDamageParams get_gc_params(const std::string& seq) const {
+        int bin = get_gc_bin(seq);
+        const auto& stats = gc_bins[bin];
+
+        GCDamageParams params;
+        params.p_damaged = stats.p_damaged;
+        params.delta_s = stats.d_max;
+        params.baseline_tc = stats.baseline_tc;
+        params.lambda = lambda_5prime;  // Use fitted lambda
+        params.bin_valid = stats.valid;
+
+        return params;
+    }
 
     // Get effective damage rate for a read (posterior-weighted)
     // δ_eff = P(damaged|read) * δ_s
-    float get_effective_damage(const std::string& seq, float read_ancient_prob) const;
+    float get_effective_damage(const std::string& seq, float read_ancient_prob) const {
+        int bin = get_gc_bin(seq);
+        return read_ancient_prob * gc_bins[bin].d_max;
+    }
 };
 
-// Tri-state damage validation (Channel A + Channel B decision)
+// ============================================================================
+// TRI-STATE DAMAGE VALIDATION
+// Unified semantics for Channel A + Channel B decision:
+//   VALIDATED:    Both channels agree → full damage probability
+//   CONTRADICTED: Channel A fires but Channel B negative → hard suppression
+//   UNVALIDATED:  Insufficient Channel B data → soft suppression
+// ============================================================================
+
 enum class DamageValidationState {
     VALIDATED,      // Both channels fired → full damage
     CONTRADICTED,   // Channel A fired but Channel B negative → artifact

@@ -20,7 +20,7 @@ if(GIT_FOUND)
         ERROR_QUIET
     )
     if(GIT_RESULT EQUAL 0 AND GIT_VERSION)
-        # Extract version from tag (e.g., v0.2.1 -> 0.2.1)
+        # Extract version from tag (e.g., v0.3.0 -> 0.3.0)
         string(REGEX REPLACE "^v" "" AGP_VERSION "${GIT_VERSION}")
     else()
         set(AGP_VERSION "${PROJECT_VERSION}-${GIT_COMMIT}")
@@ -113,7 +113,6 @@ set(AGP_CORE_SOURCES
     src/damage_scoring.cpp
     src/frame_selector.cpp
     src/adaptive_damage.cpp
-    src/bdamage_reader.cpp
     src/damage_index_writer.cpp
     src/damage_index_reader.cpp
 )
@@ -141,45 +140,6 @@ add_executable(agp-validate-standalone src/validate.cpp ${AGP_CORE_SOURCES})
 target_link_libraries(agp-validate-standalone ${ZLIB_LIBRARIES})
 target_compile_definitions(agp-validate-standalone PRIVATE AGP_STANDALONE_VALIDATE)
 
-# Hexamer extraction tool
-add_executable(extract-hexamers scripts/extract_refseq_hexamers.cpp)
-target_link_libraries(extract-hexamers ${ZLIB_LIBRARIES})
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(extract-hexamers OpenMP::OpenMP_CXX)
-endif()
-
-# Position-specific hexamer extraction tool
-add_executable(extract-positional-hexamers scripts/extract_positional_hexamers.cpp)
-target_link_libraries(extract-positional-hexamers ${ZLIB_LIBRARIES})
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(extract-positional-hexamers OpenMP::OpenMP_CXX)
-endif()
-
-# Unified hexamer training tool (generates all hexamer tables for a domain)
-add_executable(agp-train-hexamers scripts/agp_train_hexamers.cpp)
-target_link_libraries(agp-train-hexamers ${ZLIB_LIBRARIES})
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(agp-train-hexamers OpenMP::OpenMP_CXX)
-endif()
-
-# Dicodon phase hexamer extraction tool (frame-discriminative hexamers)
-add_executable(extract-dicodon-phase-hexamers scripts/extract_dicodon_phase_hexamers.cpp)
-target_link_libraries(extract-dicodon-phase-hexamers ${ZLIB_LIBRARIES})
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(extract-dicodon-phase-hexamers OpenMP::OpenMP_CXX)
-endif()
-
-# Codon bigram extraction tool (for damage correction context)
-add_executable(extract-codon-bigrams scripts/extract_codon_bigrams.cpp)
-target_link_libraries(extract-codon-bigrams ${ZLIB_LIBRARIES})
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(extract-codon-bigrams OpenMP::OpenMP_CXX)
-endif()
-
-# Hamming distance benchmark tool
-add_executable(benchmark-hamming scripts/benchmark_hamming.cpp)
-target_link_libraries(benchmark-hamming ${ZLIB_LIBRARIES})
-
 # Error analysis tool
 add_executable(agp-analyze-errors src/cli/analyze_errors.cpp)
 target_link_libraries(agp-analyze-errors ${ZLIB_LIBRARIES})
@@ -188,12 +148,5 @@ target_link_libraries(agp-analyze-errors ${ZLIB_LIBRARIES})
 add_executable(agp-benchmark-damage src/cli/benchmark_damage.cpp)
 target_link_libraries(agp-benchmark-damage ${ZLIB_LIBRARIES})
 
-# Tripeptide extraction tool (rare patterns for damage correction)
-add_executable(extract-tripeptides scripts/extract_tripeptides.cpp)
-target_link_libraries(extract-tripeptides ${ZLIB_LIBRARIES})
-if(OpenMP_CXX_FOUND)
-    target_link_libraries(extract-tripeptides OpenMP::OpenMP_CXX)
-endif()
-
 # Install
-install(TARGETS agp agp-train-hexamers extract-hexamers extract-positional-hexamers extract-dicodon-phase-hexamers DESTINATION bin)
+install(TARGETS agp DESTINATION bin)

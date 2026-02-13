@@ -6,7 +6,6 @@
 #include "agp/frame_selector.hpp"
 #include "agp/hexamer_tables.hpp"
 #include "agp/codon_tables.hpp"
-#include "agp/bdamage_reader.hpp"
 #include "agp/unified_codon_scorer.hpp"
 #include "agp/damage_index_writer.hpp"
 #include "agp/version.h"
@@ -106,31 +105,8 @@ int cmd_predict(int argc, char* argv[]) {
         // Adaptive damage calibrator
         agp::AdaptiveDamageCalibrator calibrator;
 
-        bool bdamage_loaded = false;
-
-        // Load external bdamage file if provided
-        if (!opts.bdamage_file.empty() && opts.use_damage) {
-            std::cerr << "[External] Loading damage profile from bdamage file...\n";
-            auto bdamage_result = agp::load_bdamage(opts.bdamage_file);
-            if (!bdamage_result.success) {
-                std::cerr << "  [ERROR] " << bdamage_result.error_message << "\n";
-                return 1;
-            }
-            sample_profile = bdamage_result.profile;
-            sample_profile.forced_library_type = to_sample_library_type(opts.forced_library_type);
-            bdamage_loaded = true;
-
-            float d_max = std::max(sample_profile.max_damage_5prime, sample_profile.max_damage_3prime);
-            std::cerr << "  5' damage: " << std::fixed << std::setprecision(1)
-                      << (sample_profile.max_damage_5prime * 100.0f) << "%\n";
-            std::cerr << "  3' damage: " << (sample_profile.max_damage_3prime * 100.0f) << "%\n";
-
-            calibrator.initialize(sample_profile);
-            damage_model.update_from_sample_profile(sample_profile);
-        }
-
         // Pass 1: Damage detection
-        if (opts.aggregate_damage && opts.use_damage && !bdamage_loaded) {
+        if (opts.aggregate_damage && opts.use_damage) {
             auto pass1_start = std::chrono::high_resolution_clock::now();
             std::cerr << "[Pass 1] Scanning for damage patterns...\n";
 
@@ -147,9 +123,9 @@ int cmd_predict(int argc, char* argv[]) {
             }
 
             // EM training sequences
-            std::vector<std::string> em_training_seqs;
             const size_t EM_MAX_SEQS = 50000;
-            std::mutex em_mutex;
+            std::vector<std::string> em_training_seqs(EM_MAX_SEQS);
+            std::atomic<size_t> em_training_count{0};
 
             while (true) {
                 batch.clear();
@@ -170,9 +146,9 @@ int cmd_predict(int argc, char* argv[]) {
                         agp::FrameSelector::update_sample_profile(thread_profiles[tid], seq);
 
                         if (seq.length() >= 60 && seq.length() <= 200) {
-                            std::lock_guard<std::mutex> lock(em_mutex);
-                            if (em_training_seqs.size() < EM_MAX_SEQS) {
-                                em_training_seqs.push_back(seq);
+                            size_t slot = em_training_count.fetch_add(1, std::memory_order_relaxed);
+                            if (slot < EM_MAX_SEQS) {
+                                em_training_seqs[slot] = seq;
                             }
                         }
                     }
@@ -188,6 +164,9 @@ int cmd_predict(int argc, char* argv[]) {
             for (int t = 0; t < num_threads; ++t) {
                 agp::FrameSelector::merge_sample_profiles(sample_profile, thread_profiles[t]);
             }
+
+            size_t kept_training = std::min(em_training_count.load(std::memory_order_relaxed), EM_MAX_SEQS);
+            em_training_seqs.resize(kept_training);
 
             agp::FrameSelector::finalize_sample_profile(sample_profile);
 
@@ -253,7 +232,7 @@ int cmd_predict(int argc, char* argv[]) {
                     std::cerr << "  d_metamatch: " << std::fixed << std::setprecision(1)
                               << (d_metamatch * 100.0f) << "% (was "
                               << (sample_profile.d_max_combined * 100.0f) << "%)\n";
-                    sample_profile.metamatch.d_metamatch = d_metamatch;
+                    sample_profile.d_metamatch = d_metamatch;
                     sample_profile.d_max_combined = d_metamatch;  // Use for prediction
                 }
             }

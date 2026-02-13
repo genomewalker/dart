@@ -2,7 +2,9 @@
 // Streaming damage-aware clustering pipeline
 //
 // Integrates syncmer-based read clustering with ORF emission.
-// All parameters are learned from warmup data.
+// All parameters are learned from warmup data - no magic numbers.
+//
+// Design:
 
 #include <algorithm>
 #include <array>

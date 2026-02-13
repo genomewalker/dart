@@ -4,6 +4,8 @@
 // Hard-EM-lite approach with 2 rounds:
 // Round 0: Frame from coding score alone
 // Round 1: Refine using cluster support + terminal damage consistency
+//
+// Design:
 
 #include <array>
 #include <algorithm>

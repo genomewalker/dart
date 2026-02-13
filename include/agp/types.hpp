@@ -132,15 +132,16 @@ struct alignas(64) Gene {
     Score strand_conf = 0.5f; // Strand confidence (0.5 = uncertain, 1.0 = confident)
     std::string sequence;    // Predicted gene sequence (potentially damaged)
     std::string protein;     // Translated protein sequence (from damaged DNA, stops as *)
-    std::string search_protein;       // MMseqs2-safe: damage-convertible stops as inferred AA (Q/R/W)
+    std::string search_protein;       // Search-optimized: terminal damage stops as X (for MMseqs2)
     std::string corrected_sequence;   // Damage-corrected DNA sequence
-    std::string corrected_protein;    // Computational inference of pre-damage sequence (metadata only, not for FASTA output)
+    std::string corrected_protein;    // Observed protein with X markers (for debugging)
     size_t dna_corrections = 0;       // Number of DNA corrections made
     size_t aa_corrections = 0;        // Number of amino acid changes from correction
     size_t stop_fixes = 0;            // Number of stop codons corrected (damage-induced)
     size_t stop_restorations = 0;     // Number of stop codons restored to sense codons
     Score corrected_coding_prob = 0;  // Coding probability after correction (0 = not computed)
     char correction_pattern = 'N';    // 'F'=forward strand, 'R'=reverse strand, 'N'=none
+    Score p_correct = 0.0f;           // Calibrated probability of correct prediction (0-1) [DEPRECATED]
     Score damage_pctile = 0.0f;       // Percentile rank of damage_signal within sample (0-100)
     size_t internal_stops = 0;        // Number of internal stop codons in predicted protein
     Score frame_pmax = 0.0f;          // Best frame posterior (max of 6-way)
@@ -182,9 +183,9 @@ using DamageMatrix = std::array<std::array<float, 4>, 4>;
 // Codon translation table (standard genetic code)
 struct CodonTable {
     static inline char translate_codon(char c1, char c2, char c3) {
-        c1 = std::toupper(c1);
-        c2 = std::toupper(c2);
-        c3 = std::toupper(c3);
+        c1 = std::toupper(static_cast<unsigned char>(c1));
+        c2 = std::toupper(static_cast<unsigned char>(c2));
+        c3 = std::toupper(static_cast<unsigned char>(c3));
 
         // TTx codons
         if (c1 == 'T' && c2 == 'T') {
@@ -248,17 +249,17 @@ struct CodonTable {
     }
 
     static inline bool is_stop_codon(char c1, char c2, char c3) {
-        c1 = std::toupper(c1);
-        c2 = std::toupper(c2);
-        c3 = std::toupper(c3);
+        c1 = std::toupper(static_cast<unsigned char>(c1));
+        c2 = std::toupper(static_cast<unsigned char>(c2));
+        c3 = std::toupper(static_cast<unsigned char>(c3));
         return (c1 == 'T' && c2 == 'A' && (c3 == 'A' || c3 == 'G')) ||
                (c1 == 'T' && c2 == 'G' && c3 == 'A');
     }
 
     static inline bool is_start_codon(char c1, char c2, char c3) {
-        c1 = std::toupper(c1);
-        c2 = std::toupper(c2);
-        c3 = std::toupper(c3);
+        c1 = std::toupper(static_cast<unsigned char>(c1));
+        c2 = std::toupper(static_cast<unsigned char>(c2));
+        c3 = std::toupper(static_cast<unsigned char>(c3));
         // ATG is the standard start, also GTG and TTG in bacteria
         return (c1 == 'A' && c2 == 'T' && c3 == 'G') ||
                (c1 == 'G' && c2 == 'T' && c3 == 'G') ||

@@ -6,6 +6,8 @@
 // 2. Round 1: Score frames using coding + cluster support + terminal damage
 // 3. Round 2: Rescore with neighbors restricted to best slots
 // 4. Compute per-read damage + X-mask positions
+//
+// Design:
 
 #include <algorithm>
 #include <array>

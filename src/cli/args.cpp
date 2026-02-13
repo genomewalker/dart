@@ -10,40 +10,37 @@ void print_version() {
     std::cout << "agp " << AGP_VERSION << "\n";
 }
 
-void print_usage([[maybe_unused]] const char* program_name) {
+void print_usage(const char* program_name) {
     std::cout << "Ancient Gene Predictor v" << AGP_VERSION << "\n\n";
-    std::cout << "Usage: agp predict -i <input> -o <output> [options]\n\n";
-    std::cout << "Predict genes from ancient DNA sequencing reads.\n\n";
-    std::cout << "Required:\n";
-    std::cout << "  -i, --input <file>       Input FASTA/FASTQ file (.gz supported)\n";
-    std::cout << "  -o, --output <file>      Output GFF3 file\n\n";
-    std::cout << "Output Options:\n";
-    std::cout << "  --fasta-nt <file>        Nucleotide FASTA\n";
-    std::cout << "  --fasta-nt-corrected <file>  Damage-corrected nucleotide FASTA\n";
-    std::cout << "  --fasta-aa <file>        Amino acid FASTA (observed, stops as *)\n";
-    std::cout << "  --fasta-aa-masked <file> Search-optimized FASTA (damage stops as X)\n";
-    std::cout << "  --summary <file>         Sample statistics (JSON)\n";
-    std::cout << "  --damage-index <file>    Binary damage index (.agd)\n\n";
-    std::cout << "Damage Options:\n";
+    std::cout << "Usage: " << program_name << " -i <input> -o <output> [options]\n\n";
+    std::cout << "Options:\n";
+    std::cout << "  -i, --input <file>       Input FASTA/FASTQ file (or .gz)\n";
+    std::cout << "  -o, --output <file>      Output GFF3 file (default: predictions.gff)\n";
+    std::cout << "  --fasta-nt <file>        Output nucleotide FASTA\n";
+    std::cout << "  --fasta-nt-corrected <file> Output damage-corrected nucleotide FASTA\n";
+    std::cout << "  --fasta-aa <file>        Output amino acid FASTA (observed, stops as *)\n";
+    std::cout << "  --fasta-aa-masked <file> Search-optimized: terminal damage stops as X\n";
+    std::cout << "  --summary <file>         Output sample statistics (JSON format)\n";
+    std::cout << "  --damage-index <file>    Output binary damage index (.agd) for damage-annotate\n";
+    std::cout << "  --min-length <int>       Minimum sequence length (default: 30)\n";
+    std::cout << "  -t, --threads <int>      Number of threads (default: auto)\n";
     std::cout << "  --no-damage              Disable damage detection\n";
     std::cout << "  --no-aggregate           Disable two-pass damage aggregation\n";
-    std::cout << "  --damage-only            Run damage detection only\n";
-    std::cout << "  --library-type <type>    Force library type: ds, ss, or auto\n";
-    std::cout << "  --bdamage <file>         Import damage from metaDMG bdamage file\n\n";
-    std::cout << "ORF Options:\n";
-    std::cout << "  --min-length <int>       Minimum sequence length (default: 30)\n";
-    std::cout << "  --orf-min-aa <int>       Minimum ORF length in aa (default: 10)\n";
-    std::cout << "  --adaptive               Adaptive ORF selection\n";
+    std::cout << "  --damage-only            Run damage detection only, skip gene prediction\n";
     std::cout << "  --domain <name>          Taxonomic domain (default: gtdb)\n";
-    std::cout << "                           Options: gtdb, fungi, plant, protozoa,\n";
-    std::cout << "                                    invertebrate, viral\n\n";
-    std::cout << "General:\n";
-    std::cout << "  -t, --threads <int>      Number of threads (default: auto)\n";
+    std::cout << "                           Options: gtdb, fungi, plant, protozoa, invertebrate, viral\n";
+    std::cout << "  --library-type <type>    Force library type: ds, ss, or auto (default)\n";
+    std::cout << "\nORF Parameters:\n";
+    std::cout << "  --orf-min-aa <int>       Minimum ORF length in amino acids (default: 10)\n";
+    std::cout << "  --adaptive               Adaptive ORF selection (score-based threshold)\n";
+    std::cout << "\n";
     std::cout << "  -v, --verbose            Verbose output\n";
-    std::cout << "  -h, --help               Show this help\n\n";
+    std::cout << "  -V, --version            Show version and exit\n";
+    std::cout << "  -h, --help               Show this help message\n";
+    std::cout << "\n";
     std::cout << "Examples:\n";
-    std::cout << "  agp predict -i reads.fq.gz -o pred.gff --fasta-aa proteins.faa\n";
-    std::cout << "  agp predict -i reads.fq.gz -o pred.gff --damage-index pred.agd --adaptive\n";
+    std::cout << "  " << program_name << " -i reads.fq.gz -o predictions.gff --fasta-aa proteins.faa\n";
+    std::cout << "  " << program_name << " -i reads.fq.gz -o predictions.gff --no-damage\n";
 }
 
 Options parse_args(int argc, char* argv[]) {
@@ -102,8 +99,6 @@ Options parse_args(int argc, char* argv[]) {
             }
         } else if (arg == "--domain") {
             if (i + 1 < argc) opts.domain_name = argv[++i];
-        } else if (arg == "--bdamage") {
-            if (i + 1 < argc) opts.bdamage_file = argv[++i];
         } else if (arg == "--orf-min-aa") {
             if (i + 1 < argc) {
                 opts.orf_min_aa = std::stoul(argv[++i]);

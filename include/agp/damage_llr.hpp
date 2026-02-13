@@ -10,6 +10,11 @@
  * - Hexamer-level: P(obs_hexamer | damaged) / P(obs_hexamer | undamaged)
  *
  * Uses domain-specific hexamer tables for proper priors.
+ *
+ * From OpenCode collaboration:
+ * - STOP_LOG_ODDS = 1.0 threshold for stop codon correction
+ * - NONSTOP_LOG_ODDS = 2.5 threshold for non-stop correction
+ * - D_MIN_STOP = 0.005 minimum damage rate to consider
  */
 
 #include "hexamer_tables.hpp"
@@ -43,7 +48,7 @@ public:
     float lambda_3p = 0.3f;   // Decay rate from 3' end
     Domain domain = Domain::GTDB;
 
-    // Correction thresholds
+    // Correction thresholds (from OpenCode review)
     static constexpr float STOP_LOG_ODDS = 1.0f;    // ~73% posterior for stop correction
     static constexpr float NONSTOP_LOG_ODDS = 2.5f; // ~92% posterior for non-stop correction
     static constexpr float D_MIN_STOP = 0.005f;     // Minimum damage rate to consider
