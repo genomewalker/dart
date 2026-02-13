@@ -307,7 +307,7 @@ Positional probability weights these substitutions: sites near termini (where da
 
 ## Performance
 
-Benchmarked on synthetic ancient DNA with known damage patterns (3.1M reads).
+Benchmarked on synthetic ancient DNA with known damage patterns (3.4M reads).
 
 ### Protein damage annotation
 
@@ -363,21 +363,21 @@ score = 0.80 \cdot p_{read} + 0.40 \cdot I_{nonsyn} + 0.05 \cdot I_{syn}
 
 Where `I_nonsyn` indicates whether the alignment contains non-synonymous substitutions consistent with damage (D→N, E→K, H→Y, etc.) and `has_syn` indicates synonymous damage patterns. The combined score is evaluated against binary ground truth (read contains any C→T or G→A event) using AUC-ROC.
 
-**Per-sample results** (10 synthetic samples, 3.1M reads total):
+**Per-sample results** (10 synthetic samples, 3.4M reads total):
 
 | Sample | Reads | AUC-ROC |
 |--------|-------|---------|
-| 119_B3...-24 | 94,407 | 0.753 |
-| 119_B3...-25 | 21,737 | 0.779 |
-| 119_B3...-27 | 69,152 | 0.752 |
-| 119_B3...-29 | 57,252 | 0.768 |
-| 69_B2...-31 | 304,896 | 0.759 |
-| 69_B2...-33 | 377,497 | 0.779 |
-| 69_B2...-34 | 799,059 | 0.797 |
-| 69_B2...-35 | 668,142 | 0.782 |
-| 69_B2...-36 | 608,086 | 0.789 |
-| 69_B2...-37 | 148,617 | 0.795 |
-| **Weighted mean** | **3,148,845** | **0.78** |
+| 119_B3...-24 | 100,275 | 0.756 |
+| 119_B3...-25 | 23,252 | 0.781 |
+| 119_B3...-27 | 73,308 | 0.755 |
+| 119_B3...-29 | 61,487 | 0.771 |
+| 69_B2...-31 | 328,403 | 0.762 |
+| 69_B2...-33 | 402,301 | 0.781 |
+| 69_B2...-34 | 855,961 | 0.799 |
+| 69_B2...-35 | 712,272 | 0.784 |
+| 69_B2...-36 | 645,449 | 0.791 |
+| 69_B2...-37 | 157,064 | 0.798 |
+| **Mean** | **3,359,772** | **0.78** |
 
 <p align="center">
 <img src="docs/protein_damage_classification.png" width="800" alt="Read-level damage classification">
