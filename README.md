@@ -307,41 +307,54 @@ Positional probability weights these substitutions: sites near termini (where da
 
 ## Performance
 
-Benchmarked on synthetic ancient DNA with known damage patterns (3.4M reads).
+Benchmarked on synthetic ancient DNA from the KapK community with known damage patterns and source proteins.
 
 ### Protein damage annotation
 
 The `damage-annotate` command scores each protein hit by combining:
 - **p_read**: Pre-mapping terminal nucleotide damage signal (0-1)
-- **I_nonsyn**: Post-mapping damage-consistent AA substitutions (0 or 1)
+- **n_damage / L_aln**: Damage density — fraction of alignment with damage-consistent substitutions
 - **I_syn**: Post-mapping synonymous damage patterns (0 or 1)
 
-$$\text{score} = 0.80 \cdot p_{\text{read}} + 0.40 \cdot I_{\text{nonsyn}} + 0.05 \cdot I_{\text{syn}}$$
+$$\text{score} = 0.80 \cdot p_{\text{read}} + 4.0 \cdot \frac{n_{\text{damage}}}{L_{\text{aln}}} + 0.05 \cdot I_{\text{syn}}$$
 
-> **Note**: Scores range 0-1.25 (not normalized). Threshold 0.7 is recommended for classification.
+> **Note**: Scores range 0-1.25 (not normalized). Threshold 0.4 is recommended for classification.
 
 | Metric | Value |
 |--------|-------|
 | Read-level AUC-ROC | **0.78** |
-| Precision @ threshold 0.7 | 92% |
-| Recall @ threshold 0.7 | 81% |
+| Precision @ threshold 0.4 | 93% |
+| Recall @ threshold 0.4 | 81% |
 
 ### Gene prediction
 
-Comparison with other methods for frame selection accuracy:
+Benchmarked on 18.3M synthetic ancient DNA reads (10 KapK community samples) with known source proteins. Functional matching counts a hit as correct if it has ≥90% sequence identity to any reference protein.
 
-| Method | Recall | Precision | F1 |
-|--------|--------|-----------|-----|
-| AGP (adaptive) | 76.4% | 100% | 86.6% |
-| MMseqs2 blastx | 76.2% | 99.8% | 86.4% |
-| AGP (6-frame) | 74.2% | 100% | 85.2% |
-| FGS-rs | 29.8% | 100% | 45.9% |
+**Functional matching (≥90% identity):**
 
-FGS-rs (FragGeneScan) performs poorly on ancient DNA because it treats damage-induced stop codons as real stops. AGP's damage-aware frame selection recovers these reads.
+| Method | Recall | Precision | Avg Identity |
+|--------|--------|-----------|--------------|
+| AGP | 67.6% | **97.2%** | **96.2%** |
+| MMseqs2 blastx | **68.5%** | 96.3% | 94.8% |
+| FGS-rs | 19.1% | 95.3% | 94.2% |
+
+**Timing (4.4M reads, 8 threads):**
+
+| Method | Predict | Search | Total |
+|--------|---------|--------|-------|
+| AGP | 149s | 4 min | ~6.5 min |
+| MMseqs2 blastx | N/A | 10 min | ~10 min |
+| FGS-rs | ~18s | 4 min | ~4.5 min |
+
+**Key findings:**
+- AGP and BLASTX have equivalent functional recall (~68%), both far exceed FGS-rs (19%)
+- AGP produces +1.4% higher identity hits than BLASTX (better quality matches)
+- AGP is ~1.5x faster than BLASTX (damage-aware frame selection vs 6-frame brute force)
+- FGS-rs fails on ancient DNA because it treats damage-induced stop codons as real stops
 
 ### Throughput
 
-~20,000 reads/second with SIMD optimization.
+~35,000 sequences/second for gene prediction (8 threads, SIMD optimization).
 
 ## Validation
 
@@ -351,17 +364,17 @@ AGP validation uses two complementary datasets: (1) synthetic reads from the Kap
 
 After database search, the `damage-annotate` command computes a combined score for each protein hit:
 
-$$\text{score} = 0.80 \times p_{\text{read}} + 0.40 \times I_{\text{nonsyn}} + 0.05 \times I_{\text{syn}}$$
+$$\text{score} = 0.80 \times p_{\text{read}} + 4.0 \times \frac{n_{\text{damage}}}{L_{\text{aln}}} + 0.05 \times I_{\text{syn}}$$
 
-Where *p_read* is the Bayesian damage probability from terminal patterns, *I_nonsyn* indicates damage-consistent amino acid substitutions (R→W, H→Y, Q→*, etc.), and *I_syn* indicates synonymous damage patterns. The score ranges from 0 to 1.25.
+Where *p_read* is the Bayesian damage probability from terminal patterns, *n_damage/L_aln* is the damage density (fraction of alignment with damage-consistent substitutions like R→W, H→Y, Q→*), and *I_syn* indicates synonymous damage patterns. The score ranges from 0 to ~1.0.
 
-We validated this score on 3.4M synthetic reads where each read has known damage status:
+We validated this score on 4.4M synthetic reads where each read has known damage status:
 
 | Metric | Value |
 |--------|-------|
 | Mean AUC-ROC (10 samples) | **0.78** |
-| Precision @ threshold 0.7 | 92% |
-| Recall @ threshold 0.7 | 81% |
+| Precision @ threshold 0.4 | 93% |
+| Recall @ threshold 0.4 | 81% |
 
 The figure below shows score distributions across samples. Three peaks arise from GC content variation: AT-rich samples show stronger terminal signal than GC-rich samples.
 
@@ -485,7 +498,7 @@ In damage-aware mode, stop penalties are weighted by (1 - P_damage), reducing pe
 
 The per-protein damage score integrates pre-mapping and post-mapping evidence:
 
-$$\text{score} = 0.80 \cdot p_{\text{read}} + 0.40 \cdot I_{\text{nonsyn}} + 0.05 \cdot I_{\text{syn}}$$
+$$\text{score} = 0.80 \cdot p_{\text{read}} + 4.0 \cdot \frac{n_{\text{damage}}}{L_{\text{aln}}} + 0.05 \cdot I_{\text{syn}}$$
 
 Where *p_read* is the Bayesian damage posterior from terminal nucleotide patterns, and I_nonsyn/I_syn indicate non-synonymous/synonymous damage-consistent substitutions in the alignment.
 
