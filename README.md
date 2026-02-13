@@ -315,14 +315,15 @@ Benchmarked on synthetic ancient DNA from the KapK community with known damage p
 The `damage-annotate` command computes a Bayesian posterior probability for each protein hit using:
 - **Terminal evidence**: Pre-mapping T/(T+C) damage signal from read termini
 - **Site evidence**: Damage-consistent amino acid substitutions from alignment (R→W, H→Y, Q→*, etc.)
+- **Identity evidence**: Ancient proteins have +2.8% higher alignment identity than spurious modern matches
 
-The Bayesian scoring combines both signals in log-odds space for 3-state classification (damaged/uncertain/non-damaged).
+The hybrid Bayesian scoring combines all three signals in log-odds space for 3-state classification (damaged/uncertain/non-damaged).
 
 | Metric | Value |
 |--------|-------|
-| Protein-level AUC-ROC | **0.79** |
+| Protein-level AUC-ROC | **0.86** |
 | Precision @ threshold 0.4 | 93% |
-| Recall @ threshold 0.4 | 83% |
+| Recall @ threshold 0.4 | 93% |
 
 ### Gene prediction
 
@@ -362,31 +363,31 @@ AGP validation uses two complementary datasets: (1) synthetic reads from the Kap
 
 After database search, the `damage-annotate` command computes a Bayesian posterior probability for each protein hit:
 
-$$\text{logit}(P_{\text{posterior}}) = \text{logit}(\pi) + \log BF_{\text{terminal}} + \log BF_{\text{sites}}$$
+$$\text{logit}(P_{\text{posterior}}) = \text{logit}(\pi) + \log BF_{\text{terminal}} + \log BF_{\text{sites}} + \log BF_{\text{identity}}$$
 
-Where *π* is the prior probability of ancient origin, *BF_terminal* is the Bayes factor from terminal nucleotide patterns (p_read), and *BF_sites* is the Bayes factor from damage-consistent amino acid substitutions in the alignment (R→W, H→Y, Q→*, etc.).
+Where *π* is the prior probability of ancient origin, *BF_terminal* is the Bayes factor from terminal nucleotide patterns (p_read), *BF_sites* is the Bayes factor from damage-consistent amino acid substitutions (R→W, H→Y, Q→*, etc.), and *BF_identity* is the Bayes factor from alignment identity (ancient proteins have +2.8% higher identity than spurious modern matches).
 
 We validated on 4.36M proteins from 10 synthetic KapK samples with known damage status:
 
 | Metric | Value |
 |--------|-------|
-| Protein-level AUC-ROC | **0.79** |
+| Protein-level AUC-ROC | **0.86** |
 | Precision @ threshold 0.4 | 93% |
-| Recall @ threshold 0.4 | 83% |
+| Recall @ threshold 0.4 | 93% |
 
-The figure below shows precision-recall curves for Bayesian scoring versus the simpler weighted formula.
+The figure below shows score distributions, ROC curves, and precision-recall-F1 at various thresholds.
 
 <p align="center">
 <img src="docs/protein_damage_classification.png" width="800" alt="Read-level damage classification">
 </p>
 
-**Why AUC 0.79?** This approaches the information-theoretic limit for reference-free classification. C→T damage produces thymine indistinguishable from natural T without a reference:
+**Why AUC 0.86?** AGP achieves high classification accuracy by combining three independent evidence sources via Bayesian log-odds fusion:
 
-$$P(T \mid \text{damage}) = 0.25 + 0.75 \times d = 0.475 \quad \text{(at } d=30\%)$$
+1. **Terminal evidence** (BF_terminal): T/(T+C) elevation at read termini from C→T deamination
+2. **Site evidence** (BF_sites): Damage-consistent amino acid substitutions in alignments (R→W, H→Y, Q→*, etc.)
+3. **Identity evidence** (BF_identity): Ancient proteins have +2.8% higher alignment identity than spurious modern matches
 
-$$P(T \mid \text{no damage}) = 0.25$$
-
-A single terminal position yields AUC ~0.61. AGP achieves 0.80 by combining terminal evidence with alignment-derived damage-consistent substitutions via Bayesian log-odds fusion.
+Each evidence source contributes independently. Terminal evidence alone yields AUC ~0.78, but identity evidence is particularly valuable for GC-rich samples where terminal signal is weak.
 
 ### Sample-wide damage validation
 
@@ -496,12 +497,13 @@ In damage-aware mode, stop penalties are weighted by (1 - P_damage), reducing pe
 
 The per-protein damage score uses Bayesian log-odds fusion to integrate pre-mapping and post-mapping evidence:
 
-$$\text{logit}(P_{\text{posterior}}) = \text{logit}(\pi) + \log BF_{\text{terminal}} + \log BF_{\text{sites}}$$
+$$\text{logit}(P_{\text{posterior}}) = \text{logit}(\pi) + \log BF_{\text{terminal}} + \log BF_{\text{sites}} + \log BF_{\text{identity}}$$
 
 Where:
 - $\pi$ is the prior probability of damage (from sample-level estimate)
 - $BF_{\text{terminal}}$ is the Bayes factor from terminal nucleotide patterns (p_read)
 - $BF_{\text{sites}}$ is the Bayes factor from damage-consistent amino acid substitutions (R→W, H→Y, Q→*, etc.)
+- $BF_{\text{identity}}$ is the Bayes factor from alignment identity: $\log BF = k \times (\text{fident} - 0.90)$ where $k = 20$
 
 The output is a posterior probability that supports 3-state classification (damaged/uncertain/non-damaged).
 
