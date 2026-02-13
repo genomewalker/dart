@@ -347,20 +347,11 @@ FGS-rs (FragGeneScan) performs poorly on ancient DNA because it treats damage-in
 
 ## Validation
 
-AGP is validated using two complementary datasets:
-
-| Dataset | Purpose | Ground truth |
-|---------|---------|--------------|
-| **Synthetic community** | Gene prediction, per-read damage | aMGSIM-simulated reads (58 ancient + 42 modern genomes) |
-| **Real metagenomes** | Sample-level damage | 31 samples with metaDMG estimates |
-
----
-
 ### Read-level damage classification
 
-Evaluated on synthetic data where each read has known damage status from aMGSIM simulation.
+Each protein hit receives a damage score combining pre-mapping terminal patterns with post-mapping amino acid substitutions. We validate this score against synthetic data (aMGSIM) where each read has known damage status.
 
-**Per-sample results** (10 synthetic samples, 3.4M reads total):
+**AUC-ROC per sample** (10 synthetic samples, 3.4M reads):
 
 | Sample | Reads | AUC-ROC |
 |--------|-------|---------|
@@ -382,19 +373,13 @@ Evaluated on synthetic data where each read has known damage status from aMGSIM 
 
 *Score distributions show three peaks due to GC content variation across samples. AT-rich samples (6 of 10) show strong terminal damage signal (AUC 0.79); GC-rich samples (4 of 10) have weaker signal (AUC 0.76) because high baseline C content dilutes the C→T shift.*
 
-> **Why AUC ~0.78?** This approaches the information-theoretic ceiling for reference-free single-read classification. C→T damage produces thymine indistinguishable from natural T without a reference. AGP aggregates evidence across terminal positions using Bayesian inference, but 68% of damaged reads contain only one C→T event.
-
----
+> **Why AUC ~0.78?** This approaches the information-theoretic limit for reference-free classification. C→T damage produces thymine indistinguishable from natural T without a reference—and 68% of damaged reads contain only one C→T event.
 
 ### Sample-wide damage validation
 
-Validated against **metaDMG** (reference-based) on 31 real ancient metagenomes.
+AGP estimates sample-wide damage rate without reference alignment using two-channel validation: terminal T/(T+C) elevation (Channel A) combined with stop codon conversion rates (Channel B). We validate against metaDMG (reference-based) on 31 real ancient metagenomes.
 
-AGP uses two-channel validation:
-- **Channel A**: T/(T+C) terminal frequency elevation
-- **Channel B**: Stop codon conversion rates (CAA→TAA, CAG→TAG, CGA→TGA)
-
-**Representative samples**:
+**Comparison with metaDMG**:
 
 | Sample | metaDMG (%) | AGP d_max (%) | Channel B LLR | Decision |
 |--------|-------------|---------------|---------------|----------|
@@ -420,13 +405,11 @@ AGP uses two-channel validation:
 | Mean bias | +4.4% (AGP higher) |
 | Mean absolute error | 8.0% |
 
-The strong correlation (r = 0.807) demonstrates that AGP's reference-free estimates track metaDMG well across the full damage range from <1% to >55%. This is notable because the two methods measure fundamentally different signals: metaDMG counts actual C→T mismatches in aligned reads, while AGP infers damage from terminal nucleotide frequencies without any reference.
+The strong correlation (r = 0.807) shows AGP's reference-free estimates track metaDMG across the full 0-55% damage range. The +4.4% bias reflects different estimands: metaDMG only analyzes reads that align to references, while AGP analyzes all reads.
 
-**Channel B prevents false positives**: The four low-damage samples (low_001 through low_004) illustrate Channel B's critical role. All four have metaDMG estimates below 1.3% yet show elevated terminal T/(T+C) in Channel A—exactly the pattern that would cause reference-free methods to incorrectly report damage. However, their negative Channel B LLR values (-365 to -24,707) indicate that stop codon conversion rates at termini are actually *lower* than interior baseline, proving the terminal T enrichment is compositional, not deamination. AGP correctly reports d_max = 0 for all four.
+> **Channel B prevents false positives**: Samples low_001–low_004 show elevated terminal T/(T+C) but negative Channel B LLR, indicating the T enrichment is compositional rather than damage. AGP correctly reports d_max = 0.
 
-**Systematic bias exists but is expected**: AGP's +4.4% average overestimation reflects different estimands. metaDMG only analyzes reads that successfully align to reference genomes—a subset biased toward conserved, potentially better-preserved sequences. AGP analyzes all reads regardless of alignment status. This selection bias cannot be eliminated without reference genomes, but the strong correlation means AGP estimates remain useful for sample authentication and quality control.
-
-**Limitations**: Channel B validation requires sufficient convertible codon coverage (typically >10,000 reads containing CAA, CAG, or CGA at terminal positions). Very short reads (<60 bp) may lack enough interior sequence to establish reliable baseline frequencies. AT-rich organisms can show inverted terminal patterns (lower T at termini than interior), which confounds Channel A; in these cases, Channel B becomes the primary signal.
+> **Limitations**: Requires >10,000 reads with convertible codons (CAA, CAG, CGA) at termini. Very short reads (<60 bp) may lack sufficient interior baseline.
 
 ## Methods
 
