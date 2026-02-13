@@ -10,6 +10,7 @@
 #include "agp/version.h"
 #include "agp/damage_stats.hpp"
 #include "agp/damage_index_reader.hpp"
+#include "agp/bayesian_damage_score.hpp"
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -150,6 +151,7 @@ struct ProteinDamageSummary {
     std::string qaln;
     std::string taln;
     size_t qstart_0;
+    size_t qlen = 0;  // Total read length (for Bayesian scoring)
 };
 
 // Parse strand and frame from AGP header suffix (e.g., readname_+_1 -> '+', 1)
@@ -209,21 +211,33 @@ static std::string field_str(const std::string& line, size_t start, size_t end) 
     return line.substr(start, end - start);
 }
 
-// Compute combined damage score using per-read + alignment evidence
-// Formula: 0.80*p_read + 0.40*(has_nonsyn) + 0.05*(has_syn)
-// Achieves AUC 0.8149 vs 0.7509 for alignment-only scoring (+6.4%)
-// Weights optimized via grid search on 715K protein benchmark
-static float compute_combined_score(float p_read, bool has_nonsyn, bool has_syn) {
-    constexpr float W_READ = 0.80f;
-    constexpr float W_NONSYN = 0.40f;
-    constexpr float W_SYN = 0.05f;
+// Compute combined damage score using noisy-OR model
+// P(ancient) = 1 - (1 - p_read) × (1 - p_nonsyn) × (1 - p_syn)
+//
+// All probabilities are sample-calibrated via d_max:
+// - p_read: from sample damage model (already calibrated)
+// - p_nonsyn: damage sites → probability, scaled by d_max
+// - p_syn: synonymous damage → weaker signal, scaled by d_max
+//
+// No magic weights - everything derived from sample's damage level.
+static float compute_combined_score(float p_read, size_t damage_sites, bool has_syn, float d_max) {
+    // p_nonsyn: probability that observed damage sites indicate ancient origin
+    // Uses saturation function: more sites = stronger evidence, caps at d_max
+    // p = d_max × (1 - exp(-0.5 × n)) where n = number of damage sites
+    // At n=1: p ≈ 0.39 × d_max, n=2: p ≈ 0.63 × d_max, n=3+: p → d_max
+    float p_nonsyn = damage_sites > 0
+        ? d_max * (1.0f - std::exp(-0.5f * static_cast<float>(damage_sites)))
+        : 0.0f;
 
-    float score = W_READ * p_read;
-    if (has_nonsyn) score += W_NONSYN;
-    if (has_syn) score += W_SYN;
+    // p_syn: synonymous damage is weaker evidence (doesn't change protein)
+    // but still indicates deamination occurred
+    float p_syn = has_syn ? (d_max * 0.5f) : 0.0f;
 
-    // Clamp to [0, 1]
-    return std::min(1.0f, std::max(0.0f, score));
+    // Noisy-OR: each evidence source independently suggests ancient origin
+    // Combined probability = 1 - P(none of them indicate ancient)
+    float combined = 1.0f - (1.0f - p_read) * (1.0f - p_nonsyn) * (1.0f - p_syn);
+
+    return std::min(1.0f, std::max(0.0f, combined));
 }
 
 // Annotate a single alignment
@@ -698,12 +712,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
         if (summary.total_mismatches > 0) {
             filter_sites_by_distance(summary, max_dist);
-            // Store alignment data for single-pass corrected output
-            if (need_alignments && !summary.sites.empty()) {
-                summary.qaln = std::move(qaln);
-                summary.taln = std::move(taln);
-                summary.qstart_0 = qstart_0;
-            }
+            // Store alignment data for Bayesian scoring and corrected output
+            summary.qlen = qlen;
+            summary.qaln = qaln;
+            summary.taln = taln;
+            summary.qstart_0 = qstart_0;
             // Look up synonymous damage and per-read p_damaged from index if available
             if (damage_index) {
                 if (const AgdRecord* rec = damage_index->find(query_id)) {
@@ -740,6 +753,37 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         std::cerr << "  C->T class: " << total_ct << "\n";
         std::cerr << "  G->A class: " << total_ga << "\n";
         std::cerr << "  High confidence: " << total_high << "\n";
+    }
+
+    // Bayesian scoring setup
+    // 1. Create decay lookup table for position-weighted hazards
+    agp::ExpDecayLUT decay_lut(lambda, 300);
+
+    // 2. Estimate q_modern from low p_read reads (likely undamaged)
+    // Use reads with p_read < 0.20 as modern proxy (p_read is bimodal: ~0 or ~0.5+)
+    std::vector<std::pair<uint32_t, uint32_t>> modern_proxy;
+    for (const auto& s : summaries) {
+        if (s.has_p_read && s.p_read < 0.20f && !s.qaln.empty()) {
+            auto ev = agp::compute_site_evidence(s.qaln, s.taln, s.qstart_0, s.qlen, d_max, decay_lut);
+            modern_proxy.emplace_back(ev.m, ev.k);
+        }
+    }
+    agp::ModernBaseline modern_est = agp::estimate_modern_baseline(modern_proxy);
+
+    // Set up scoring parameters
+    agp::BayesianScoreParams score_params;
+    score_params.pi = 0.10f;           // Prior P(ancient) - conservative
+    score_params.pi0 = 0.10f;          // Prior used in p_read calculation
+    score_params.q_modern = modern_est.q_modern;
+    score_params.terminal_threshold = 0.50f;
+
+    if (verbose) {
+        std::cerr << "\nBayesian scoring:\n";
+        std::cerr << "  Modern proxy reads: " << modern_est.n_reads << "\n";
+        std::cerr << "  Pooled opportunities: " << modern_est.M0 << "\n";
+        std::cerr << "  Pooled hits: " << modern_est.K0 << "\n";
+        std::cerr << "  Estimated q_modern: " << std::fixed << std::setprecision(5)
+                  << modern_est.q_modern << "\n";
     }
 
     // Write per-site output
@@ -811,18 +855,29 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         out = &file_out;
     }
 
+    // Output header with Bayesian decomposition columns
     *out << "query_id\ttarget_id\tevalue\tbits\tfident\talnlen\t"
             "total_mismatches\tdamage_consistent\tnon_damage\t"
             "ct_sites\tga_sites\thigh_conf\tdamage_fraction\t"
-            "max_p_damage\tp_damaged\tp_read\tcombined_score\t"
-            "is_damaged\tsyn_5prime\tsyn_3prime\n";
+            "max_p_damage\tp_damaged\tp_read\tposterior\t"
+            "is_damaged\tlogBF_terminal\tlogBF_sites\t"
+            "m_opportunities\tk_hits\tq_eff\ttier\t"
+            "syn_5prime\tsyn_3prime\n";
 
     for (const auto& s : summaries) {
-        // Compute combined score using per-read + alignment evidence
-        bool has_nonsyn = s.damage_consistent > 0;
-        bool has_syn = s.syn_5prime > 0 || s.syn_3prime > 0;
-        float combined = s.has_p_read ?
-            compute_combined_score(s.p_read, has_nonsyn, has_syn) : s.p_damaged;
+        // Compute Bayesian score with decomposition
+        float posterior = s.p_damaged;  // fallback if no alignment data
+        agp::BayesianScoreOutput bayes_out{};
+
+        if (s.has_p_read && !s.qaln.empty()) {
+            // Compute site evidence from alignment
+            auto ev = agp::compute_site_evidence(
+                s.qaln, s.taln, s.qstart_0, s.qlen, d_max, decay_lut);
+
+            // Compute Bayesian score
+            bayes_out = agp::compute_bayesian_score(s.p_read, ev, score_params);
+            posterior = bayes_out.posterior;
+        }
 
         *out << s.query_id << "\t" << s.target_id << "\t"
              << std::scientific << std::setprecision(2) << s.evalue << "\t"
@@ -836,8 +891,13 @@ int cmd_damage_annotate(int argc, char* argv[]) {
              << std::fixed << std::setprecision(4) << s.max_p_damage << "\t"
              << std::fixed << std::setprecision(4) << s.p_damaged << "\t"
              << std::fixed << std::setprecision(4) << (s.has_p_read ? s.p_read : 0.0f) << "\t"
-             << std::fixed << std::setprecision(4) << combined << "\t"
-             << (combined >= threshold ? 1 : 0) << "\t"
+             << std::fixed << std::setprecision(4) << posterior << "\t"
+             << (posterior >= threshold ? 1 : 0) << "\t"
+             << std::fixed << std::setprecision(3) << bayes_out.logBF_terminal << "\t"
+             << std::fixed << std::setprecision(3) << bayes_out.logBF_sites << "\t"
+             << bayes_out.m << "\t" << bayes_out.k << "\t"
+             << std::fixed << std::setprecision(5) << bayes_out.q_eff << "\t"
+             << agp::tier_name(bayes_out.tier) << "\t"
              << (s.has_syn_data ? std::to_string(s.syn_5prime) : ".") << "\t"
              << (s.has_syn_data ? std::to_string(s.syn_3prime) : ".") << "\n";
     }

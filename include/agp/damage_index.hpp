@@ -94,16 +94,17 @@ inline uint64_t fnv1a_hash(std::string_view str) {
  * @brief Strip AGP frame/strand suffix from read ID.
  *
  * AGP output format: "read_name_+_1" or "read_name_-_2"
+ * Frames can be 1-6 (6-frame translation) or 0-2 (3-frame)
  * Returns: "read_name"
  */
 inline std::string_view strip_agp_suffix(std::string_view id) {
-    // Look for pattern _[+-]_[0-2] at end
+    // Look for pattern _[+-]_[0-9] at end
     if (id.size() >= 4) {
         size_t pos = id.size() - 4;
         if (id[pos] == '_' &&
             (id[pos + 1] == '+' || id[pos + 1] == '-') &&
             id[pos + 2] == '_' &&
-            id[pos + 3] >= '0' && id[pos + 3] <= '2') {
+            id[pos + 3] >= '0' && id[pos + 3] <= '9') {
             return id.substr(0, pos);
         }
     }
