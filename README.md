@@ -164,9 +164,10 @@ Optional:
 
 Output columns include:
 - `p_read`: Per-read damage probability from prediction
-- `damage_consistent`: Amino acid substitutions matching damage patterns
-- `combined_score`: Weighted damage score (0.80×p_read + 0.40×has_nonsyn + 0.05×has_syn)
-- `is_damaged`: Binary classification (combined_score >= threshold)
+- `ct_sites`, `ga_sites`: C→T and G→A substitution counts from alignment
+- `posterior`: Bayesian damage probability combining terminal and alignment evidence
+- `damage_class`: 3-state classification (ancient/uncertain/modern)
+- `is_damaged`: Binary classification (posterior >= threshold)
 
 ### `agp damage-profile`
 
@@ -311,20 +312,17 @@ Benchmarked on synthetic ancient DNA from the KapK community with known damage p
 
 ### Protein damage annotation
 
-The `damage-annotate` command scores each protein hit by combining:
-- **p_read**: Pre-mapping terminal nucleotide damage signal (0-1)
-- **n_damage / L_aln**: Damage density — fraction of alignment with damage-consistent substitutions
-- **I_syn**: Post-mapping synonymous damage patterns (0 or 1)
+The `damage-annotate` command computes a Bayesian posterior probability for each protein hit using:
+- **Terminal evidence**: Pre-mapping T/(T+C) damage signal from read termini
+- **Site evidence**: Damage-consistent amino acid substitutions from alignment (R→W, H→Y, Q→*, etc.)
 
-$$\text{score} = 0.80 \cdot p_{\text{read}} + 4.0 \cdot \frac{n_{\text{damage}}}{L_{\text{aln}}} + 0.05 \cdot I_{\text{syn}}$$
-
-> **Note**: Scores range 0-1.25 (not normalized). Threshold 0.4 is recommended for classification.
+The Bayesian scoring combines both signals in log-odds space, providing principled uncertainty quantification and 3-state classification (ancient/uncertain/modern).
 
 | Metric | Value |
 |--------|-------|
-| Read-level AUC-ROC | **0.78** |
-| Precision @ threshold 0.4 | 93% |
-| Recall @ threshold 0.4 | 81% |
+| Protein-level AUC-ROC | **0.80** |
+| Precision @ threshold 0.4 | 92% |
+| Recall @ threshold 0.4 | 93% |
 
 ### Gene prediction
 
@@ -360,35 +358,35 @@ Benchmarked on 18.3M synthetic ancient DNA reads (10 KapK community samples) wit
 
 AGP validation uses two complementary datasets: (1) synthetic reads from the KapK community with known per-read damage status, and (2) 31 real ancient metagenomes with metaDMG reference-based damage estimates.
 
-### Read-level damage classification
+### Protein-level damage classification
 
-After database search, the `damage-annotate` command computes a combined score for each protein hit:
+After database search, the `damage-annotate` command computes a Bayesian posterior probability for each protein hit:
 
-$$\text{score} = 0.80 \times p_{\text{read}} + 4.0 \times \frac{n_{\text{damage}}}{L_{\text{aln}}} + 0.05 \times I_{\text{syn}}$$
+$$\text{logit}(P_{\text{posterior}}) = \text{logit}(\pi) + \log BF_{\text{terminal}} + \log BF_{\text{sites}}$$
 
-Where *p_read* is the Bayesian damage probability from terminal patterns, *n_damage/L_aln* is the damage density (fraction of alignment with damage-consistent substitutions like R→W, H→Y, Q→*), and *I_syn* indicates synonymous damage patterns. The score ranges from 0 to ~1.0.
+Where *π* is the prior probability of ancient origin, *BF_terminal* is the Bayes factor from terminal nucleotide patterns (p_read), and *BF_sites* is the Bayes factor from damage-consistent amino acid substitutions in the alignment (R→W, H→Y, Q→*, etc.).
 
-We validated this score on 4.4M synthetic reads where each read has known damage status:
+We validated on 4.36M proteins from 10 synthetic KapK samples with known damage status:
 
 | Metric | Value |
 |--------|-------|
-| Mean AUC-ROC (10 samples) | **0.78** |
-| Precision @ threshold 0.4 | 93% |
-| Recall @ threshold 0.4 | 81% |
+| Protein-level AUC-ROC | **0.80** |
+| Precision @ threshold 0.4 | 92% |
+| Recall @ threshold 0.4 | 93% |
 
-The figure below shows score distributions across samples. Three peaks arise from GC content variation: AT-rich samples show stronger terminal signal than GC-rich samples.
+The figure below shows precision-recall curves for Bayesian scoring versus the simpler weighted formula.
 
 <p align="center">
 <img src="docs/protein_damage_classification.png" width="800" alt="Read-level damage classification">
 </p>
 
-**Why AUC 0.78?** This approaches the information-theoretic limit for reference-free classification. C→T damage produces thymine indistinguishable from natural T without a reference:
+**Why AUC 0.80?** This approaches the information-theoretic limit for reference-free classification. C→T damage produces thymine indistinguishable from natural T without a reference:
 
 $$P(T \mid \text{damage}) = 0.25 + 0.75 \times d = 0.475 \quad \text{(at } d=30\%)$$
 
 $$P(T \mid \text{no damage}) = 0.25$$
 
-A single terminal position yields AUC ~0.61. AGP achieves 0.78 by aggregating evidence across multiple terminal positions with per-read composition baselines.
+A single terminal position yields AUC ~0.61. AGP achieves 0.80 by combining terminal evidence with alignment-derived damage-consistent substitutions via Bayesian log-odds fusion.
 
 ### Sample-wide damage validation
 

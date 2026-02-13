@@ -877,10 +877,23 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         float posterior = s.p_damaged;  // fallback if no alignment data
         agp::BayesianScoreOutput bayes_out{};
 
-        if (s.has_p_read && !s.qaln.empty()) {
-            // Compute site evidence from alignment
-            auto ev = agp::compute_site_evidence(
-                s.qaln, s.taln, s.qstart_0, s.qlen, d_max, decay_lut);
+        if (s.has_p_read) {
+            // Use ct_sites + ga_sites as damage evidence (correctly computed from AA substitutions)
+            // The compute_site_evidence function was broken - it expected nucleotides but got amino acids
+            agp::SiteEvidence ev{};
+            ev.k = static_cast<uint32_t>(s.ct_sites + s.ga_sites);  // damage-consistent hits
+            ev.m = static_cast<uint32_t>(s.alnlen);  // opportunities ~ alignment length
+
+            // Compute log-likelihood contribution for hits
+            // Each damage site at terminal position has ~d_max probability
+            // log(q_ancient / q_modern) where q_ancient ~ d_max, q_modern ~ 0.005
+            constexpr float Q_BASELINE = 0.005f;
+            if (ev.k > 0 && d_max > Q_BASELINE) {
+                float avg_q_ancient = d_max * 0.5f + Q_BASELINE;  // average over positions
+                ev.sum_log_qA_hits = static_cast<float>(ev.k) * std::log(avg_q_ancient / Q_BASELINE);
+            }
+            ev.sum_qA = d_max * 0.3f * static_cast<float>(ev.m);  // rough average damage rate
+            ev.q_eff = (ev.m > 0) ? (ev.sum_qA / static_cast<float>(ev.m)) : 0.0f;
 
             // Compute Bayesian score
             bayes_out = agp::compute_bayesian_score(s.p_read, ev, score_params);
