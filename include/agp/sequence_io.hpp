@@ -193,6 +193,44 @@ private:
 };
 
 /**
+ * Statistics writer for damage model and codon usage
+ */
+class StatsWriter {
+public:
+    explicit StatsWriter(const std::string& filename);
+    ~StatsWriter();
+
+    /**
+     * Write codon frequency statistics
+     */
+    void write_codon_frequencies(const std::map<std::string, float>& frequencies);
+
+    /**
+     * Write damage model parameters
+     */
+    void write_damage_parameters(float lambda_5p, float lambda_3p,
+                                 float delta_max, float delta_bg);
+
+    /**
+     * Write damage profile (position-specific rates)
+     */
+    void write_damage_profile(const std::vector<float>& ct_profile,
+                             const std::vector<float>& ga_profile);
+
+    /**
+     * Write organism statistics (GC content, ENC, etc.)
+     */
+    void write_organism_stats(float gc_content, float enc,
+                             const std::map<std::string, float>& rscu);
+
+    void close();
+
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+/**
  * Sequence utilities
  */
 class SequenceUtils {

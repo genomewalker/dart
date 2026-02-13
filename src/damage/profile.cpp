@@ -105,15 +105,9 @@ const DamageProfile& DamageModel::create_profile_cached(size_t seq_len) const {
         seq_len = profile_cache_.size() - 1;
     }
 
-    // Check cache first (double-checked locking for performance)
-    if (profile_cache_[seq_len].has_value()) {
-        return *profile_cache_[seq_len];
-    }
-
-    // Lock and create profile if not cached
+    // Lock before both read and write to avoid races on optional storage.
     std::lock_guard<std::mutex> lock(cache_mutex_);
 
-    // Double-check after acquiring lock
     if (!profile_cache_[seq_len].has_value()) {
         profile_cache_[seq_len] = create_profile(seq_len);
     }

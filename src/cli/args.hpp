@@ -25,7 +25,6 @@ struct Options {
     std::string fasta_aa_masked;     // Search-optimized: terminal damage stops masked as X
     std::string summary_file;        // Summary statistics output file (JSON format)
     std::string damage_index;        // Binary damage index (.agd) for post-mapping annotation
-    std::string bdamage_file;        // External metaDMG bdamage file for damage profile
 
     // Taxonomic domain
     std::string domain_name = "gtdb";  // Default to bacteria/archaea for ancient DNA

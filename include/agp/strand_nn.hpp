@@ -207,9 +207,9 @@ inline int count_internal_stops(const std::string& seq, int frame) {
     int stops = 0;
     int n_codons = 0;
     for (size_t i = frame; i + 2 < seq.length(); i += 3) {
-        char c1 = std::toupper(seq[i]);
-        char c2 = std::toupper(seq[i+1]);
-        char c3 = std::toupper(seq[i+2]);
+        char c1 = std::toupper(static_cast<unsigned char>(seq[i]));
+        char c2 = std::toupper(static_cast<unsigned char>(seq[i+1]));
+        char c3 = std::toupper(static_cast<unsigned char>(seq[i+2]));
         n_codons++;
         bool is_stop = (c1=='T' && c2=='A' && c3=='A') ||
                        (c1=='T' && c2=='A' && c3=='G') ||
@@ -227,7 +227,7 @@ inline float compute_hexamer_score(const std::string& seq, int frame) {
         int gc = 0;
         bool valid = true;
         for (int j = 0; j < 6; j++) {
-            char c = std::toupper(seq[i+j]);
+            char c = std::toupper(static_cast<unsigned char>(seq[i+j]));
             if (c != 'A' && c != 'C' && c != 'G' && c != 'T') { valid = false; break; }
             if (c == 'G' || c == 'C') gc++;
         }
@@ -243,8 +243,8 @@ inline float compute_hexamer_score(const std::string& seq, int frame) {
 inline float compute_rny_score(const std::string& seq, int frame) {
     int count = 0, total = 0;
     for (size_t i = frame; i + 2 < seq.length(); i += 3) {
-        char pos1 = std::toupper(seq[i]);
-        char pos3 = std::toupper(seq[i+2]);
+        char pos1 = std::toupper(static_cast<unsigned char>(seq[i]));
+        char pos3 = std::toupper(static_cast<unsigned char>(seq[i+2]));
         if ((pos1 == 'A' || pos1 == 'C' || pos1 == 'G' || pos1 == 'T') &&
             (pos3 == 'A' || pos3 == 'C' || pos3 == 'G' || pos3 == 'T')) {
             total++;
@@ -260,7 +260,7 @@ inline void compute_gc_by_position(const std::string& seq, int frame, float gc_p
     int total[3] = {0, 0, 0};
     for (size_t i = frame; i < seq.length(); i++) {
         int pos = (i - frame) % 3;
-        char c = std::toupper(seq[i]);
+        char c = std::toupper(static_cast<unsigned char>(seq[i]));
         if (c == 'A' || c == 'C' || c == 'G' || c == 'T') {
             total[pos]++;
             if (c == 'G' || c == 'C') gc[pos]++;
@@ -321,18 +321,18 @@ inline std::array<float, INPUT_SIZE> extract_features(const std::string& seq) {
         
         // Start/stop presence
         bool has_atg = (bf + 2 < strand.length() &&
-                        std::toupper(strand[bf]) == 'A' &&
-                        std::toupper(strand[bf+1]) == 'T' &&
-                        std::toupper(strand[bf+2]) == 'G');
+                        std::toupper(static_cast<unsigned char>(strand[bf])) == 'A' &&
+                        std::toupper(static_cast<unsigned char>(strand[bf+1])) == 'T' &&
+                        std::toupper(static_cast<unsigned char>(strand[bf+2])) == 'G');
         features[idx++] = has_atg ? 1.0f : 0.0f;
         
         // Terminal stop
         size_t last_codon = ((strand.length() - bf) / 3 - 1) * 3 + bf;
         bool has_term_stop = false;
         if (last_codon + 2 < strand.length()) {
-            char c1 = std::toupper(strand[last_codon]);
-            char c2 = std::toupper(strand[last_codon+1]);
-            char c3 = std::toupper(strand[last_codon+2]);
+            char c1 = std::toupper(static_cast<unsigned char>(strand[last_codon]));
+            char c2 = std::toupper(static_cast<unsigned char>(strand[last_codon+1]));
+            char c3 = std::toupper(static_cast<unsigned char>(strand[last_codon+2]));
             has_term_stop = (c1=='T' && c2=='A' && (c3=='A' || c3=='G')) ||
                            (c1=='T' && c2=='G' && c3=='A');
         }

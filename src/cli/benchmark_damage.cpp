@@ -9,7 +9,11 @@
 #include <unordered_map>
 #include <algorithm>
 #include <cmath>
+#include <charconv>
+#include <cerrno>
+#include <cctype>
 #include <cstring>
+#include <cstdlib>
 #include <cstdio>
 
 struct Prediction {
@@ -27,14 +31,61 @@ struct Truth {
     bool has_stop_damage = false; // Creates premature stop codon (>*)
 };
 
+namespace {
+
+std::string shell_escape(const std::string& arg) {
+    std::string escaped = "'";
+    for (char c : arg) {
+        if (c == '\'') {
+            escaped += "'\\''";
+        } else {
+            escaped += c;
+        }
+    }
+    escaped += "'";
+    return escaped;
+}
+
+bool parse_int_token(const std::string& value, int& out) {
+    const char* begin = value.data();
+    const char* end = begin + value.size();
+    while (begin < end && std::isspace(static_cast<unsigned char>(*begin))) ++begin;
+    while (begin < end && std::isspace(static_cast<unsigned char>(*(end - 1)))) --end;
+    if (begin == end) return false;
+
+    auto res = std::from_chars(begin, end, out);
+    return res.ec == std::errc() && res.ptr == end;
+}
+
+bool parse_float_token(const std::string& value, float& out) {
+    const char* begin = value.c_str();
+    while (*begin != '\0' && std::isspace(static_cast<unsigned char>(*begin))) ++begin;
+    if (*begin == '\0') return false;
+
+    char* end = nullptr;
+    errno = 0;
+    float parsed = std::strtof(begin, &end);
+    if (begin == end || errno == ERANGE) return false;
+    while (*end != '\0' && std::isspace(static_cast<unsigned char>(*end))) ++end;
+    if (*end != '\0') return false;
+
+    out = parsed;
+    return true;
+}
+
+}  // namespace
+
 // Parse GFF attributes
-float get_attr_float(const std::string& attrs, const std::string& key) {
+float get_attr_float(const std::string& attrs, const std::string& key, float default_val = 0.0f) {
     size_t pos = attrs.find(key + "=");
-    if (pos == std::string::npos) return 0;
+    if (pos == std::string::npos) return default_val;
     pos += key.length() + 1;
     size_t end = attrs.find(';', pos);
     if (end == std::string::npos) end = attrs.length();
-    return std::stof(attrs.substr(pos, end - pos));
+
+    float parsed = default_val;
+    if (!parse_float_token(attrs.substr(pos, end - pos), parsed)) return default_val;
+    return parsed;
 }
 
 // Parse AGP GFF output
@@ -65,7 +116,9 @@ std::unordered_map<std::string, Prediction> parse_gff(const std::string& path) {
 
         size_t score_start = pos + 1;
         size_t score_end = line.find('\t', score_start);
-        float score = std::stof(line.substr(score_start, score_end - score_start));
+        std::string score_str = line.substr(score_start, score_end - score_start);
+        float score = 0.0f;
+        if (!parse_float_token(score_str, score)) continue;
 
         // Find attributes (field 9)
         size_t attr_start = line.rfind('\t');
@@ -100,7 +153,8 @@ std::unordered_map<std::string, Truth> parse_truth(const std::string& path) {
     truth.reserve(10000000);
 
     // Use zcat/pigz for gzip
-    std::string cmd = "pigz -dc '" + path + "' 2>/dev/null || zcat '" + path + "'";
+    std::string escaped_path = shell_escape(path);
+    std::string cmd = "pigz -dc " + escaped_path + " 2>/dev/null || zcat " + escaped_path;
     FILE* pipe = popen(cmd.c_str(), "r");
     if (!pipe) {
         std::cerr << "Error opening: " << path << "\n";
@@ -153,6 +207,7 @@ std::unordered_map<std::string, Truth> parse_truth(const std::string& path) {
 
     int max_idx = std::max({read_name_idx, damage_idx, ct_idx, ag_idx, aa_diffs_idx, codon_diffs_idx});
     size_t count = 0;
+    size_t invalid_damage_tokens = 0;
 
     while ((line_len = getline(&line_buf, &line_cap, pipe)) > 0) {
         // Fast tab-delimited parsing
@@ -187,15 +242,17 @@ std::unordered_map<std::string, Truth> parse_truth(const std::string& path) {
                 if (comma == std::string::npos) comma = damage_str.length();
                 std::string num_str = damage_str.substr(pos, comma - pos);
                 if (!num_str.empty()) {
-                    try {
-                        int damage_pos = std::stoi(num_str);
+                    int damage_pos = 0;
+                    if (parse_int_token(num_str, damage_pos)) {
                         t.total_damage++;
                         // Terminal = position 1-15 from either end
                         if ((damage_pos > 0 && damage_pos <= 15) ||
                             (damage_pos < 0 && damage_pos >= -15)) {
                             t.terminal_damage++;
                         }
-                    } catch (...) {}
+                    } else {
+                        ++invalid_damage_tokens;
+                    }
                 }
                 pos = comma + 1;
             }
@@ -239,6 +296,10 @@ std::unordered_map<std::string, Truth> parse_truth(const std::string& path) {
         }
     }
     std::cerr << "  Parsed " << count << " truth lines                    \n";
+    if (invalid_damage_tokens > 0) {
+        std::cerr << "  Warning: ignored " << invalid_damage_tokens
+                  << " malformed damage position tokens\n";
+    }
 
     free(line_buf);
     pclose(pipe);
@@ -337,6 +398,11 @@ int main(int argc, char* argv[]) {
         if (has_terminal) n_terminal++;
         if (t.has_aa_change) n_aa_change++;
         if (t.has_stop_damage) n_stop++;
+    }
+
+    if (matched == 0) {
+        std::cerr << "No overlapping reads between predictions and truth; cannot compute metrics.\n";
+        return 1;
     }
 
     std::cout << "\n=== Ground Truth Distribution ===\n";

@@ -32,9 +32,9 @@ int SubcommandRegistry::run_command(const std::string& name, int argc, char* arg
     return it->second(argc, argv);
 }
 
-void SubcommandRegistry::print_help([[maybe_unused]] const char* program_name) const {
+void SubcommandRegistry::print_help(const char* program_name) const {
     std::cerr << "Ancient Gene Predictor v" << AGP_VERSION << "\n\n";
-    std::cerr << "Usage: agp <command> [options]\n\n";
+    std::cerr << "Usage: " << program_name << " <command> [options]\n\n";
     std::cerr << "Commands:\n";
 
     // Sort by workflow order
@@ -57,7 +57,7 @@ void SubcommandRegistry::print_help([[maybe_unused]] const char* program_name) c
         std::cerr << cmd.description << "\n";
     }
 
-    std::cerr << "\nFor help on a specific command: agp <command> --help\n";
+    std::cerr << "\nFor help on a specific command: " << program_name << " <command> --help\n";
 }
 
 }  // namespace cli

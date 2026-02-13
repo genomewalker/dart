@@ -12,9 +12,9 @@ namespace agp {
 
 // Check if a codon is a stop codon
 static inline bool is_stop_codon(const char* codon) {
-    char c1 = std::toupper(codon[0]);
-    char c2 = std::toupper(codon[1]);
-    char c3 = std::toupper(codon[2]);
+    char c1 = std::toupper(static_cast<unsigned char>(codon[0]));
+    char c2 = std::toupper(static_cast<unsigned char>(codon[1]));
+    char c3 = std::toupper(static_cast<unsigned char>(codon[2]));
 
     return (c1 == 'T' && c2 == 'A' && c3 == 'A') ||  // TAA
            (c1 == 'T' && c2 == 'A' && c3 == 'G') ||  // TAG

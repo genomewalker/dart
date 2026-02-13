@@ -6,6 +6,8 @@
 // 2. Round 1: Score frames using coding + cluster support + terminal damage
 // 3. Round 2: Rescore with neighbors restricted to best slots
 // 4. Compute per-read damage + X-mask positions
+//
+// Design from GPT-5.3-codex discussion (2026-02-06)
 
 #include <algorithm>
 #include <array>

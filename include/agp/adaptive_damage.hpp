@@ -339,7 +339,7 @@ struct ReadDamageLLR {
         // 5' end: compare observed T/(T+C) to expected under damage vs no-damage
         double t_count = 0, c_count = 0;
         for (size_t i = 0; i < std::min<size_t>(5, len); ++i) {
-            char b = std::toupper(seq[i]);
+            char b = std::toupper(static_cast<unsigned char>(seq[i]));
             if (b == 'T') t_count++;
             else if (b == 'C') c_count++;
         }
@@ -362,7 +362,7 @@ struct ReadDamageLLR {
         // 3' end: similar for A/(A+G)
         double a_count = 0, g_count = 0;
         for (size_t i = len - std::min<size_t>(5, len); i < len; ++i) {
-            char b = std::toupper(seq[i]);
+            char b = std::toupper(static_cast<unsigned char>(seq[i]));
             if (b == 'A') a_count++;
             else if (b == 'G') g_count++;
         }
@@ -424,21 +424,21 @@ public:
 
         // 5' terminal (positions 0-5)
         for (size_t i = 0; i < 6 && i < len; ++i) {
-            char b = std::toupper(seq[i]);
+            char b = std::toupper(static_cast<unsigned char>(seq[i]));
             if (b == 'T') terminal_stats_.terminal_5prime_t[i]++;
             else if (b == 'C') terminal_stats_.terminal_5prime_c[i]++;
         }
 
         // 3' terminal (positions 0-5 from end)
         for (size_t i = 0; i < 6 && i < len; ++i) {
-            char b = std::toupper(seq[len - 1 - i]);
+            char b = std::toupper(static_cast<unsigned char>(seq[len - 1 - i]));
             if (b == 'A') terminal_stats_.terminal_3prime_a[i]++;
             else if (b == 'G') terminal_stats_.terminal_3prime_g[i]++;
         }
 
         // Interior (positions 15-25)
         for (size_t i = 15; i < 25 && i < len; ++i) {
-            char b = std::toupper(seq[i]);
+            char b = std::toupper(static_cast<unsigned char>(seq[i]));
             if (b == 'T') terminal_stats_.interior_t++;
             else if (b == 'C') terminal_stats_.interior_c++;
             else if (b == 'A') terminal_stats_.interior_a++;

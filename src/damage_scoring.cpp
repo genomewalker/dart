@@ -10,6 +10,19 @@
 
 namespace agp {
 
+// ============================================================================
+// ADAPTIVE CALIBRATION FOR TERMINAL DAMAGE PROBABILITY
+//
+// Key insight: Raw scores cluster around ~0.65 regardless of actual damage rate.
+// We need to recalibrate so that:
+//   - Mean output ≈ sample's validated d_max
+//   - Scores spread appropriately around that mean
+//
+// Method: Sigmoid scaling based on sample d_max
+//   calibrated = d_max * sigmoid(k * (raw - threshold))
+// where threshold is chosen so mean output ≈ d_max
+// ============================================================================
+
 // Check if a codon could be a damaged stop codon
 // Returns: 0 = not a damaged stop, 1 = possible, 2 = likely
 static int is_damaged_stop_codon(char c1, char c2, char c3) {
@@ -34,7 +47,13 @@ float FrameSelector::estimate_damage_signal(
 
     const bool has_quality = !quality.empty() && quality.length() == seq.length();
 
-    // Tri-state Channel B validation: 1.0=validated, 0.5=uncertain, 0.0=artifact
+    // ==========================================================================
+    // TRI-STATE DAMAGE VALIDATION
+    // Uses shared get_damage_suppression_factor() for consistent semantics:
+    //   - VALIDATED: factor = 1.0 (full confidence in per-read scores)
+    //   - CONTRADICTED: factor = 0.0 (hard suppress for artifacts)
+    //   - UNVALIDATED: factor = 0.5 (soft suppression)
+    // ==========================================================================
     const float channel_b_factor = get_damage_suppression_factor(sample_profile);
 
     // Early exit for contradicted samples (artifact identified)
@@ -42,12 +61,26 @@ float FrameSelector::estimate_damage_signal(
         return 0.0f;  // Hard suppress for artifacts
     }
 
-    // GC-conditional Bayesian damage detection using exponential decay from termini
+    // ==========================================================================
+    // GC-CONDITIONAL BAYESIAN LIKELIHOOD-BASED DAMAGE DETECTION
+    //
+    // Uses GC-bin specific damage rates and priors for per-read inference:
+    //   1. Get GC-conditional parameters for this read
+    //   2. Compute per-read LLR using bin-specific delta_s
+    //   3. Combine with GC-bin prior: posterior = sigmoid(logit(p0) + LLR)
+    //
+    // Key insight: Ancient DNA damage shows EXPONENTIAL DECAY from termini
+    // Different GC bins may have different damage levels due to organism heterogeneity
+    // ==========================================================================
+
     const size_t len = seq.length();
     float log_lr = 0.0f;  // Log-likelihood ratio
 
     // Get GC-conditional parameters for this read
     auto gc_params = sample_profile.get_gc_params(seq);
+
+    // Use GC-bin prior if available (p_damaged), else neutral prior
+    float p0 = gc_params.bin_valid ? gc_params.p_damaged : 0.5f;
 
     // Get damage rate: use GC-bin specific delta_s if available
     float delta_s = gc_params.bin_valid ? gc_params.delta_s : sample_profile.d_max_combined;
@@ -77,7 +110,11 @@ float FrameSelector::estimate_damage_signal(
                   static_cast<float>(sample_profile.d_max_combined) : 0.05f;
     }
 
-    // 5' end C→T damage likelihood (first 10 positions)
+    // ==========================================================================
+    // 5' END LIKELIHOOD: C→T DAMAGE
+    // Analyze first 10 positions with GC-bin specific damage rates
+    // ==========================================================================
+
     const size_t analyze_5prime = std::min(size_t(10), len);
 
     for (size_t i = 0; i < analyze_5prime; ++i) {
@@ -96,12 +133,16 @@ float FrameSelector::estimate_damage_signal(
         float decay = std::exp(-lambda * static_cast<float>(i));
         float dmg_rate = delta_s * decay;
 
-        // Codon position modulation: wobble (pos 2) tolerates synonymous C→T,
-        // first position (pos 0) less tolerant due to non-synonymous changes
+        // Codon position modulation: wobble position (3rd) more tolerant
         int codon_pos = (static_cast<int>(i) - frame + 300) % 3;
         float codon_mod = 1.0f;
-        if (codon_pos == 2) codon_mod = 1.2f;       // Wobble: damage preserved
-        else if (codon_pos == 0) codon_mod = 0.9f;  // First: damage less preserved
+        if (codon_pos == 2) {
+            // Wobble position: damage more likely preserved (synonymous)
+            codon_mod = 1.2f;
+        } else if (codon_pos == 0) {
+            // First codon position: damage less likely preserved
+            codon_mod = 0.9f;
+        }
 
         float effective_dmg = std::min(dmg_rate * codon_mod, 0.95f);
 
@@ -129,7 +170,11 @@ float FrameSelector::estimate_damage_signal(
         // A and G at 5' end are uninformative for C→T damage
     }
 
-    // 3' end G→A damage likelihood (last 10 positions)
+    // ==========================================================================
+    // 3' END LIKELIHOOD: G→A DAMAGE
+    // Analyze last 10 positions with GC-bin specific damage rates
+    // ==========================================================================
+
     const size_t analyze_3prime = std::min(size_t(10), len);
     float lambda_3p = sample_profile.lambda_3prime > 0 ? sample_profile.lambda_3prime : lambda;
 
@@ -148,11 +193,14 @@ float FrameSelector::estimate_damage_signal(
         float decay = std::exp(-lambda_3p * static_cast<float>(i));
         float dmg_rate = delta_s * decay;
 
-        // Codon position modulation (same as 5' end)
+        // Codon position modulation
         int codon_pos = (static_cast<int>(pos) - frame + 300) % 3;
         float codon_mod = 1.0f;
-        if (codon_pos == 2) codon_mod = 1.2f;
-        else if (codon_pos == 0) codon_mod = 0.9f;
+        if (codon_pos == 2) {
+            codon_mod = 1.2f;  // Wobble more tolerant
+        } else if (codon_pos == 0) {
+            codon_mod = 0.9f;
+        }
 
         float effective_dmg = std::min(dmg_rate * codon_mod, 0.95f);
 
@@ -179,7 +227,11 @@ float FrameSelector::estimate_damage_signal(
         }
     }
 
-    // Multi-signal stop codon damage detection
+    // ==========================================================================
+    // MULTI-SIGNAL DAMAGE DETECTION
+    // Three signals: ORF extension, context hexamer, hexamer improvement
+    // ==========================================================================
+
     int terminal_stop_pos = -1;
     int terminal_stop_codon_idx = -1;
     for (int codon_idx = 0; codon_idx < 4; ++codon_idx) {
@@ -216,12 +268,11 @@ float FrameSelector::estimate_damage_signal(
                 break;
             }
         }
-        // ORF extension thresholds: 60/30/15 nt = 20/10/5 codons
         int orf_extension = (next_stop_pos >= 0) ?
             (next_stop_pos - terminal_stop_pos) : (static_cast<int>(len) - terminal_stop_pos);
-        if (orf_extension > 60) damage_evidence += 1.5f;       // 20+ codons: strong evidence
-        else if (orf_extension > 30) damage_evidence += 0.8f;  // 10+ codons: moderate
-        else if (orf_extension < 15) no_damage_evidence += 0.5f;  // <5 codons: likely real stop
+        if (orf_extension > 60) damage_evidence += 1.5f;
+        else if (orf_extension > 30) damage_evidence += 0.8f;
+        else if (orf_extension < 15) no_damage_evidence += 0.5f;
 
         // Signal 2: Context hexamer
         if (terminal_stop_pos >= 3 && len >= 6) {
@@ -280,7 +331,12 @@ float FrameSelector::estimate_damage_signal(
         }
     }
 
-    // Wobble position T enrichment: synonymous C→T damage preserved by selection
+    // ==========================================================================
+    // WOBBLE POSITION T ENRICHMENT (5' end)
+    // In coding regions with C→T damage, wobble position should show more T
+    // because synonymous C→T changes are preserved by selection
+    // ==========================================================================
+
     std::array<int, 3> t_count = {0, 0, 0};
     std::array<int, 3> c_count = {0, 0, 0};
 
@@ -307,10 +363,31 @@ float FrameSelector::estimate_damage_signal(
         log_lr += 0.6f * wobble_enrichment;
     }
 
-    // Convert log-odds to posterior probability (neutral prior: log_odds = log_lr)
-    float posterior = 1.0f / (1.0f + std::exp(-log_lr));
+    // ==========================================================================
+    // PRIOR FOR PER-READ CLASSIFICATION
+    // Use a balanced prior (0.5) so per-read LLR determines classification.
+    // The GC-bin prior (p0) is too strong for individual read classification -
+    // it treats ALL reads in a bin the same, ignoring per-read features.
+    // ==========================================================================
 
-    // Apply Channel B modulation (validated=1.0, uncertain=0.5, artifact=0.0)
+    // Use neutral prior - let LLR do the discrimination
+    // The GC-conditional sample-level statistics inform delta_s but not the prior
+    float prior_clamped = 0.5f;
+    float prior_log_odds = 0.0f;  // log(0.5 / 0.5) = 0
+
+    // Combine likelihood and prior: posterior = sigmoid(logit(prior) + LLR)
+    float total_log_odds = log_lr + prior_log_odds;
+
+    // Convert log-odds to probability - this is the GC-conditional posterior
+    float posterior = 1.0f / (1.0f + std::exp(-total_log_odds));
+
+    // ==========================================================================
+    // CHANNEL B MODULATION
+    // Apply Channel B factor to ensure sample-level validation affects per-read scores
+    // - Validated damage samples: full posterior
+    // - Artifact samples: heavily suppressed (already handled in early exit)
+    // - Uncertain samples: partial confidence
+    // ==========================================================================
     posterior *= channel_b_factor;
 
     return std::clamp(posterior, 0.0f, 1.0f);

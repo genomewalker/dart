@@ -15,6 +15,7 @@
 #include <vector>
 #include <array>
 #include <algorithm>
+#include <unordered_map>
 #include <immintrin.h>
 
 namespace agp {
@@ -144,8 +145,8 @@ public:
             extract_seeds(proteins[i], i, seeds);
         }
 
-        // 2. Radix sort by hash (O(n) for 64-bit keys)
-        std::sort(seeds.begin(), seeds.end());  // TODO: radix sort
+        // 2. Radix sort by hash (O(n) for fixed-width integer keys)
+        radix_sort_by_hash(seeds);
 
         // 3. Initialize DSU
         DSUWithOffset dsu(n);
@@ -193,6 +194,39 @@ public:
     }
 
 private:
+    static void radix_sort_by_hash(std::vector<Seed>& seeds) {
+        if (seeds.size() < 2) return;
+
+        uint64_t max_hash = 0;
+        for (const auto& s : seeds) {
+            max_hash = std::max(max_hash, s.hash);
+        }
+
+        std::vector<Seed> tmp(seeds.size());
+        std::array<size_t, 256> count{};
+
+        // LSD radix sort with 8-bit digits.
+        for (unsigned shift = 0; shift == 0 || (max_hash >> shift) != 0; shift += 8) {
+            count.fill(0);
+            for (const auto& s : seeds) {
+                ++count[(s.hash >> shift) & 0xFFu];
+            }
+
+            size_t prefix = 0;
+            for (size_t i = 0; i < count.size(); ++i) {
+                size_t c = count[i];
+                count[i] = prefix;
+                prefix += c;
+            }
+
+            for (const auto& s : seeds) {
+                size_t bucket = (s.hash >> shift) & 0xFFu;
+                tmp[count[bucket]++] = s;
+            }
+            seeds.swap(tmp);
+        }
+    }
+
     void extract_seeds(const std::string& prot, uint32_t read_id,
                        std::vector<Seed>& seeds) {
         if (prot.length() < K) return;
@@ -262,10 +296,26 @@ private:
         size_t overlap_len = a_end - a_start;
         if (overlap_len < K) return false;  // Overlap too short
 
-        // Count mismatches (simple loop, TODO: AVX-512)
+        const size_t a_start_u = static_cast<size_t>(a_start);
+        const size_t b_start_u = static_cast<size_t>(b_start);
         int mismatches = 0;
-        for (size_t i = 0; i < overlap_len && mismatches <= MAX_MISMATCH; ++i) {
-            if (a[a_start + i] != b[b_start + i]) ++mismatches;
+        size_t i = 0;
+
+#if defined(__SSE2__)
+        const char* a_ptr = a.data() + a_start_u;
+        const char* b_ptr = b.data() + b_start_u;
+        for (; i + 16 <= overlap_len; i += 16) {
+            __m128i av = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a_ptr + i));
+            __m128i bv = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b_ptr + i));
+            __m128i eq = _mm_cmpeq_epi8(av, bv);
+            unsigned eq_mask = static_cast<unsigned>(_mm_movemask_epi8(eq));
+            mismatches += 16 - __builtin_popcount(eq_mask);
+            if (mismatches > MAX_MISMATCH) return false;
+        }
+#endif
+
+        for (; i < overlap_len && mismatches <= MAX_MISMATCH; ++i) {
+            if (a[a_start_u + i] != b[b_start_u + i]) ++mismatches;
         }
 
         return mismatches <= MAX_MISMATCH;

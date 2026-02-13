@@ -4,6 +4,8 @@
 // Dual-seed strategy:
 // - Strict seeds (k=7): no canonicalization, high precision
 // - Tolerant seeds (k=5): damage-canonicalized, terminal regions only
+//
+// Design from GPT-5.3-codex discussion (2026-02-06)
 
 #include <algorithm>
 #include <array>

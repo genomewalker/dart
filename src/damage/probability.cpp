@@ -125,30 +125,31 @@ std::array<float, 21> DamageModel::calculate_aa_probabilities(
     auto get_possible_originals = [](char observed, float ct_rate, float ga_rate)
         -> std::vector<std::pair<char, float>> {
         std::vector<std::pair<char, float>> originals;
-        char obs = std::toupper(observed);
+        originals.reserve(4);
+        char obs = std::toupper(static_cast<unsigned char>(observed));
 
         if (obs == 'T') {
             float denom = 1.0f + ct_rate;
-            originals.push_back({'T', 1.0f / denom});
-            originals.push_back({'C', ct_rate / denom});
+            originals.emplace_back('T', 1.0f / denom);
+            originals.emplace_back('C', ct_rate / denom);
         }
         else if (obs == 'A') {
             float denom = 1.0f + ga_rate;
-            originals.push_back({'A', 1.0f / denom});
-            originals.push_back({'G', ga_rate / denom});
+            originals.emplace_back('A', 1.0f / denom);
+            originals.emplace_back('G', ga_rate / denom);
         }
         else if (obs == 'C') {
-            originals.push_back({'C', 1.0f});
+            originals.emplace_back('C', 1.0f);
         }
         else if (obs == 'G') {
-            originals.push_back({'G', 1.0f});
+            originals.emplace_back('G', 1.0f);
         }
         else {
             // N or unknown - uniform distribution
-            originals.push_back({'A', 0.25f});
-            originals.push_back({'C', 0.25f});
-            originals.push_back({'G', 0.25f});
-            originals.push_back({'T', 0.25f});
+            originals.emplace_back('A', 0.25f);
+            originals.emplace_back('C', 0.25f);
+            originals.emplace_back('G', 0.25f);
+            originals.emplace_back('T', 0.25f);
         }
         return originals;
     };

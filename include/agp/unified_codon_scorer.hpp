@@ -1895,24 +1895,17 @@ inline std::array<FrameStrandResult, 6> score_all_hypotheses(
     const char* rev_seq = rc_view.data();
 
     // Compute strand-only LLR once (same for all frames of same strand)
-    // OPTIMIZATION: Skip if weight is zero (saves O(L) log calls per read)
-    float strand_llr = 0.0f;
-    if (weights.w_strand_only > 0.0f) {
-        BasePriors pi = estimate_base_priors(seq, 10);
-        strand_llr = strand_only_llr_terminal(seq, dmg, pi, 15);
-    }
+    BasePriors pi = estimate_base_priors(seq, 10);
+    float strand_llr = strand_only_llr_terminal(seq, dmg, pi, 15);
 
     // Compute strand hexamer LLR
-    // OPTIMIZATION: Skip if weight is zero (saves O(L) hexamer encodes + reverse complement)
     float strand_hex_fwd = 0.0f, strand_hex_rev = 0.0f;
-    if (weights.w_strand_hex > 0.0f) {
-        bool use_interior_only = (dmg.d_max_5p > 0.05f && seq.size() >= 45);
-        strand::compute_both_llrs(fwd_seq, seq.size(), strand_hex_fwd, strand_hex_rev, use_interior_only);
-        size_t effective_len = use_interior_only ? (seq.size() > 30 ? seq.size() - 30 : 1) : seq.size();
-        float norm = static_cast<float>(effective_len > 6 ? effective_len - 5 : 1);
-        strand_hex_fwd /= norm;
-        strand_hex_rev /= norm;
-    }
+    bool use_interior_only = (dmg.d_max_5p > 0.05f && seq.size() >= 45);
+    strand::compute_both_llrs(fwd_seq, seq.size(), strand_hex_fwd, strand_hex_rev, use_interior_only);
+    size_t effective_len = use_interior_only ? (seq.size() > 30 ? seq.size() - 30 : 1) : seq.size();
+    float norm = static_cast<float>(effective_len > 6 ? effective_len - 5 : 1);
+    strand_hex_fwd /= norm;
+    strand_hex_rev /= norm;
 
     // Get learned model
     const auto& periodic_model = get_learned_periodic_model();
@@ -1999,15 +1992,9 @@ inline std::array<FrameStrandResult, 6> score_all_hypotheses(
         float s_periodic = dicodon::calculate_frame_score_fast(oriented, L, frame, Domain::GTDB);
 
         // Self-trained and GC-conditional (these use the original seq)
-        // OPTIMIZATION: Skip if weight is zero (saves string allocs + O(L) log calls per hypothesis)
-        float s_self_trained = 0.0f;
-        if (weights.w_self_trained > 0.0f && periodic_model.trained) {
-            s_self_trained = periodic_model.score(seq, frame, forward);
-        }
-        float s_gc_conditional = 0.0f;
-        if (weights.w_gc_conditional > 0.0f && get_gc_conditional_model().trained) {
-            s_gc_conditional = get_gc_conditional_model().score(seq, frame, forward);
-        }
+        float s_self_trained = periodic_model.trained ? periodic_model.score(seq, frame, forward) : 0.0f;
+        float s_gc_conditional = get_gc_conditional_model().trained ?
+            get_gc_conditional_model().score(seq, frame, forward) : 0.0f;
 
         // Fourier periodogram
         float s_fourier = score_fourier_periodicity_fast(oriented, L, frame);

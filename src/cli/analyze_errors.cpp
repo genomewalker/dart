@@ -106,7 +106,7 @@ float get_attr_float(const std::string& attrs, const std::string& key, float def
 
     try {
         return std::stof(attrs.substr(pos, end - pos));
-    } catch (...) {
+    } catch (const std::exception&) {
         return default_val;
     }
 }
@@ -122,7 +122,7 @@ int get_attr_int(const std::string& attrs, const std::string& key, int default_v
 
     try {
         return std::stoi(attrs.substr(pos, end - pos));
-    } catch (...) {
+    } catch (const std::exception&) {
         return default_val;
     }
 }

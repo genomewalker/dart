@@ -180,12 +180,13 @@ public:
             }
 
             // Build position-wise consensus with proper alignment
-            auto consensus = build_consensus_aligned(proteins, members, offsets);
+            int32_t coord_shift = 0;
+            auto consensus = build_consensus_aligned(proteins, members, offsets, coord_shift);
 
             // Score each member against consensus
             for (size_t idx : members) {
                 results[idx] = score_against_consensus_aligned(
-                    proteins[idx], offsets[idx], consensus, cid, members.size(), d_max, lambda);
+                    proteins[idx], offsets[idx], consensus, coord_shift, cid, members.size(), d_max, lambda);
             }
         }
 
@@ -208,32 +209,52 @@ private:
     std::vector<std::vector<PositionVote>> build_consensus_aligned(
         const std::vector<std::string>& proteins,
         const std::vector<size_t>& members,
-        const std::vector<int32_t>& offsets)
+        const std::vector<int32_t>& offsets,
+        int32_t& coord_shift)
     {
-        // Find max aligned position
-        size_t max_aligned_pos = 0;
+        // Find aligned coordinate bounds (offsets may be negative).
+        int32_t min_aligned_pos = 0;
+        int32_t max_aligned_pos = 0;
+        bool have_any = false;
         for (size_t idx : members) {
-            size_t end_pos = offsets[idx] + proteins[idx].length();
-            max_aligned_pos = std::max(max_aligned_pos, end_pos);
+            int32_t start_pos = offsets[idx];
+            int32_t end_pos = start_pos + static_cast<int32_t>(proteins[idx].length());
+            if (!have_any) {
+                min_aligned_pos = start_pos;
+                max_aligned_pos = end_pos;
+                have_any = true;
+            } else {
+                min_aligned_pos = std::min(min_aligned_pos, start_pos);
+                max_aligned_pos = std::max(max_aligned_pos, end_pos);
+            }
         }
+        if (!have_any || max_aligned_pos <= min_aligned_pos) {
+            coord_shift = 0;
+            return {};
+        }
+        coord_shift = -min_aligned_pos;
+        size_t consensus_len = static_cast<size_t>(max_aligned_pos - min_aligned_pos);
 
         // Count votes at each aligned position
-        std::vector<std::unordered_map<char, uint16_t>> position_counts(max_aligned_pos);
+        std::vector<std::unordered_map<char, uint16_t>> position_counts(consensus_len);
 
         for (size_t idx : members) {
             const auto& prot = proteins[idx];
             int32_t offset = offsets[idx];
             for (size_t pos = 0; pos < prot.length(); ++pos) {
-                size_t aligned_pos = offset + pos;
-                if (aligned_pos < max_aligned_pos) {
-                    position_counts[aligned_pos][prot[pos]]++;
+                int64_t aligned_pos = static_cast<int64_t>(offset) +
+                                      static_cast<int64_t>(pos) +
+                                      static_cast<int64_t>(coord_shift);
+                if (aligned_pos >= 0 &&
+                    aligned_pos < static_cast<int64_t>(consensus_len)) {
+                    position_counts[static_cast<size_t>(aligned_pos)][prot[pos]]++;
                 }
             }
         }
 
         // Convert to sorted vote lists
-        std::vector<std::vector<PositionVote>> consensus(max_aligned_pos);
-        for (size_t pos = 0; pos < max_aligned_pos; ++pos) {
+        std::vector<std::vector<PositionVote>> consensus(consensus_len);
+        for (size_t pos = 0; pos < consensus_len; ++pos) {
             for (const auto& [aa, count] : position_counts[pos]) {
                 consensus[pos].push_back({aa, count, 0.0f});
             }
@@ -251,7 +272,8 @@ private:
         const std::vector<size_t>& members)
     {
         std::vector<int32_t> dummy_offsets(proteins.size(), 0);
-        return build_consensus_aligned(proteins, members, dummy_offsets);
+        int32_t coord_shift = 0;
+        return build_consensus_aligned(proteins, members, dummy_offsets, coord_shift);
     }
 
     // Score single protein against consensus with alignment offset
@@ -259,6 +281,7 @@ private:
         const std::string& protein,
         int32_t offset,
         const std::vector<std::vector<PositionVote>>& consensus,
+        int32_t coord_shift,
         uint32_t cluster_id,
         uint32_t cluster_size,
         float d_max,
@@ -270,13 +293,17 @@ private:
         int mismatch_count = 0;
 
         for (size_t pos = 0; pos < protein.length(); ++pos) {
-            size_t aligned_pos = offset + pos;
-            if (aligned_pos >= consensus.size()) continue;
+            int64_t aligned_pos = static_cast<int64_t>(offset) +
+                                  static_cast<int64_t>(pos) +
+                                  static_cast<int64_t>(coord_shift);
+            if (aligned_pos < 0 ||
+                aligned_pos >= static_cast<int64_t>(consensus.size())) continue;
+            size_t aligned_idx = static_cast<size_t>(aligned_pos);
 
             char my_aa = protein[pos];
-            if (consensus[aligned_pos].empty()) continue;
+            if (consensus[aligned_idx].empty()) continue;
 
-            char consensus_aa = consensus[aligned_pos][0].aa;
+            char consensus_aa = consensus[aligned_idx][0].aa;
             if (my_aa == consensus_aa) continue;
 
             // Mismatch - analyze it
@@ -321,7 +348,7 @@ private:
         float d_max,
         float lambda)
     {
-        return score_against_consensus_aligned(protein, 0, consensus, cluster_id, cluster_size, d_max, lambda);
+        return score_against_consensus_aligned(protein, 0, consensus, 0, cluster_id, cluster_size, d_max, lambda);
     }
 };
 

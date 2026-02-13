@@ -2,7 +2,9 @@
 // Streaming damage-aware clustering pipeline
 //
 // Integrates syncmer-based read clustering with ORF emission.
-// All parameters are learned from warmup data.
+// All parameters are learned from warmup data - no magic numbers.
+//
+// Design from GPT-5.3-codex discussion (2026-02-06)
 
 #include <algorithm>
 #include <array>

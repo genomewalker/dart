@@ -4,6 +4,8 @@
 // Hard-EM-lite approach with 2 rounds:
 // Round 0: Frame from coding score alone
 // Round 1: Refine using cluster support + terminal damage consistency
+//
+// Design from GPT-5.3-codex discussion (2026-02-06)
 
 #include <array>
 #include <algorithm>
