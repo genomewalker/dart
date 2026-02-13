@@ -88,6 +88,13 @@ struct BayesianScoreParams {
     bool channel_b_valid = true;   // whether sample-level damage is validated
     float eps = 1e-6f;             // numerical stability
 
+    // Identity evidence parameters (hybrid scoring)
+    // Ancient proteins have higher alignment identity (+2.8% on average)
+    // because they match their reference better than spurious modern matches
+    float k_identity = 20.0f;      // coefficient for identity evidence
+    float identity_baseline = 0.90f;  // neutral point (identity = baseline -> no evidence)
+    bool use_identity = false;     // enable identity evidence (requires fident input)
+
     // Thresholds for 3-state classification
     float ancient_threshold = 0.60f;   // posterior >= this -> Ancient
     float modern_threshold = 0.25f;    // posterior <= this -> Modern
@@ -100,6 +107,7 @@ struct BayesianScoreOutput {
     float logit_posterior = 0.0f;  // log-odds form
     float logBF_terminal = 0.0f;   // Bayes factor from terminal pattern
     float logBF_sites = 0.0f;      // Bayes factor from alignment sites
+    float logBF_identity = 0.0f;   // Bayes factor from alignment identity
     float q_eff = 0.0f;            // effective ancient rate for this read
     uint32_t m = 0;                // opportunities
     uint32_t k = 0;                // hits
@@ -271,10 +279,12 @@ inline ModernBaseline estimate_modern_baseline(
 
 // Compute final Bayesian score with decomposition
 // Implements: tempered evidence, site capping, Channel B gating, 3-state output
+// Optional fident: alignment identity (0-1), pass -1 to disable identity evidence
 inline BayesianScoreOutput compute_bayesian_score(
     float p_read,
     const SiteEvidence& ev,
-    const BayesianScoreParams& params) noexcept
+    const BayesianScoreParams& params,
+    float fident = -1.0f) noexcept
 {
     using namespace detail;
 
@@ -334,8 +344,19 @@ inline BayesianScoreOutput compute_bayesian_score(
                                   static_cast<double>(params.site_cap));
     }
 
+    // Identity evidence (hybrid scoring)
+    // Ancient proteins have higher alignment identity because they're real matches
+    // logBF_identity = k * (fident - baseline), where k=20, baseline=0.90
+    double logBF_identity = 0.0;
+    if (params.use_identity && fident >= 0.0f) {
+        logBF_identity = static_cast<double>(params.k_identity) *
+                         (static_cast<double>(fident) - static_cast<double>(params.identity_baseline));
+        // Cap to avoid extreme values from outlier identities
+        logBF_identity = std::clamp(logBF_identity, -5.0, 5.0);
+    }
+
     // Combine in log-odds space
-    const double logit_post = logit(pi) + logBF_terminal + logBF_sites;
+    const double logit_post = logit(pi) + logBF_terminal + logBF_sites + logBF_identity;
     const double post = inv_logit(logit_post);
 
     // Determine evidence tier
@@ -367,6 +388,7 @@ inline BayesianScoreOutput compute_bayesian_score(
     out.logit_posterior = static_cast<float>(logit_post);
     out.logBF_terminal = static_cast<float>(logBF_terminal);
     out.logBF_sites = static_cast<float>(logBF_sites);
+    out.logBF_identity = static_cast<float>(logBF_identity);
     out.q_eff = static_cast<float>(q_eff_clamped);
     out.m = ev.m;
     out.k = ev.k;

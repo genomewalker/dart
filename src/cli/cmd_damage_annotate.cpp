@@ -536,6 +536,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     int max_dist = -1;
     std::string lib_type = "auto";    // ss, ds, or auto-detect
     float threshold = 0.7f;           // Classification threshold for is_damaged
+    bool use_identity = false;        // Enable identity evidence (hybrid scoring)
     bool verbose = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -563,6 +564,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             threshold = std::stof(argv[++i]);
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             verbose = true;
+        } else if (strcmp(argv[i], "--use-identity") == 0) {
+            use_identity = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             std::cerr << "Usage: agp damage-annotate --hits <results.tsv> [options]\n\n";
             std::cerr << "Post-mapping damage annotation using MMseqs2 alignments.\n";
@@ -583,6 +586,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cerr << "                       Enables synonymous damage detection\n";
             std::cerr << "  --threshold FLOAT Damage classification threshold (default: 0.7)\n";
             std::cerr << "                       Adds is_damaged column (1 if combined_score >= threshold)\n";
+            std::cerr << "  --use-identity    Enable identity evidence (hybrid scoring, +7% AUC)\n";
             std::cerr << "  -v                Verbose output\n\n";
             std::cerr << "MMseqs2 format (16 columns with qaln/taln):\n";
             std::cerr << "  --format-output \"query,target,fident,alnlen,mismatch,gapopen,\n";
@@ -782,6 +786,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     score_params.channel_b_valid = (d_max > 0.0f);  // Trust site evidence if damage detected
     score_params.ancient_threshold = 0.60f;
     score_params.modern_threshold = 0.25f;
+    score_params.use_identity = use_identity;
+    score_params.k_identity = 20.0f;
+    score_params.identity_baseline = 0.90f;
 
     if (verbose) {
         std::cerr << "\nBayesian scoring (empirical Bayes):\n";
@@ -792,6 +799,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                   << modern_est.q_modern << "\n";
         std::cerr << "  Tempering w0: " << score_params.w0 << "\n";
         std::cerr << "  Channel B valid: " << (score_params.channel_b_valid ? "yes" : "no") << "\n";
+        std::cerr << "  Identity evidence: " << (use_identity ? "enabled (k=20, baseline=0.90)" : "disabled") << "\n";
     }
 
     // Write per-site output
@@ -868,7 +876,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             "total_mismatches\tdamage_consistent\tnon_damage\t"
             "ct_sites\tga_sites\thigh_conf\tdamage_fraction\t"
             "max_p_damage\tp_damaged\tp_read\tposterior\t"
-            "is_damaged\tlogBF_terminal\tlogBF_sites\t"
+            "is_damaged\tlogBF_terminal\tlogBF_sites\tlogBF_identity\t"
             "m_opportunities\tk_hits\tq_eff\ttier\tdamage_class\t"
             "syn_5prime\tsyn_3prime\n";
 
@@ -895,8 +903,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             ev.sum_qA = d_max * 0.3f * static_cast<float>(ev.m);  // rough average damage rate
             ev.q_eff = (ev.m > 0) ? (ev.sum_qA / static_cast<float>(ev.m)) : 0.0f;
 
-            // Compute Bayesian score
-            bayes_out = agp::compute_bayesian_score(s.p_read, ev, score_params);
+            // Compute Bayesian score (with optional identity evidence)
+            bayes_out = agp::compute_bayesian_score(s.p_read, ev, score_params, s.fident);
             posterior = bayes_out.posterior;
         }
 
@@ -916,6 +924,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
              << (posterior >= threshold ? 1 : 0) << "\t"
              << std::fixed << std::setprecision(3) << bayes_out.logBF_terminal << "\t"
              << std::fixed << std::setprecision(3) << bayes_out.logBF_sites << "\t"
+             << std::fixed << std::setprecision(3) << bayes_out.logBF_identity << "\t"
              << bayes_out.m << "\t" << bayes_out.k << "\t"
              << std::fixed << std::setprecision(5) << bayes_out.q_eff << "\t"
              << agp::tier_name(bayes_out.tier) << "\t"
