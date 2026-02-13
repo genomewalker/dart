@@ -320,9 +320,9 @@ The Bayesian scoring combines both signals in log-odds space, providing principl
 
 | Metric | Value |
 |--------|-------|
-| Protein-level AUC-ROC | **0.80** |
-| Precision @ threshold 0.4 | 92% |
-| Recall @ threshold 0.4 | 93% |
+| Protein-level AUC-ROC | **0.79** |
+| Precision @ threshold 0.4 | 93% |
+| Recall @ threshold 0.4 | 83% |
 
 ### Gene prediction
 
@@ -370,9 +370,9 @@ We validated on 4.36M proteins from 10 synthetic KapK samples with known damage 
 
 | Metric | Value |
 |--------|-------|
-| Protein-level AUC-ROC | **0.80** |
-| Precision @ threshold 0.4 | 92% |
-| Recall @ threshold 0.4 | 93% |
+| Protein-level AUC-ROC | **0.79** |
+| Precision @ threshold 0.4 | 93% |
+| Recall @ threshold 0.4 | 83% |
 
 The figure below shows precision-recall curves for Bayesian scoring versus the simpler weighted formula.
 
@@ -380,7 +380,7 @@ The figure below shows precision-recall curves for Bayesian scoring versus the s
 <img src="docs/protein_damage_classification.png" width="800" alt="Read-level damage classification">
 </p>
 
-**Why AUC 0.80?** This approaches the information-theoretic limit for reference-free classification. C→T damage produces thymine indistinguishable from natural T without a reference:
+**Why AUC 0.79?** This approaches the information-theoretic limit for reference-free classification. C→T damage produces thymine indistinguishable from natural T without a reference:
 
 $$P(T \mid \text{damage}) = 0.25 + 0.75 \times d = 0.475 \quad \text{(at } d=30\%)$$
 
