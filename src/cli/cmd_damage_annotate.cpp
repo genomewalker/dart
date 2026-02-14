@@ -507,6 +507,9 @@ struct GeneSummaryAccumulator {
     double sum_aln_len = 0.0;       // Sum of alignment lengths (for avg)
     double sum_aln_len_sq = 0.0;    // Sum of squared aln lengths (for std)
     std::vector<float> coverage;    // Per-position coverage depth (gamma-weighted)
+    std::unordered_set<uint32_t> unique_starts;  // Distinct start positions
+    uint32_t min_start = UINT32_MAX;
+    uint32_t max_start = 0;
 
     // Add read with EM weight (gamma). For best-hit mode, gamma=1.0
     void add_read(AncientClassification cls, float posterior, float fident,
@@ -517,6 +520,12 @@ struct GeneSummaryAccumulator {
         sum_fident += gamma * fident;
         sum_aln_len += gamma * aln_len_on_target;
         sum_aln_len_sq += gamma * aln_len_on_target * aln_len_on_target;
+
+        // Track start position diversity
+        uint32_t start32 = static_cast<uint32_t>(tstart);
+        unique_starts.insert(start32);
+        if (start32 < min_start) min_start = start32;
+        if (start32 > max_start) max_start = start32;
 
         // Gamma-weighted classification counts
         switch (cls) {
@@ -583,6 +592,33 @@ struct GeneSummaryAccumulator {
         double mean = sum_aln_len / n_reads_eff;
         double var = (sum_aln_len_sq / n_reads_eff) - (mean * mean);
         return static_cast<float>(std::sqrt(std::max(0.0, var)));
+    }
+
+    // Number of unique start positions
+    uint32_t n_unique_starts() const {
+        return static_cast<uint32_t>(unique_starts.size());
+    }
+
+    // Start diversity: n_unique_starts / min(n_reads, tlen)
+    // High = reads start at different positions (authentic)
+    // Low = all reads start at same position (spurious)
+    float start_diversity() const {
+        if (n_reads == 0 || tlen == 0) return 0.0f;
+        uint32_t max_possible = std::min(n_reads, tlen);
+        return static_cast<float>(unique_starts.size()) / static_cast<float>(max_possible);
+    }
+
+    // Start span: (max_start - min_start + 1) / tlen
+    // Measures how spread out the start positions are across the gene
+    float start_span() const {
+        if (tlen == 0 || min_start > max_start) return 0.0f;
+        return static_cast<float>(max_start - min_start + 1) / static_cast<float>(tlen);
+    }
+
+    // Positional score: sqrt(diversity * span) [0-1]
+    // Combined metric for filtering spurious matches
+    float positional_score() const {
+        return std::sqrt(start_diversity() * start_span());
     }
 
     // Effective read count (sum of gamma weights)
@@ -1665,10 +1701,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             return 1;
         }
 
-        // Full gene-level stats including coverage, damage, and alignment metrics
+        // Full gene-level stats including coverage, damage, alignment, and diversity metrics
         gf << "target_id\tn_reads\teff_reads\tn_ancient\tn_modern\tn_undetermined\t"
               "ancient_frac\tci_low\tci_high\tmean_posterior\tmean_identity\t"
               "breadth\tabundance\tdepth_std\tdepth_evenness\t"
+              "n_unique_starts\tstart_diversity\tstart_span\tpositional_score\t"
               "avg_aln_len\tstd_aln_len\n";
 
         for (const auto& [tid, acc] : gene_agg) {
@@ -1702,6 +1739,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                << '\t' << std::setprecision(4) << abundance
                << '\t' << std::setprecision(4) << acc.depth_std()
                << '\t' << std::setprecision(4) << acc.depth_evenness()
+               << '\t' << acc.n_unique_starts()
+               << '\t' << std::setprecision(4) << acc.start_diversity()
+               << '\t' << std::setprecision(4) << acc.start_span()
+               << '\t' << std::setprecision(4) << acc.positional_score()
                << '\t' << std::setprecision(2) << acc.avg_aln_len()
                << '\t' << std::setprecision(2) << acc.std_aln_len()
                << '\n';
