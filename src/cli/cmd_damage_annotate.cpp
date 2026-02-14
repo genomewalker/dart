@@ -504,6 +504,8 @@ struct GeneSummaryAccumulator {
     double n_modern_conf = 0.0;     // Gamma-weighted modern confident
     double sum_posterior = 0.0;
     double sum_fident = 0.0;
+    double sum_aln_len = 0.0;       // Sum of alignment lengths (for avg)
+    double sum_aln_len_sq = 0.0;    // Sum of squared aln lengths (for std)
     std::vector<float> coverage;    // Per-position coverage depth (gamma-weighted)
 
     // Add read with EM weight (gamma). For best-hit mode, gamma=1.0
@@ -513,6 +515,8 @@ struct GeneSummaryAccumulator {
         n_reads_eff += gamma;
         sum_posterior += gamma * posterior;
         sum_fident += gamma * fident;
+        sum_aln_len += gamma * aln_len_on_target;
+        sum_aln_len_sq += gamma * aln_len_on_target * aln_len_on_target;
 
         // Gamma-weighted classification counts
         switch (cls) {
@@ -547,6 +551,38 @@ struct GeneSummaryAccumulator {
         double total = 0.0;
         for (float v : coverage) total += v;
         return static_cast<float>(total / coverage.size());
+    }
+
+    // Coverage standard deviation
+    float depth_std() const {
+        if (coverage.empty()) return 0.0f;
+        double mean = depth_mean();
+        double sum_sq = 0.0;
+        for (float v : coverage) {
+            double diff = v - mean;
+            sum_sq += diff * diff;
+        }
+        return static_cast<float>(std::sqrt(sum_sq / coverage.size()));
+    }
+
+    // Coverage evenness (coefficient of variation): std / mean
+    // Lower = more even coverage, higher = more uneven
+    float depth_evenness() const {
+        float mean = depth_mean();
+        return mean > 0 ? depth_std() / mean : 0.0f;
+    }
+
+    // Average alignment length
+    float avg_aln_len() const {
+        return n_reads_eff > 0 ? static_cast<float>(sum_aln_len / n_reads_eff) : 0.0f;
+    }
+
+    // Standard deviation of alignment length
+    float std_aln_len() const {
+        if (n_reads_eff <= 1) return 0.0f;
+        double mean = sum_aln_len / n_reads_eff;
+        double var = (sum_aln_len_sq / n_reads_eff) - (mean * mean);
+        return static_cast<float>(std::sqrt(std::max(0.0, var)));
     }
 
     // Effective read count (sum of gamma weights)
@@ -1629,10 +1665,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             return 1;
         }
 
-        // Header includes eff_reads (effective reads from EM weights) and abundance
+        // Full gene-level stats including coverage, damage, and alignment metrics
         gf << "target_id\tn_reads\teff_reads\tn_ancient\tn_modern\tn_undetermined\t"
               "ancient_frac\tci_low\tci_high\tmean_posterior\tmean_identity\t"
-              "breadth\tabundance\n";
+              "breadth\tabundance\tdepth_std\tdepth_evenness\t"
+              "avg_aln_len\tstd_aln_len\n";
 
         for (const auto& [tid, acc] : gene_agg) {
             if (acc.n_reads < min_reads) continue;
@@ -1663,6 +1700,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                << '\t' << std::setprecision(4) << acc.avg_fident()
                << '\t' << std::setprecision(4) << b
                << '\t' << std::setprecision(4) << abundance
+               << '\t' << std::setprecision(4) << acc.depth_std()
+               << '\t' << std::setprecision(4) << acc.depth_evenness()
+               << '\t' << std::setprecision(2) << acc.avg_aln_len()
+               << '\t' << std::setprecision(2) << acc.std_aln_len()
                << '\n';
         }
 
