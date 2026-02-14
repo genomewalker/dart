@@ -87,6 +87,23 @@ endif()
 # Find zlib for compressed file support
 find_package(ZLIB REQUIRED)
 
+# Find zstd for columnar compression (optional)
+find_package(PkgConfig)
+if(PkgConfig_FOUND)
+    pkg_check_modules(ZSTD libzstd)
+    if(ZSTD_FOUND)
+        add_compile_definitions(HAVE_ZSTD)
+        message(STATUS "ZSTD found: ${ZSTD_VERSION}")
+    endif()
+
+    # TBB disabled - linking issues on this system
+    # pkg_check_modules(TBB tbb)
+    # if(TBB_FOUND)
+    #     add_compile_definitions(HAVE_TBB)
+    #     message(STATUS "TBB found: ${TBB_VERSION}")
+    # endif()
+endif()
+
 # Include directories
 include_directories(
     ${PROJECT_SOURCE_DIR}/include
@@ -117,6 +134,8 @@ set(AGP_CORE_SOURCES
     src/damage_index_reader.cpp
     src/reference_stats.cpp
     src/em_reassign.cpp
+    src/em_index.cpp
+    src/columnar_index.cpp
 )
 
 # Subcommand sources
@@ -127,11 +146,24 @@ set(AGP_SUBCOMMAND_SOURCES
     src/cli/cmd_sample_damage.cpp     # cmd_sample_damage
     src/cli/cmd_damage_annotate.cpp   # cmd_damage_annotate
     src/cli/cmd_damage_profile.cpp    # cmd_damage_profile
+    src/cli/cmd_em_prepare.cpp        # cmd_em_prepare
+    src/cli/cmd_em_solve.cpp          # cmd_em_solve
+    src/cli/cmd_hits2emi.cpp          # hits2emi (TSV to columnar)
+    src/cli/cmd_em_solve2.cpp         # cmd_em_solve2 (columnar)
 )
 
 # Main executable with subcommands
 add_executable(agp ${AGP_CORE_SOURCES} ${AGP_SUBCOMMAND_SOURCES})
 target_link_libraries(agp ${ZLIB_LIBRARIES})
+if(ZSTD_FOUND)
+    target_include_directories(agp PRIVATE ${ZSTD_INCLUDE_DIRS})
+    target_link_libraries(agp ${ZSTD_LIBRARIES})
+endif()
+# TBB disabled - linking issues
+# if(TBB_FOUND)
+#     target_include_directories(agp PRIVATE /usr/include ${TBB_INCLUDE_DIRS})
+#     target_link_libraries(agp ${TBB_LIBRARIES})
+# endif()
 
 if(OpenMP_CXX_FOUND)
     target_link_libraries(agp OpenMP::OpenMP_CXX)

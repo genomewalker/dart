@@ -1334,7 +1334,7 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
     // =========================================================================
     // If the negative control (A/(A+G) at 5', T/(T+C) at 3') shows comparable
     // enrichment to the "damage" signal, it's likely composition bias, not damage.
-    // Decision rule from GPT-5.2:
+    // Decision rule:
     //   Flag as bias if: |ctrl_shift| >= max(0.005, 0.5 * |damage_shift|)
 
     float damage_shift_5 = profile.terminal_shift_5prime;

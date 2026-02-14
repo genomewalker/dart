@@ -27,7 +27,7 @@ namespace detail {
 // Compute log2(freq * 4096 + 1e-10) at compile time
 constexpr float compute_log2_score(float freq) {
     // Can't use std::log2 in constexpr, so we'll initialize at runtime once
-    return 0.0f;  // Placeholder - filled at static init
+    return 0.0f;  // Initialized in runtime log tables
 }
 
 // Runtime initialization of log tables

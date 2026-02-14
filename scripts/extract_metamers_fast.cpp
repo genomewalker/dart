@@ -1,5 +1,5 @@
 /*
- * Ultra-fast AA 6-mer extractor using direct array indexing
+ * AA 6-mer extractor using direct array indexing
  *
  * Key optimization: 6-mer AA = 21^6 = 85,766,121 possible values
  * Use direct array indexing (O(1)) instead of hash map (O(1) avg with collisions)

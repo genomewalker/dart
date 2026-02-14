@@ -4,8 +4,6 @@
 // Integrates syncmer-based read clustering with ORF emission.
 // All parameters are learned from warmup data - no magic numbers.
 //
-// Design from GPT-5.3-codex discussion (2026-02-06)
-
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -445,11 +443,21 @@ private:
         std::array<float, 3>& scores,
         uint8_t& n_cand
     ) {
-        // Use existing frame selector for initial candidates
-        // This is a simplified version - integrate with FrameSelector properly
-        frames = {{0, 1, 2}};
-        scores = {{1.0f, 0.8f, 0.6f}};
-        n_cand = 3;
+        auto scored = FrameSelector::score_all_frames(nt, nullptr);
+        n_cand = static_cast<uint8_t>(std::min<size_t>(3, scored.size()));
+
+        if (n_cand == 0) {
+            frames = {{0, 1, 2}};
+            scores = {{0.0f, 0.0f, 0.0f}};
+            n_cand = 1;
+            return;
+        }
+
+        for (uint8_t i = 0; i < n_cand; ++i) {
+            const auto& fs = scored[i];
+            frames[i] = static_cast<uint8_t>(fs.frame + (fs.forward ? 0 : 3));
+            scores[i] = fs.total_score;
+        }
     }
 
     static std::string translate_frame_(const std::string& nt, uint8_t frame) {
@@ -563,12 +571,36 @@ inline LearnedParams calibrate_params_from_warmup(
     builder.set_num_nodes(static_cast<uint32_t>(warmup_reads.size() * 4));
 
     for (size_t i = 0; i < warmup_reads.size(); ++i) {
-        // Translate to protein (frame 0 for simplicity)
         std::string protein;
         const std::string& nt = warmup_reads[i];
+        static const char codon_table[64] = {
+            'K','N','K','N','T','T','T','T','R','S','R','S','I','I','M','I',
+            'Q','H','Q','H','P','P','P','P','R','R','R','R','L','L','L','L',
+            'E','D','E','D','A','A','A','A','G','G','G','G','V','V','V','V',
+            '*','Y','*','Y','S','S','S','S','*','C','W','C','L','F','L','F'
+        };
+
+        auto base_idx = [](char c) -> int {
+            switch (c) {
+                case 'A': case 'a': return 0;
+                case 'C': case 'c': return 1;
+                case 'G': case 'g': return 2;
+                case 'T': case 't': return 3;
+                default: return -1;
+            }
+        };
+
         for (size_t p = 0; p + 2 < nt.size(); p += 3) {
-            // Simple translation, stop on first stop codon
-            protein += 'A';  // Placeholder - real implementation would translate
+            int b0 = base_idx(nt[p]);
+            int b1 = base_idx(nt[p + 1]);
+            int b2 = base_idx(nt[p + 2]);
+            if (b0 < 0 || b1 < 0 || b2 < 0) {
+                protein += 'X';
+                continue;
+            }
+            char aa = codon_table[(b0 << 4) | (b1 << 2) | b2];
+            if (aa == '*') break;
+            protein += aa;
         }
 
         auto seeds = emit_strict_seeds(protein, cfg.strict_k);

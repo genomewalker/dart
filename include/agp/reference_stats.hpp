@@ -13,6 +13,7 @@
 #include <numeric>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace agp {
@@ -28,10 +29,22 @@ struct ReferenceStats {
     float depth_std = 0.0f;        // std dev of depth
     float depth_evenness = 0.0f;   // 1 - (std/mean), measures uniformity
 
+    // Positional diversity (better for short proteins than entropy)
+    // High = reads start at different positions (authentic)
+    // Low = all reads start at same position (spurious motif match)
+    float start_diversity = 0.0f;  // n_unique_starts / min(n_reads, ref_len)
+    float start_span = 0.0f;       // (max_start - min_start + 1) / ref_length
+    float positional_score = 0.0f; // sqrt(diversity * span) [0-1]
+
+    // Terminal coverage (detects middle-only spurious matches)
+    // Real genes have reads at both ends, not just conserved middle
+    float terminal_ratio = 0.0f;   // (5'+3' coverage) / (2*middle coverage)
+
     // Counts
     uint32_t total_covered_bases = 0;
     uint64_t total_depth = 0;
     uint32_t n_reads = 0;
+    uint32_t n_unique_starts = 0;  // count of distinct read start positions
 
     // Quality metrics
     float avg_alignment_length = 0.0f;
@@ -53,12 +66,19 @@ struct FilterThresholds {
     float min_identity = 0.5f;
     float min_enrichment = 0.0f;   // positive = ancient-enriched
 
+    // Positional diversity filtering (for short proteins)
+    // Filters spurious matches where all reads hit same position
+    float min_positional_score = 0.0f;  // sqrt(diversity * span), 0-1
+    float min_terminal_ratio = 0.0f;    // terminal vs middle coverage
+
     bool passes(const ReferenceStats& s) const noexcept {
         return s.n_reads >= min_reads
             && s.breadth >= min_breadth
             && s.depth_mean >= min_depth
             && s.avg_identity >= min_identity
-            && s.damage_enrichment >= min_enrichment;
+            && s.damage_enrichment >= min_enrichment
+            && s.positional_score >= min_positional_score
+            && s.terminal_ratio >= min_terminal_ratio;
     }
 };
 
@@ -83,6 +103,15 @@ public:
         sum_aln_len_ += aln_len;
         sum_read_len_ += read_len;
         ++n_reads_;
+
+        // Track unique start positions for positional diversity
+        unique_starts_.insert(start);
+        if (n_reads_ == 1) {
+            min_start_ = max_start_ = start;
+        } else {
+            min_start_ = std::min(min_start_, start);
+            max_start_ = std::max(max_start_, start);
+        }
     }
 
     void add_em_weights(double gamma, double gamma_ancient) {
@@ -125,6 +154,55 @@ public:
                 : 0.0f;
         }
 
+        // Positional diversity (better for short proteins than entropy)
+        s.n_unique_starts = static_cast<uint32_t>(unique_starts_.size());
+        if (n_reads_ > 0 && ref_length_ > 0) {
+            // diversity: fraction of possible start positions used
+            float max_possible = static_cast<float>(std::min(n_reads_, ref_length_));
+            s.start_diversity = static_cast<float>(s.n_unique_starts) / max_possible;
+
+            // span: how much of the reference do start positions cover
+            uint32_t span_len = (max_start_ >= min_start_)
+                ? (max_start_ - min_start_ + 1) : 1;
+            s.start_span = static_cast<float>(span_len) / static_cast<float>(ref_length_);
+
+            // Combined score: geometric mean (both must be high)
+            s.positional_score = std::sqrt(s.start_diversity * s.start_span);
+        }
+
+        // Terminal coverage ratio
+        // Real genes have reads covering both ends, not just conserved middle
+        if (ref_length_ >= 6) {
+            // 5' terminal: first 2 positions (or 10% of length)
+            // 3' terminal: last 2 positions (or 10% of length)
+            uint32_t term_size = std::max(2u, ref_length_ / 10);
+            term_size = std::min(term_size, ref_length_ / 3);
+
+            double term_5prime = 0.0, term_3prime = 0.0, middle = 0.0;
+            for (uint32_t p = 0; p < ref_length_; ++p) {
+                double d = coverage_[p];
+                if (p < term_size) {
+                    term_5prime += d;
+                } else if (p >= ref_length_ - term_size) {
+                    term_3prime += d;
+                } else {
+                    middle += d;
+                }
+            }
+
+            // Normalize by region size
+            double term_avg = (term_5prime + term_3prime) / (2.0 * term_size);
+            uint32_t middle_size = ref_length_ - 2 * term_size;
+            double middle_avg = (middle_size > 0) ? middle / middle_size : 0.0;
+
+            // Ratio: high = good terminal coverage, low = middle-only (spurious)
+            // Add small epsilon to avoid division by zero
+            s.terminal_ratio = static_cast<float>(
+                (term_avg + 0.01) / (middle_avg + 0.01));
+        } else {
+            s.terminal_ratio = 1.0f;  // Too short to measure
+        }
+
         // Quality metrics
         float nr = static_cast<float>(n_reads_);
         s.avg_identity = sum_identity_ / nr;
@@ -161,6 +239,11 @@ private:
     double n_effective_ = 0.0;
     double n_ancient_ = 0.0;
     double n_modern_ = 0.0;
+
+    // Positional diversity tracking
+    std::unordered_set<uint32_t> unique_starts_;
+    uint32_t min_start_ = 0;
+    uint32_t max_start_ = 0;
 };
 
 // Thread-safe collector for parallel read processing

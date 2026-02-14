@@ -42,12 +42,12 @@
 #include <cmath>
 #include <ctime>
 
-// ============== CONSTANTS ==============
+// Constants
 constexpr size_t CACHE_LINE_SIZE = 64;
 constexpr size_t MIN_CDS_LENGTH = 30;  // Minimum length for processing
 constexpr size_t READ_BUFFER_SIZE = 1 << 16;
 
-// ============== HEXAMER ENCODING ==============
+// Hexamer encoding
 alignas(CACHE_LINE_SIZE) static const int8_t BASE_MAP[256] = {
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
@@ -89,7 +89,7 @@ std::string decode_hexamer(uint32_t code) {
     return hex;
 }
 
-// ============== CDS VALIDATION ==============
+// CDS validation
 inline bool has_valid_start(const char* seq, size_t len) {
     if (len < 3) return false;
     uint8_t c0 = seq[0] & 0xDF;
@@ -107,7 +107,7 @@ inline bool has_valid_stop(const char* seq, size_t len) {
     return (c0 == 'T' && ((c1 == 'A' && (c2 == 'A' || c2 == 'G')) || (c1 == 'G' && c2 == 'A')));
 }
 
-// ============== THREAD-LOCAL STATE ==============
+// Thread-local state
 struct ThreadState {
     // Dicodon phase hexamer frequencies
     // Phase 0: hexamers starting at codon boundary (positions 0, 3, 6, ...)
@@ -138,7 +138,7 @@ struct ThreadState {
     }
 };
 
-// ============== FILE PROCESSING ==============
+// File processing
 void process_file(const std::string& filepath, ThreadState& state) {
     gzFile file = gzopen(filepath.c_str(), "rb");
     if (!file) return;
@@ -221,7 +221,7 @@ void process_file(const std::string& filepath, ThreadState& state) {
     gzclose(file);
 }
 
-// ============== FILE DISCOVERY ==============
+// File discovery
 void find_fasta_files(const std::string& dir_path, std::vector<std::string>& files) {
     DIR* dir = opendir(dir_path.c_str());
     if (!dir) return;
@@ -249,7 +249,7 @@ void find_fasta_files(const std::string& dir_path, std::vector<std::string>& fil
     closedir(dir);
 }
 
-// ============== OUTPUT GENERATION ==============
+// Output generation
 void write_dicodon_phase_header(const std::string& output_dir, const std::string& domain,
                                  const std::array<uint64_t, 4096>& phase0,
                                  const std::array<uint64_t, 4096>& phase1,
@@ -428,7 +428,7 @@ void write_dicodon_phase_header(const std::string& output_dir, const std::string
     std::cerr << "  Wrote: " << filename << "\n";
 }
 
-// ============== MAIN ==============
+// Main
 int main(int argc, char* argv[]) {
     if (argc < 3) {
         std::cerr << "Dicodon Phase Hexamer Extractor for AGP\n\n";
@@ -473,7 +473,7 @@ int main(int argc, char* argv[]) {
     
     omp_set_num_threads(num_threads);
     
-    std::cerr << "=== Dicodon Phase Hexamer Extractor ===\n";
+    std::cerr << "Dicodon phase hexamer extractor\n";
     std::cerr << "Domain: " << domain << "\n";
     std::cerr << "Threads: " << num_threads << "\n";
     std::cerr << "Output dir: " << output_dir << "\n";
@@ -548,7 +548,7 @@ int main(int argc, char* argv[]) {
         }
     }
     
-    std::cerr << "\n\n=== RESULTS ===\n";
+    std::cerr << "\n\nResults\n";
     std::cerr << "Files processed: " << total_files.load() << "\n";
     std::cerr << "Total sequences: " << total_sequences.load() << "\n";
     std::cerr << "Valid CDS: " << total_valid_cds.load() << "\n";
@@ -557,7 +557,7 @@ int main(int argc, char* argv[]) {
     std::cerr << "Phase 2 hexamers: " << total_phase2.load() << "\n";
     
     // Show codon position stats
-    std::cerr << "\n=== CODON POSITION NUCLEOTIDE FREQUENCIES ===\n";
+    std::cerr << "\nCodon-position nucleotide frequencies\n";
     const char* bases = "ACGT";
     for (int pos = 0; pos < 3; pos++) {
         const auto& counts = (pos == 0) ? global_pos0_nt : (pos == 1) ? global_pos1_nt : global_pos2_nt;
@@ -577,7 +577,7 @@ int main(int argc, char* argv[]) {
     }
     
     // Write output
-    std::cerr << "\n=== WRITING OUTPUT ===\n";
+    std::cerr << "\nWriting output\n";
     
     write_dicodon_phase_header(output_dir, domain,
                                 global_phase0, global_phase1, global_phase2,

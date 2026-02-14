@@ -1,5 +1,5 @@
 /*
- * Ultra-fast metamer extractor using Metabuli-style encoding
+ * Metamer extractor using Metabuli-style encoding
  *
  * Encoding: 64-bit = (8 AAs × 5 bits) << 24 | (8 codons × 3 bits)
  * Storage: Sorted vectors, merge per thread

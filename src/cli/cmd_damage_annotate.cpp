@@ -155,6 +155,11 @@ struct ProteinDamageSummary {
     std::string taln;
     size_t qstart_0;
     size_t qlen = 0;  // Total read length (for Bayesian scoring)
+    // Short protein filtering metrics
+    float delta_bits = 0.0f;    // bits_best - bits_second
+    float bpa = 0.0f;           // bits / alnlen (bits-per-aligned-AA)
+    uint8_t length_bin = 0;     // 0=15-24, 1=25-39, 2=40-59, 3=60+
+    float z_bpa = 0.0f;         // Length-normalized BPA z-score
 };
 
 // Parse strand and frame from AGP header suffix (e.g., readname_+_1 -> '+', 1)
@@ -464,6 +469,11 @@ struct ProteinAggregate {
 
     // Per-read observations for Beta-Binomial model
     std::vector<ReadDamageObs> read_obs;  // Collected for proper statistical inference
+
+    // Short protein filtering aggregates
+    float sum_delta_bits = 0.0f;
+    float sum_bpa = 0.0f;
+    std::array<uint32_t, 4> length_bin_counts{};  // per-bin read counts
 };
 
 // Estimate d_max from alignment mismatches (first pass)
@@ -551,6 +561,13 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     float min_breadth = 0.10f;
     float min_depth = 0.5f;
     uint32_t min_reads = 3;
+    float min_positional_score = 0.0f;
+    float min_terminal_ratio = 0.0f;
+
+    // Alignment-level pre-filters (applied before any processing)
+    float aln_min_identity = 0.0f;   // 0 = no filter
+    float aln_min_bits = 0.0f;       // 0 = no filter
+    float aln_max_evalue = 1e10f;    // very large = no filter
 
     for (int i = 1; i < argc; ++i) {
         if ((strcmp(argv[i], "--hits") == 0 || strcmp(argv[i], "-i") == 0) && i + 1 < argc) {
@@ -597,6 +614,16 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             min_depth = std::stof(argv[++i]);
         } else if (strcmp(argv[i], "--min-reads") == 0 && i + 1 < argc) {
             min_reads = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (strcmp(argv[i], "--min-positional-score") == 0 && i + 1 < argc) {
+            min_positional_score = std::stof(argv[++i]);
+        } else if (strcmp(argv[i], "--min-terminal-ratio") == 0 && i + 1 < argc) {
+            min_terminal_ratio = std::stof(argv[++i]);
+        } else if (strcmp(argv[i], "--aln-min-identity") == 0 && i + 1 < argc) {
+            aln_min_identity = std::stof(argv[++i]);
+        } else if (strcmp(argv[i], "--aln-min-bits") == 0 && i + 1 < argc) {
+            aln_min_bits = std::stof(argv[++i]);
+        } else if (strcmp(argv[i], "--aln-max-evalue") == 0 && i + 1 < argc) {
+            aln_max_evalue = std::stof(argv[++i]);
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             std::cerr << "Usage: agp damage-annotate --hits <results.tsv> [options]\n\n";
             std::cerr << "Post-mapping damage annotation using MMseqs2 alignments.\n";
@@ -627,7 +654,16 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cerr << "  --gene-summary FILE  Per-gene EM-weighted statistics TSV\n";
             std::cerr << "  --min-breadth FLOAT  Minimum breadth filter (default: 0.1)\n";
             std::cerr << "  --min-depth FLOAT    Minimum depth filter (default: 0.5)\n";
-            std::cerr << "  --min-reads INT      Minimum read count (default: 3)\n\n";
+            std::cerr << "  --min-reads INT      Minimum read count (default: 3)\n";
+            std::cerr << "  --min-positional-score FLOAT  Min read start diversity (default: 0)\n";
+            std::cerr << "                       Filters spurious matches where all reads hit same position\n";
+            std::cerr << "                       Score = sqrt(diversity * span), range 0-1\n";
+            std::cerr << "  --min-terminal-ratio FLOAT  Min terminal/middle coverage ratio (default: 0)\n";
+            std::cerr << "                       Filters matches with reads only in middle (spurious motif)\n\n";
+            std::cerr << "Alignment-level pre-filters (applied before any processing):\n";
+            std::cerr << "  --aln-min-identity FLOAT  Min identity fraction (default: 0, no filter)\n";
+            std::cerr << "  --aln-min-bits FLOAT      Min bit score (default: 0, no filter)\n";
+            std::cerr << "  --aln-max-evalue FLOAT    Max e-value (default: 1e10, no filter)\n\n";
             std::cerr << "MMseqs2 format (16 columns with qaln/taln):\n";
             std::cerr << "  --format-output \"query,target,fident,alnlen,mismatch,gapopen,\n";
             std::cerr << "                   qstart,qend,tstart,tend,evalue,bits,qlen,tlen,qaln,taln\"\n";
@@ -702,7 +738,16 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             if (verbose) {
                 std::cerr << "Loaded damage index: " << damage_index->record_count() << " records\n";
                 std::cerr << "Index d_max: " << (damage_index->d_max() * 100.0f) << "%\n";
-                std::cerr << "Index lambda: " << damage_index->lambda() << "\n\n";
+                std::cerr << "Index lambda: " << damage_index->lambda() << "\n";
+                std::cerr << "Damage informative: "
+                          << (damage_index->damage_informative() ? "yes" : "no") << "\n";
+                if (!damage_index->damage_informative()) {
+                    std::cerr << "  (damage_validated=" << damage_index->damage_validated()
+                              << " damage_artifact=" << damage_index->damage_artifact()
+                              << " terminal_shift=" << std::fixed << std::setprecision(4)
+                              << damage_index->terminal_shift() << ")\n";
+                }
+                std::cerr << "\n";
             }
         } catch (const std::exception& e) {
             std::cerr << "Warning: Cannot load damage index: " << e.what() << "\n";
@@ -720,9 +765,14 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
 
     std::vector<ProteinDamageSummary> summaries;
-    std::unordered_set<std::string> seen_queries;
     std::string line;
     size_t starts[16], ends[16];
+
+    // Alignment filter counters
+    size_t total_alignments = 0;
+    size_t filtered_identity = 0;
+    size_t filtered_bits = 0;
+    size_t filtered_evalue = 0;
 
     // EM mode: also collect CompactAlignment records for all hits
     agp::StringTable read_names, ref_names;
@@ -733,6 +783,25 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         em_aln_count = 0;
     }
 
+    // Best hit tracking: query_id -> (bit_score, line_data)
+    // MMseqs2 doesn't guarantee best-first ordering, so we keep track of the
+    // best hit (highest bit_score) for each query and process them after.
+    struct BestHitData {
+        float bits;
+        float bits_second = 0.0f;  // second-best bit score for this query
+        std::string target_id;
+        uint32_t ref_idx;  // For EM: ref_idx corresponding to target_id
+        float fident;
+        float evalue;
+        size_t qstart_0;
+        size_t tstart_0;
+        size_t qlen;
+        size_t tlen;
+        std::string qaln;
+        std::string taln;
+    };
+    std::unordered_map<std::string, BestHitData> best_hits;
+
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') continue;
 
@@ -740,11 +809,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         if (nf < 16) continue;
 
         std::string query_id = field_str(line, starts[0], ends[0]);
-        // In EM mode, keep all hits per read; otherwise dedup to first hit
-        if (!use_em && seen_queries.count(query_id)) continue;
-        bool is_first_hit = (seen_queries.count(query_id) == 0);
-        seen_queries.insert(query_id);
-
         std::string target_id = field_str(line, starts[1], ends[1]);
         float fident = std::stof(field_str(line, starts[2], ends[2]));
         size_t qstart = static_cast<size_t>(std::stoul(field_str(line, starts[6], ends[6])));
@@ -754,17 +818,24 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         float evalue = static_cast<float>(std::stod(field_str(line, starts[10], ends[10])));
         float bits = std::stof(field_str(line, starts[11], ends[11]));
         size_t qlen = static_cast<size_t>(std::stoul(field_str(line, starts[12], ends[12])));
+        size_t tlen = static_cast<size_t>(std::stoul(field_str(line, starts[13], ends[13])));
         std::string qaln = field_str(line, starts[14], ends[14]);
         std::string taln = field_str(line, starts[15], ends[15]);
 
         size_t qstart_0 = (qstart > 0) ? qstart - 1 : 0;
         size_t tstart_0 = (tstart > 0) ? tstart - 1 : 0;
-        size_t tlen = static_cast<size_t>(std::stoul(field_str(line, starts[13], ends[13])));
+
+        // Alignment-level pre-filtering
+        ++total_alignments;
+        if (fident < aln_min_identity) { ++filtered_identity; continue; }
+        if (bits < aln_min_bits) { ++filtered_bits; continue; }
+        if (evalue > aln_max_evalue) { ++filtered_evalue; continue; }
 
         // EM mode: collect CompactAlignment for every hit
+        uint32_t tidx = 0;  // Track ref_idx for best hit comparison
         if (use_em) {
             uint32_t ridx = read_names.insert(query_id);
-            uint32_t tidx = ref_names.insert(target_id);
+            tidx = ref_names.insert(target_id);
 
             // Look up damage score from AGD index
             float ds = 0.0f;
@@ -790,21 +861,66 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             ca.flags = 0;
         }
 
-        // Summaries: only for first hit per read (dedup for annotation output)
-        if (!is_first_hit) continue;
+        // Track best hit per query (highest bit_score) and second-best
+        auto it = best_hits.find(query_id);
+        if (it == best_hits.end()) {
+            best_hits[query_id] = BestHitData{
+                bits, 0.0f, target_id, tidx, fident, evalue,
+                qstart_0, tstart_0, qlen, tlen,
+                qaln, taln
+            };
+        } else if (bits > it->second.bits) {
+            it->second.bits_second = it->second.bits;  // demote current best
+            it->second.bits = bits;
+            it->second.target_id = target_id;
+            it->second.ref_idx = tidx;
+            it->second.fident = fident;
+            it->second.evalue = evalue;
+            it->second.qstart_0 = qstart_0;
+            it->second.tstart_0 = tstart_0;
+            it->second.qlen = qlen;
+            it->second.tlen = tlen;
+            it->second.qaln = qaln;
+            it->second.taln = taln;
+        } else if (bits > it->second.bits_second) {
+            it->second.bits_second = bits;  // new second-best
+        }
+    }
+    in.close();
 
+    if (verbose) {
+        size_t passed = total_alignments - filtered_identity - filtered_bits - filtered_evalue;
+        std::cerr << "Alignment pre-filtering:\n";
+        std::cerr << "  Total alignments: " << total_alignments << "\n";
+        if (filtered_identity > 0 || aln_min_identity > 0)
+            std::cerr << "  Filtered (identity < " << aln_min_identity << "): " << filtered_identity << "\n";
+        if (filtered_bits > 0 || aln_min_bits > 0)
+            std::cerr << "  Filtered (bits < " << aln_min_bits << "): " << filtered_bits << "\n";
+        if (filtered_evalue > 0 || aln_max_evalue < 1e9f)
+            std::cerr << "  Filtered (evalue > " << aln_max_evalue << "): " << filtered_evalue << "\n";
+        std::cerr << "  Passed: " << passed << " (" << (100.0 * passed / total_alignments) << "%)\n\n";
+    }
+
+    // Process best hits into summaries
+    for (auto& [query_id, hit] : best_hits) {
         auto summary = annotate_alignment(
-            query_id, target_id, qaln, taln,
-            qstart_0, tstart_0, qlen,
-            evalue, bits, fident, d_max, lambda);
+            query_id, hit.target_id, hit.qaln, hit.taln,
+            hit.qstart_0, hit.tstart_0, hit.qlen,
+            hit.evalue, hit.bits, hit.fident, d_max, lambda);
 
         if (summary.total_mismatches > 0) {
             filter_sites_by_distance(summary, max_dist);
             // Store alignment data for Bayesian scoring and corrected output
-            summary.qlen = qlen;
-            summary.qaln = qaln;
-            summary.taln = taln;
-            summary.qstart_0 = qstart_0;
+            summary.qlen = hit.qlen;
+            summary.qaln = hit.qaln;
+            summary.taln = hit.taln;
+            summary.qstart_0 = hit.qstart_0;
+            // Short protein filtering metrics
+            summary.delta_bits = hit.bits - hit.bits_second;
+            summary.bpa = (summary.alnlen > 0)
+                ? hit.bits / static_cast<float>(summary.alnlen) : 0.0f;
+            summary.length_bin = static_cast<uint8_t>(
+                agp::LengthBinStats::get_bin(hit.qlen));
             // Look up synonymous damage and per-read p_damaged from index if available
             if (damage_index) {
                 if (const AgdRecord* rec = damage_index->find(query_id)) {
@@ -821,7 +937,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             summaries.push_back(std::move(summary));
         }
     }
-    in.close();
 
     // EM reassignment
     agp::EMState em_state;
@@ -871,8 +986,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         // Extract best assignments and build per-read lookup
         auto best = agp::reassign_reads(aln_data, em_state, 0.01);
 
-        // Build per-read lookup: for each read, find its gamma for the best (first) hit
-        // The summaries use first-hit-per-read, so we map read_idx -> gamma of best assignment
+        // Build per-read lookup: for each read, find its gamma for the best hit
+        // Summaries use best-hit-per-read (by bit_score), so we map read_idx -> gamma of best assignment
         for (uint32_t r = 0; r < n_reads; ++r) {
             std::string_view rname = read_names.get(r);
             std::string rname_str(rname);
@@ -880,11 +995,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             uint32_t start = aln_data.read_offsets[r];
             uint32_t end = aln_data.read_offsets[r + 1];
 
-            // Find best gamma and whether this read's first hit is the best
+            // Find gamma for the best alignment per read (by EM assignment)
             float best_gamma = 0.0f;
             float best_gamma_ancient = 0.0f;
             uint32_t best_ref = best[r].first;
-            bool first_is_best = false;
+            bool bitscore_best_matches_em = false;
 
             for (uint32_t j = start; j < end; ++j) {
                 if (aln_data.alignments[j].ref_idx == best_ref) {
@@ -896,12 +1011,29 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 }
             }
 
-            // Check if first alignment for this read is the best ref
-            if (end > start && aln_data.alignments[start].ref_idx == best_ref) {
-                first_is_best = true;
+            // Check if the best-by-bitscore hit matches the EM-assigned best
+            auto bh_it = best_hits.find(rname_str);
+            if (bh_it != best_hits.end() && bh_it->second.ref_idx == best_ref) {
+                bitscore_best_matches_em = true;
             }
 
-            em_read_results[rname_str] = {best_gamma, best_gamma_ancient, first_is_best};
+            em_read_results[rname_str] = {best_gamma, best_gamma_ancient, bitscore_best_matches_em};
+        }
+
+        // Aggregate per-target short protein metrics for gene summary
+        struct GeneMetrics {
+            float sum_delta_bits = 0.0f;
+            float sum_bpa = 0.0f;
+            uint32_t count = 0;
+            std::array<uint32_t, 4> bin_counts{};
+        };
+        std::unordered_map<std::string, GeneMetrics> gene_metrics;
+        for (const auto& s : summaries) {
+            auto& gm = gene_metrics[s.target_id];
+            gm.sum_delta_bits += s.delta_bits;
+            gm.sum_bpa += s.bpa;
+            gm.count++;
+            gm.bin_counts[s.length_bin]++;
         }
 
         // Write gene summary
@@ -910,6 +1042,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             thresh.min_reads = min_reads;
             thresh.min_breadth = min_breadth;
             thresh.min_depth = min_depth;
+            thresh.min_positional_score = min_positional_score;
+            thresh.min_terminal_ratio = min_terminal_ratio;
 
             auto ref_stats = stats_collector.finalize_filtered(
                 static_cast<float>(em_state.pi), thresh);
@@ -929,7 +1063,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             }
 
             gf << "gene_id\tn_reads\tn_effective\tn_ancient\tn_modern\t"
-                  "breadth\tdepth_mean\tavg_identity\tenrichment\tis_ancient\n";
+                  "breadth\tdepth_mean\tavg_identity\tenrichment\t"
+                  "start_diversity\tstart_span\tpositional_score\t"
+                  "terminal_ratio\tn_unique_starts\tis_ancient\t"
+                  "avg_delta_bits\tavg_bpa\tlength_bin\n";
 
             for (const auto& s : ref_stats) {
                 bool is_ancient = s.damage_enrichment > 0.0f;
@@ -942,7 +1079,24 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                    << '\t' << std::setprecision(2) << s.depth_mean
                    << '\t' << std::setprecision(4) << s.avg_identity
                    << '\t' << std::setprecision(4) << s.damage_enrichment
-                   << '\t' << (is_ancient ? 1 : 0) << '\n';
+                   << '\t' << std::setprecision(4) << s.start_diversity
+                   << '\t' << std::setprecision(4) << s.start_span
+                   << '\t' << std::setprecision(4) << s.positional_score
+                   << '\t' << std::setprecision(4) << s.terminal_ratio
+                   << '\t' << s.n_unique_starts
+                   << '\t' << (is_ancient ? 1 : 0);
+                auto gm_it = gene_metrics.find(s.ref_id);
+                if (gm_it != gene_metrics.end() && gm_it->second.count > 0) {
+                    const auto& gm = gm_it->second;
+                    gf << '\t' << std::setprecision(1) << (gm.sum_delta_bits / gm.count)
+                       << '\t' << std::setprecision(3) << (gm.sum_bpa / gm.count)
+                       << '\t' << static_cast<int>(std::max_element(
+                              gm.bin_counts.begin(),
+                              gm.bin_counts.end()) - gm.bin_counts.begin());
+                } else {
+                    gf << "\t.\t.\t.";
+                }
+                gf << '\n';
             }
 
             if (verbose) {
@@ -1015,6 +1169,18 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     score_params.k_identity = 20.0f;
     score_params.identity_baseline = 0.90f;
 
+    // Damage informativeness gating from AGD v3 header
+    // When uninformative: terminal evidence is zeroed, posterior output is NA
+    float damage_detectability = 1.0f;
+    if (damage_index) {
+        score_params.damage_informative = damage_index->damage_informative();
+        score_params.channel_b_valid = damage_index->channel_b_valid();
+        damage_detectability = agp::compute_damage_detectability(
+            damage_index->d_max(), damage_index->stop_decay_llr(),
+            damage_index->terminal_shift(), damage_index->damage_validated(),
+            damage_index->damage_artifact());
+    }
+
     if (verbose) {
         std::cerr << "\nBayesian scoring (empirical Bayes):\n";
         std::cerr << "  Modern proxy reads: " << modern_est.n_reads << "\n";
@@ -1024,7 +1190,24 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                   << modern_est.q_modern << "\n";
         std::cerr << "  Tempering w0: " << score_params.w0 << "\n";
         std::cerr << "  Channel B valid: " << (score_params.channel_b_valid ? "yes" : "no") << "\n";
+        std::cerr << "  Damage informative: " << (score_params.damage_informative ? "yes" : "no") << "\n";
+        std::cerr << "  Damage detectability: " << std::fixed << std::setprecision(3)
+                  << damage_detectability << "\n";
         std::cerr << "  Identity evidence: " << (use_identity ? "enabled (k=20, baseline=0.90)" : "disabled") << "\n";
+    }
+
+    // Compute length-binned BPA z-scores (two-pass: accumulate then normalize)
+    {
+        agp::LengthBinStats bpa_stats;
+        for (const auto& s : summaries) {
+            if (s.has_p_read && s.p_read < 0.20f) {
+                bpa_stats.add(s.qlen, s.bpa);
+            }
+        }
+        bpa_stats.finalize();
+        for (auto& s : summaries) {
+            s.z_bpa = bpa_stats.z_score(s.qlen, s.bpa);
+        }
     }
 
     // Write per-site output
@@ -1101,9 +1284,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             "total_mismatches\tdamage_consistent\tnon_damage\t"
             "ct_sites\tga_sites\thigh_conf\tdamage_fraction\t"
             "max_p_damage\tp_damaged\tp_read\tposterior\t"
-            "is_damaged\tlogBF_terminal\tlogBF_sites\tlogBF_identity\t"
+            "classification\tlogBF_terminal\tlogBF_sites\tlogBF_identity\t"
             "m_opportunities\tk_hits\tq_eff\ttier\tdamage_class\t"
-            "syn_5prime\tsyn_3prime";
+            "syn_5prime\tsyn_3prime\t"
+            "delta_bits\tbpa\tlength_bin\tz_bpa\t"
+            "damage_informative";
     if (use_em) {
         *out << "\tgamma\tgamma_ancient\tbest_hit";
     }
@@ -1148,9 +1333,19 @@ int cmd_damage_annotate(int argc, char* argv[]) {
              << std::fixed << std::setprecision(3) << s.damage_fraction << "\t"
              << std::fixed << std::setprecision(4) << s.max_p_damage << "\t"
              << std::fixed << std::setprecision(4) << s.p_damaged << "\t"
-             << std::fixed << std::setprecision(4) << (s.has_p_read ? s.p_read : 0.0f) << "\t"
-             << std::fixed << std::setprecision(4) << posterior << "\t"
-             << (posterior >= threshold ? 1 : 0) << "\t"
+             << std::fixed << std::setprecision(4) << (s.has_p_read ? s.p_read : 0.0f) << "\t";
+        // Classify using damage informativeness + posterior + quality metrics
+        auto classification = agp::classify_protein(
+            bayes_out.informative, posterior, s.fident, s.z_bpa, s.delta_bits,
+            score_params.ancient_threshold, score_params.modern_threshold);
+
+        if (bayes_out.informative) {
+            *out << std::fixed << std::setprecision(4) << posterior << "\t";
+        } else {
+            *out << "NA\t";
+        }
+        *out << agp::classification_name(classification) << "\t";
+        *out
              << std::fixed << std::setprecision(3) << bayes_out.logBF_terminal << "\t"
              << std::fixed << std::setprecision(3) << bayes_out.logBF_sites << "\t"
              << std::fixed << std::setprecision(3) << bayes_out.logBF_identity << "\t"
@@ -1159,7 +1354,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
              << agp::tier_name(bayes_out.tier) << "\t"
              << agp::damage_class_name(bayes_out.damage_class) << "\t"
              << (s.has_syn_data ? std::to_string(s.syn_5prime) : ".") << "\t"
-             << (s.has_syn_data ? std::to_string(s.syn_3prime) : ".");
+             << (s.has_syn_data ? std::to_string(s.syn_3prime) : ".") << "\t"
+             << std::fixed << std::setprecision(1) << s.delta_bits << "\t"
+             << std::fixed << std::setprecision(3) << s.bpa << "\t"
+             << static_cast<int>(s.length_bin) << "\t"
+             << std::fixed << std::setprecision(3) << s.z_bpa << "\t"
+             << (bayes_out.informative ? 1 : 0);
 
         if (use_em) {
             auto it = em_read_results.find(s.query_id);
@@ -1190,6 +1390,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             agg.total_damage_sites += s.damage_consistent;
             if (s.p_damaged > agg.max_p_damaged) agg.max_p_damaged = s.p_damaged;
             agg.sum_p_damaged += s.p_damaged;
+            agg.sum_delta_bits += s.delta_bits;
+            agg.sum_bpa += s.bpa;
+            agg.length_bin_counts[s.length_bin]++;
 
             // Collect per-read observation for Beta-Binomial model
             // info = sum of p_damage at sites (informativeness for weighting)
@@ -1256,7 +1459,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
               "terminal_5\tterminal_3\t"
               "max_p_damaged\tmean_p_damaged\tfrac_damaged\t"
               "p_protein_damaged\tdelta_mle\tci_lower\tci_upper\t"
-              "lrt_pvalue\tlog_bf\td_aa\n";
+              "lrt_pvalue\tlog_bf\td_aa\t"
+              "avg_delta_bits\tavg_bpa\tlength_bin\n";
 
         for (const auto& [id, agg] : protein_agg) {
             float mean_p = agg.n_reads > 0 ? agg.sum_p_damaged / agg.n_reads : 0.0f;
@@ -1301,7 +1505,15 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                << std::fixed << std::setprecision(4) << ci_upper << "\t"
                << std::scientific << std::setprecision(3) << lrt_pvalue << "\t"
                << std::fixed << std::setprecision(2) << log_bf << "\t"
-               << std::fixed << std::setprecision(4) << d_aa << "\n";
+               << std::fixed << std::setprecision(4) << d_aa << "\t"
+               << std::fixed << std::setprecision(1)
+               << (agg.n_reads > 0 ? agg.sum_delta_bits / agg.n_reads : 0.0f) << "\t"
+               << std::fixed << std::setprecision(3)
+               << (agg.n_reads > 0 ? agg.sum_bpa / agg.n_reads : 0.0f) << "\t"
+               << static_cast<int>(std::max_element(
+                      agg.length_bin_counts.begin(),
+                      agg.length_bin_counts.end()) - agg.length_bin_counts.begin())
+               << "\n";
         }
 
         if (verbose) {
