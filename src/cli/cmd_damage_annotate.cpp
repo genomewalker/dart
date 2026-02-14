@@ -492,38 +492,43 @@ inline std::pair<float, float> wilson_ci(uint32_t successes, uint32_t n, float z
 
 // Per-gene accumulator for functional profiling
 // Aggregates read-level damage annotations into gene-level summaries
+// Supports both best-hit (gamma=1.0) and EM-weighted (gamma<1.0) modes
 struct GeneSummaryAccumulator {
     std::string target_id;
     uint32_t tlen = 0;
-    uint32_t n_reads = 0;
-    uint32_t n_ancient_conf = 0;
-    uint32_t n_ancient_likely = 0;
-    uint32_t n_undetermined = 0;
-    uint32_t n_modern_conf = 0;
+    uint32_t n_reads = 0;           // Actual read count
+    double n_reads_eff = 0.0;       // Effective reads (sum of gamma weights)
+    double n_ancient_conf = 0.0;    // Gamma-weighted ancient confident
+    double n_ancient_likely = 0.0;  // Gamma-weighted ancient likely
+    double n_undetermined = 0.0;    // Gamma-weighted undetermined
+    double n_modern_conf = 0.0;     // Gamma-weighted modern confident
     double sum_posterior = 0.0;
     double sum_fident = 0.0;
-    std::vector<float> coverage;  // Per-position coverage depth
+    std::vector<float> coverage;    // Per-position coverage depth (gamma-weighted)
 
+    // Add read with EM weight (gamma). For best-hit mode, gamma=1.0
     void add_read(AncientClassification cls, float posterior, float fident,
-                  size_t tstart, size_t aln_len_on_target) {
+                  size_t tstart, size_t aln_len_on_target, float gamma = 1.0f) {
         ++n_reads;
-        sum_posterior += posterior;
-        sum_fident += fident;
+        n_reads_eff += gamma;
+        sum_posterior += gamma * posterior;
+        sum_fident += gamma * fident;
 
+        // Gamma-weighted classification counts
         switch (cls) {
-            case AncientClassification::AncientConfident: ++n_ancient_conf; break;
-            case AncientClassification::AncientLikely:    ++n_ancient_likely; break;
-            case AncientClassification::Undetermined:     ++n_undetermined; break;
-            case AncientClassification::ModernConfident:  ++n_modern_conf; break;
+            case AncientClassification::AncientConfident: n_ancient_conf += gamma; break;
+            case AncientClassification::AncientLikely:    n_ancient_likely += gamma; break;
+            case AncientClassification::Undetermined:     n_undetermined += gamma; break;
+            case AncientClassification::ModernConfident:  n_modern_conf += gamma; break;
         }
 
-        // Update per-position coverage
+        // Update per-position coverage with gamma weight
         if (tlen > 0 && coverage.empty()) {
             coverage.resize(tlen, 0.0f);
         }
         size_t end = std::min(tstart + aln_len_on_target, static_cast<size_t>(tlen));
         for (size_t p = tstart; p < end; ++p) {
-            coverage[p] += 1.0f;
+            coverage[p] += gamma;  // Gamma-weighted coverage
         }
     }
 
@@ -536,6 +541,7 @@ struct GeneSummaryAccumulator {
         return static_cast<float>(covered) / static_cast<float>(coverage.size());
     }
 
+    // Abundance estimate: gamma-weighted depth (sum of coverage / length)
     float depth_mean() const {
         if (coverage.empty()) return 0.0f;
         double total = 0.0;
@@ -543,12 +549,23 @@ struct GeneSummaryAccumulator {
         return static_cast<float>(total / coverage.size());
     }
 
+    // Effective read count (sum of gamma weights)
+    float eff_reads() const {
+        return static_cast<float>(n_reads_eff);
+    }
+
     float avg_posterior() const {
-        return n_reads > 0 ? static_cast<float>(sum_posterior / n_reads) : 0.0f;
+        return n_reads_eff > 0 ? static_cast<float>(sum_posterior / n_reads_eff) : 0.0f;
     }
 
     float avg_fident() const {
-        return n_reads > 0 ? static_cast<float>(sum_fident / n_reads) : 0.0f;
+        return n_reads_eff > 0 ? static_cast<float>(sum_fident / n_reads_eff) : 0.0f;
+    }
+
+    // Ancient fraction based on effective counts
+    float ancient_frac() const {
+        double total = n_ancient_conf + n_ancient_likely + n_modern_conf;
+        return total > 0 ? static_cast<float>((n_ancient_conf + n_ancient_likely) / total) : 0.0f;
     }
 };
 
@@ -1574,8 +1591,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         *out << "\n";
     }
 
-    // Write gene summary (works without EM — uses best-hit per read)
-    if (!gene_summary_file.empty() && !use_em) {
+    // Write gene summary (supports both best-hit and EM-weighted modes)
+    if (!gene_summary_file.empty()) {
         std::unordered_map<std::string, GeneSummaryAccumulator> gene_agg;
 
         for (size_t i = 0; i < summaries.size(); ++i) {
@@ -1592,8 +1609,18 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             for (char c : s.taln) {
                 if (c != '-') ++aln_on_target;
             }
+
+            // Get gamma weight: 1.0 for best-hit mode, actual gamma for EM mode
+            float gamma = 1.0f;
+            if (use_em) {
+                auto it = em_read_results.find(s.query_id);
+                if (it != em_read_results.end()) {
+                    gamma = std::get<0>(it->second);  // gamma from EM
+                }
+            }
+
             acc.add_read(read_classifications[i], read_posteriors[i],
-                         s.fident, s.tstart_0, aln_on_target);
+                         s.fident, s.tstart_0, aln_on_target, gamma);
         }
 
         std::ofstream gf(gene_summary_file);
@@ -1602,34 +1629,40 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             return 1;
         }
 
-        gf << "target_id\tn_reads\tn_ancient_conf\tn_ancient_likely\t"
-              "n_undetermined\tn_modern_conf\tancient_frac\tci_low\tci_high\t"
-              "mean_posterior\tmean_identity\tbreadth\tdepth\n";
+        // Header includes eff_reads (effective reads from EM weights) and abundance
+        gf << "target_id\tn_reads\teff_reads\tn_ancient\tn_modern\tn_undetermined\t"
+              "ancient_frac\tci_low\tci_high\tmean_posterior\tmean_identity\t"
+              "breadth\tabundance\n";
 
         for (const auto& [tid, acc] : gene_agg) {
             if (acc.n_reads < min_reads) continue;
             float b = acc.breadth();
             if (b < min_breadth) continue;
-            float d = acc.depth_mean();
-            if (d < min_depth) continue;
+            float abundance = acc.depth_mean();  // Gamma-weighted depth = abundance
+            if (abundance < min_depth) continue;
 
-            uint32_t n_ancient = acc.n_ancient_conf + acc.n_ancient_likely;
-            auto [ci_lo, ci_hi] = wilson_ci(n_ancient, acc.n_reads);
+            // Gamma-weighted ancient/modern counts
+            float n_ancient = static_cast<float>(acc.n_ancient_conf + acc.n_ancient_likely);
+            float n_modern = static_cast<float>(acc.n_modern_conf);
+            float n_undet = static_cast<float>(acc.n_undetermined);
+
+            // Wilson CI uses integer counts (actual reads for CI calculation)
+            uint32_t n_anc_int = static_cast<uint32_t>(std::round(n_ancient));
+            auto [ci_lo, ci_hi] = wilson_ci(n_anc_int, acc.n_reads);
 
             gf << acc.target_id
                << '\t' << acc.n_reads
-               << '\t' << acc.n_ancient_conf
-               << '\t' << acc.n_ancient_likely
-               << '\t' << acc.n_undetermined
-               << '\t' << acc.n_modern_conf
-               << '\t' << std::fixed << std::setprecision(4)
-               << (acc.n_reads > 0 ? static_cast<float>(n_ancient) / acc.n_reads : 0.0f)
+               << '\t' << std::fixed << std::setprecision(2) << acc.eff_reads()
+               << '\t' << std::setprecision(2) << n_ancient
+               << '\t' << std::setprecision(2) << n_modern
+               << '\t' << std::setprecision(2) << n_undet
+               << '\t' << std::setprecision(4) << acc.ancient_frac()
                << '\t' << std::setprecision(4) << ci_lo
                << '\t' << std::setprecision(4) << ci_hi
                << '\t' << std::setprecision(4) << acc.avg_posterior()
                << '\t' << std::setprecision(4) << acc.avg_fident()
                << '\t' << std::setprecision(4) << b
-               << '\t' << std::setprecision(2) << d
+               << '\t' << std::setprecision(4) << abundance
                << '\n';
         }
 
@@ -1665,9 +1698,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             // Aggregate gene stats by function
             for (const auto& [tid, acc] : gene_agg) {
                 // Skip filtered genes
-                if (acc.n_reads < min_reads || acc.breadth() < min_breadth || acc.depth_mean() < min_depth)
+                float abundance = acc.depth_mean();  // EM-weighted abundance
+                if (acc.n_reads < min_reads || acc.breadth() < min_breadth || abundance < min_depth)
                     continue;
 
+                // Use effective reads (gamma-weighted) for proper abundance estimation
+                uint32_t eff_reads = static_cast<uint32_t>(std::round(acc.eff_reads()));
                 float gene_ancient = static_cast<float>(acc.n_ancient_conf + acc.n_ancient_likely);
                 float gene_modern = static_cast<float>(acc.n_modern_conf);
                 float gene_undetermined = static_cast<float>(acc.n_undetermined);
@@ -1680,7 +1716,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                         fa.function_id = kegg_it->second;
                         fa.db_type = "KEGG";
                     }
-                    fa.add_gene(acc.n_reads, gene_ancient, gene_modern, gene_undetermined, acc.avg_posterior());
+                    fa.add_gene(eff_reads, gene_ancient, gene_modern, gene_undetermined, acc.avg_posterior());
                 }
 
                 // CAZyme
@@ -1693,7 +1729,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                         fam_acc.function_id = family;
                         fam_acc.db_type = "CAZyme";
                     }
-                    fam_acc.add_gene(acc.n_reads, gene_ancient, gene_modern, gene_undetermined, acc.avg_posterior());
+                    fam_acc.add_gene(eff_reads, gene_ancient, gene_modern, gene_undetermined, acc.avg_posterior());
 
                     // Class level (GH, GT, PL, CE, AA, CBM)
                     std::string cls = cazyme_class_from_family(family);
@@ -1703,7 +1739,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                             cls_acc.function_id = cls;
                             cls_acc.db_type = "CAZyme_class";
                         }
-                        cls_acc.add_gene(acc.n_reads, gene_ancient, gene_modern, gene_undetermined, acc.avg_posterior());
+                        cls_acc.add_gene(eff_reads, gene_ancient, gene_modern, gene_undetermined, acc.avg_posterior());
                     }
                 }
 
@@ -1715,7 +1751,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                         va.function_id = viral_it->second;
                         va.db_type = "Viral";
                     }
-                    va.add_gene(acc.n_reads, gene_ancient, gene_modern, gene_undetermined, acc.avg_posterior());
+                    va.add_gene(eff_reads, gene_ancient, gene_modern, gene_undetermined, acc.avg_posterior());
                 }
             }
 
@@ -1760,7 +1796,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
             // Write Anvi'o-compatible gene abundance (for anvi-estimate-metabolism --enzymes-txt)
             // Format: gene_id  enzyme_accession  source  coverage  detection
-            // Where coverage = depth (abundance estimate), detection = breadth
+            // Where coverage = EM-weighted abundance (gamma-weighted depth), detection = breadth
             if (!anvio_ko_file.empty() && !kegg_map.empty()) {
                 std::ofstream af(anvio_ko_file);
                 if (!af.is_open()) {
@@ -1770,7 +1806,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     size_t n_written = 0;
                     for (const auto& [tid, acc] : gene_agg) {
                         // Skip filtered genes
-                        if (acc.n_reads < min_reads || acc.breadth() < min_breadth || acc.depth_mean() < min_depth)
+                        float abundance = acc.depth_mean();  // EM-weighted abundance
+                        if (acc.n_reads < min_reads || acc.breadth() < min_breadth || abundance < min_depth)
                             continue;
                         // Look up KO for this gene
                         auto it = kegg_map.find(tid);
@@ -1780,8 +1817,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                         if (ko.size() > 3 && ko.substr(0, 3) == "ko:") {
                             ko = ko.substr(3);
                         }
+                        // coverage = EM-weighted abundance (sum of gamma-weighted depth)
                         af << tid << '\t' << ko << '\t' << "AGP" << '\t'
-                           << std::fixed << std::setprecision(4) << acc.depth_mean() << '\t'
+                           << std::fixed << std::setprecision(4) << abundance << '\t'
                            << std::setprecision(4) << acc.breadth() << '\n';
                         ++n_written;
                     }
