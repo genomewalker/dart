@@ -1,5 +1,5 @@
 /*
- * HIGHLY OPTIMIZED Position-Specific Hexamer Extractor
+ * Position-specific hexamer extractor
  *
  * Performance optimizations:
  * - Cache-aligned count arrays (64-byte alignment for L1 cache)
@@ -30,14 +30,14 @@
 #include <cmath>
 #include <new>  // For aligned allocation
 
-// ============== COMPILE-TIME CONSTANTS ==============
+// Compile-time constants
 constexpr size_t CACHE_LINE_SIZE = 64;
 constexpr size_t START_REGION_SIZE = 30;   // First 30bp
 constexpr size_t END_REGION_SIZE = 30;     // Last 30bp
 constexpr size_t MIN_CDS_LENGTH = 90;      // Minimum for distinct regions
 constexpr size_t READ_BUFFER_SIZE = 1 << 16;  // 64KB read buffer
 
-// ============== CACHE-ALIGNED COUNTER ARRAY ==============
+// Cache-aligned counter array
 // Each thread gets its own cache-aligned array to avoid false sharing
 struct alignas(CACHE_LINE_SIZE) AlignedCounts {
     uint64_t counts[4096];
@@ -55,7 +55,7 @@ struct alignas(CACHE_LINE_SIZE) AlignedCounts {
     }
 };
 
-// ============== BRANCHLESS HEXAMER ENCODING ==============
+// Branchless hexamer encoding
 // Pre-computed lookup table for all possible 6-mer prefixes
 // This avoids branches in the hot encoding loop
 
@@ -106,7 +106,7 @@ std::string decode_hexamer(uint32_t code) {
     return hex;
 }
 
-// ============== FAST CODON CHECKS ==============
+// Fast codon checks
 // Branchless start codon check
 __attribute__((always_inline))
 inline bool has_valid_start_fast(const char* seq, size_t len) {
@@ -130,7 +130,7 @@ inline bool has_valid_stop_fast(const char* seq, size_t len) {
     return (c0 == 'T' && ((c1 == 'A' && (c2 == 'A' || c2 == 'G')) || (c1 == 'G' && c2 == 'A')));
 }
 
-// ============== THREAD-LOCAL STATE ==============
+// Thread-local state
 struct ThreadState {
     AlignedCounts start_counts;
     AlignedCounts internal_counts;
@@ -146,7 +146,7 @@ struct ThreadState {
     }
 };
 
-// ============== OPTIMIZED FILE PROCESSING ==============
+// File processing
 void process_file_fast(const std::string& filepath, ThreadState& state) {
     gzFile file = gzopen(filepath.c_str(), "rb");
     if (!file) return;
@@ -253,7 +253,7 @@ void process_file_fast(const std::string& filepath, ThreadState& state) {
     gzclose(file);
 }
 
-// ============== FILE DISCOVERY ==============
+// File discovery
 void find_fasta_files_recursive(const std::string& dir_path, std::vector<std::string>& files) {
     DIR* dir = opendir(dir_path.c_str());
     if (!dir) return;
@@ -280,7 +280,7 @@ void find_fasta_files_recursive(const std::string& dir_path, std::vector<std::st
     closedir(dir);
 }
 
-// ============== OUTPUT GENERATION ==============
+// Output generation
 void write_table_array(std::ofstream& out, const std::string& name,
                        const uint64_t* counts, uint64_t total) {
     out << "constexpr float " << name << "[4096] = {\n";
@@ -298,7 +298,7 @@ void write_table_array(std::ofstream& out, const std::string& name,
     out << "};\n\n";
 }
 
-// ============== MAIN ==============
+// Main
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0] << " <directory1> [directory2 ...] [--threads N] [--output PREFIX]\n";
@@ -379,7 +379,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    std::cerr << "\n\n=== RESULTS ===\n";
+    std::cerr << "\n\nResults\n";
     std::cerr << "Files: " << total_files.load() << "\n";
     std::cerr << "Sequences: " << total_sequences.load() << "\n";
     std::cerr << "Valid CDS: " << total_valid_cds.load() << "\n";
@@ -436,7 +436,7 @@ int main(int argc, char* argv[]) {
     std::cerr << "\nWrote: " << output_file << "\n";
 
     // Show top differences
-    std::cerr << "\n=== TOP START vs INTERNAL DIFFERENCES ===\n";
+    std::cerr << "\nTop start vs internal differences\n";
     std::vector<std::tuple<uint32_t, double, double>> diffs;
     for (uint32_t i = 0; i < 4096; i++) {
         double fs = (ts > 0) ? static_cast<double>(global_start[i]) / ts : 0.0;

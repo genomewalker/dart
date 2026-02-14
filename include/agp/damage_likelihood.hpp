@@ -155,9 +155,8 @@ inline float get_hexamer_damage_prob(const char* seq, size_t position, size_t se
     return get_hexamer_damage_prob(seq, position, seq_len, get_active_domain());
 }
 
-// Simple hexamer damage probability lookup (1-argument version)
+// Hexamer damage probability lookup (1-argument version)
 // Uses 5' LLR for terminal position estimate
-// This is a simplified version for quick damage checks
 inline float get_hexamer_damage_prob(const char* seq) {
     uint32_t code = encode_hexamer(seq);
     if (code == UINT32_MAX) return 0.0f;

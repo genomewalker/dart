@@ -209,8 +209,8 @@ inline std::array<float, INPUT_SIZE> extract_features(const char* seq, size_t le
     // Feature 18: RNY compliance
     features[18] = static_cast<float>(rny_count) / n_codons;
     
-    // Feature 19: Dipeptide entropy (simplified - use 0.5 as default)
-    features[19] = 0.5f;  // Could compute properly but expensive
+    // Feature 19: Dipeptide entropy default
+    features[19] = 0.5f;
     
     // Feature 20: Length normalized
     features[20] = std::min(1.0f, static_cast<float>(n_codons) / 50.0f);

@@ -7,8 +7,6 @@
 // 3. Round 2: Rescore with neighbors restricted to best slots
 // 4. Compute per-read damage + X-mask positions
 //
-// Design:
-
 #include <algorithm>
 #include <array>
 #include <cstdint>

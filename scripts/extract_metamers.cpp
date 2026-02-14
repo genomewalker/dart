@@ -1,5 +1,5 @@
 /*
- * Ultra-fast metamer extractor for strand-discriminative training
+ * Metamer extractor for strand-discriminative training
  *
  * Metamers = 8-mer amino acids + codon encoding (like Metabuli)
  * This captures both AA conservation AND strand-specific codon usage.
@@ -41,7 +41,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
-// ============== CONSTANTS ==============
+// Constants
 constexpr size_t KMER_AA = 6;           // 6-mer amino acids (21^6 = 85M possible)
 constexpr size_t KMER_NT = 18;          // 18-mer nucleotides (6 codons)
 constexpr size_t BOUNDARY_WINDOW = 24;  // bases around start/stop (8 codons)
@@ -49,7 +49,7 @@ constexpr size_t MIN_GENE_LEN = 60;     // minimum gene length (20 codons)
 constexpr size_t INTERGENIC_KMER = 12;  // 12-mer for intergenic regions
 constexpr size_t READ_BUFFER = 1 << 18; // 256KB read buffer
 
-// ============== ENCODING TABLES ==============
+// Encoding tables
 
 // Nucleotide to 2-bit: A=0, C=1, G=2, T=3
 alignas(64) static const int8_t NT_MAP[256] = {
@@ -129,7 +129,7 @@ void init_codon_variants() {
     }
 }
 
-// ============== METAMER ENCODING ==============
+// Metamer encoding
 
 // Metamer: 8 amino acids + codon variants
 // Encoding:
@@ -190,7 +190,7 @@ inline uint64_t encode_nt_kmer(const char* seq, int k) {
     return code;
 }
 
-// ============== THREAD-SAFE COUNTERS ==============
+// Thread-safe counters
 
 struct MetamerCounts {
     std::unordered_map<Metamer, uint64_t, MetamerHash> coding;
@@ -241,7 +241,7 @@ struct ThreadBatch {
     std::unordered_map<Metamer, uint64_t, MetamerHash> coding;
     std::unordered_map<Metamer, uint64_t, MetamerHash> boundary_5p;
     std::unordered_map<Metamer, uint64_t, MetamerHash> boundary_3p;
-    // Skip intergenic for now - we focus on coding/boundary for strand discrimination
+    // Skip intergenic regions and focus on coding/boundary classes
 
     uint64_t total_coding = 0;
     uint64_t total_5p = 0;
@@ -268,7 +268,7 @@ struct ThreadBatch {
     }
 };
 
-// ============== GENE PARSING ==============
+// Gene parsing
 
 struct Gene {
     std::string contig;
@@ -316,7 +316,7 @@ bool parse_prodigal_header(const std::string& header, Gene& gene) {
     return field >= 3;
 }
 
-// ============== FILE PROCESSING ==============
+// File processing
 
 void process_cds_file(const std::string& filepath, ThreadBatch& batch, MetamerCounts& global) {
     gzFile file = gzopen(filepath.c_str(), "rb");
@@ -424,7 +424,7 @@ void find_files(const std::string& dir, std::vector<std::string>& files, const s
     closedir(d);
 }
 
-// ============== OUTPUT ==============
+// Output
 
 void write_metamer_table(const std::string& filename,
                          const std::unordered_map<Metamer, uint64_t, MetamerHash>& counts,
@@ -535,7 +535,7 @@ struct MetamerHash {
     out << "} // namespace agp\n";
 }
 
-// ============== MAIN ==============
+// Main
 
 int main(int argc, char* argv[]) {
     std::string cds_dir;
@@ -565,7 +565,7 @@ int main(int argc, char* argv[]) {
 
     init_codon_variants();
 
-    std::cerr << "=== Metamer Extractor for Strand-Discriminative Training ===\n";
+    std::cerr << "Metamer extractor for strand-discriminative training\n";
     std::cerr << "CDS directory: " << cds_dir << "\n";
     std::cerr << "Output prefix: " << output_prefix << "\n";
     std::cerr << "Threads: " << num_threads << "\n\n";
@@ -612,7 +612,7 @@ int main(int argc, char* argv[]) {
         batch.flush(global);
     }
 
-    std::cerr << "\n\n=== Results ===\n";
+    std::cerr << "\n\nResults\n";
     std::cerr << "Genes processed: " << global.genes_processed << "\n";
     std::cerr << "Coding metamers: " << global.total_coding << " (" << global.coding.size() << " unique)\n";
     std::cerr << "5' boundary metamers: " << global.total_5p << " (" << global.boundary_5p.size() << " unique)\n";

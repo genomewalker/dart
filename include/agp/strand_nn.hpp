@@ -313,11 +313,11 @@ inline std::array<float, INPUT_SIZE> extract_features(const std::string& seq) {
         features[idx++] = gc_pos[2];
         features[idx++] = gc_pos[2] - gc_pos[0];  // GC3 - GC1
         
-        // Dipeptide entropy (simplified)
-        features[idx++] = 0.5f;  // Placeholder - compute if needed
+        // Dipeptide entropy default
+        features[idx++] = 0.5f;
         
-        // Hydrophobic fraction (simplified)
-        features[idx++] = 0.3f;  // Placeholder
+        // Hydrophobic fraction default
+        features[idx++] = 0.3f;
         
         // Start/stop presence
         bool has_atg = (bf + 2 < strand.length() &&

@@ -14,7 +14,9 @@ namespace agp {
 void write_reference_stats_tsv(std::ostream& out,
                                const std::vector<ReferenceStats>& stats) {
     out << "ref_id\tref_length\tn_reads\tbreadth\tdepth_mean\tdepth_std"
-        << "\tdepth_evenness\tavg_identity\tavg_aln_len\tavg_read_len"
+        << "\tdepth_evenness\tstart_diversity\tstart_span\tpositional_score"
+        << "\tterminal_ratio\tn_unique_starts"
+        << "\tavg_identity\tavg_aln_len\tavg_read_len"
         << "\tn_effective\tn_ancient\tn_modern\tdamage_enrichment\n";
 
     out << std::fixed;
@@ -26,6 +28,11 @@ void write_reference_stats_tsv(std::ostream& out,
             << '\t' << std::setprecision(2) << s.depth_mean
             << '\t' << std::setprecision(2) << s.depth_std
             << '\t' << std::setprecision(4) << s.depth_evenness
+            << '\t' << std::setprecision(4) << s.start_diversity
+            << '\t' << std::setprecision(4) << s.start_span
+            << '\t' << std::setprecision(4) << s.positional_score
+            << '\t' << std::setprecision(4) << s.terminal_ratio
+            << '\t' << s.n_unique_starts
             << '\t' << std::setprecision(4) << s.avg_identity
             << '\t' << std::setprecision(1) << s.avg_alignment_length
             << '\t' << std::setprecision(1) << s.avg_read_length

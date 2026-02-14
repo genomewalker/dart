@@ -27,6 +27,13 @@ struct EMParams {
     double min_weight = 1e-10;   // floor for reference weights (prevents log(0))
     bool use_squarem = true;     // enable SQUAREM acceleration
     bool use_damage = true;      // incorporate damage evidence in responsibilities
+
+    // Rich-get-richer prevention
+    double alpha_prior = 1.0;    // Dirichlet pseudocount (1.0 = uniform prior)
+                                 // Higher values shrink weights toward uniform
+                                 // 0 = no regularization (original behavior)
+    bool normalize_by_length = false;  // Divide weights by sqrt(ref_length)
+                                       // Prevents longer references from dominating
 };
 
 // Per-alignment record: one read mapping to one reference
@@ -43,6 +50,7 @@ struct AlignmentData {
     std::vector<Alignment> alignments;     // all alignments, sorted by read_idx
     std::vector<uint32_t> read_offsets;    // read_offsets[r] = first alignment index for read r
                                            // read_offsets[num_reads] = alignments.size()
+    std::vector<uint32_t> ref_lengths;     // ref_lengths[t] = length of reference t (for normalization)
     uint32_t num_reads = 0;
     uint32_t num_refs = 0;
 
@@ -130,20 +138,27 @@ inline double e_step(
     return ll;
 }
 
-// M-step: update weights w_t = (1/N) * sum_r gamma_{rt}
-// Writes new weights into out_weights (size = num_refs)
+// M-step: update weights with Dirichlet prior and optional length normalization
+// w_t ∝ (α₀ + Σ_r γ_rt) / sqrt(len_t)   [if normalize_by_length]
+// w_t ∝ (α₀ + Σ_r γ_rt)                  [otherwise]
+//
+// Dirichlet prior prevents "rich get richer": references can't collapse to 0 weight,
+// and extreme weights are shrunk toward uniform. α₀=1 is symmetric uniform prior.
+//
+// Length normalization prevents longer references from dominating multi-mappers
+// simply because they have more opportunity for matches.
 inline void m_step(
     const AlignmentData& data,
+    const EMParams& params,
     const double* gamma,
-    double min_weight,
     double* out_weights)
 {
     const uint32_t T = data.num_refs;
-    const double N = static_cast<double>(data.num_reads);
 
-    // Zero accumulator
+    // Initialize with Dirichlet prior pseudocounts
+    // α₀ = 1.0 gives uniform prior; higher values = stronger shrinkage toward uniform
     for (uint32_t t = 0; t < T; ++t) {
-        out_weights[t] = 0.0;
+        out_weights[t] = params.alpha_prior;
     }
 
     // Accumulate responsibilities
@@ -152,10 +167,19 @@ inline void m_step(
         out_weights[data.alignments[i].ref_idx] += gamma[i];
     }
 
-    // Normalize
+    // Optional length normalization: divide by sqrt(ref_length)
+    // This prevents longer references from attracting more multi-mappers
+    if (params.normalize_by_length && !data.ref_lengths.empty()) {
+        for (uint32_t t = 0; t < T; ++t) {
+            double len = static_cast<double>(std::max(data.ref_lengths[t], 1u));
+            out_weights[t] /= std::sqrt(len);
+        }
+    }
+
+    // Apply floor and normalize to simplex
     double sum = 0.0;
     for (uint32_t t = 0; t < T; ++t) {
-        out_weights[t] = std::max(out_weights[t] / N, min_weight);
+        out_weights[t] = std::max(out_weights[t], params.min_weight);
         sum += out_weights[t];
     }
     double inv_sum = 1.0 / sum;
@@ -175,7 +199,7 @@ inline double em_fixed_point(
     double* gamma)
 {
     double ll = e_step(data, params, weights_in, gamma);
-    m_step(data, gamma, params.min_weight, weights_out);
+    m_step(data, params, gamma, weights_out);
     return ll;
 }
 
@@ -329,7 +353,7 @@ inline EMState em_solve(
             } else {
                 e_step(data, params, w0.data(), state.gamma.data());
             }
-            m_step(data, state.gamma.data(), params.min_weight, w1.data());
+            m_step(data, params, state.gamma.data(), w1.data());
 
             // Second EM step: w1 -> w2
             if (params.use_damage) {
@@ -337,7 +361,7 @@ inline EMState em_solve(
             } else {
                 e_step(data, params, w1.data(), state.gamma.data());
             }
-            m_step(data, state.gamma.data(), params.min_weight, w2.data());
+            m_step(data, params, state.gamma.data(), w2.data());
 
             // SQUAREM extrapolation: modifies w0 in-place
             squarem_step(w0.data(), w1.data(), w2.data(), r_buf.data(), v_buf.data(), T);
@@ -367,7 +391,7 @@ inline EMState em_solve(
             } else {
                 ll = e_step(data, params, state.weights.data(), state.gamma.data());
             }
-            m_step(data, state.gamma.data(), params.min_weight, state.weights.data());
+            m_step(data, params, state.gamma.data(), state.weights.data());
         }
 
         // Update pi (ancient fraction) from damage responsibilities

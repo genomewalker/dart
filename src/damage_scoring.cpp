@@ -11,7 +11,7 @@
 namespace agp {
 
 // ============================================================================
-// ADAPTIVE CALIBRATION FOR TERMINAL DAMAGE PROBABILITY
+// Adaptive calibration for terminal damage probability
 //
 // Key insight: Raw scores cluster around ~0.65 regardless of actual damage rate.
 // We need to recalibrate so that:

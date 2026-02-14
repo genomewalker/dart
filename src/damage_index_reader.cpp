@@ -53,9 +53,11 @@ DamageIndexReader::DamageIndexReader(const std::string& path) {
         close();
         throw std::runtime_error("Invalid damage index magic: " + path);
     }
-    if (header_->version != AGD_VERSION) {
+    if (header_->version < 2 || header_->version > AGD_VERSION) {
         close();
-        throw std::runtime_error("Unsupported damage index version: " + path);
+        throw std::runtime_error("Unsupported damage index version " +
+                                 std::to_string(header_->version) + " (expected 2-" +
+                                 std::to_string(AGD_VERSION) + "): " + path);
     }
 
     // Calculate section offsets

@@ -230,7 +230,7 @@ int main(int argc, char* argv[]) {
 
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    std::cerr << "=== Ultra-fast 6-mer AA Extractor ===\n";
+    std::cerr << "=== 6-mer AA Extractor ===\n";
     std::cerr << "Allocating " << (AA6_SIZE * 4 * 4 / 1e9) << " GB for counters...\n";
 
     Counters cnt;

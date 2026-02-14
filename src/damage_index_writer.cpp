@@ -29,6 +29,13 @@ DamageIndexWriter::DamageIndexWriter(const std::string& path,
             break;
     }
 
+    // v3: damage informativeness fields
+    header_.damage_validated = profile.damage_validated ? 1 : 0;
+    header_.damage_artifact = profile.damage_artifact ? 1 : 0;
+    header_.channel_b_valid = profile.channel_b_valid ? 1 : 0;
+    header_.stop_decay_llr = profile.stop_decay_llr_5prime;
+    header_.terminal_shift = profile.terminal_shift_5prime;
+
     // Reserve space for typical dataset
     records_.reserve(100000);
 }
