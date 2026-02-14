@@ -155,6 +155,8 @@ struct ProteinDamageSummary {
     std::string taln;
     size_t qstart_0;
     size_t qlen = 0;  // Total read length (for Bayesian scoring)
+    size_t tstart_0 = 0;  // 0-based target start position
+    size_t tlen = 0;      // Target (reference) length
     // Short protein filtering metrics
     float delta_bits = 0.0f;    // bits_best - bits_second
     float bpa = 0.0f;           // bits / alnlen (bits-per-aligned-AA)
@@ -476,6 +478,167 @@ struct ProteinAggregate {
     std::array<uint32_t, 4> length_bin_counts{};  // per-bin read counts
 };
 
+// Wilson score confidence interval for binomial proportion
+// Returns (lower, upper) bounds for the true proportion given observed successes/n
+inline std::pair<float, float> wilson_ci(uint32_t successes, uint32_t n, float z = 1.96f) {
+    if (n == 0) return {0.0f, 0.0f};
+    float p = static_cast<float>(successes) / n;
+    float z2 = z * z;
+    float denom = 1.0f + z2 / n;
+    float center = (p + z2 / (2.0f * n)) / denom;
+    float margin = z * std::sqrt((p * (1.0f - p) + z2 / (4.0f * n)) / n) / denom;
+    return {std::max(0.0f, center - margin), std::min(1.0f, center + margin)};
+}
+
+// Per-gene accumulator for functional profiling
+// Aggregates read-level damage annotations into gene-level summaries
+struct GeneSummaryAccumulator {
+    std::string target_id;
+    uint32_t tlen = 0;
+    uint32_t n_reads = 0;
+    uint32_t n_ancient_conf = 0;
+    uint32_t n_ancient_likely = 0;
+    uint32_t n_undetermined = 0;
+    uint32_t n_modern_conf = 0;
+    double sum_posterior = 0.0;
+    double sum_fident = 0.0;
+    std::vector<float> coverage;  // Per-position coverage depth
+
+    void add_read(AncientClassification cls, float posterior, float fident,
+                  size_t tstart, size_t aln_len_on_target) {
+        ++n_reads;
+        sum_posterior += posterior;
+        sum_fident += fident;
+
+        switch (cls) {
+            case AncientClassification::AncientConfident: ++n_ancient_conf; break;
+            case AncientClassification::AncientLikely:    ++n_ancient_likely; break;
+            case AncientClassification::Undetermined:     ++n_undetermined; break;
+            case AncientClassification::ModernConfident:  ++n_modern_conf; break;
+        }
+
+        // Update per-position coverage
+        if (tlen > 0 && coverage.empty()) {
+            coverage.resize(tlen, 0.0f);
+        }
+        size_t end = std::min(tstart + aln_len_on_target, static_cast<size_t>(tlen));
+        for (size_t p = tstart; p < end; ++p) {
+            coverage[p] += 1.0f;
+        }
+    }
+
+    float breadth() const {
+        if (coverage.empty()) return 0.0f;
+        uint32_t covered = 0;
+        for (float v : coverage) {
+            if (v > 0.0f) ++covered;
+        }
+        return static_cast<float>(covered) / static_cast<float>(coverage.size());
+    }
+
+    float depth_mean() const {
+        if (coverage.empty()) return 0.0f;
+        double total = 0.0;
+        for (float v : coverage) total += v;
+        return static_cast<float>(total / coverage.size());
+    }
+
+    float avg_posterior() const {
+        return n_reads > 0 ? static_cast<float>(sum_posterior / n_reads) : 0.0f;
+    }
+
+    float avg_fident() const {
+        return n_reads > 0 ? static_cast<float>(sum_fident / n_reads) : 0.0f;
+    }
+};
+
+// Functional profiling accumulator
+struct FunctionalAccumulator {
+    std::string function_id;
+    std::string db_type;  // "KEGG", "CAZyme", "Viral"
+    uint32_t n_genes = 0;
+    uint32_t n_reads = 0;
+    float n_ancient = 0.0f;  // Can be fractional from EM
+    float n_modern = 0.0f;
+    float n_undetermined = 0.0f;
+    double sum_posterior = 0.0;
+
+    void add_gene(uint32_t gene_reads, float gene_ancient, float gene_modern,
+                  float gene_undetermined, float gene_mean_posterior) {
+        ++n_genes;
+        n_reads += gene_reads;
+        n_ancient += gene_ancient;
+        n_modern += gene_modern;
+        n_undetermined += gene_undetermined;
+        sum_posterior += gene_mean_posterior * gene_reads;
+    }
+
+    float ancient_frac() const {
+        float total = n_ancient + n_modern;
+        return total > 0 ? n_ancient / total : 0.0f;
+    }
+
+    float mean_posterior() const {
+        return n_reads > 0 ? static_cast<float>(sum_posterior / n_reads) : 0.0f;
+    }
+};
+
+// Load a 2-column mapping file: gene_id<TAB>function_id
+static std::unordered_map<std::string, std::string> load_mapping_file(
+    const std::string& path, bool verbose = false)
+{
+    std::unordered_map<std::string, std::string> mapping;
+    std::ifstream in(path);
+    if (!in.is_open()) {
+        if (verbose) {
+            std::cerr << "Warning: Cannot open mapping file: " << path << "\n";
+        }
+        return mapping;
+    }
+
+    std::string line;
+    // Skip header if present
+    if (std::getline(in, line)) {
+        // Check if it's a header (starts with "gene" or "#")
+        if (line.empty() || line[0] == '#' ||
+            line.find("gene") == 0 || line.find("Gene") == 0) {
+            // It's a header, skip it
+        } else {
+            // Not a header, process it
+            size_t tab = line.find('\t');
+            if (tab != std::string::npos) {
+                mapping[line.substr(0, tab)] = line.substr(tab + 1);
+            }
+        }
+    }
+
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        size_t tab = line.find('\t');
+        if (tab != std::string::npos) {
+            mapping[line.substr(0, tab)] = line.substr(tab + 1);
+        }
+    }
+
+    if (verbose) {
+        std::cerr << "Loaded " << mapping.size() << " mappings from " << path << "\n";
+    }
+    return mapping;
+}
+
+// Extract CAZyme class from family (e.g., "GH13" -> "GH", "GT2" -> "GT")
+static std::string cazyme_class_from_family(const std::string& family) {
+    std::string cls;
+    for (char c : family) {
+        if (std::isalpha(c)) {
+            cls += c;
+        } else {
+            break;  // Stop at first non-alpha (digit)
+        }
+    }
+    return cls;
+}
+
 // Estimate d_max from alignment mismatches (first pass)
 // Counts damage-consistent substitutions at terminal vs interior positions
 struct DamageEstimate {
@@ -552,11 +715,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     bool use_identity = true;         // Identity evidence enabled by default (+7.6% AUC)
     bool verbose = false;
 
-    // EM reassignment options
-    bool use_em = false;
-    uint32_t em_max_iters = 100;
-    double em_lambda_b = 3.0;
-    double em_tol = 1e-4;
+    // Gene summary options (work with or without --em)
     std::string gene_summary_file;
     float min_breadth = 0.10f;
     float min_depth = 0.5f;
@@ -564,10 +723,23 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     float min_positional_score = 0.0f;
     float min_terminal_ratio = 0.0f;
 
+    // EM reassignment options
+    bool use_em = false;
+    uint32_t em_max_iters = 100;
+    double em_lambda_b = 3.0;
+    double em_tol = 1e-4;
+
     // Alignment-level pre-filters (applied before any processing)
     float aln_min_identity = 0.0f;   // 0 = no filter
     float aln_min_bits = 0.0f;       // 0 = no filter
     float aln_max_evalue = 1e10f;    // very large = no filter
+
+    // Functional profiling options
+    std::string kegg_map_file;       // gene_id -> KO mapping
+    std::string cazyme_map_file;     // gene_id -> CAZyme family mapping
+    std::string viral_map_file;      // gene_id -> VOG mapping
+    std::string functional_summary_file;  // Output: per-function stats
+    std::string anvio_ko_file;       // Output: Anvi'o-compatible KO abundance
 
     for (int i = 1; i < argc; ++i) {
         if ((strcmp(argv[i], "--hits") == 0 || strcmp(argv[i], "-i") == 0) && i + 1 < argc) {
@@ -624,6 +796,16 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             aln_min_bits = std::stof(argv[++i]);
         } else if (strcmp(argv[i], "--aln-max-evalue") == 0 && i + 1 < argc) {
             aln_max_evalue = std::stof(argv[++i]);
+        } else if (strcmp(argv[i], "--kegg-map") == 0 && i + 1 < argc) {
+            kegg_map_file = argv[++i];
+        } else if (strcmp(argv[i], "--cazyme-map") == 0 && i + 1 < argc) {
+            cazyme_map_file = argv[++i];
+        } else if (strcmp(argv[i], "--viral-map") == 0 && i + 1 < argc) {
+            viral_map_file = argv[++i];
+        } else if (strcmp(argv[i], "--functional-summary") == 0 && i + 1 < argc) {
+            functional_summary_file = argv[++i];
+        } else if (strcmp(argv[i], "--anvio-ko") == 0 && i + 1 < argc) {
+            anvio_ko_file = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             std::cerr << "Usage: agp damage-annotate --hits <results.tsv> [options]\n\n";
             std::cerr << "Post-mapping damage annotation using MMseqs2 alignments.\n";
@@ -646,15 +828,22 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cerr << "                       Adds is_damaged column (1 if combined_score >= threshold)\n";
             std::cerr << "  --no-identity     Disable identity evidence (enabled by default)\n";
             std::cerr << "  -v                Verbose output\n\n";
+            std::cerr << "Gene summary (per-gene aggregation, works with or without --em):\n";
+            std::cerr << "  --gene-summary FILE  Per-gene statistics TSV\n";
+            std::cerr << "  --min-breadth FLOAT  Minimum breadth filter (default: 0.1)\n";
+            std::cerr << "  --min-depth FLOAT    Minimum depth filter (default: 0.5)\n";
+            std::cerr << "  --min-reads INT      Minimum read count (default: 3)\n\n";
+            std::cerr << "Functional profiling (requires --gene-summary):\n";
+            std::cerr << "  --kegg-map FILE      Gene-to-KO mapping TSV (gene_id<TAB>KO)\n";
+            std::cerr << "  --cazyme-map FILE    Gene-to-CAZyme family mapping TSV\n";
+            std::cerr << "  --viral-map FILE     Gene-to-VOG mapping TSV\n";
+            std::cerr << "  --functional-summary FILE  Per-function stats TSV\n";
+            std::cerr << "  --anvio-ko FILE      Gene-level KO abundance for anvi-estimate-metabolism\n\n";
             std::cerr << "EM reassignment (multi-mapping resolution):\n";
             std::cerr << "  --em              Enable EM multi-mapping resolution\n";
             std::cerr << "  --em-iters INT    Max EM iterations (default: 100)\n";
             std::cerr << "  --em-lambda FLOAT Temperature parameter (default: 3.0)\n";
             std::cerr << "  --em-tol FLOAT    Convergence tolerance (default: 1e-4)\n";
-            std::cerr << "  --gene-summary FILE  Per-gene EM-weighted statistics TSV\n";
-            std::cerr << "  --min-breadth FLOAT  Minimum breadth filter (default: 0.1)\n";
-            std::cerr << "  --min-depth FLOAT    Minimum depth filter (default: 0.5)\n";
-            std::cerr << "  --min-reads INT      Minimum read count (default: 3)\n";
             std::cerr << "  --min-positional-score FLOAT  Min read start diversity (default: 0)\n";
             std::cerr << "                       Filters spurious matches where all reads hit same position\n";
             std::cerr << "                       Score = sqrt(diversity * span), range 0-1\n";
@@ -915,6 +1104,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             summary.qaln = hit.qaln;
             summary.taln = hit.taln;
             summary.qstart_0 = hit.qstart_0;
+            summary.tstart_0 = hit.tstart_0;
+            summary.tlen = hit.tlen;
             // Short protein filtering metrics
             summary.delta_bits = hit.bits - hit.bits_second;
             summary.bpa = (summary.alnlen > 0)
@@ -1294,7 +1485,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
     *out << "\n";
 
-    for (const auto& s : summaries) {
+    // Store per-read posteriors and classifications for gene summary aggregation
+    std::vector<float> read_posteriors(summaries.size());
+    std::vector<agp::AncientClassification> read_classifications(summaries.size());
+
+    for (size_t si = 0; si < summaries.size(); ++si) {
+        const auto& s = summaries[si];
         // Compute Bayesian score with decomposition
         float posterior = s.p_damaged;  // fallback if no alignment data
         agp::BayesianScoreOutput bayes_out{};
@@ -1339,6 +1535,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             bayes_out.informative, posterior, s.fident, s.z_bpa, s.delta_bits,
             score_params.ancient_threshold, score_params.modern_threshold);
 
+        read_posteriors[si] = posterior;
+        read_classifications[si] = classification;
+
         if (bayes_out.informative) {
             *out << std::fixed << std::setprecision(4) << posterior << "\t";
         } else {
@@ -1373,6 +1572,226 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             }
         }
         *out << "\n";
+    }
+
+    // Write gene summary (works without EM — uses best-hit per read)
+    if (!gene_summary_file.empty() && !use_em) {
+        std::unordered_map<std::string, GeneSummaryAccumulator> gene_agg;
+
+        for (size_t i = 0; i < summaries.size(); ++i) {
+            const auto& s = summaries[i];
+            auto& acc = gene_agg[s.target_id];
+            if (acc.tlen == 0) {
+                acc.target_id = s.target_id;
+                acc.tlen = static_cast<uint32_t>(s.tlen);
+                if (acc.tlen > 0) {
+                    acc.coverage.assign(acc.tlen, 0.0f);
+                }
+            }
+            size_t aln_on_target = 0;
+            for (char c : s.taln) {
+                if (c != '-') ++aln_on_target;
+            }
+            acc.add_read(read_classifications[i], read_posteriors[i],
+                         s.fident, s.tstart_0, aln_on_target);
+        }
+
+        std::ofstream gf(gene_summary_file);
+        if (!gf.is_open()) {
+            std::cerr << "Error: Cannot open gene summary file: " << gene_summary_file << "\n";
+            return 1;
+        }
+
+        gf << "target_id\tn_reads\tn_ancient_conf\tn_ancient_likely\t"
+              "n_undetermined\tn_modern_conf\tancient_frac\tci_low\tci_high\t"
+              "mean_posterior\tmean_identity\tbreadth\tdepth\n";
+
+        for (const auto& [tid, acc] : gene_agg) {
+            if (acc.n_reads < min_reads) continue;
+            float b = acc.breadth();
+            if (b < min_breadth) continue;
+            float d = acc.depth_mean();
+            if (d < min_depth) continue;
+
+            uint32_t n_ancient = acc.n_ancient_conf + acc.n_ancient_likely;
+            auto [ci_lo, ci_hi] = wilson_ci(n_ancient, acc.n_reads);
+
+            gf << acc.target_id
+               << '\t' << acc.n_reads
+               << '\t' << acc.n_ancient_conf
+               << '\t' << acc.n_ancient_likely
+               << '\t' << acc.n_undetermined
+               << '\t' << acc.n_modern_conf
+               << '\t' << std::fixed << std::setprecision(4)
+               << (acc.n_reads > 0 ? static_cast<float>(n_ancient) / acc.n_reads : 0.0f)
+               << '\t' << std::setprecision(4) << ci_lo
+               << '\t' << std::setprecision(4) << ci_hi
+               << '\t' << std::setprecision(4) << acc.avg_posterior()
+               << '\t' << std::setprecision(4) << acc.avg_fident()
+               << '\t' << std::setprecision(4) << b
+               << '\t' << std::setprecision(2) << d
+               << '\n';
+        }
+
+        if (verbose) {
+            size_t total = gene_agg.size();
+            size_t passed = 0;
+            for (const auto& [tid, acc] : gene_agg) {
+                if (acc.n_reads >= min_reads && acc.breadth() >= min_breadth
+                    && acc.depth_mean() >= min_depth)
+                    ++passed;
+            }
+            std::cerr << "Gene summary written to: " << gene_summary_file
+                      << " (" << passed << "/" << total << " genes after filtering)\n";
+        }
+
+        // Functional profiling (aggregate gene stats by function)
+        bool do_functional = !kegg_map_file.empty() || !cazyme_map_file.empty() || !viral_map_file.empty();
+        if (do_functional) {
+            // Load mapping files
+            auto kegg_map = kegg_map_file.empty() ? std::unordered_map<std::string, std::string>{}
+                          : load_mapping_file(kegg_map_file, verbose);
+            auto cazyme_map = cazyme_map_file.empty() ? std::unordered_map<std::string, std::string>{}
+                            : load_mapping_file(cazyme_map_file, verbose);
+            auto viral_map = viral_map_file.empty() ? std::unordered_map<std::string, std::string>{}
+                           : load_mapping_file(viral_map_file, verbose);
+
+            // Accumulators by function
+            std::unordered_map<std::string, FunctionalAccumulator> kegg_acc;    // KO -> stats
+            std::unordered_map<std::string, FunctionalAccumulator> cazyme_fam_acc;  // Family -> stats
+            std::unordered_map<std::string, FunctionalAccumulator> cazyme_cls_acc;  // Class -> stats
+            std::unordered_map<std::string, FunctionalAccumulator> viral_acc;   // VOG -> stats
+
+            // Aggregate gene stats by function
+            for (const auto& [tid, acc] : gene_agg) {
+                // Skip filtered genes
+                if (acc.n_reads < min_reads || acc.breadth() < min_breadth || acc.depth_mean() < min_depth)
+                    continue;
+
+                float gene_ancient = static_cast<float>(acc.n_ancient_conf + acc.n_ancient_likely);
+                float gene_modern = static_cast<float>(acc.n_modern_conf);
+                float gene_undetermined = static_cast<float>(acc.n_undetermined);
+
+                // KEGG
+                auto kegg_it = kegg_map.find(tid);
+                if (kegg_it != kegg_map.end()) {
+                    auto& fa = kegg_acc[kegg_it->second];
+                    if (fa.function_id.empty()) {
+                        fa.function_id = kegg_it->second;
+                        fa.db_type = "KEGG";
+                    }
+                    fa.add_gene(acc.n_reads, gene_ancient, gene_modern, gene_undetermined, acc.avg_posterior());
+                }
+
+                // CAZyme
+                auto cazyme_it = cazyme_map.find(tid);
+                if (cazyme_it != cazyme_map.end()) {
+                    const std::string& family = cazyme_it->second;
+                    // Family level
+                    auto& fam_acc = cazyme_fam_acc[family];
+                    if (fam_acc.function_id.empty()) {
+                        fam_acc.function_id = family;
+                        fam_acc.db_type = "CAZyme";
+                    }
+                    fam_acc.add_gene(acc.n_reads, gene_ancient, gene_modern, gene_undetermined, acc.avg_posterior());
+
+                    // Class level (GH, GT, PL, CE, AA, CBM)
+                    std::string cls = cazyme_class_from_family(family);
+                    if (!cls.empty()) {
+                        auto& cls_acc = cazyme_cls_acc[cls];
+                        if (cls_acc.function_id.empty()) {
+                            cls_acc.function_id = cls;
+                            cls_acc.db_type = "CAZyme_class";
+                        }
+                        cls_acc.add_gene(acc.n_reads, gene_ancient, gene_modern, gene_undetermined, acc.avg_posterior());
+                    }
+                }
+
+                // Viral
+                auto viral_it = viral_map.find(tid);
+                if (viral_it != viral_map.end()) {
+                    auto& va = viral_acc[viral_it->second];
+                    if (va.function_id.empty()) {
+                        va.function_id = viral_it->second;
+                        va.db_type = "Viral";
+                    }
+                    va.add_gene(acc.n_reads, gene_ancient, gene_modern, gene_undetermined, acc.avg_posterior());
+                }
+            }
+
+            // Write functional summary
+            if (!functional_summary_file.empty()) {
+                std::ofstream ff(functional_summary_file);
+                if (!ff.is_open()) {
+                    std::cerr << "Error: Cannot open functional summary file: " << functional_summary_file << "\n";
+                } else {
+                    ff << "db\tfunction_id\tlevel\tn_genes\tn_reads\tn_ancient\tn_modern\tn_undetermined\t"
+                       << "ancient_frac\tci_low\tci_high\tmean_posterior\n";
+
+                    auto write_acc = [&ff](const std::unordered_map<std::string, FunctionalAccumulator>& accs,
+                                           const std::string& level) {
+                        for (const auto& [fid, fa] : accs) {
+                            float frac = fa.ancient_frac();
+                            auto [ci_low, ci_high] = wilson_ci(
+                                static_cast<uint32_t>(fa.n_ancient),
+                                static_cast<uint32_t>(fa.n_ancient + fa.n_modern));
+                            ff << fa.db_type << '\t' << fa.function_id << '\t' << level << '\t'
+                               << fa.n_genes << '\t' << fa.n_reads << '\t'
+                               << std::fixed << std::setprecision(1) << fa.n_ancient << '\t'
+                               << fa.n_modern << '\t' << fa.n_undetermined << '\t'
+                               << std::setprecision(4) << frac << '\t' << ci_low << '\t' << ci_high << '\t'
+                               << fa.mean_posterior() << '\n';
+                        }
+                    };
+
+                    write_acc(kegg_acc, "KO");
+                    write_acc(cazyme_fam_acc, "family");
+                    write_acc(cazyme_cls_acc, "class");
+                    write_acc(viral_acc, "VOG");
+
+                    if (verbose) {
+                        size_t total_funcs = kegg_acc.size() + cazyme_fam_acc.size() +
+                                             cazyme_cls_acc.size() + viral_acc.size();
+                        std::cerr << "Functional summary written to: " << functional_summary_file
+                                  << " (" << total_funcs << " functions)\n";
+                    }
+                }
+            }
+
+            // Write Anvi'o-compatible gene abundance (for anvi-estimate-metabolism --enzymes-txt)
+            // Format: gene_id  enzyme_accession  source  coverage  detection
+            // Where coverage = depth (abundance estimate), detection = breadth
+            if (!anvio_ko_file.empty() && !kegg_map.empty()) {
+                std::ofstream af(anvio_ko_file);
+                if (!af.is_open()) {
+                    std::cerr << "Error: Cannot open Anvi'o KO file: " << anvio_ko_file << "\n";
+                } else {
+                    af << "gene_id\tenzyme_accession\tsource\tcoverage\tdetection\n";
+                    size_t n_written = 0;
+                    for (const auto& [tid, acc] : gene_agg) {
+                        // Skip filtered genes
+                        if (acc.n_reads < min_reads || acc.breadth() < min_breadth || acc.depth_mean() < min_depth)
+                            continue;
+                        // Look up KO for this gene
+                        auto it = kegg_map.find(tid);
+                        if (it == kegg_map.end()) continue;
+                        std::string ko = it->second;
+                        // Strip "ko:" prefix if present
+                        if (ko.size() > 3 && ko.substr(0, 3) == "ko:") {
+                            ko = ko.substr(3);
+                        }
+                        af << tid << '\t' << ko << '\t' << "AGP" << '\t'
+                           << std::fixed << std::setprecision(4) << acc.depth_mean() << '\t'
+                           << std::setprecision(4) << acc.breadth() << '\n';
+                        ++n_written;
+                    }
+                    if (verbose) {
+                        std::cerr << "Anvi'o gene abundance written to: " << anvio_ko_file
+                                  << " (" << n_written << " genes with KO annotations)\n";
+                    }
+                }
+            }
+        }
     }
 
     // Write per-protein aggregated summary (aggregates across all reads per target)
