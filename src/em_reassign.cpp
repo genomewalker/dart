@@ -625,6 +625,8 @@ double streaming_e_step_rowgroup(
     const uint32_t* ref_idx,
     const float* bit_score,
     const float* damage_score,
+    const float* dmg_ll_a,    // Alignment-level log P(evidence | ancient)
+    const float* dmg_ll_m,    // Alignment-level log P(evidence | modern)
     const double* weights,
     uint32_t num_refs,
     const agp::EMParams& params,
@@ -640,6 +642,9 @@ double streaming_e_step_rowgroup(
     if (!read_idx || !ref_idx || !bit_score || !damage_score || !weights) {
         return 0.0;
     }
+
+    // For alignment damage likelihood mode, we need dmg_ll_a/dmg_ll_m
+    const bool use_aln_dmg = params.use_alignment_damage_likelihood && dmg_ll_a && dmg_ll_m;
 
     // Group alignments by read for normalization
     // Since row groups are sorted by read_idx, we can process in order
@@ -666,10 +671,18 @@ double streaming_e_step_rowgroup(
                 uint32_t idx = read_start + j;
                 double log_w = std::log(std::max(weights[ref_idx[idx]], params.min_weight));
                 double score_contrib = params.lambda_b * static_cast<double>(bit_score[idx]);
-                double ds = std::clamp(static_cast<double>(damage_score[idx]), eps, 1.0 - eps);
 
-                log_scores[2 * j]     = log_w + score_contrib + std::log(pi_a) + std::log(ds);
-                log_scores[2 * j + 1] = log_w + score_contrib + std::log(1.0 - pi_a) + std::log(1.0 - ds);
+                if (use_aln_dmg) {
+                    // Use alignment-level damage likelihoods with per-read prior
+                    double p_read = std::clamp(static_cast<double>(damage_score[idx]), eps, 1.0 - eps);
+                    log_scores[2 * j]     = log_w + score_contrib + std::log(p_read) + dmg_ll_a[idx];
+                    log_scores[2 * j + 1] = log_w + score_contrib + std::log(1.0 - p_read) + dmg_ll_m[idx];
+                } else {
+                    // Simple mode: damage_score as probability, learn pi
+                    double ds = std::clamp(static_cast<double>(damage_score[idx]), eps, 1.0 - eps);
+                    log_scores[2 * j]     = log_w + score_contrib + std::log(pi_a) + std::log(ds);
+                    log_scores[2 * j + 1] = log_w + score_contrib + std::log(1.0 - pi_a) + std::log(1.0 - ds);
+                }
             }
 
             double lse = agp::log_sum_exp(log_scores.data(), 2 * deg);
@@ -808,8 +821,8 @@ StreamingEMResult streaming_em(
             const float* /*evalue_log10*/,
             const uint16_t* /*dmg_k*/,
             const uint16_t* /*dmg_m*/,
-            const float* /*dmg_ll_a*/,
-            const float* /*dmg_ll_m*/,
+            const float* dmg_ll_a,
+            const float* dmg_ll_m,
             const uint16_t* /*identity_q*/,
             const uint16_t* /*aln_len*/,
             const uint16_t* /*qstart*/,
@@ -832,6 +845,7 @@ StreamingEMResult streaming_em(
 
             double local_ll = streaming_e_step_rowgroup(
                 num_rows, read_idx, ref_idx, bit_score, damage_score,
+                dmg_ll_a, dmg_ll_m,
                 result.weights.data(), T, params, result.pi,
                 local_ref_sums, local_ref_sums_ancient
             );
