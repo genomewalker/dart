@@ -973,6 +973,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // EM reassignment options (enabled by default for abundance estimation)
     bool use_em = true;
     bool em_streaming = false;       // Use streaming EM (O(num_refs) memory instead of O(num_alns))
+    size_t em_max_memory_mb = 4096;  // Max memory for EM (MB), 0 = no limit, auto-switch to streaming if exceeded
     uint32_t em_max_iters = 100;
     double em_lambda_b = 3.0;
     double em_tol = 1e-4;
@@ -1051,6 +1052,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             em_prob_fraction = std::stod(argv[++i]);
         } else if (strcmp(argv[i], "--em-streaming") == 0) {
             em_streaming = true;
+        } else if ((strcmp(argv[i], "--em-max-memory") == 0 || strcmp(argv[i], "-m") == 0) && i + 1 < argc) {
+            em_max_memory_mb = static_cast<size_t>(std::stoul(argv[++i]));
         } else if (strcmp(argv[i], "--gene-summary") == 0 && i + 1 < argc) {
             gene_summary_file = argv[++i];
         } else if (strcmp(argv[i], "--min-breadth") == 0 && i + 1 < argc) {
@@ -1133,6 +1136,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cout << "  --em-min-prob FLOAT     Min EM posterior to keep (default: 1e-6)\n";
             std::cout << "  --em-prob-fraction FLOAT Keep if gamma >= fraction*max_gamma(read) (default: 0.3)\n";
             std::cout << "  --em-streaming    Use streaming EM (low memory, ~2.5x slower)\n";
+            std::cout << "  --em-max-memory, -m MB  Max EM memory in MB (default: 4096)\n";
+            std::cout << "                       Auto-switches to streaming if estimate exceeds limit\n";
             std::cout << "  --min-positional-score FLOAT  Min read start diversity (default: 0)\n";
             std::cout << "                       Filters spurious matches where all reads hit same position\n";
             std::cout << "                       Score = sqrt(diversity * span), range 0-1\n";
@@ -2040,6 +2045,23 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         float em_ref_neff = 1.0f;       // Effective number of references: 1 / sum_j gamma_j^2
     };
     std::vector<EmReadResult> em_read_results(n_reads);
+
+    // Auto-switch to streaming EM if estimated memory exceeds limit
+    // Memory estimate: ~48 bytes per alignment (gamma double + Alignment struct overhead)
+    // Plus ~4 bytes per read for offsets
+    if (use_em && !em_streaming && em_max_memory_mb > 0) {
+        const size_t num_alignments = reader.num_alignments();
+        const size_t estimated_mb = (num_alignments * 48 + n_reads * 4) / (1024 * 1024);
+        if (estimated_mb > em_max_memory_mb) {
+            em_streaming = true;
+            if (verbose) {
+                std::cerr << "\nAuto-switching to streaming EM:\n";
+                std::cerr << "  Estimated memory: " << estimated_mb << " MB\n";
+                std::cerr << "  Memory limit: " << em_max_memory_mb << " MB\n";
+                std::cerr << "  Use --em-max-memory to adjust limit, or --em-streaming to force\n";
+            }
+        }
+    }
 
     if (use_em && em_streaming) {
         // Streaming EM path - O(num_refs) memory instead of O(num_alignments)
