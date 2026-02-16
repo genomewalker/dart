@@ -49,10 +49,7 @@ int cmd_validate(int argc, char* argv[]);
 int cmd_sample_damage(int argc, char* argv[]);
 int cmd_damage_annotate(int argc, char* argv[]);
 int cmd_damage_profile(int argc, char* argv[]);
-int cmd_em_prepare(int argc, char* argv[]);
 int cmd_hits2emi(int argc, char* argv[]);
-int cmd_em_solve(int argc, char* argv[]);
-int cmd_em_solve2(int argc, char* argv[]);
 
 }  // namespace cli
 }  // namespace agp

@@ -363,8 +363,9 @@ struct ReadDamageObs {
  * @param phi Concentration parameter φ = α + β (higher = less overdispersion)
  * @return Log-likelihood
  */
-inline double log_beta_binomial(size_t k, size_t n, double theta, double phi) {
-    if (n == 0) return 0.0;
+inline double log_beta_binomial(double k, double n, double theta, double phi) {
+    if (n <= 0.0) return 0.0;
+    k = std::clamp(k, 0.0, n);
 
     // Reparameterize: α = θφ, β = (1-θ)φ
     theta = std::clamp(theta, 1e-10, 1.0 - 1e-10);
@@ -377,7 +378,7 @@ inline double log_beta_binomial(size_t k, size_t n, double theta, double phi) {
     // P(k|n,α,β) = C(n,k) * B(k+α, n-k+β) / B(α, β)
     // log P = log C(n,k) + log B(k+α, n-k+β) - log B(α, β)
 
-    double log_binom = log_gamma(n + 1) - log_gamma(k + 1) - log_gamma(n - k + 1);
+    double log_binom = log_gamma(n + 1.0) - log_gamma(k + 1.0) - log_gamma(n - k + 1.0);
     double log_beta_num = log_beta(k + alpha, n - k + beta);
     double log_beta_denom = log_beta(alpha, beta);
 
@@ -412,14 +413,11 @@ inline ProteinDamageResult fit_protein_damage(
 
     // Aggregate statistics
     double sum_p = 0.0, sum_p2 = 0.0;
-    double sum_lr = 0.0, sum_info = 0.0;
     size_t n_damaged = 0, total_sites = 0;
 
     for (const auto& o : obs) {
         sum_p += o.p_damaged;
         sum_p2 += o.p_damaged * o.p_damaged;
-        sum_lr += o.log_lr;
-        sum_info += o.info;
         if (o.is_damaged) ++n_damaged;
         total_sites += o.n_sites;
     }
@@ -429,7 +427,12 @@ inline ProteinDamageResult fit_protein_damage(
     result.mean_p_damaged = sum_p / obs.size();
 
     const size_t n = obs.size();
-    const size_t k = n_damaged;
+    const double n_eff = static_cast<double>(n);
+    const double k_eff = sum_p;  // Soft count from per-read posteriors
+    const double prior_theta_clamped = std::clamp(prior_theta, 1e-6, 1.0 - 1e-6);
+    const double prior_strength_pos = std::max(prior_strength, 1e-6);
+    const double prior_alpha = prior_theta_clamped * prior_strength_pos;
+    const double prior_beta = (1.0 - prior_theta_clamped) * prior_strength_pos;
 
     // =========================================================================
     // Method of moments for initial estimates
@@ -446,14 +449,15 @@ inline ProteinDamageResult fit_protein_damage(
     // But we're using continuous posteriors, so approximate with:
     // φ ≈ θ(1-θ)/var_p - 1
 
-    double theta_init = std::clamp(mean_p, 0.01, 0.99);
+    double theta_init = (k_eff + prior_alpha) / (n_eff + prior_alpha + prior_beta);
+    theta_init = std::clamp(theta_init, 0.01, 0.99);
     double phi_init = theta_init * (1.0 - theta_init) / var_p - 1.0;
     phi_init = std::clamp(phi_init, 2.0, 1000.0);  // Reasonable range
 
     // =========================================================================
     // Null model: θ = 0 (no damage)
     // =========================================================================
-    result.log_lik_m0 = log_beta_binomial(k, n, 1e-6, phi_init);
+    result.log_lik_m0 = log_beta_binomial(k_eff, n_eff, 1e-6, phi_init);
 
     // =========================================================================
     // Damage model: θ > 0 with Newton-Raphson MLE
@@ -469,11 +473,11 @@ inline ProteinDamageResult fit_protein_damage(
 
         // Score: d/dθ log L
         // = φ * (digamma(k + α) - digamma(n - k + β) - digamma(α) + digamma(β))
-        double score = phi * (digamma(k + alpha) - digamma(n - k + beta)
+        double score = phi * (digamma(k_eff + alpha) - digamma(n_eff - k_eff + beta)
                               - digamma(alpha) + digamma(beta));
 
         // Fisher information (expected)
-        double info = phi * phi * (trigamma(k + alpha) + trigamma(n - k + beta)
+        double info = phi * phi * (trigamma(k_eff + alpha) + trigamma(n_eff - k_eff + beta)
                                    - trigamma(alpha) - trigamma(beta));
         info = std::max(std::abs(info), 1e-6);
 
@@ -485,7 +489,7 @@ inline ProteinDamageResult fit_protein_damage(
 
     result.delta_max = theta;
     result.phi = phi;
-    result.log_lik_m1 = log_beta_binomial(k, n, theta, phi);
+    result.log_lik_m1 = log_beta_binomial(k_eff, n_eff, theta, phi);
 
     // =========================================================================
     // Likelihood Ratio Test
@@ -510,7 +514,7 @@ inline ProteinDamageResult fit_protein_damage(
     // With uniform prior on [0,1], this simplifies
     double alpha_hat = theta * phi;
     double beta_hat = (1.0 - theta) * phi;
-    double fisher_info = phi * phi * (trigamma(k + alpha_hat) + trigamma(n - k + beta_hat)
+    double fisher_info = phi * phi * (trigamma(k_eff + alpha_hat) + trigamma(n_eff - k_eff + beta_hat)
                                       - trigamma(alpha_hat) - trigamma(beta_hat));
     fisher_info = std::max(std::abs(fisher_info), 1e-6);
 
@@ -538,7 +542,7 @@ inline ProteinDamageResult fit_protein_damage(
     // Search for lower bound
     double lower = 0.0;
     for (double t = theta; t >= 1e-4; t -= 0.01) {
-        double ll = log_beta_binomial(k, n, t, phi);
+        double ll = log_beta_binomial(k_eff, n_eff, t, phi);
         if (ll < ll_threshold) {
             lower = t + 0.01;
             break;
@@ -549,7 +553,7 @@ inline ProteinDamageResult fit_protein_damage(
     // Search for upper bound
     double upper = 1.0;
     for (double t = theta; t <= 1.0 - 1e-4; t += 0.01) {
-        double ll = log_beta_binomial(k, n, t, phi);
+        double ll = log_beta_binomial(k_eff, n_eff, t, phi);
         if (ll < ll_threshold) {
             upper = t - 0.01;
             break;

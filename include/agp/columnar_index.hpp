@@ -9,7 +9,7 @@
  * - Chunk statistics for predicate pushdown (min/max per column per row group)
  * - Column pruning: only load columns needed for query
  *
- * File format (.emi2):
+ * File format (.emi):
  * ┌─────────────────────────────────────────┐
  * │ Header (128 bytes)                      │
  * ├─────────────────────────────────────────┤
@@ -51,12 +51,21 @@
 
 namespace agp {
 
-// Magic: "AGPEMI02" for columnar EM index format v2 (little-endian)
+// Magic: "AGPEMI02" for columnar EM index format (little-endian)
 // v2 adds READ_IDX column to fix CSR/row-group incompatibility
+// v3 adds AGP-specific execution metadata/flags for faster consumers
+// v4 adds TSV parity columns: qstart/qend/mismatch/gapopen
+// v5 adds per-alignment damage evidence for reassignment:
+//    dmg_k, dmg_m, dmg_ll_a, dmg_ll_m
 constexpr uint64_t EMI_MAGIC = 0x3230494D45504741ULL;  // "AGPEMI02"
 constexpr uint64_t EMI_MAGIC_V1 = 0x3130494D45504741ULL;  // "AGPEMI01" (legacy)
-constexpr uint32_t EMI_VERSION = 2;
+constexpr uint32_t EMI_VERSION = 5;
 constexpr uint32_t ROW_GROUP_SIZE = 65536;  // 64K rows per group
+
+// Header flags (AGP execution hints/capabilities)
+constexpr uint32_t EMI_FLAG_SORTED_BY_READ_THEN_SCORE = 1u << 0;
+constexpr uint32_t EMI_FLAG_HAS_ALIGNMENT_STRINGS = 1u << 1;
+constexpr uint32_t EMI_FLAG_HAS_ROW_GROUP_READ_INDEX = 1u << 2;
 
 // Column IDs for selective loading
 // v2: Added READ_IDX to store read index per alignment (fixes CSR/row-group issue)
@@ -68,13 +77,21 @@ enum class ColumnID : uint8_t {
     EVALUE_LOG10 = 4,
     IDENTITY_Q = 5,
     ALN_LEN = 6,
-    TSTART = 7,
-    TEND = 8,
-    TLEN = 9,
-    QLEN = 10,
-    QALN = 11,
-    TALN = 12,
-    NUM_COLUMNS = 13
+    QSTART = 7,        // v4: query start (1-based from TSV, clamped to uint16)
+    QEND = 8,          // v4: query end (1-based from TSV, clamped to uint16)
+    TSTART = 9,
+    TEND = 10,
+    TLEN = 11,
+    QLEN = 12,
+    MISMATCH = 13,     // v4: mismatch count (clamped to uint16)
+    GAPOPEN = 14,      // v4: gap-open count (clamped to uint16)
+    QALN = 15,
+    TALN = 16,
+    DMG_K = 17,        // v5: damage-consistent hits among opportunities
+    DMG_M = 18,        // v5: damage opportunities in aligned columns
+    DMG_LL_A = 19,     // v5: log P(evidence | ancient)
+    DMG_LL_M = 20,     // v5: log P(evidence | modern)
+    NUM_COLUMNS = 21
 };
 
 // Compression codec per column
@@ -114,6 +131,14 @@ struct RowGroupMeta {
     ColumnChunk columns[static_cast<size_t>(ColumnID::NUM_COLUMNS)];
 };
 
+// Optional per-row-group read span index (v3 extension)
+struct RowGroupReadIndex {
+    uint32_t first_read_idx = 0;
+    uint32_t last_read_idx = 0;
+    uint64_t start_row = 0;          // Global start row (inclusive)
+    uint64_t end_row_exclusive = 0;  // Global end row (exclusive)
+};
+
 // File header (128 bytes)
 struct EMIHeader {
     uint64_t magic = EMI_MAGIC;
@@ -129,7 +154,11 @@ struct EMIHeader {
     uint64_t csr_offsets_offset = 0;
     float d_max = 0.0f;
     float lambda = 0.3f;
-    uint8_t _reserved[52];
+    // v3 extension fields (kept within former reserved space)
+    uint64_t row_group_read_index_offset = 0;
+    uint32_t row_group_read_index_count = 0;
+    uint32_t row_group_read_index_entry_size = 0;
+    uint8_t _reserved[36];
 };
 static_assert(sizeof(EMIHeader) == 128);
 
@@ -154,14 +183,22 @@ struct AlignmentRecord {
     uint32_t read_idx;
     uint32_t ref_idx;
     float bit_score;
-    float damage_score;
+    float damage_score;   // per-read prior p_read
+    uint16_t dmg_k = 0;
+    uint16_t dmg_m = 0;
+    float dmg_ll_a = 0.0f;
+    float dmg_ll_m = 0.0f;
     float evalue_log10;
     float identity;      // 0-1, will be quantized
     uint16_t aln_len;
+    uint16_t qstart;
+    uint16_t qend;
     uint16_t tstart;
     uint16_t tend;
     uint16_t tlen;
     uint16_t qlen;
+    uint16_t mismatch;
+    uint16_t gapopen;
     std::string_view qaln;
     std::string_view taln;
 };
@@ -212,6 +249,10 @@ public:
     uint32_t num_reads() const;
     uint32_t num_refs() const;
     uint32_t num_row_groups() const;
+    uint32_t version() const;
+    bool has_alignment_strings() const;
+    bool is_sorted_by_read_then_score() const;
+    bool has_row_group_read_index() const;
     float d_max() const;
     float lambda() const;
 
@@ -222,6 +263,7 @@ public:
     // CSR access for per-read iteration
     uint64_t read_offset(uint32_t read_idx) const;
     uint32_t read_degree(uint32_t read_idx) const;
+    RowGroupReadIndex row_group_read_index(uint32_t row_group) const;
 
     // Set filters for predicate pushdown (call before iterating)
     void add_filter(FilterPredicate pred);
@@ -242,16 +284,27 @@ public:
         const float* bit_score,
         const float* damage_score,
         const float* evalue_log10,
+        const uint16_t* dmg_k,
+        const uint16_t* dmg_m,
+        const float* dmg_ll_a,
+        const float* dmg_ll_m,
         const uint16_t* identity_q,
         const uint16_t* aln_len,
+        const uint16_t* qstart,
+        const uint16_t* qend,
         const uint16_t* tstart,
         const uint16_t* tend,
         const uint16_t* tlen,
-        const uint16_t* qlen
+        const uint16_t* qlen,
+        const uint16_t* mismatch,
+        const uint16_t* gapopen
     )>;
 
     // Process row groups in parallel (OpenMP)
     void parallel_scan(RowGroupCallback callback) const;
+    void parallel_scan_selected(
+        const std::vector<uint32_t>& row_group_indices,
+        RowGroupCallback callback) const;
 
     // Get alignment strings for specific row (lazy load)
     std::string_view get_qaln(uint32_t row_group, uint32_t row_in_group) const;

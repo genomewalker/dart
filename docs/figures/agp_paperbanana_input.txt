@@ -1,0 +1,44 @@
+AGP (Ancient Gene Predictor) is a modular pipeline for damage-aware functional profiling of ancient DNA reads. Create one central architecture figure with clear modules, data artifacts, and optional branches. The style should look like a NeurIPS systems-method figure: clean, publication-ready, color-coded modules, consistent arrows, minimal clutter.
+
+Main linear workflow (left to right):
+1) Input: ancient DNA reads (FASTQ/FASTA, often gzip).
+2) Module: agp predict.
+   - Performs damage-aware ORF calling and translation.
+   - Internally has two conceptual sub-blocks:
+     a) Damage modeling / calibration (C->T and G->A deamination).
+     b) Gene prediction + translation.
+   - Outputs three key artifacts:
+     - predictions.gff (gene calls)
+     - proteins.faa / search.faa (translated proteins)
+     - predictions.agd (per-read damage index)
+3) Module: external protein search (MMseqs2 against KEGG/CAZy/viral DBs).
+   - Input: proteins/search.faa
+   - Output: hits.tsv (or convert to EMI with hits2emi)
+4) Module: hits2emi (columnar conversion).
+   - Input: hits.tsv (+ optionally predictions.agd)
+   - Output: hits.emi (columnar index with alignment fields and damage scores)
+5) Module: agp damage-annotate (EMI-first).
+   - Inputs: hits.emi (+ optional predictions.agd for synonymous site metadata)
+   - Core sub-blocks inside this module:
+     a) Alignment filtering / best-hit selection
+     b) EM reassignment for multi-mapped reads
+     c) Damage evidence scoring (terminal + substitution + identity)
+     d) Aggregation to per-read, per-protein, and per-function summaries
+   - Outputs:
+     - annotated_hits.tsv
+     - optional protein_summary.tsv, functional_summary.tsv, corrected proteins
+
+Add secondary modules as side branches:
+- agp sample-damage: runs directly from reads as a quick QC branch; outputs sample-level d_max and lambda.
+- agp validate: benchmarking branch comparing predictions vs reference.
+- agp damage-profile: optional profile analysis branch from reads + hits.
+
+Visual requirements:
+- Use 4 horizontal tiers with labels: "Raw Data", "Core AGP", "Search/Index", "Downstream Inference".
+- Distinguish AGP native modules (predict, hits2emi, damage-annotate) with one color family, external tools (MMseqs2) with another, and file artifacts as rounded rectangles.
+- Include a legend that explains colors and artifact types.
+- Emphasize that damage-annotate consumes EMI as primary input.
+- Add small callouts for performance-sensitive points: "columnar EMI", "parallel row-group scan", "EM reassignment".
+- Keep text concise and readable at paper scale.
+
+The figure should be self-contained and understandable without referencing the manuscript body.

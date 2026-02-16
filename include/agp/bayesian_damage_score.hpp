@@ -283,19 +283,6 @@ inline ModernBaseline estimate_modern_baseline(
     return out;
 }
 
-// Compute damage detectability from sample-level indicators
-// Returns 0.0 (uninformative) to 1.0 (highly informative)
-inline float compute_damage_detectability(
-    float d_max, float stop_decay_llr, float terminal_shift,
-    bool damage_validated, bool damage_artifact) noexcept
-{
-    if (damage_artifact) return 0.0f;
-    if (!damage_validated) return std::clamp(d_max * 5.0f, 0.0f, 0.3f);
-    float llr_component = std::clamp(stop_decay_llr / 10000.0f, 0.0f, 0.5f);
-    float shift_component = std::clamp(terminal_shift * 10.0f, 0.0f, 0.5f);
-    return std::min(1.0f, llr_component + shift_component);
-}
-
 // Compute final Bayesian score with decomposition
 // Implements: tempered evidence, site capping, Channel B gating, 3-state output
 // Optional fident: alignment identity (0-1), pass -1 to disable identity evidence

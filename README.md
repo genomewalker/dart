@@ -55,12 +55,16 @@ flowchart LR
     B --> D[index.agd]
     C --> E[MMseqs2 search]
     E --> F[hits.tsv]
-    F --> G[agp damage-annotate]
+    F --> G[agp hits2emi]
+    G --> H[hits.emi]
+    H --> I[agp damage-annotate]
     D --> G
-    G --> H[annotated_hits.tsv]
+    D --> I
+    I --> J[annotated_hits.tsv]
 
     style B fill:#bbdefb
     style G fill:#bbdefb
+    style I fill:#bbdefb
 ```
 
 Search predicted proteins against KEGG for pathway analysis:
@@ -77,8 +81,11 @@ mmseqs easy-search search.faa kegg_genes.faa hits.tsv tmp/ \
     --sub-mat VTML20.out \
     --format-output "query,target,fident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits,qlen,tlen,qaln,taln"
 
-# 3. Annotate hits with per-protein damage scores
-agp damage-annotate -i hits.tsv --damage-index out.agd -o annotated_hits.tsv
+# 3. Convert hits TSV to EMI (columnar)
+agp hits2emi -i hits.tsv -o hits.emi --damage-index out.agd -t 16
+
+# 4. Annotate hits with per-protein damage scores (+ integrated EM reassignment)
+agp damage-annotate --emi hits.emi --damage-index out.agd -o annotated_hits.tsv -t 16
 ```
 
 The `--fasta-aa-masked` output replaces damage-induced stop codons with X for better database matching.
@@ -144,23 +151,71 @@ Output fields:
   library_type       single-stranded or double-stranded
 ```
 
+### `agp hits2emi`
+
+Converts MMseqs2 hit TSV into AGP EMI (columnar) with alignment strings (`qaln`, `taln`) required by `damage-annotate`.
+
+```
+Usage: agp hits2emi -i <hits.tsv[.gz]> -o <hits.emi> [options]
+
+Required:
+  -i, --tsv FILE         MMseqs2 16-column hits TSV (plain or gz)
+  -o, --output FILE      Output EMI file
+
+Options:
+  -t, --threads N        Thread count (default: all available)
+  -m, --memory SIZE      Memory budget with required K/M/G/T suffix (default: 10% available RAM)
+  --streaming            Force streaming mode
+  --damage-index FILE    Optional AGD; embeds per-read damage probability into EMI
+  --d-max FLOAT          Store sample d_max in EMI metadata
+  --lambda FLOAT         Store decay lambda in EMI metadata
+```
+
 ### `agp damage-annotate`
 
 Annotates database hits with per-protein damage evidence. Compares observed proteins to reference proteins to identify damage-consistent amino acid substitutions (R→W, H→Y, Q→*, etc.).
 
 ```
-Usage: agp damage-annotate -i <hits.tsv> --damage-index <index.agd> -o <output.tsv>
+Usage: agp damage-annotate --emi <hits.emi> -o <output.tsv> [options]
 
 Required:
-  -i, --hits FILE        MMseqs2 results (16-column format with qaln/taln)
-  --damage-index FILE    AGP damage index from predict
-  -o FILE                Output annotated TSV
+  -i, --emi FILE         EMI index from `agp hits2emi` (with qaln/taln)
 
 Optional:
+  -t, --threads INT      OpenMP threads for EMI scans
   --protein-summary FILE Per-protein aggregated statistics
+  --protein-filtered FILE Per-protein subset that passes mapping-pattern filters
+  --combined-output FILE Per-target combined protein+gene summary
+  --blast8-unique FILE   BLAST8-like export with unique mappers only (no multimaps)
+  --analysis-prefix STR  Output prefix: .reads.tsv, .protein.tsv, .blast8.unique.tsv,
+                         and .categories.tsv (if --map is provided)
+  --analysis-proteins FILE   Proteins output file
+  --analysis-blast8 FILE     Unique BLAST8 output file
+  --analysis-categories FILE Categories output file
+  --gene-summary FILE    Per-protein/gene mapping summary (coverage/diversity metrics)
+  --map FILE             Gene-to-group mapping TSV (gene_id<TAB>group)
+  --functional-summary FILE  Per-group stats TSV (includes category damage enrichment)
+  --anvio-ko FILE        Gene-level group abundance for anvi-estimate-metabolism
+  --annotation-source STR  Source label for anvi output (default: AGP)
+  --min-positional-score FLOAT  Minimum positional score (default: 0)
+  --min-terminal-ratio FLOAT    Minimum terminal/middle coverage ratio (default: 0)
+  --min-reads INT        Minimum supporting reads for filtered outputs (default: 3)
+  --damage-index FILE    AGP damage index from predict
   --corrected FILE       Reference-corrected protein FASTA
   --threshold FLOAT      Classification threshold (default: 0.7)
+  --no-em                Disable EM reassignment (enabled by default)
+  --em-iters INT         Max EM iterations (default: 100)
+  --em-lambda FLOAT      EM score temperature (default: 3.0)
+  --em-tol FLOAT         EM convergence tolerance (default: 1e-4)
+  --em-min-prob FLOAT    Min EM posterior to keep assigned read (default: 1e-6)
+  --em-prob-fraction FLOAT Keep if gamma >= fraction*max_gamma(read) (default: 0.3)
 ```
+
+By default, `damage-annotate` resolves multi-mapping with integrated EM (SQUAREM-accelerated) directly on EMI alignments.
+Aggregation semantics are split by design:
+- Assignment channel (abundance/mapping): all EM-kept best-hit reads.
+- Damage channel (damage evidence): reads with at least one mismatch in `qaln/taln`.
+- `--protein-summary` now includes both channels in one table; assignment-derived fields are prefixed with `assign_`.
 
 Output columns include:
 - `p_read`: Per-read damage probability from prediction
@@ -186,7 +241,7 @@ Options:
 Compares predictions against ground truth for benchmarking.
 
 ```
-Usage: agp validate <predictions.gff> <reference.gff>
+Usage: agp validate <fastq.gz> <aa-damage.tsv.gz> <predictions.gff> [proteins.faa] [corrected.faa] [--csv output.csv]
 ```
 
 ## Output formats
@@ -207,9 +262,19 @@ read_001  AGP  CDS  1  150  0.85  +  0  ID=gene_1;ancient_prob=0.72;damage_pct=1
 
 Binary format for O(1) per-read damage lookup. Contains sequence length, frame, strand, damage probability, and terminal codon information. Required by `damage-annotate`.
 
+### EMI (.emi)
+
+Columnar alignment index consumed by `damage-annotate`.
+
+- Source: generated by `agp hits2emi` from MMseqs2 TSV.
+- Stores all alignment fields used downstream (including `qaln`/`taln`).
+- Sorted/grouped for efficient per-read scans and parallel chunk processing.
+- Includes optional embedded per-read damage priors when `--damage-index` is provided to `hits2emi`.
+- Uses AGP-specific binary layout optimized for this workflow (not Parquet-compatible).
+
 ### Annotated Hits TSV
 
-Per-read output from `damage-annotate`:
+Per-read output from `damage-annotate` (mismatch-evidence reads only):
 
 | Column | Description |
 |--------|-------------|
@@ -220,6 +285,8 @@ Per-read output from `damage-annotate`:
 | is_damaged | 1 if posterior >= threshold |
 | syn_5prime | Synonymous C→T at 5' terminus (from damage index) |
 | syn_3prime | Synonymous G→A at 3' terminus (from damage index) |
+| em_keep | 1 if read assignment passes posterior filter |
+| gamma | EM responsibility for the selected target |
 
 ## How it works
 
@@ -305,6 +372,17 @@ After database search, `damage-annotate` identifies damage-consistent amino acid
 | R | K | G→A (3') | AGA→AAA |
 
 Positional probability weights these substitutions: sites near termini (where damage is expected) score higher than interior sites.
+
+### EM reassignment in `damage-annotate`
+
+`damage-annotate` runs EM by default to resolve multi-mapping alignments from EMI.
+
+- E-step uses alignment score, optional damage prior, and reference-length normalization.
+- M-step updates reference weights with a MAP-style prior to avoid unstable collapse.
+- SQUAREM acceleration is used with objective safeguards for faster convergence.
+- Output keeps posterior-style assignment probabilities instead of forcing best-hit only.
+
+Use `--no-em` only when you explicitly want deterministic non-EM assignment.
 
 ## Performance
 

@@ -9,6 +9,7 @@
 #include "agp/columnar_index.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <numeric>
 #include <cmath>
@@ -23,11 +24,67 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifdef HAVE_ZSTD
+#include <zstd.h>
+#endif
+
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
 namespace agp {
+
+namespace {
+
+inline void decompress_chunk_to_buffer(const ColumnChunk& chunk,
+                                       const char* src,
+                                       std::vector<char>& out) {
+    out.resize(chunk.uncompressed_size);
+
+    switch (chunk.codec) {
+        case Codec::NONE:
+            std::memcpy(out.data(), src, chunk.uncompressed_size);
+            return;
+        case Codec::ZSTD:
+#ifdef HAVE_ZSTD
+        {
+            size_t got = ZSTD_decompress(out.data(),
+                                         static_cast<size_t>(chunk.uncompressed_size),
+                                         src,
+                                         static_cast<size_t>(chunk.compressed_size));
+            if (ZSTD_isError(got) || got != static_cast<size_t>(chunk.uncompressed_size)) {
+                throw std::runtime_error("EMI ZSTD decompression failed");
+            }
+            return;
+        }
+#else
+            throw std::runtime_error("EMI chunk uses ZSTD but binary was built without ZSTD support");
+#endif
+        default:
+            throw std::runtime_error("Unsupported EMI compression codec");
+    }
+}
+
+inline void madvise_willneed_range(const char* addr, size_t len) {
+#ifdef MADV_WILLNEED
+    if (addr == nullptr || len == 0) return;
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) return;
+    const uintptr_t mask = static_cast<uintptr_t>(page_size - 1);
+    const uintptr_t raw = reinterpret_cast<uintptr_t>(addr);
+    const uintptr_t aligned_start = raw & ~mask;
+    const uintptr_t aligned_end = (raw + len + mask) & ~mask;
+    if (aligned_end <= aligned_start) return;
+    madvise(reinterpret_cast<void*>(aligned_start),
+            static_cast<size_t>(aligned_end - aligned_start),
+            MADV_WILLNEED);
+#else
+    (void)addr;
+    (void)len;
+#endif
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // FilterPredicate implementation
@@ -38,10 +95,16 @@ bool FilterPredicate::can_skip(const ColumnStats& stats) const {
     switch (column) {
         case ColumnID::REF_IDX:
         case ColumnID::ALN_LEN:
+        case ColumnID::QSTART:
+        case ColumnID::QEND:
         case ColumnID::TSTART:
         case ColumnID::TEND:
         case ColumnID::TLEN:
         case ColumnID::QLEN:
+        case ColumnID::MISMATCH:
+        case ColumnID::GAPOPEN:
+        case ColumnID::DMG_K:
+        case ColumnID::DMG_M:
         case ColumnID::IDENTITY_Q:
             // Integer columns
             switch (op) {
@@ -55,6 +118,8 @@ bool FilterPredicate::can_skip(const ColumnStats& stats) const {
         case ColumnID::BIT_SCORE:
         case ColumnID::DAMAGE_SCORE:
         case ColumnID::EVALUE_LOG10:
+        case ColumnID::DMG_LL_A:
+        case ColumnID::DMG_LL_M:
             // Float columns
             switch (op) {
                 case Op::GE: return stats.max_f < value_f;
@@ -91,13 +156,21 @@ struct ColumnarIndexWriter::Impl {
     std::vector<uint32_t> buf_ref_idx;
     std::vector<float> buf_bit_score;
     std::vector<float> buf_damage_score;
+    std::vector<uint16_t> buf_dmg_k;
+    std::vector<uint16_t> buf_dmg_m;
+    std::vector<float> buf_dmg_ll_a;
+    std::vector<float> buf_dmg_ll_m;
     std::vector<float> buf_evalue_log10;
     std::vector<uint16_t> buf_identity_q;
     std::vector<uint16_t> buf_aln_len;
+    std::vector<uint16_t> buf_qstart;
+    std::vector<uint16_t> buf_qend;
     std::vector<uint16_t> buf_tstart;
     std::vector<uint16_t> buf_tend;
     std::vector<uint16_t> buf_tlen;
     std::vector<uint16_t> buf_qlen;
+    std::vector<uint16_t> buf_mismatch;
+    std::vector<uint16_t> buf_gapopen;
     std::vector<uint32_t> buf_qaln_offsets;
     std::vector<char> buf_qaln_data;
     std::vector<uint32_t> buf_taln_offsets;
@@ -105,11 +178,18 @@ struct ColumnarIndexWriter::Impl {
 
     // Row group metadata
     std::vector<RowGroupMeta> row_groups;
+    std::vector<RowGroupReadIndex> row_group_read_index;
+    uint64_t emitted_rows = 0;
 
     // CSR offsets (per-read)
     std::vector<uint64_t> csr_offsets;
     uint32_t current_read_idx = UINT32_MAX;
     uint64_t total_alignments = 0;
+    bool sorted_by_read_then_score = true;
+    bool saw_alignment_strings = false;
+    bool has_prev_sort_key = false;
+    uint32_t prev_read_idx = 0;
+    float prev_bit_score = 0.0f;
 
     // Temporary file for row group data
     std::string temp_path;
@@ -125,13 +205,21 @@ struct ColumnarIndexWriter::Impl {
         buf_ref_idx.reserve(ROW_GROUP_SIZE);
         buf_bit_score.reserve(ROW_GROUP_SIZE);
         buf_damage_score.reserve(ROW_GROUP_SIZE);
+        buf_dmg_k.reserve(ROW_GROUP_SIZE);
+        buf_dmg_m.reserve(ROW_GROUP_SIZE);
+        buf_dmg_ll_a.reserve(ROW_GROUP_SIZE);
+        buf_dmg_ll_m.reserve(ROW_GROUP_SIZE);
         buf_evalue_log10.reserve(ROW_GROUP_SIZE);
         buf_identity_q.reserve(ROW_GROUP_SIZE);
         buf_aln_len.reserve(ROW_GROUP_SIZE);
+        buf_qstart.reserve(ROW_GROUP_SIZE);
+        buf_qend.reserve(ROW_GROUP_SIZE);
         buf_tstart.reserve(ROW_GROUP_SIZE);
         buf_tend.reserve(ROW_GROUP_SIZE);
         buf_tlen.reserve(ROW_GROUP_SIZE);
         buf_qlen.reserve(ROW_GROUP_SIZE);
+        buf_mismatch.reserve(ROW_GROUP_SIZE);
+        buf_gapopen.reserve(ROW_GROUP_SIZE);
         buf_qaln_offsets.reserve(ROW_GROUP_SIZE + 1);
         buf_qaln_offsets.push_back(0);
         buf_taln_offsets.reserve(ROW_GROUP_SIZE + 1);
@@ -141,7 +229,7 @@ struct ColumnarIndexWriter::Impl {
     void flush_row_group() {
         if (buf_read_idx.empty()) return;
 
-        RowGroupMeta rg;
+        RowGroupMeta rg{};
         rg.num_rows = static_cast<uint32_t>(buf_ref_idx.size());
         rg.first_read_idx = current_read_idx;
 
@@ -198,11 +286,26 @@ struct ColumnarIndexWriter::Impl {
         write_column(ColumnID::EVALUE_LOG10, buf_evalue_log10.data(), sizeof(float), buf_evalue_log10.size());
         rg.columns[static_cast<size_t>(ColumnID::EVALUE_LOG10)].stats = compute_stats_f32(buf_evalue_log10);
 
+        write_column(ColumnID::DMG_K, buf_dmg_k.data(), sizeof(uint16_t), buf_dmg_k.size());
+        rg.columns[static_cast<size_t>(ColumnID::DMG_K)].stats = compute_stats_u16(buf_dmg_k);
+        write_column(ColumnID::DMG_M, buf_dmg_m.data(), sizeof(uint16_t), buf_dmg_m.size());
+        rg.columns[static_cast<size_t>(ColumnID::DMG_M)].stats = compute_stats_u16(buf_dmg_m);
+        write_column(ColumnID::DMG_LL_A, buf_dmg_ll_a.data(), sizeof(float), buf_dmg_ll_a.size());
+        rg.columns[static_cast<size_t>(ColumnID::DMG_LL_A)].stats = compute_stats_f32(buf_dmg_ll_a);
+        write_column(ColumnID::DMG_LL_M, buf_dmg_ll_m.data(), sizeof(float), buf_dmg_ll_m.size());
+        rg.columns[static_cast<size_t>(ColumnID::DMG_LL_M)].stats = compute_stats_f32(buf_dmg_ll_m);
+
         write_column(ColumnID::IDENTITY_Q, buf_identity_q.data(), sizeof(uint16_t), buf_identity_q.size());
         rg.columns[static_cast<size_t>(ColumnID::IDENTITY_Q)].stats = compute_stats_u16(buf_identity_q);
 
         write_column(ColumnID::ALN_LEN, buf_aln_len.data(), sizeof(uint16_t), buf_aln_len.size());
         rg.columns[static_cast<size_t>(ColumnID::ALN_LEN)].stats = compute_stats_u16(buf_aln_len);
+
+        write_column(ColumnID::QSTART, buf_qstart.data(), sizeof(uint16_t), buf_qstart.size());
+        rg.columns[static_cast<size_t>(ColumnID::QSTART)].stats = compute_stats_u16(buf_qstart);
+
+        write_column(ColumnID::QEND, buf_qend.data(), sizeof(uint16_t), buf_qend.size());
+        rg.columns[static_cast<size_t>(ColumnID::QEND)].stats = compute_stats_u16(buf_qend);
 
         write_column(ColumnID::TSTART, buf_tstart.data(), sizeof(uint16_t), buf_tstart.size());
         rg.columns[static_cast<size_t>(ColumnID::TSTART)].stats = compute_stats_u16(buf_tstart);
@@ -216,6 +319,12 @@ struct ColumnarIndexWriter::Impl {
         write_column(ColumnID::QLEN, buf_qlen.data(), sizeof(uint16_t), buf_qlen.size());
         rg.columns[static_cast<size_t>(ColumnID::QLEN)].stats = compute_stats_u16(buf_qlen);
 
+        write_column(ColumnID::MISMATCH, buf_mismatch.data(), sizeof(uint16_t), buf_mismatch.size());
+        rg.columns[static_cast<size_t>(ColumnID::MISMATCH)].stats = compute_stats_u16(buf_mismatch);
+
+        write_column(ColumnID::GAPOPEN, buf_gapopen.data(), sizeof(uint16_t), buf_gapopen.size());
+        rg.columns[static_cast<size_t>(ColumnID::GAPOPEN)].stats = compute_stats_u16(buf_gapopen);
+
         // Write string columns (offsets + data)
         write_column(ColumnID::QALN, buf_qaln_offsets.data(), sizeof(uint32_t), buf_qaln_offsets.size());
         temp_out.write(buf_qaln_data.data(), buf_qaln_data.size());
@@ -224,19 +333,34 @@ struct ColumnarIndexWriter::Impl {
         temp_out.write(buf_taln_data.data(), buf_taln_data.size());
 
         row_groups.push_back(rg);
+        row_group_read_index.push_back(RowGroupReadIndex{
+            buf_read_idx.front(),
+            buf_read_idx.back(),
+            emitted_rows,
+            emitted_rows + rg.num_rows
+        });
+        emitted_rows += rg.num_rows;
 
         // Clear buffers
         buf_read_idx.clear();
         buf_ref_idx.clear();
         buf_bit_score.clear();
         buf_damage_score.clear();
+        buf_dmg_k.clear();
+        buf_dmg_m.clear();
+        buf_dmg_ll_a.clear();
+        buf_dmg_ll_m.clear();
         buf_evalue_log10.clear();
         buf_identity_q.clear();
         buf_aln_len.clear();
+        buf_qstart.clear();
+        buf_qend.clear();
         buf_tstart.clear();
         buf_tend.clear();
         buf_tlen.clear();
         buf_qlen.clear();
+        buf_mismatch.clear();
+        buf_gapopen.clear();
         buf_qaln_offsets.clear();
         buf_qaln_offsets.push_back(0);
         buf_qaln_data.clear();
@@ -285,6 +409,18 @@ uint32_t ColumnarIndexWriter::add_read(std::string_view name) {
 }
 
 void ColumnarIndexWriter::add_alignment(const AlignmentRecord& rec) {
+    // Track global sort invariant required by AGP fast-path consumers.
+    if (!impl_->has_prev_sort_key) {
+        impl_->has_prev_sort_key = true;
+    } else if (impl_->sorted_by_read_then_score) {
+        if (rec.read_idx < impl_->prev_read_idx ||
+            (rec.read_idx == impl_->prev_read_idx && rec.bit_score > impl_->prev_bit_score)) {
+            impl_->sorted_by_read_then_score = false;
+        }
+    }
+    impl_->prev_read_idx = rec.read_idx;
+    impl_->prev_bit_score = rec.bit_score;
+
     // Track CSR
     if (rec.read_idx != impl_->current_read_idx) {
         impl_->current_read_idx = rec.read_idx;
@@ -300,15 +436,26 @@ void ColumnarIndexWriter::add_alignment(const AlignmentRecord& rec) {
     impl_->buf_ref_idx.push_back(rec.ref_idx);
     impl_->buf_bit_score.push_back(rec.bit_score);
     impl_->buf_damage_score.push_back(rec.damage_score);
+    impl_->buf_dmg_k.push_back(rec.dmg_k);
+    impl_->buf_dmg_m.push_back(rec.dmg_m);
+    impl_->buf_dmg_ll_a.push_back(rec.dmg_ll_a);
+    impl_->buf_dmg_ll_m.push_back(rec.dmg_ll_m);
     impl_->buf_evalue_log10.push_back(rec.evalue_log10);
     impl_->buf_identity_q.push_back(static_cast<uint16_t>(std::clamp(rec.identity, 0.0f, 1.0f) * 65535.0f));
     impl_->buf_aln_len.push_back(rec.aln_len);
+    impl_->buf_qstart.push_back(rec.qstart);
+    impl_->buf_qend.push_back(rec.qend);
     impl_->buf_tstart.push_back(rec.tstart);
     impl_->buf_tend.push_back(rec.tend);
     impl_->buf_tlen.push_back(rec.tlen);
     impl_->buf_qlen.push_back(rec.qlen);
+    impl_->buf_mismatch.push_back(rec.mismatch);
+    impl_->buf_gapopen.push_back(rec.gapopen);
 
     // Add alignment strings
+    if (!rec.qaln.empty() || !rec.taln.empty()) {
+        impl_->saw_alignment_strings = true;
+    }
     impl_->buf_qaln_data.insert(impl_->buf_qaln_data.end(), rec.qaln.begin(), rec.qaln.end());
     impl_->buf_qaln_offsets.push_back(static_cast<uint32_t>(impl_->buf_qaln_data.size()));
 
@@ -345,6 +492,12 @@ void ColumnarIndexWriter::finalize(float d_max, float lambda) {
     header.row_group_size = ROW_GROUP_SIZE;
     header.d_max = d_max;
     header.lambda = lambda;
+    if (impl_->sorted_by_read_then_score) {
+        header.flags |= EMI_FLAG_SORTED_BY_READ_THEN_SCORE;
+    }
+    if (impl_->saw_alignment_strings) {
+        header.flags |= EMI_FLAG_HAS_ALIGNMENT_STRINGS;
+    }
 
     out.write(reinterpret_cast<const char*>(&header), sizeof(header));
 
@@ -390,6 +543,16 @@ void ColumnarIndexWriter::finalize(float d_max, float lambda) {
     }
 
     // Write CSR offsets
+    if (!impl_->row_group_read_index.empty()) {
+        header.flags |= EMI_FLAG_HAS_ROW_GROUP_READ_INDEX;
+        header.row_group_read_index_offset = out.tellp();
+        header.row_group_read_index_count = static_cast<uint32_t>(impl_->row_group_read_index.size());
+        header.row_group_read_index_entry_size = sizeof(RowGroupReadIndex);
+        out.write(reinterpret_cast<const char*>(impl_->row_group_read_index.data()),
+                  impl_->row_group_read_index.size() * sizeof(RowGroupReadIndex));
+    }
+
+    // Write CSR offsets
     header.csr_offsets_offset = out.tellp();
     out.write(reinterpret_cast<const char*>(impl_->csr_offsets.data()),
               impl_->csr_offsets.size() * sizeof(uint64_t));
@@ -418,6 +581,7 @@ struct ColumnarIndexReader::Impl {
     const EMIHeader* header = nullptr;
     const RowGroupMeta* row_groups = nullptr;
     const uint64_t* csr_offsets = nullptr;
+    const RowGroupReadIndex* row_group_read_index = nullptr;
 
     // String dictionaries
     const uint32_t* read_name_offsets = nullptr;
@@ -476,6 +640,10 @@ ColumnarIndexReader::ColumnarIndexReader(const std::string& path)
         impl_->close();
         return;
     }
+    if (impl_->header->version != EMI_VERSION) {
+        impl_->close();
+        return;
+    }
 
     const char* base = static_cast<const char*>(impl_->data);
 
@@ -506,6 +674,15 @@ ColumnarIndexReader::ColumnarIndexReader(const std::string& path)
     // CSR offsets
     impl_->csr_offsets = reinterpret_cast<const uint64_t*>(
         base + impl_->header->csr_offsets_offset);
+
+    // Optional row-group read index (v3)
+    if ((impl_->header->flags & EMI_FLAG_HAS_ROW_GROUP_READ_INDEX) != 0 &&
+        impl_->header->row_group_read_index_offset > 0 &&
+        impl_->header->row_group_read_index_count == impl_->header->num_row_groups &&
+        impl_->header->row_group_read_index_entry_size == sizeof(RowGroupReadIndex)) {
+        impl_->row_group_read_index = reinterpret_cast<const RowGroupReadIndex*>(
+            base + impl_->header->row_group_read_index_offset);
+    }
 
     // Default: load all columns
     std::fill(std::begin(impl_->column_needed), std::end(impl_->column_needed), true);
@@ -538,6 +715,22 @@ uint32_t ColumnarIndexReader::num_row_groups() const {
     return impl_->header->num_row_groups;
 }
 
+uint32_t ColumnarIndexReader::version() const {
+    return impl_->header->version;
+}
+
+bool ColumnarIndexReader::has_alignment_strings() const {
+    return (impl_->header->flags & EMI_FLAG_HAS_ALIGNMENT_STRINGS) != 0;
+}
+
+bool ColumnarIndexReader::is_sorted_by_read_then_score() const {
+    return (impl_->header->flags & EMI_FLAG_SORTED_BY_READ_THEN_SCORE) != 0;
+}
+
+bool ColumnarIndexReader::has_row_group_read_index() const {
+    return impl_->row_group_read_index != nullptr;
+}
+
 float ColumnarIndexReader::d_max() const {
     return impl_->header->d_max;
 }
@@ -566,6 +759,19 @@ uint32_t ColumnarIndexReader::read_degree(uint32_t read_idx) const {
     return static_cast<uint32_t>(impl_->csr_offsets[read_idx + 1] - impl_->csr_offsets[read_idx]);
 }
 
+RowGroupReadIndex ColumnarIndexReader::row_group_read_index(uint32_t row_group) const {
+    if (row_group >= impl_->header->num_row_groups) return {};
+    if (impl_->row_group_read_index) return impl_->row_group_read_index[row_group];
+
+    const RowGroupMeta& rg = impl_->row_groups[row_group];
+    RowGroupReadIndex fallback{};
+    fallback.first_read_idx = rg.first_read_idx;
+    fallback.last_read_idx = rg.first_read_idx;
+    fallback.start_row = static_cast<uint64_t>(row_group) * impl_->header->row_group_size;
+    fallback.end_row_exclusive = fallback.start_row + rg.num_rows;
+    return fallback;
+}
+
 void ColumnarIndexReader::add_filter(FilterPredicate pred) {
     impl_->filters.push_back(pred);
 }
@@ -590,10 +796,34 @@ void ColumnarIndexReader::set_all_columns() {
 void ColumnarIndexReader::parallel_scan(RowGroupCallback callback) const {
     const char* base = static_cast<const char*>(impl_->data);
     const uint32_t num_rg = impl_->header->num_row_groups;
+    constexpr uint32_t kPrefetchDistance = 2;
 
-    #pragma omp parallel for schedule(dynamic)
+    auto prefetch_row_group = [&](uint32_t rg_idx) {
+        if (rg_idx >= num_rg) return;
+        const RowGroupMeta& rg = impl_->row_groups[rg_idx];
+        size_t min_off = std::numeric_limits<size_t>::max();
+        size_t max_end = 0;
+        bool any = false;
+
+        for (size_t c = 0; c < static_cast<size_t>(ColumnID::NUM_COLUMNS); ++c) {
+            if (!impl_->load_all_columns && !impl_->column_needed[c]) continue;
+            const auto& chunk = rg.columns[c];
+            const size_t off = static_cast<size_t>(chunk.offset);
+            const size_t sz = static_cast<size_t>(chunk.compressed_size);
+            if (sz == 0) continue;
+            min_off = std::min(min_off, off);
+            max_end = std::max(max_end, off + sz);
+            any = true;
+        }
+        if (any && max_end > min_off) {
+            madvise_willneed_range(base + min_off, max_end - min_off);
+        }
+    };
+
+    #pragma omp parallel for schedule(static)
     for (uint32_t rg_idx = 0; rg_idx < num_rg; ++rg_idx) {
         const RowGroupMeta& rg = impl_->row_groups[rg_idx];
+        prefetch_row_group(rg_idx + kPrefetchDistance);
 
         // Check if row group can be skipped via predicate pushdown
         bool skip = false;
@@ -608,10 +838,21 @@ void ColumnarIndexReader::parallel_scan(RowGroupCallback callback) const {
         }
         if (skip) continue;
 
-        // Load column data (direct pointers into mmap'd region)
+        std::array<std::vector<char>, static_cast<size_t>(ColumnID::NUM_COLUMNS)> decoded_columns;
+
+        // Load column data (direct mmap pointers for uncompressed; decoded buffers for compressed).
         auto get_col = [&](ColumnID col) -> const void* {
             size_t idx = static_cast<size_t>(col);
-            return base + rg.columns[idx].offset;
+            if (!impl_->load_all_columns && !impl_->column_needed[idx]) {
+                return nullptr;
+            }
+            const auto& chunk = rg.columns[idx];
+            const char* src = base + chunk.offset;
+            if (chunk.codec == Codec::NONE) {
+                return src;
+            }
+            decompress_chunk_to_buffer(chunk, src, decoded_columns[idx]);
+            return decoded_columns[idx].data();
         };
 
         callback(
@@ -622,22 +863,151 @@ void ColumnarIndexReader::parallel_scan(RowGroupCallback callback) const {
             static_cast<const float*>(get_col(ColumnID::BIT_SCORE)),
             static_cast<const float*>(get_col(ColumnID::DAMAGE_SCORE)),
             static_cast<const float*>(get_col(ColumnID::EVALUE_LOG10)),
+            static_cast<const uint16_t*>(get_col(ColumnID::DMG_K)),
+            static_cast<const uint16_t*>(get_col(ColumnID::DMG_M)),
+            static_cast<const float*>(get_col(ColumnID::DMG_LL_A)),
+            static_cast<const float*>(get_col(ColumnID::DMG_LL_M)),
             static_cast<const uint16_t*>(get_col(ColumnID::IDENTITY_Q)),
             static_cast<const uint16_t*>(get_col(ColumnID::ALN_LEN)),
+            static_cast<const uint16_t*>(get_col(ColumnID::QSTART)),
+            static_cast<const uint16_t*>(get_col(ColumnID::QEND)),
             static_cast<const uint16_t*>(get_col(ColumnID::TSTART)),
             static_cast<const uint16_t*>(get_col(ColumnID::TEND)),
             static_cast<const uint16_t*>(get_col(ColumnID::TLEN)),
-            static_cast<const uint16_t*>(get_col(ColumnID::QLEN))
+            static_cast<const uint16_t*>(get_col(ColumnID::QLEN)),
+            static_cast<const uint16_t*>(get_col(ColumnID::MISMATCH)),
+            static_cast<const uint16_t*>(get_col(ColumnID::GAPOPEN))
+        );
+    }
+}
+
+void ColumnarIndexReader::parallel_scan_selected(
+    const std::vector<uint32_t>& row_group_indices,
+    RowGroupCallback callback) const {
+    if (row_group_indices.empty()) return;
+
+    const char* base = static_cast<const char*>(impl_->data);
+    const uint32_t num_rg = impl_->header->num_row_groups;
+    constexpr uint32_t kPrefetchDistance = 2;
+
+    auto prefetch_selected = [&](size_t list_idx) {
+        const size_t pf_idx = list_idx + kPrefetchDistance;
+        if (pf_idx >= row_group_indices.size()) return;
+        const uint32_t rg_idx = row_group_indices[pf_idx];
+        if (rg_idx >= num_rg) return;
+
+        const RowGroupMeta& rg = impl_->row_groups[rg_idx];
+        size_t min_off = std::numeric_limits<size_t>::max();
+        size_t max_end = 0;
+        bool any = false;
+
+        for (size_t c = 0; c < static_cast<size_t>(ColumnID::NUM_COLUMNS); ++c) {
+            if (!impl_->load_all_columns && !impl_->column_needed[c]) continue;
+            const auto& chunk = rg.columns[c];
+            const size_t off = static_cast<size_t>(chunk.offset);
+            const size_t sz = static_cast<size_t>(chunk.compressed_size);
+            if (sz == 0) continue;
+            min_off = std::min(min_off, off);
+            max_end = std::max(max_end, off + sz);
+            any = true;
+        }
+        if (any && max_end > min_off) {
+            madvise_willneed_range(base + min_off, max_end - min_off);
+        }
+    };
+
+    #pragma omp parallel for schedule(static)
+    for (size_t idx = 0; idx < row_group_indices.size(); ++idx) {
+        const uint32_t rg_idx = row_group_indices[idx];
+        if (rg_idx >= num_rg) continue;
+        const RowGroupMeta& rg = impl_->row_groups[rg_idx];
+        prefetch_selected(idx);
+
+        bool skip = false;
+        for (const auto& filter : impl_->filters) {
+            size_t col_idx = static_cast<size_t>(filter.column);
+            if (col_idx < static_cast<size_t>(ColumnID::NUM_COLUMNS)) {
+                if (filter.can_skip(rg.columns[col_idx].stats)) {
+                    skip = true;
+                    break;
+                }
+            }
+        }
+        if (skip) continue;
+
+        std::array<std::vector<char>, static_cast<size_t>(ColumnID::NUM_COLUMNS)> decoded_columns;
+
+        auto get_col = [&](ColumnID col) -> const void* {
+            size_t cidx = static_cast<size_t>(col);
+            if (!impl_->load_all_columns && !impl_->column_needed[cidx]) {
+                return nullptr;
+            }
+            const auto& chunk = rg.columns[cidx];
+            const char* src = base + chunk.offset;
+            if (chunk.codec == Codec::NONE) {
+                return src;
+            }
+            decompress_chunk_to_buffer(chunk, src, decoded_columns[cidx]);
+            return decoded_columns[cidx].data();
+        };
+
+        callback(
+            rg_idx,
+            rg.num_rows,
+            static_cast<const uint32_t*>(get_col(ColumnID::READ_IDX)),
+            static_cast<const uint32_t*>(get_col(ColumnID::REF_IDX)),
+            static_cast<const float*>(get_col(ColumnID::BIT_SCORE)),
+            static_cast<const float*>(get_col(ColumnID::DAMAGE_SCORE)),
+            static_cast<const float*>(get_col(ColumnID::EVALUE_LOG10)),
+            static_cast<const uint16_t*>(get_col(ColumnID::DMG_K)),
+            static_cast<const uint16_t*>(get_col(ColumnID::DMG_M)),
+            static_cast<const float*>(get_col(ColumnID::DMG_LL_A)),
+            static_cast<const float*>(get_col(ColumnID::DMG_LL_M)),
+            static_cast<const uint16_t*>(get_col(ColumnID::IDENTITY_Q)),
+            static_cast<const uint16_t*>(get_col(ColumnID::ALN_LEN)),
+            static_cast<const uint16_t*>(get_col(ColumnID::QSTART)),
+            static_cast<const uint16_t*>(get_col(ColumnID::QEND)),
+            static_cast<const uint16_t*>(get_col(ColumnID::TSTART)),
+            static_cast<const uint16_t*>(get_col(ColumnID::TEND)),
+            static_cast<const uint16_t*>(get_col(ColumnID::TLEN)),
+            static_cast<const uint16_t*>(get_col(ColumnID::QLEN)),
+            static_cast<const uint16_t*>(get_col(ColumnID::MISMATCH)),
+            static_cast<const uint16_t*>(get_col(ColumnID::GAPOPEN))
         );
     }
 }
 
 std::string_view ColumnarIndexReader::get_qaln(uint32_t row_group, uint32_t row_in_group) const {
+    if (!has_alignment_strings()) return {};
+    if (row_group >= impl_->header->num_row_groups) return {};
     const char* base = static_cast<const char*>(impl_->data);
     const RowGroupMeta& rg = impl_->row_groups[row_group];
+    if (row_in_group >= rg.num_rows) return {};
 
     const auto& col = rg.columns[static_cast<size_t>(ColumnID::QALN)];
-    const uint32_t* offsets = reinterpret_cast<const uint32_t*>(base + col.offset);
+    const char* chunk_bytes = nullptr;
+    if (col.codec == Codec::NONE) {
+        chunk_bytes = base + col.offset;
+    } else {
+        struct QalnCache {
+            const void* impl_ptr = nullptr;
+            uint64_t chunk_offset = 0;
+            std::vector<char> data;
+        };
+        thread_local QalnCache cache;
+        if (cache.impl_ptr != impl_.get() || cache.chunk_offset != col.offset ||
+            cache.data.size() != static_cast<size_t>(col.uncompressed_size)) {
+            decompress_chunk_to_buffer(col, base + col.offset, cache.data);
+            cache.impl_ptr = impl_.get();
+            cache.chunk_offset = col.offset;
+        }
+        chunk_bytes = cache.data.data();
+    }
+
+    const size_t offsets_bytes = (static_cast<size_t>(rg.num_rows) + 1) * sizeof(uint32_t);
+    if (static_cast<size_t>(col.uncompressed_size) < offsets_bytes) return {};
+
+    const uint32_t* offsets = reinterpret_cast<const uint32_t*>(chunk_bytes);
     const char* data = reinterpret_cast<const char*>(offsets + rg.num_rows + 1);
 
     uint32_t start = offsets[row_in_group];
@@ -646,11 +1016,36 @@ std::string_view ColumnarIndexReader::get_qaln(uint32_t row_group, uint32_t row_
 }
 
 std::string_view ColumnarIndexReader::get_taln(uint32_t row_group, uint32_t row_in_group) const {
+    if (!has_alignment_strings()) return {};
+    if (row_group >= impl_->header->num_row_groups) return {};
     const char* base = static_cast<const char*>(impl_->data);
     const RowGroupMeta& rg = impl_->row_groups[row_group];
+    if (row_in_group >= rg.num_rows) return {};
 
     const auto& col = rg.columns[static_cast<size_t>(ColumnID::TALN)];
-    const uint32_t* offsets = reinterpret_cast<const uint32_t*>(base + col.offset);
+    const char* chunk_bytes = nullptr;
+    if (col.codec == Codec::NONE) {
+        chunk_bytes = base + col.offset;
+    } else {
+        struct TalnCache {
+            const void* impl_ptr = nullptr;
+            uint64_t chunk_offset = 0;
+            std::vector<char> data;
+        };
+        thread_local TalnCache cache;
+        if (cache.impl_ptr != impl_.get() || cache.chunk_offset != col.offset ||
+            cache.data.size() != static_cast<size_t>(col.uncompressed_size)) {
+            decompress_chunk_to_buffer(col, base + col.offset, cache.data);
+            cache.impl_ptr = impl_.get();
+            cache.chunk_offset = col.offset;
+        }
+        chunk_bytes = cache.data.data();
+    }
+
+    const size_t offsets_bytes = (static_cast<size_t>(rg.num_rows) + 1) * sizeof(uint32_t);
+    if (static_cast<size_t>(col.uncompressed_size) < offsets_bytes) return {};
+
+    const uint32_t* offsets = reinterpret_cast<const uint32_t*>(chunk_bytes);
     const char* data = reinterpret_cast<const char*>(offsets + rg.num_rows + 1);
 
     uint32_t start = offsets[row_in_group];
@@ -687,6 +1082,8 @@ struct FlatColumnarData {
     std::vector<uint32_t> ref_idx;
     std::vector<float> bit_score;
     std::vector<float> damage_score;
+    std::vector<float> dmg_ll_a;
+    std::vector<float> dmg_ll_m;
     std::vector<uint64_t> read_offsets;  // CSR offsets built from sorted read_idx
 
     void load(ColumnarIndexReader& reader) {
@@ -696,11 +1093,17 @@ struct FlatColumnarData {
         ref_idx.resize(n);
         bit_score.resize(n);
         damage_score.resize(n);
+        dmg_ll_a.resize(n);
+        dmg_ll_m.resize(n);
 
         reader.parallel_scan([&](
             uint32_t rg_idx, uint32_t num_rows,
             const uint32_t* rd_idx, const uint32_t* rf_idx,
             const float* b_score, const float* d_score, const float*,
+            const uint16_t*, const uint16_t*,
+            const float* ll_a, const float* ll_m,
+            const uint16_t*, const uint16_t*,
+            const uint16_t*, const uint16_t*,
             const uint16_t*, const uint16_t*,
             const uint16_t*, const uint16_t*,
             const uint16_t*, const uint16_t*)
@@ -712,41 +1115,64 @@ struct FlatColumnarData {
                 ref_idx[base + i] = rf_idx[i];
                 bit_score[base + i] = b_score[i];
                 damage_score[base + i] = d_score[i];
+                dmg_ll_a[base + i] = ll_a ? ll_a[i] : 0.0f;
+                dmg_ll_m[base + i] = ll_m ? ll_m[i] : 0.0f;
             }
         });
-
-        // Sort by (read_idx, bit_score DESC) so best hit per read comes first
-        std::vector<uint64_t> perm(n);
-        std::iota(perm.begin(), perm.end(), 0);
-        std::sort(perm.begin(), perm.end(), [&](uint64_t a, uint64_t b) {
-            if (read_idx[a] != read_idx[b]) return read_idx[a] < read_idx[b];
-            return bit_score[a] > bit_score[b];  // Descending by score
-        });
-
-        // Apply permutation to all columns
-        auto apply_perm = [&](auto& vec) {
-            using T = typename std::remove_reference<decltype(vec)>::type::value_type;
-            std::vector<T> temp(vec.size());
-            for (uint64_t i = 0; i < n; ++i) {
-                temp[i] = vec[perm[i]];
-            }
-            vec = std::move(temp);
-        };
-        apply_perm(read_idx);
-        apply_perm(ref_idx);
-        apply_perm(bit_score);
-        apply_perm(damage_score);
-
-        // Build CSR-style offsets from sorted read_idx
-        read_offsets.resize(num_reads + 1, 0);
-        for (uint64_t i = 0; i < n; ++i) {
-            if (read_idx[i] < num_reads) {
-                read_offsets[read_idx[i] + 1]++;
+        // Fast path for v3+ files that are guaranteed sorted by (read_idx, bit_score DESC).
+        bool already_sorted = reader.is_sorted_by_read_then_score();
+        if (already_sorted && n > 1) {
+            for (uint64_t i = 1; i < n; ++i) {
+                if (read_idx[i] < read_idx[i - 1] ||
+                    (read_idx[i] == read_idx[i - 1] && bit_score[i] > bit_score[i - 1])) {
+                    already_sorted = false;
+                    break;
+                }
             }
         }
-        // Prefix sum to get offsets
-        for (uint32_t r = 1; r <= num_reads; ++r) {
-            read_offsets[r] += read_offsets[r - 1];
+
+        if (!already_sorted) {
+            // Sort by (read_idx, bit_score DESC) so best hit per read comes first.
+            std::vector<uint64_t> perm(n);
+            std::iota(perm.begin(), perm.end(), 0);
+            std::sort(perm.begin(), perm.end(), [&](uint64_t a, uint64_t b) {
+                if (read_idx[a] != read_idx[b]) return read_idx[a] < read_idx[b];
+                return bit_score[a] > bit_score[b];  // Descending by score
+            });
+
+            // Apply permutation to all columns.
+            auto apply_perm = [&](auto& vec) {
+                using T = typename std::remove_reference<decltype(vec)>::type::value_type;
+                std::vector<T> temp(vec.size());
+                for (uint64_t i = 0; i < n; ++i) {
+                    temp[i] = vec[perm[i]];
+                }
+                vec = std::move(temp);
+            };
+            apply_perm(read_idx);
+            apply_perm(ref_idx);
+            apply_perm(bit_score);
+            apply_perm(damage_score);
+            apply_perm(dmg_ll_a);
+            apply_perm(dmg_ll_m);
+
+            // Build CSR-style offsets from sorted read_idx.
+            read_offsets.resize(num_reads + 1, 0);
+            for (uint64_t i = 0; i < n; ++i) {
+                if (read_idx[i] < num_reads) {
+                    read_offsets[read_idx[i] + 1]++;
+                }
+            }
+            for (uint32_t r = 1; r <= num_reads; ++r) {
+                read_offsets[r] += read_offsets[r - 1];
+            }
+            return;
+        }
+
+        // Reuse on-disk CSR directly for already-sorted files.
+        read_offsets.resize(num_reads + 1, 0);
+        for (uint32_t r = 0; r <= num_reads; ++r) {
+            read_offsets[r] = reader.read_offset(r);
         }
     }
 

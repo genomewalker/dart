@@ -1,6 +1,6 @@
 // agp damage-annotate: Post-mapping damage annotation
 //
-// Given MMseqs2 alignments (with qaln/taln), identifies amino acid positions
+// Given EMI alignments (with qaln/taln), identifies amino acid positions
 // where the query (observed protein) differs from the target (reference)
 // in a damage-consistent way. C->T deamination (5' end) and G->A (3' end)
 // cause specific amino acid substitution patterns that can be identified
@@ -12,8 +12,9 @@
 #include "agp/damage_index_reader.hpp"
 #include "agp/bayesian_damage_score.hpp"
 #include "agp/em_reassign.hpp"
+#include "agp/columnar_index.hpp"
+#include "agp/log_utils.hpp"
 #include "agp/mmap_array.hpp"
-#include "agp/reference_stats.hpp"
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -27,6 +28,16 @@
 #include <memory>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
+#include <string_view>
+#include <atomic>
+#include <mutex>
+#include <limits>
+#include <chrono>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace agp {
 namespace cli {
@@ -104,6 +115,23 @@ struct DamageLookup {
 
 static constexpr DamageLookup DAMAGE_LOOKUP{};
 
+// For opportunity counting in Bayesian scoring: which target AAs can be produced
+// by C->T or G->A damage in at least one codon context.
+struct DamageTargetClassLookup {
+    std::array<uint8_t, 128> class_mask;
+
+    constexpr DamageTargetClassLookup() : class_mask{} {
+        for (size_t i = 0; i < NUM_DAMAGE_SUBS; ++i) {
+            auto t = static_cast<unsigned char>(DAMAGE_SUBS[i].target_aa);
+            if (t >= 128) continue;
+            if (DAMAGE_SUBS[i].damage_class == 'C') class_mask[t] |= 0x1;
+            if (DAMAGE_SUBS[i].damage_class == 'G') class_mask[t] |= 0x2;
+        }
+    }
+};
+
+static constexpr DamageTargetClassLookup DAMAGE_TARGET_CLASSES{};
+
 static const DamageSubstitution* find_damage_sub(char target_aa, char query_aa) {
     auto t = static_cast<unsigned char>(target_aa);
     auto q = static_cast<unsigned char>(query_aa);
@@ -127,6 +155,7 @@ struct DamageSite {
 };
 
 struct ProteinDamageSummary {
+    uint32_t read_idx = 0;
     std::string query_id;
     std::string target_id;
     float evalue;
@@ -150,6 +179,11 @@ struct ProteinDamageSummary {
     // Per-read p_damaged from AGP predict (stored in AGD index)
     float p_read = 0.0f;        // Per-read damage probability from predict
     bool has_p_read = false;    // True if p_read was retrieved from index
+    // AA-level Bayesian evidence terms (derived from alignment + site calls)
+    uint32_t aa_m_opportunities = 0;
+    uint32_t aa_k_hits = 0;
+    float aa_sum_qA = 0.0f;
+    float aa_sum_log_qA_hits = 0.0f;
     // Stored for single-pass corrected output
     std::string qaln;
     std::string taln;
@@ -200,54 +234,9 @@ static float positional_damage_prob(size_t dist_from_terminus, float d_max, floa
     return d_max * std::exp(-lambda * static_cast<float>(dist_from_terminus));
 }
 
-// Manual tab-split: returns views into the line via start/end positions
-// Much faster than std::istringstream for millions of lines
-static size_t split_tabs(const std::string& line, size_t* starts, size_t* ends, size_t max_fields) {
-    size_t n = 0;
-    size_t pos = 0;
-    size_t len = line.size();
-    while (pos <= len && n < max_fields) {
-        starts[n] = pos;
-        size_t tab = line.find('\t', pos);
-        ends[n] = (tab != std::string::npos) ? tab : len;
-        n++;
-        pos = (tab != std::string::npos) ? tab + 1 : len + 1;
-    }
-    return n;
-}
-
-// Extract substring view helper
-static std::string field_str(const std::string& line, size_t start, size_t end) {
-    return line.substr(start, end - start);
-}
-
-// Compute combined damage score using noisy-OR model
-// P(ancient) = 1 - (1 - p_read) × (1 - p_nonsyn) × (1 - p_syn)
-//
-// All probabilities are sample-calibrated via d_max:
-// - p_read: from sample damage model (already calibrated)
-// - p_nonsyn: damage sites → probability, scaled by d_max
-// - p_syn: synonymous damage → weaker signal, scaled by d_max
-//
-// No magic weights - everything derived from sample's damage level.
-static float compute_combined_score(float p_read, size_t damage_sites, bool has_syn, float d_max) {
-    // p_nonsyn: probability that observed damage sites indicate ancient origin
-    // Uses saturation function: more sites = stronger evidence, caps at d_max
-    // p = d_max × (1 - exp(-0.5 × n)) where n = number of damage sites
-    // At n=1: p ≈ 0.39 × d_max, n=2: p ≈ 0.63 × d_max, n=3+: p → d_max
-    float p_nonsyn = damage_sites > 0
-        ? d_max * (1.0f - std::exp(-0.5f * static_cast<float>(damage_sites)))
-        : 0.0f;
-
-    // p_syn: synonymous damage is weaker evidence (doesn't change protein)
-    // but still indicates deamination occurred
-    float p_syn = has_syn ? (d_max * 0.5f) : 0.0f;
-
-    // Noisy-OR: each evidence source independently suggests ancient origin
-    // Combined probability = 1 - P(none of them indicate ancient)
-    float combined = 1.0f - (1.0f - p_read) * (1.0f - p_nonsyn) * (1.0f - p_syn);
-
-    return std::min(1.0f, std::max(0.0f, combined));
+static inline float evalue_from_log10(float evalue_log10) {
+    if (!std::isfinite(evalue_log10) || evalue_log10 <= -300.0f) return 0.0f;
+    return std::pow(10.0f, evalue_log10);
 }
 
 // Annotate a single alignment
@@ -258,11 +247,15 @@ static ProteinDamageSummary annotate_alignment(
     float evalue, float bits, float fident,
     float d_max, float lambda)
 {
+    constexpr float Q_BASELINE = 0.005f;
     char strand = parse_strand(query_id);
 
     std::vector<DamageSite> sites;
     size_t total_mismatches = 0;
-    size_t damage_consistent = 0;
+    uint32_t aa_m_opportunities = 0;
+    uint32_t aa_k_hits = 0;
+    float aa_sum_qA = 0.0f;
+    float aa_sum_log_qA_hits = 0.0f;
 
     size_t q_pos = qstart;  // 0-based
     size_t t_pos = tstart;
@@ -280,28 +273,38 @@ static ProteinDamageSummary annotate_alignment(
             continue;
         }
 
+        size_t dist_5 = 0;
+        size_t dist_3 = 0;
+        if (strand == '+') {
+            dist_5 = q_pos * 3;
+            dist_3 = (qlen > 0 && q_pos < qlen) ? (qlen - 1 - q_pos) * 3 : 0;
+        } else {
+            dist_5 = (qlen > 0 && q_pos < qlen) ? (qlen - 1 - q_pos) * 3 : 0;
+            dist_3 = q_pos * 3;
+        }
+
+        const auto t_code = static_cast<unsigned char>(t_aa);
+        const uint8_t class_mask = (t_code < 128) ? DAMAGE_TARGET_CLASSES.class_mask[t_code] : 0;
+        if (class_mask != 0) {
+            aa_m_opportunities++;
+            const float q_ct = (class_mask & 0x1) ? positional_damage_prob(dist_5, d_max, lambda) : 0.0f;
+            const float q_ga = (class_mask & 0x2) ? positional_damage_prob(dist_3, d_max, lambda) : 0.0f;
+            aa_sum_qA += std::max(q_ct, q_ga);
+        }
+
         if (q_aa != t_aa) {
             total_mismatches++;
 
             const DamageSubstitution* sub = find_damage_sub(t_aa, q_aa);
             if (sub) {
-                damage_consistent++;
-
-                size_t dist_5, dist_3;
-                if (strand == '+') {
-                    dist_5 = q_pos * 3;
-                    dist_3 = (qlen > 0 && q_pos < qlen) ? (qlen - 1 - q_pos) * 3 : 0;
-                } else {
-                    dist_5 = (qlen > 0 && q_pos < qlen) ? (qlen - 1 - q_pos) * 3 : 0;
-                    dist_3 = q_pos * 3;
-                }
-
                 float p_dmg;
                 if (sub->damage_class == 'C') {
                     p_dmg = positional_damage_prob(dist_5, d_max, lambda);
                 } else {
                     p_dmg = positional_damage_prob(dist_3, d_max, lambda);
                 }
+                aa_k_hits++;
+                aa_sum_log_qA_hits += std::log((p_dmg + Q_BASELINE) / Q_BASELINE);
 
                 sites.push_back({
                     query_id, target_id,
@@ -323,15 +326,10 @@ static ProteinDamageSummary annotate_alignment(
     // Use positional weighting for probability, but don't filter sites out
     // This improves recall while maintaining precision via scoring
 
-    // Two thresholds:
-    // - HIGH_CONF: Terminal sites with strong positional signal (for strict filtering)
-    // - LOW_CONF: All damage-consistent sites weighted by position (for scoring)
-    constexpr float HIGH_CONF_THRESHOLD = 0.05f;  // ~5% for high-confidence terminal
     constexpr float EMPIRICAL_PRECISION = 0.83f;   // Validated precision at terminal
     constexpr float INTERIOR_PRECISION = 0.40f;    // Estimated precision for interior sites
 
     size_t ct = 0, ga = 0, hc = 0;
-    size_t terminal_damage = 0;  // Sites with p_damage >= HIGH_CONF_THRESHOLD
     float max_p_damage = 0.0f;
     float log_odds_sum = 0.0f;   // Log-odds accumulator for scoring
 
@@ -340,11 +338,6 @@ static ProteinDamageSummary annotate_alignment(
         else ga++;
         if (s.high_confidence) hc++;
         if (s.p_damage > max_p_damage) max_p_damage = s.p_damage;
-
-        // Count high-confidence terminal sites separately
-        if (s.p_damage >= HIGH_CONF_THRESHOLD) {
-            terminal_damage++;
-        }
 
         // Weighted scoring: all sites contribute based on position
         // Higher p_damage → more likely true damage → stronger evidence
@@ -358,9 +351,8 @@ static ProteinDamageSummary annotate_alignment(
         log_odds_sum += std::log(odds);
     }
 
-    // p_damaged: sigmoid of accumulated log-odds
-    // With no sites: p_damaged = 0.5 (prior)
-    // With positive evidence: p_damaged > 0.5
+    // p_damaged: sigmoid of accumulated log-odds.
+    // With no compatible sites: 0.0 (no AA-level evidence).
     float p_damaged = 0.0f;
     if (!sites.empty()) {
         // Normalize by number of sites and apply sigmoid
@@ -372,22 +364,65 @@ static ProteinDamageSummary annotate_alignment(
     // terminal_damage is the subset with high p_damage
     size_t all_damage_consistent = sites.size();
 
-    return {
-        query_id, target_id,
-        evalue, bits, fident,
-        qaln.size(),
-        total_mismatches,
-        all_damage_consistent,  // ALL damage-consistent sites (improved recall)
-        total_mismatches - all_damage_consistent,
-        ct, ga, hc,
-        total_mismatches > 0
-            ? static_cast<float>(all_damage_consistent) / static_cast<float>(total_mismatches)
-            : 0.0f,
-        max_p_damage,
-        p_damaged,
-        std::move(sites),
-        {}, {}, 0  // qaln/taln/qstart_0 filled by caller if needed
-    };
+    ProteinDamageSummary out{};
+    out.read_idx = 0;
+    out.query_id = query_id;
+    out.target_id = target_id;
+    out.evalue = evalue;
+    out.bits = bits;
+    out.fident = fident;
+    out.alnlen = qaln.size();
+    out.total_mismatches = total_mismatches;
+    out.damage_consistent = all_damage_consistent;
+    out.non_damage_mismatches = total_mismatches - all_damage_consistent;
+    out.ct_sites = ct;
+    out.ga_sites = ga;
+    out.high_conf_sites = hc;
+    out.damage_fraction = total_mismatches > 0
+        ? static_cast<float>(all_damage_consistent) / static_cast<float>(total_mismatches)
+        : 0.0f;
+    out.max_p_damage = max_p_damage;
+    out.p_damaged = p_damaged;
+    out.sites = std::move(sites);
+    out.aa_m_opportunities = aa_m_opportunities;
+    out.aa_k_hits = aa_k_hits;
+    out.aa_sum_qA = aa_sum_qA;
+    out.aa_sum_log_qA_hits = aa_sum_log_qA_hits;
+    return out;
+}
+
+static void recompute_summary_site_metrics(ProteinDamageSummary& summary) {
+    constexpr float Q_BASELINE = 0.005f;
+    constexpr float EMPIRICAL_PRECISION = 0.83f;
+    constexpr float INTERIOR_PRECISION = 0.40f;
+    float log_odds_sum = 0.0f;
+    summary.ct_sites = 0;
+    summary.ga_sites = 0;
+    summary.high_conf_sites = 0;
+    summary.max_p_damage = 0.0f;
+    summary.aa_k_hits = 0;
+    summary.aa_sum_log_qA_hits = 0.0f;
+
+    for (const auto& s : summary.sites) {
+        if (s.damage_class == 'C') summary.ct_sites++;
+        else summary.ga_sites++;
+        if (s.high_confidence) summary.high_conf_sites++;
+        summary.max_p_damage = std::max(summary.max_p_damage, s.p_damage);
+        summary.aa_k_hits++;
+        summary.aa_sum_log_qA_hits += std::log((s.p_damage + Q_BASELINE) / Q_BASELINE);
+
+        float p_true_damage = EMPIRICAL_PRECISION * s.p_damage +
+                              INTERIOR_PRECISION * (1.0f - s.p_damage);
+        float odds = p_true_damage / (1.0f - p_true_damage + 1e-6f);
+        log_odds_sum += std::log(odds);
+    }
+
+    if (!summary.sites.empty()) {
+        float avg_log_odds = log_odds_sum / static_cast<float>(summary.sites.size());
+        summary.p_damaged = 1.0f / (1.0f + std::exp(-avg_log_odds));
+    } else {
+        summary.p_damaged = 0.0f;
+    }
 }
 
 // Filter sites by distance from relevant terminus
@@ -404,14 +439,7 @@ static void filter_sites_by_distance(ProteinDamageSummary& summary, int max_dist
 
     summary.sites = std::move(filtered);
     summary.damage_consistent = summary.sites.size();
-    summary.ct_sites = 0;
-    summary.ga_sites = 0;
-    summary.high_conf_sites = 0;
-    for (const auto& s : summary.sites) {
-        if (s.damage_class == 'C') summary.ct_sites++;
-        else summary.ga_sites++;
-        if (s.high_confidence) summary.high_conf_sites++;
-    }
+    recompute_summary_site_metrics(summary);
     summary.non_damage_mismatches = summary.total_mismatches - summary.damage_consistent;
     summary.damage_fraction = summary.total_mismatches > 0
         ? static_cast<float>(summary.damage_consistent) / static_cast<float>(summary.total_mismatches)
@@ -461,8 +489,11 @@ static std::string generate_corrected_protein(
 // Per-protein aggregated damage summary
 struct ProteinAggregate {
     std::string protein_id;
-    size_t n_reads = 0;           // Total reads mapping to this protein
-    size_t n_damaged = 0;         // Reads with damage detected (p_damaged > 0)
+    uint32_t tlen = 0;            // Target length (AA)
+    size_t n_reads = 0;           // Total assigned reads mapping to this protein
+    double n_reads_eff = 0.0;     // EM-effective assigned reads (sum gamma)
+    size_t n_damage_reads = 0;    // Assigned reads with mismatch evidence
+    size_t n_damaged = 0;         // Damage-evidence reads with p_damaged > 0.5
     size_t total_damage_sites = 0; // Sum of damage_consistent across reads
     size_t terminal_5 = 0;        // C→T sites at 5' end (first 3 codons)
     size_t terminal_3 = 0;        // G→A sites at 3' end (first 3 codons)
@@ -476,6 +507,62 @@ struct ProteinAggregate {
     float sum_delta_bits = 0.0f;
     float sum_bpa = 0.0f;
     std::array<uint32_t, 4> length_bin_counts{};  // per-bin read counts
+
+    // Mapping-pattern aggregates for spurious-hit filtering
+    std::unordered_set<uint32_t> unique_starts;
+    uint32_t min_start = UINT32_MAX;
+    uint32_t max_start = 0;
+    double terminal_cov = 0.0;  // Alignment overlap in terminal windows
+    double middle_cov = 0.0;    // Alignment overlap in middle region
+    double sum_aln_len = 0.0;
+    double sum_aln_len_sq = 0.0;
+
+    float start_diversity() const {
+        if (n_reads == 0 || tlen == 0) return 0.0f;
+        const uint32_t max_possible = std::min<uint32_t>(static_cast<uint32_t>(n_reads), tlen);
+        if (max_possible == 0) return 0.0f;
+        return static_cast<float>(unique_starts.size()) / static_cast<float>(max_possible);
+    }
+
+    float start_span() const {
+        if (tlen == 0 || min_start > max_start) return 0.0f;
+        return static_cast<float>(max_start - min_start + 1) / static_cast<float>(tlen);
+    }
+
+    float positional_score() const {
+        return std::sqrt(start_diversity() * start_span());
+    }
+
+    float terminal_middle_ratio() const {
+        if (tlen == 0) return 0.0f;
+        size_t edge = std::max<size_t>(1, static_cast<size_t>(tlen) / 10);
+        edge = std::min(edge, static_cast<size_t>(tlen) / 2);
+        if (edge == 0) return 0.0f;
+        const size_t term_len = 2 * edge;
+        const size_t mid_len = (static_cast<size_t>(tlen) > term_len)
+            ? (static_cast<size_t>(tlen) - term_len)
+            : 0;
+        const double term_mean = terminal_cov / static_cast<double>(term_len);
+        if (mid_len == 0) {
+            return term_mean > 0.0 ? std::numeric_limits<float>::infinity() : 0.0f;
+        }
+        const double mid_mean = middle_cov / static_cast<double>(mid_len);
+        if (mid_mean <= 0.0) {
+            return term_mean > 0.0 ? std::numeric_limits<float>::infinity() : 0.0f;
+        }
+        return static_cast<float>(term_mean / mid_mean);
+    }
+
+    float avg_aln_len() const {
+        return n_reads > 0 ? static_cast<float>(sum_aln_len / static_cast<double>(n_reads)) : 0.0f;
+    }
+
+    float std_aln_len() const {
+        if (n_reads <= 1) return 0.0f;
+        const double mean = sum_aln_len / static_cast<double>(n_reads);
+        const double var = std::max(0.0, (sum_aln_len_sq / static_cast<double>(n_reads)) - (mean * mean));
+        return static_cast<float>(std::sqrt(var));
+    }
 };
 
 // Wilson score confidence interval for binomial proportion
@@ -490,20 +577,47 @@ inline std::pair<float, float> wilson_ci(uint32_t successes, uint32_t n, float z
     return {std::max(0.0f, center - margin), std::min(1.0f, center + margin)};
 }
 
+// Wilson score interval for effective (possibly fractional) counts.
+inline std::pair<float, float> wilson_ci_effective(double successes, double n, float z = 1.96f) {
+    if (n <= 0.0) return {0.0f, 0.0f};
+    successes = std::clamp(successes, 0.0, n);
+    const double p = successes / n;
+    const double z2 = static_cast<double>(z) * static_cast<double>(z);
+    const double denom = 1.0 + z2 / n;
+    const double center = (p + z2 / (2.0 * n)) / denom;
+    const double margin = (static_cast<double>(z) / denom) *
+        std::sqrt((p * (1.0 - p) + z2 / (4.0 * n)) / n);
+    return {
+        static_cast<float>(std::max(0.0, center - margin)),
+        static_cast<float>(std::min(1.0, center + margin))
+    };
+}
+
+// In-place quantile via nth_element. q is in [0, 1].
+inline float quantile_inplace(std::vector<float>& values, double q) {
+    if (values.empty()) return 0.0f;
+    const double qc = std::clamp(q, 0.0, 1.0);
+    const size_t idx = static_cast<size_t>(qc * static_cast<double>(values.size() - 1));
+    std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(idx), values.end());
+    return values[idx];
+}
+
 // Per-gene accumulator for functional profiling
 // Aggregates read-level damage annotations into gene-level summaries
 // Supports both best-hit (gamma=1.0) and EM-weighted (gamma<1.0) modes
 struct GeneSummaryAccumulator {
     std::string target_id;
     uint32_t tlen = 0;
-    uint32_t n_reads = 0;           // Actual read count
-    double n_reads_eff = 0.0;       // Effective reads (sum of gamma weights)
-    double n_ancient_conf = 0.0;    // Gamma-weighted ancient confident
-    double n_ancient_likely = 0.0;  // Gamma-weighted ancient likely
-    double n_undetermined = 0.0;    // Gamma-weighted undetermined
-    double n_modern_conf = 0.0;     // Gamma-weighted modern confident
-    double sum_posterior = 0.0;
-    double sum_fident = 0.0;
+    uint32_t n_reads = 0;             // Assigned read count
+    double n_reads_eff = 0.0;         // Effective assigned reads (sum of gamma)
+    uint32_t n_damage_reads = 0;      // Assigned reads with mismatch evidence
+    double n_damage_reads_eff = 0.0;  // Effective mismatch-evidence reads (sum gamma)
+    double n_ancient_conf = 0.0;      // Gamma-weighted ancient confident (damage-evidence reads)
+    double n_ancient_likely = 0.0;    // Gamma-weighted ancient likely (damage-evidence reads)
+    double n_undetermined = 0.0;      // Gamma-weighted undetermined (damage-evidence reads)
+    double n_modern_conf = 0.0;       // Gamma-weighted modern confident (damage-evidence reads)
+    double sum_posterior = 0.0;       // Gamma-weighted posterior over damage-evidence reads
+    double sum_fident = 0.0;          // Gamma-weighted identity over assigned reads
     double sum_aln_len = 0.0;       // Sum of alignment lengths (for avg)
     double sum_aln_len_sq = 0.0;    // Sum of squared aln lengths (for std)
     std::vector<float> coverage;    // Per-position coverage depth (gamma-weighted)
@@ -511,12 +625,11 @@ struct GeneSummaryAccumulator {
     uint32_t min_start = UINT32_MAX;
     uint32_t max_start = 0;
 
-    // Add read with EM weight (gamma). For best-hit mode, gamma=1.0
-    void add_read(AncientClassification cls, float posterior, float fident,
-                  size_t tstart, size_t aln_len_on_target, float gamma = 1.0f) {
+    // Add assigned read with EM weight (gamma). For best-hit mode, gamma=1.0.
+    void add_assignment(float fident, size_t tstart, size_t aln_len_on_target,
+                        float gamma = 1.0f) {
         ++n_reads;
         n_reads_eff += gamma;
-        sum_posterior += gamma * posterior;
         sum_fident += gamma * fident;
         sum_aln_len += gamma * aln_len_on_target;
         sum_aln_len_sq += gamma * aln_len_on_target * aln_len_on_target;
@@ -527,14 +640,6 @@ struct GeneSummaryAccumulator {
         if (start32 < min_start) min_start = start32;
         if (start32 > max_start) max_start = start32;
 
-        // Gamma-weighted classification counts
-        switch (cls) {
-            case AncientClassification::AncientConfident: n_ancient_conf += gamma; break;
-            case AncientClassification::AncientLikely:    n_ancient_likely += gamma; break;
-            case AncientClassification::Undetermined:     n_undetermined += gamma; break;
-            case AncientClassification::ModernConfident:  n_modern_conf += gamma; break;
-        }
-
         // Update per-position coverage with gamma weight
         if (tlen > 0 && coverage.empty()) {
             coverage.resize(tlen, 0.0f);
@@ -542,6 +647,20 @@ struct GeneSummaryAccumulator {
         size_t end = std::min(tstart + aln_len_on_target, static_cast<size_t>(tlen));
         for (size_t p = tstart; p < end; ++p) {
             coverage[p] += gamma;  // Gamma-weighted coverage
+        }
+    }
+
+    // Add damage-evidence observation for classification/posterior summaries.
+    void add_damage_observation(AncientClassification cls, float posterior, float gamma = 1.0f) {
+        ++n_damage_reads;
+        n_damage_reads_eff += gamma;
+        sum_posterior += gamma * posterior;
+
+        switch (cls) {
+            case AncientClassification::AncientConfident: n_ancient_conf += gamma; break;
+            case AncientClassification::AncientLikely:    n_ancient_likely += gamma; break;
+            case AncientClassification::Undetermined:     n_undetermined += gamma; break;
+            case AncientClassification::ModernConfident:  n_modern_conf += gamma; break;
         }
     }
 
@@ -621,13 +740,48 @@ struct GeneSummaryAccumulator {
         return std::sqrt(start_diversity() * start_span());
     }
 
+    // Terminal/middle coverage ratio.
+    // Low values indicate reads concentrated in the middle (typical spurious motif hits).
+    float terminal_middle_ratio() const {
+        if (coverage.empty()) return 0.0f;
+        const size_t n = coverage.size();
+        size_t edge = std::max<size_t>(1, n / 10);
+        edge = std::min(edge, n / 2);
+        if (edge == 0) return 0.0f;
+
+        double term_sum = 0.0;
+        double mid_sum = 0.0;
+        size_t term_n = 0;
+        size_t mid_n = 0;
+        for (size_t i = 0; i < n; ++i) {
+            if (i < edge || i >= n - edge) {
+                term_sum += coverage[i];
+                ++term_n;
+            } else {
+                mid_sum += coverage[i];
+                ++mid_n;
+            }
+        }
+
+        if (term_n == 0) return 0.0f;
+        const double term_mean = term_sum / static_cast<double>(term_n);
+        if (mid_n == 0) {
+            return term_mean > 0.0 ? std::numeric_limits<float>::infinity() : 0.0f;
+        }
+        const double mid_mean = mid_sum / static_cast<double>(mid_n);
+        if (mid_mean <= 0.0) {
+            return term_mean > 0.0 ? std::numeric_limits<float>::infinity() : 0.0f;
+        }
+        return static_cast<float>(term_mean / mid_mean);
+    }
+
     // Effective read count (sum of gamma weights)
     float eff_reads() const {
         return static_cast<float>(n_reads_eff);
     }
 
     float avg_posterior() const {
-        return n_reads_eff > 0 ? static_cast<float>(sum_posterior / n_reads_eff) : 0.0f;
+        return n_damage_reads_eff > 0 ? static_cast<float>(sum_posterior / n_damage_reads_eff) : 0.0f;
     }
 
     float avg_fident() const {
@@ -644,8 +798,9 @@ struct GeneSummaryAccumulator {
 // Functional profiling accumulator
 struct FunctionalAccumulator {
     std::string function_id;
-    std::string db_type;  // "KEGG", "CAZyme", "Viral"
+    std::string db_type;  // e.g. "MAP" (generic mapping source)
     uint32_t n_genes = 0;
+    uint32_t n_damaged_genes = 0;  // Genes with mean posterior >= threshold
     uint32_t n_reads = 0;
     float n_ancient = 0.0f;  // Can be fractional from EM
     float n_modern = 0.0f;
@@ -653,8 +808,10 @@ struct FunctionalAccumulator {
     double sum_posterior = 0.0;
 
     void add_gene(uint32_t gene_reads, float gene_ancient, float gene_modern,
-                  float gene_undetermined, float gene_mean_posterior) {
+                  float gene_undetermined, float gene_mean_posterior,
+                  bool gene_is_damaged) {
         ++n_genes;
+        if (gene_is_damaged) ++n_damaged_genes;
         n_reads += gene_reads;
         n_ancient += gene_ancient;
         n_modern += gene_modern;
@@ -669,6 +826,10 @@ struct FunctionalAccumulator {
 
     float mean_posterior() const {
         return n_reads > 0 ? static_cast<float>(sum_posterior / n_reads) : 0.0f;
+    }
+
+    float damaged_gene_frac() const {
+        return n_genes > 0 ? static_cast<float>(n_damaged_genes) / static_cast<float>(n_genes) : 0.0f;
     }
 };
 
@@ -713,19 +874,6 @@ static std::unordered_map<std::string, std::string> load_mapping_file(
         std::cerr << "Loaded " << mapping.size() << " mappings from " << path << "\n";
     }
     return mapping;
-}
-
-// Extract CAZyme class from family (e.g., "GH13" -> "GH", "GT2" -> "GT")
-static std::string cazyme_class_from_family(const std::string& family) {
-    std::string cls;
-    for (char c : family) {
-        if (std::isalpha(c)) {
-            cls += c;
-        } else {
-            break;  // Stop at first non-alpha (digit)
-        }
-    }
-    return cls;
 }
 
 // Estimate d_max from alignment mismatches (first pass)
@@ -790,14 +938,23 @@ static void count_damage_for_estimate(
 }
 
 int cmd_damage_annotate(int argc, char* argv[]) {
-    std::string hits_file;
+    const auto run_start = std::chrono::steady_clock::now();
+    std::string emi_file;
     std::string output_file;
     std::string sites_file;
     std::string corrected_file;
     std::string protein_summary_file;  // Per-protein aggregation
+    std::string protein_filtered_file; // Per-protein filtered subset
+    std::string combined_output_file;  // Combined per-target protein+gene summary
+    std::string blast8_unique_file;    // BLAST8-like export with unique mappers only
+    std::string analysis_prefix;       // Output bundle prefix
+    std::string analysis_proteins_file;   // Explicit name for analysis proteins output
+    std::string analysis_blast8_file;     // Explicit name for analysis blast8 unique output
+    std::string analysis_categories_file; // Explicit name for analysis categories output
     std::string damage_index_file;     // Binary damage index from predict
     float d_max = -1.0f;  // -1 means "estimate from data"
     float lambda = 0.3f;
+    bool lambda_set_by_user = false;
     int max_dist = -1;
     std::string lib_type = "auto";    // ss, ds, or auto-detect
     float threshold = 0.7f;           // Classification threshold for is_damaged
@@ -811,32 +968,36 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     uint32_t min_reads = 3;
     float min_positional_score = 0.0f;
     float min_terminal_ratio = 0.0f;
+    bool auto_calibrate_spurious = false;  // Auto-derive thresholds from data
 
-    // EM reassignment options
-    bool use_em = false;
+    // EM reassignment options (enabled by default for abundance estimation)
+    bool use_em = true;
     uint32_t em_max_iters = 100;
     double em_lambda_b = 3.0;
     double em_tol = 1e-4;
+    double em_min_prob = 1e-6;       // absolute posterior threshold for keeping alignment
+    double em_prob_fraction = 0.3;   // keep if gamma >= fraction * read_max_gamma
 
     // Alignment-level pre-filters (applied before any processing)
     float aln_min_identity = 0.0f;   // 0 = no filter
     float aln_min_bits = 0.0f;       // 0 = no filter
     float aln_max_evalue = 1e10f;    // very large = no filter
+    int threads = 0;                 // 0 = OpenMP runtime default
 
     // Functional profiling options
-    std::string kegg_map_file;       // gene_id -> KO mapping
-    std::string cazyme_map_file;     // gene_id -> CAZyme family mapping
-    std::string viral_map_file;      // gene_id -> VOG mapping
+    std::string map_file;            // gene_id -> group mapping
     std::string functional_summary_file;  // Output: per-function stats
-    std::string anvio_ko_file;       // Output: Anvi'o-compatible KO abundance
+    std::string anvio_ko_file;       // Output: Anvi'o-compatible grouped abundance
+    std::string annotation_source = "AGP";
 
     for (int i = 1; i < argc; ++i) {
-        if ((strcmp(argv[i], "--hits") == 0 || strcmp(argv[i], "-i") == 0) && i + 1 < argc) {
-            hits_file = argv[++i];
+        if ((strcmp(argv[i], "--emi") == 0 || strcmp(argv[i], "-i") == 0) && i + 1 < argc) {
+            emi_file = argv[++i];
         } else if (strcmp(argv[i], "--d-max") == 0 && i + 1 < argc) {
             d_max = std::stof(argv[++i]);
         } else if (strcmp(argv[i], "--lambda") == 0 && i + 1 < argc) {
             lambda = std::stof(argv[++i]);
+            lambda_set_by_user = true;
         } else if (strcmp(argv[i], "--max-dist") == 0 && i + 1 < argc) {
             max_dist = std::stoi(argv[++i]);
         } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
@@ -847,6 +1008,20 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             corrected_file = argv[++i];
         } else if (strcmp(argv[i], "--protein-summary") == 0 && i + 1 < argc) {
             protein_summary_file = argv[++i];
+        } else if (strcmp(argv[i], "--protein-filtered") == 0 && i + 1 < argc) {
+            protein_filtered_file = argv[++i];
+        } else if (strcmp(argv[i], "--combined-output") == 0 && i + 1 < argc) {
+            combined_output_file = argv[++i];
+        } else if (strcmp(argv[i], "--blast8-unique") == 0 && i + 1 < argc) {
+            blast8_unique_file = argv[++i];
+        } else if (strcmp(argv[i], "--analysis-prefix") == 0 && i + 1 < argc) {
+            analysis_prefix = argv[++i];
+        } else if (strcmp(argv[i], "--analysis-proteins") == 0 && i + 1 < argc) {
+            analysis_proteins_file = argv[++i];
+        } else if (strcmp(argv[i], "--analysis-blast8") == 0 && i + 1 < argc) {
+            analysis_blast8_file = argv[++i];
+        } else if (strcmp(argv[i], "--analysis-categories") == 0 && i + 1 < argc) {
+            analysis_categories_file = argv[++i];
         } else if ((strcmp(argv[i], "--library-type") == 0 || strcmp(argv[i], "--lib-type") == 0) && i + 1 < argc) {
             lib_type = argv[++i];
         } else if (strcmp(argv[i], "--damage-index") == 0 && i + 1 < argc) {
@@ -861,12 +1036,18 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             use_identity = false;
         } else if (strcmp(argv[i], "--em") == 0) {
             use_em = true;
+        } else if (strcmp(argv[i], "--no-em") == 0) {
+            use_em = false;
         } else if (strcmp(argv[i], "--em-iters") == 0 && i + 1 < argc) {
             em_max_iters = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (strcmp(argv[i], "--em-lambda") == 0 && i + 1 < argc) {
             em_lambda_b = std::stod(argv[++i]);
         } else if (strcmp(argv[i], "--em-tol") == 0 && i + 1 < argc) {
             em_tol = std::stod(argv[++i]);
+        } else if (strcmp(argv[i], "--em-min-prob") == 0 && i + 1 < argc) {
+            em_min_prob = std::stod(argv[++i]);
+        } else if (strcmp(argv[i], "--em-prob-fraction") == 0 && i + 1 < argc) {
+            em_prob_fraction = std::stod(argv[++i]);
         } else if (strcmp(argv[i], "--gene-summary") == 0 && i + 1 < argc) {
             gene_summary_file = argv[++i];
         } else if (strcmp(argv[i], "--min-breadth") == 0 && i + 1 < argc) {
@@ -879,132 +1060,169 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             min_positional_score = std::stof(argv[++i]);
         } else if (strcmp(argv[i], "--min-terminal-ratio") == 0 && i + 1 < argc) {
             min_terminal_ratio = std::stof(argv[++i]);
+        } else if (strcmp(argv[i], "--auto-calibrate-spurious") == 0) {
+            auto_calibrate_spurious = true;
         } else if (strcmp(argv[i], "--aln-min-identity") == 0 && i + 1 < argc) {
             aln_min_identity = std::stof(argv[++i]);
         } else if (strcmp(argv[i], "--aln-min-bits") == 0 && i + 1 < argc) {
             aln_min_bits = std::stof(argv[++i]);
         } else if (strcmp(argv[i], "--aln-max-evalue") == 0 && i + 1 < argc) {
             aln_max_evalue = std::stof(argv[++i]);
-        } else if (strcmp(argv[i], "--kegg-map") == 0 && i + 1 < argc) {
-            kegg_map_file = argv[++i];
-        } else if (strcmp(argv[i], "--cazyme-map") == 0 && i + 1 < argc) {
-            cazyme_map_file = argv[++i];
-        } else if (strcmp(argv[i], "--viral-map") == 0 && i + 1 < argc) {
-            viral_map_file = argv[++i];
+        } else if ((strcmp(argv[i], "--threads") == 0 || strcmp(argv[i], "-t") == 0) && i + 1 < argc) {
+            threads = std::stoi(argv[++i]);
+            if (threads < 1) {
+                std::cerr << "Error: --threads must be >= 1\n";
+                return 1;
+            }
+        } else if (strcmp(argv[i], "--map") == 0 && i + 1 < argc) {
+            map_file = argv[++i];
         } else if (strcmp(argv[i], "--functional-summary") == 0 && i + 1 < argc) {
             functional_summary_file = argv[++i];
         } else if (strcmp(argv[i], "--anvio-ko") == 0 && i + 1 < argc) {
             anvio_ko_file = argv[++i];
+        } else if (strcmp(argv[i], "--annotation-source") == 0 && i + 1 < argc) {
+            annotation_source = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            std::cerr << "Usage: agp damage-annotate --hits <results.tsv> [options]\n\n";
-            std::cerr << "Post-mapping damage annotation using MMseqs2 alignments.\n";
-            std::cerr << "Compares observed proteins against reference proteins to identify\n";
-            std::cerr << "damage-consistent amino acid substitutions with ~90% precision.\n\n";
-            std::cerr << "Required:\n";
-            std::cerr << "  --hits, -i FILE   MMseqs2 results TSV with qaln/taln columns\n\n";
-            std::cerr << "Options:\n";
-            std::cerr << "  --d-max RATE      Override damage rate (default: estimated from data)\n";
-            std::cerr << "  --lambda FLOAT    Decay constant (default: 0.3)\n";
-            std::cerr << "  --max-dist INT    Positional filter: max nt from relevant terminus (-1=off)\n";
-            std::cerr << "  -o FILE           Per-read damage summary TSV (default: stdout)\n";
-            std::cerr << "  --protein-summary FILE  Per-protein aggregated damage TSV\n";
-            std::cerr << "  --library-type TYPE     Library type: ss, ds, or auto (default: auto)\n";
-            std::cerr << "  --sites FILE      Per-site damage calls TSV\n";
-            std::cerr << "  --corrected FILE  Reference-guided corrected proteins FASTA\n";
-            std::cerr << "  --damage-index FILE  Binary damage index (.agd) from predict\n";
-            std::cerr << "                       Enables synonymous damage detection\n";
-            std::cerr << "  --threshold FLOAT Damage classification threshold (default: 0.7)\n";
-            std::cerr << "                       Adds is_damaged column (1 if combined_score >= threshold)\n";
-            std::cerr << "  --no-identity     Disable identity evidence (enabled by default)\n";
-            std::cerr << "  -v                Verbose output\n\n";
-            std::cerr << "Gene summary (per-gene aggregation, works with or without --em):\n";
-            std::cerr << "  --gene-summary FILE  Per-gene statistics TSV\n";
-            std::cerr << "  --min-breadth FLOAT  Minimum breadth filter (default: 0.1)\n";
-            std::cerr << "  --min-depth FLOAT    Minimum depth filter (default: 0.5)\n";
-            std::cerr << "  --min-reads INT      Minimum read count (default: 3)\n\n";
-            std::cerr << "Functional profiling (requires --gene-summary):\n";
-            std::cerr << "  --kegg-map FILE      Gene-to-KO mapping TSV (gene_id<TAB>KO)\n";
-            std::cerr << "  --cazyme-map FILE    Gene-to-CAZyme family mapping TSV\n";
-            std::cerr << "  --viral-map FILE     Gene-to-VOG mapping TSV\n";
-            std::cerr << "  --functional-summary FILE  Per-function stats TSV\n";
-            std::cerr << "  --anvio-ko FILE      Gene-level KO abundance for anvi-estimate-metabolism\n\n";
-            std::cerr << "EM reassignment (multi-mapping resolution):\n";
-            std::cerr << "  --em              Enable EM multi-mapping resolution\n";
-            std::cerr << "  --em-iters INT    Max EM iterations (default: 100)\n";
-            std::cerr << "  --em-lambda FLOAT Temperature parameter (default: 3.0)\n";
-            std::cerr << "  --em-tol FLOAT    Convergence tolerance (default: 1e-4)\n";
-            std::cerr << "  --min-positional-score FLOAT  Min read start diversity (default: 0)\n";
-            std::cerr << "                       Filters spurious matches where all reads hit same position\n";
-            std::cerr << "                       Score = sqrt(diversity * span), range 0-1\n";
-            std::cerr << "  --min-terminal-ratio FLOAT  Min terminal/middle coverage ratio (default: 0)\n";
-            std::cerr << "                       Filters matches with reads only in middle (spurious motif)\n\n";
-            std::cerr << "Alignment-level pre-filters (applied before any processing):\n";
-            std::cerr << "  --aln-min-identity FLOAT  Min identity fraction (default: 0, no filter)\n";
-            std::cerr << "  --aln-min-bits FLOAT      Min bit score (default: 0, no filter)\n";
-            std::cerr << "  --aln-max-evalue FLOAT    Max e-value (default: 1e10, no filter)\n\n";
-            std::cerr << "MMseqs2 format (16 columns with qaln/taln):\n";
-            std::cerr << "  --format-output \"query,target,fident,alnlen,mismatch,gapopen,\n";
-            std::cerr << "                   qstart,qend,tstart,tend,evalue,bits,qlen,tlen,qaln,taln\"\n";
+            std::cout << "Usage: agp damage-annotate --emi <hits.emi> [options]\n\n";
+            std::cout << "Post-mapping damage annotation using EMI alignments.\n";
+            std::cout << "Compares observed proteins against reference proteins to identify\n";
+            std::cout << "damage-consistent amino acid substitutions with ~90% precision.\n\n";
+            std::cout << "Required:\n";
+            std::cout << "  --emi, -i FILE    EMI v5 index with qaln/taln + damage evidence columns\n\n";
+            std::cout << "Options:\n";
+            std::cout << "  --d-max RATE      Override damage rate (default: estimated from data)\n";
+            std::cout << "  --lambda FLOAT    Decay constant (default: 0.3)\n";
+            std::cout << "  --max-dist INT    Positional filter: max nt from relevant terminus (-1=off)\n";
+            std::cout << "  -o FILE           Per-read damage summary TSV (default: stdout)\n";
+            std::cout << "  --protein-summary FILE  Per-protein aggregated damage TSV\n";
+            std::cout << "  --protein-filtered FILE Per-protein filtered subset TSV\n";
+            std::cout << "  --combined-output FILE  Per-target combined protein+gene summary TSV\n";
+            std::cout << "  --blast8-unique FILE  BLAST8-like hits for unique mappers only\n";
+            std::cout << "  --analysis-prefix STR  Output prefix: <STR>.reads.tsv, <STR>.protein.tsv,\n";
+            std::cout << "                         <STR>.blast8.unique.tsv, and <STR>.categories.tsv when --map is provided\n";
+            std::cout << "  --analysis-proteins FILE   Proteins output file\n";
+            std::cout << "  --analysis-blast8 FILE     Unique BLAST8 output file\n";
+            std::cout << "  --analysis-categories FILE Categories output file\n";
+            std::cout << "  --library-type TYPE     Library type: ss, ds, or auto (default: auto)\n";
+            std::cout << "  --sites FILE      Per-site damage calls TSV\n";
+            std::cout << "  --corrected FILE  Reference-guided corrected proteins FASTA\n";
+            std::cout << "  --damage-index FILE  Binary damage index (.agd) from predict\n";
+            std::cout << "                       Enables synonymous damage detection\n";
+            std::cout << "  --threshold FLOAT Damage classification threshold (default: 0.7)\n";
+            std::cout << "                       Adds is_damaged column (1 if posterior >= threshold)\n";
+            std::cout << "  --no-identity     Disable identity evidence (enabled by default)\n";
+            std::cout << "  -v                Verbose output\n\n";
+            std::cout << "Gene summary (per-gene aggregation, works with or without --em):\n";
+            std::cout << "  --gene-summary FILE  Per-gene statistics TSV\n";
+            std::cout << "  --min-breadth FLOAT  Minimum breadth filter (default: 0.1)\n";
+            std::cout << "  --min-depth FLOAT    Minimum depth filter (default: 0.5)\n";
+            std::cout << "  --min-reads INT      Minimum read count (default: 3)\n\n";
+            std::cout << "Functional profiling (requires --map):\n";
+            std::cout << "  --map FILE           Gene-to-group mapping TSV (gene_id<TAB>group)\n";
+            std::cout << "  --functional-summary FILE  Per-function stats TSV\n";
+            std::cout << "  --anvio-ko FILE      Gene-level group abundance for anvi-estimate-metabolism\n";
+            std::cout << "  --annotation-source STR  Source label for anvi output (default: AGP)\n\n";
+            std::cout << "EM reassignment (multi-mapping resolution, enabled by default):\n";
+            std::cout << "  --no-em           Disable EM (use best-hit only)\n";
+            std::cout << "  --em-iters INT    Max EM iterations (default: 100)\n";
+            std::cout << "  --em-lambda FLOAT Temperature parameter (default: 3.0)\n";
+            std::cout << "  --em-tol FLOAT    Convergence tolerance (default: 1e-4)\n";
+            std::cout << "  --em-min-prob FLOAT     Min EM posterior to keep (default: 1e-6)\n";
+            std::cout << "  --em-prob-fraction FLOAT Keep if gamma >= fraction*max_gamma(read) (default: 0.3)\n";
+            std::cout << "  --min-positional-score FLOAT  Min read start diversity (default: 0)\n";
+            std::cout << "                       Filters spurious matches where all reads hit same position\n";
+            std::cout << "                       Score = sqrt(diversity * span), range 0-1\n";
+            std::cout << "  --min-terminal-ratio FLOAT  Min terminal/middle coverage ratio (default: 0)\n";
+            std::cout << "                       Filters matches with reads only in middle (spurious motif)\n";
+            std::cout << "  --auto-calibrate-spurious   Auto-derive thresholds from data\n";
+            std::cout << "                       Uses 5th percentile of well-supported proteins (n_reads>=10, n_unique_starts>=3)\n\n";
+            std::cout << "Alignment-level pre-filters (applied before any processing):\n";
+            std::cout << "  --aln-min-identity FLOAT  Min identity fraction (default: 0, no filter)\n";
+            std::cout << "  --aln-min-bits FLOAT      Min bit score (default: 0, no filter)\n";
+            std::cout << "  --aln-max-evalue FLOAT    Max e-value (default: 1e10, no filter)\n\n";
+            std::cout << "Parallelism:\n";
+            std::cout << "  --threads, -t INT    OpenMP threads for EMI scans (default: runtime default)\n\n";
+            std::cout << "Pipeline:\n";
+            std::cout << "  hits2emi -> damage-annotate\n";
             return 0;
         } else {
             std::cerr << "Unknown option: " << argv[i] << "\n";
+            std::cerr << "Run 'agp damage-annotate --help' for usage.\n";
             return 1;
         }
     }
 
-    if (hits_file.empty()) {
-        std::cerr << "Error: No hits file specified (--hits).\n";
+    if (emi_file.empty()) {
+        std::cerr << "Error: No EMI index specified (--emi).\n";
+        std::cerr << "Run 'agp damage-annotate --help' for usage.\n";
+        return 1;
+    }
+    if (em_min_prob < 0.0 || em_min_prob > 1.0) {
+        std::cerr << "Error: --em-min-prob must be in [0,1]\n";
+        return 1;
+    }
+    if (em_prob_fraction < 0.0 || em_prob_fraction > 1.0) {
+        std::cerr << "Error: --em-prob-fraction must be in [0,1]\n";
         return 1;
     }
 
-    // Estimate d_max from data if not provided
-    if (d_max < 0.0f) {
-        if (verbose) {
-            std::cerr << "Estimating d_max from alignment data...\n";
-        }
-        DamageEstimate est;
-        std::ifstream est_in(hits_file);
-        if (!est_in.is_open()) {
-            std::cerr << "Error: Cannot open hits file: " << hits_file << "\n";
-            return 1;
-        }
-        std::string est_line;
-        size_t est_starts[16], est_ends[16];
-        std::unordered_set<std::string> est_seen;
-        while (std::getline(est_in, est_line)) {
-            if (est_line.empty() || est_line[0] == '#') continue;
-            size_t nf = split_tabs(est_line, est_starts, est_ends, 16);
-            if (nf < 16) continue;
-            std::string query_id = field_str(est_line, est_starts[0], est_ends[0]);
-            if (est_seen.count(query_id)) continue;
-            est_seen.insert(query_id);
-            size_t qstart = static_cast<size_t>(std::stoul(field_str(est_line, est_starts[6], est_ends[6])));
-            size_t qlen = static_cast<size_t>(std::stoul(field_str(est_line, est_starts[12], est_ends[12])));
-            std::string qaln = field_str(est_line, est_starts[14], est_ends[14]);
-            std::string taln = field_str(est_line, est_starts[15], est_ends[15]);
-            size_t qstart_0 = (qstart > 0) ? qstart - 1 : 0;
-            count_damage_for_estimate(query_id, qaln, taln, qstart_0, qlen, est);
-        }
-        est_in.close();
+    if (!analysis_proteins_file.empty()) {
+        protein_summary_file = analysis_proteins_file;
+    }
+    if (!analysis_blast8_file.empty()) {
+        blast8_unique_file = analysis_blast8_file;
+    }
+    if (!analysis_categories_file.empty()) {
+        functional_summary_file = analysis_categories_file;
+    }
 
-        d_max = est.estimate_d_max();
-        if (verbose) {
-            std::cerr << "  Terminal subs: " << est.terminal_damage << "/" << est.terminal_total
-                      << " (" << (est.terminal_total > 0 ? 100.0f * est.terminal_damage / est.terminal_total : 0) << "%)\n";
-            std::cerr << "  Interior subs: " << est.interior_damage << "/" << est.interior_total
-                      << " (" << (est.interior_total > 0 ? 100.0f * est.interior_damage / est.interior_total : 0) << "%)\n";
-            std::cerr << "  Estimated d_max: " << std::fixed << std::setprecision(3) << d_max << "\n\n";
+    if (!analysis_prefix.empty()) {
+        if (output_file.empty()) {
+            output_file = analysis_prefix + ".reads.tsv";
+        }
+        if (protein_summary_file.empty()) {
+            protein_summary_file = analysis_prefix + ".protein.tsv";
+        }
+        if (blast8_unique_file.empty()) {
+            blast8_unique_file = analysis_prefix + ".blast8.unique.tsv";
+        }
+        if (!map_file.empty() && functional_summary_file.empty()) {
+            functional_summary_file = analysis_prefix + ".categories.tsv";
         }
     }
 
+    int runtime_threads = 1;
+#ifdef _OPENMP
+    runtime_threads = (threads > 0) ? threads : std::max(1, omp_get_num_procs());
+    omp_set_dynamic(0);
+    omp_set_num_threads(runtime_threads);
+#else
+    if (threads > 0) {
+        std::cerr << "Warning: --threads ignored (OpenMP not enabled in this build)\n";
+    }
+#endif
+
     if (verbose) {
         std::cerr << "Damage annotation v" << AGP_VERSION << "\n";
-        std::cerr << "Hits: " << hits_file << "\n";
-        std::cerr << "d_max: " << d_max << "\n";
+        std::cerr << "EMI: " << emi_file << "\n";
+        if (d_max >= 0.0f) {
+            std::cerr << "d_max: " << d_max << "\n";
+        } else {
+            std::cerr << "d_max: auto\n";
+        }
         std::cerr << "lambda: " << lambda << "\n";
         if (max_dist >= 0) {
             std::cerr << "Positional filter: <=" << max_dist << " nt from terminus\n";
         }
+        if (!analysis_prefix.empty()) {
+            std::cerr << "analysis-prefix: " << analysis_prefix << "\n";
+        }
+        std::cerr << "threads: " << runtime_threads
+#ifdef _OPENMP
+                  << "\n";
+#else
+                  << " (OpenMP disabled)\n";
+#endif
         std::cerr << "\n";
     }
 
@@ -1033,160 +1251,735 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         }
     }
 
-    bool need_alignments = !corrected_file.empty();
-
-    // Parse MMseqs2 results
-    std::ifstream in(hits_file);
-    if (!in.is_open()) {
-        std::cerr << "Error: Cannot open hits file: " << hits_file << "\n";
+    // Open EMI index
+    agp::ColumnarIndexReader reader(emi_file);
+    if (!reader.is_valid()) {
+        std::cerr << "Error: Cannot open EMI index: " << emi_file << "\n";
+        return 1;
+    }
+    if (!reader.has_alignment_strings()) {
+        std::cerr << "Error: EMI index is missing alignment strings (qaln/taln).\n";
+        std::cerr << "Rebuild with hits2emi (alignment strings are required).\n";
         return 1;
     }
 
-    std::vector<ProteinDamageSummary> summaries;
-    std::string line;
-    size_t starts[16], ends[16];
+    const uint32_t n_reads = reader.num_reads();
+    const uint32_t n_refs = reader.num_refs();
 
-    // Alignment filter counters
-    size_t total_alignments = 0;
-    size_t filtered_identity = 0;
-    size_t filtered_bits = 0;
-    size_t filtered_evalue = 0;
-
-    // EM mode: also collect CompactAlignment records for all hits
-    agp::StringTable read_names, ref_names;
-    agp::MmapArray<agp::CompactAlignment> em_alignments;
-    size_t em_aln_count = 0;
-    if (use_em) {
-        em_alignments.resize(1024 * 1024);  // pre-allocate 1M, grows as needed
-        em_aln_count = 0;
+    if (verbose) {
+        std::cerr << "EMI metadata:\n";
+        std::cerr << "  Version: " << reader.version() << "\n";
+        std::cerr << "  Alignments: " << reader.num_alignments() << "\n";
+        std::cerr << "  Reads: " << n_reads << "\n";
+        std::cerr << "  References: " << n_refs << "\n";
+        std::cerr << "  Sorted (read,score): "
+                  << (reader.is_sorted_by_read_then_score() ? "yes" : "no") << "\n";
+        if (max_dist >= 0) {
+            std::cerr << "  Positional filter: <=" << max_dist << " nt from terminus\n";
+        }
+        std::cerr << "\n";
     }
 
-    // Best hit tracking: query_id -> (bit_score, line_data)
-    // MMseqs2 doesn't guarantee best-first ordering, so we keep track of the
-    // best hit (highest bit_score) for each query and process them after.
+    std::vector<ProteinDamageSummary> summaries;
+    std::vector<int32_t> summary_index_by_read(n_reads, -1);
+
     struct BestHitData {
-        float bits;
+        bool has = false;
+        float bits = 0.0f;
         float bits_second = 0.0f;  // second-best bit score for this query
-        std::string target_id;
-        uint32_t ref_idx;  // For EM: ref_idx corresponding to target_id
-        float fident;
-        float evalue;
-        size_t qstart_0;
-        size_t tstart_0;
-        size_t qlen;
-        size_t tlen;
+        float damage_score = 0.0f;
+        uint32_t ref_idx = 0;  // For EM: ref_idx corresponding to target_id
+        float fident = 0.0f;
+        float evalue = 0.0f;
+        size_t qstart_0 = 0;
+        size_t tstart_0 = 0;
+        size_t qlen = 0;
+        size_t tlen = 0;
+        size_t aln_len_on_target = 0;
+        uint32_t best_rg = UINT32_MAX;
+        uint32_t best_row = UINT32_MAX;
         std::string qaln;
         std::string taln;
     };
-    std::unordered_map<std::string, BestHitData> best_hits;
+    std::vector<BestHitData> best_hits(n_reads);
+    const bool need_unique_degree = !blast8_unique_file.empty();
+    std::vector<uint32_t> read_degree;
+    if (need_unique_degree) {
+        read_degree.assign(n_reads, 0);
+    }
+    std::vector<agp::CompactAlignment> em_alignments;
+    if (use_em) {
+        em_alignments.reserve(static_cast<size_t>(reader.num_alignments()));
+    }
+    std::mutex em_damage_stats_mutex;
+    uint64_t em_damage_n = 0;
+    uint64_t em_damage_nonzero = 0;
+    double em_damage_sum = 0.0;
+    double em_damage_sumsq = 0.0;
+    uint64_t em_damage_ll_n = 0;
+    uint64_t em_damage_ll_nonzero = 0;
+    double em_damage_llbf_sum = 0.0;
+    double em_damage_llbf_sumsq = 0.0;
+    float em_damage_min = 1.0f;
+    float em_damage_max = 0.0f;
+    struct RgDamageBoundary {
+        bool has_rows = false;
+        bool intra_read_variation = false;
+        uint32_t first_read = 0;
+        uint32_t last_read = 0;
+        float first_ds = 0.0f;
+        float last_ds = 0.0f;
+    };
+    std::vector<RgDamageBoundary> em_damage_boundaries;
+    if (use_em) {
+        em_damage_boundaries.resize(reader.num_row_groups());
+    }
 
-    while (std::getline(in, line)) {
-        if (line.empty() || line[0] == '#') continue;
+    std::atomic<size_t> total_alignments{0};
+    std::atomic<size_t> filtered_identity{0};
+    std::atomic<size_t> filtered_bits{0};
+    std::atomic<size_t> filtered_evalue{0};
+    constexpr size_t kBestHitShards = 4096;
+    std::array<std::mutex, kBestHitShards> best_hit_mutexes;
+    const float aln_max_evalue_log10 = (aln_max_evalue > 0.0f)
+        ? std::log10(aln_max_evalue)
+        : -std::numeric_limits<float>::infinity();
 
-        size_t nf = split_tabs(line, starts, ends, 16);
-        if (nf < 16) continue;
+    size_t em_shard_count = 1;
+#ifdef _OPENMP
+    if (use_em) {
+        em_shard_count = static_cast<size_t>(std::max(1, omp_get_max_threads()));
+    }
+#endif
+    std::vector<std::vector<agp::CompactAlignment>> em_alignments_by_thread;
+    if (use_em) {
+        em_alignments_by_thread.resize(em_shard_count);
+        const size_t reserve_per_shard =
+            static_cast<size_t>(reader.num_alignments() / std::max<size_t>(1, em_shard_count) + 1);
+        for (auto& shard : em_alignments_by_thread) {
+            shard.reserve(reserve_per_shard);
+        }
+    }
 
-        std::string query_id = field_str(line, starts[0], ends[0]);
-        std::string target_id = field_str(line, starts[1], ends[1]);
-        float fident = std::stof(field_str(line, starts[2], ends[2]));
-        size_t qstart = static_cast<size_t>(std::stoul(field_str(line, starts[6], ends[6])));
-        size_t tstart = static_cast<size_t>(std::stoul(field_str(line, starts[8], ends[8])));
-        // Use stod for evalue: E-values can be extremely small (e.g., 1E-100)
-        // which underflows stof but is representable in double
-        float evalue = static_cast<float>(std::stod(field_str(line, starts[10], ends[10])));
-        float bits = std::stof(field_str(line, starts[11], ends[11]));
-        size_t qlen = static_cast<size_t>(std::stoul(field_str(line, starts[12], ends[12])));
-        size_t tlen = static_cast<size_t>(std::stoul(field_str(line, starts[13], ends[13])));
-        std::string qaln = field_str(line, starts[14], ends[14]);
-        std::string taln = field_str(line, starts[15], ends[15]);
+    // Pass 1: numeric-only scan for filtering, best-hit selection, and EM payload.
+    const auto pass1_start = std::chrono::steady_clock::now();
+    reader.set_columns({
+        agp::ColumnID::READ_IDX,
+        agp::ColumnID::REF_IDX,
+        agp::ColumnID::BIT_SCORE,
+        agp::ColumnID::DAMAGE_SCORE,
+        agp::ColumnID::EVALUE_LOG10,
+        agp::ColumnID::DMG_K,
+        agp::ColumnID::DMG_M,
+        agp::ColumnID::DMG_LL_A,
+        agp::ColumnID::DMG_LL_M,
+        agp::ColumnID::IDENTITY_Q,
+        agp::ColumnID::ALN_LEN,
+        agp::ColumnID::QSTART,
+        agp::ColumnID::TSTART,
+        agp::ColumnID::TLEN,
+        agp::ColumnID::QLEN
+    });
+    reader.parallel_scan([&](
+        uint32_t rg_idx, uint32_t num_rows,
+        const uint32_t* read_idx, const uint32_t* ref_idx,
+        const float* bit_score, const float* damage_score,
+        const float* evalue_log10,
+        const uint16_t* /*dmg_k*/, const uint16_t* /*dmg_m*/,
+        const float* dmg_ll_a, const float* dmg_ll_m,
+        const uint16_t* identity_q,
+        const uint16_t* aln_len, const uint16_t* qstart, const uint16_t* /*qend*/,
+        const uint16_t* tstart, const uint16_t* /*tend*/,
+        const uint16_t* tlen, const uint16_t* qlen,
+        const uint16_t* /*mismatch*/, const uint16_t* /*gapopen*/)
+    {
+        if (!read_idx || !ref_idx || !bit_score || !evalue_log10 ||
+            !identity_q || !aln_len || !qstart || !tstart || !tlen || !qlen || !damage_score) {
+            return;
+        }
 
-        size_t qstart_0 = (qstart > 0) ? qstart - 1 : 0;
-        size_t tstart_0 = (tstart > 0) ? tstart - 1 : 0;
+        struct BestHitCandidate {
+            float bits = 0.0f;
+            float bits_second = 0.0f;
+            float damage_score = 0.0f;
+            uint32_t ref_idx = 0;
+            float fident = 0.0f;
+            float evalue = 0.0f;
+            size_t qstart_0 = 0;
+            size_t tstart_0 = 0;
+            size_t qlen = 0;
+            size_t tlen = 0;
+            size_t aln_len_on_target = 0;
+            uint32_t best_rg = UINT32_MAX;
+            uint32_t best_row = UINT32_MAX;
+        };
 
-        // Alignment-level pre-filtering
-        ++total_alignments;
-        if (fident < aln_min_identity) { ++filtered_identity; continue; }
-        if (bits < aln_min_bits) { ++filtered_bits; continue; }
-        if (evalue > aln_max_evalue) { ++filtered_evalue; continue; }
+        size_t local_total = 0;
+        size_t local_filtered_identity = 0;
+        size_t local_filtered_bits = 0;
+        size_t local_filtered_evalue = 0;
 
-        // EM mode: collect CompactAlignment for every hit
-        uint32_t tidx = 0;  // Track ref_idx for best hit comparison
+        std::vector<agp::CompactAlignment> local_em;
         if (use_em) {
-            uint32_t ridx = read_names.insert(query_id);
-            tidx = ref_names.insert(target_id);
+            local_em.reserve(num_rows);
+        }
+        uint64_t local_em_n = 0;
+        uint64_t local_em_nonzero = 0;
+        double local_em_sum = 0.0;
+        double local_em_sumsq = 0.0;
+        uint64_t local_em_ll_n = 0;
+        uint64_t local_em_ll_nonzero = 0;
+        double local_em_llbf_sum = 0.0;
+        double local_em_llbf_sumsq = 0.0;
+        float local_em_min = 1.0f;
+        float local_em_max = 0.0f;
+        bool local_em_has_rows = false;
+        bool local_em_intra_read_variation = false;
+        uint32_t local_em_first_read = 0;
+        uint32_t local_em_last_read = 0;
+        float local_em_first_ds = 0.0f;
+        float local_em_last_ds = 0.0f;
+        std::unordered_map<uint32_t, float> local_em_read_damage;
+        if (use_em) {
+            local_em_read_damage.reserve(std::max<uint32_t>(1, num_rows / 8));
+        }
 
-            // Look up damage score from AGD index
-            float ds = 0.0f;
-            if (damage_index) {
-                if (const AgdRecord* rec = damage_index->find(query_id)) {
-                    ds = static_cast<float>(rec->p_damaged_q) / 255.0f;
+        bool local_sorted_hits = true;
+        for (uint32_t i = 1; i < num_rows; ++i) {
+            if (read_idx[i] < read_idx[i - 1] ||
+                (read_idx[i] == read_idx[i - 1] && bit_score[i] > bit_score[i - 1])) {
+                local_sorted_hits = false;
+                break;
+            }
+        }
+
+        std::vector<std::pair<uint32_t, BestHitCandidate>> local_best_sorted;
+        std::unordered_map<uint32_t, BestHitCandidate> local_best_unsorted;
+        if (local_sorted_hits) {
+            local_best_sorted.reserve(std::max<uint32_t>(1, num_rows / 8));
+        } else {
+            local_best_unsorted.reserve(std::max<uint32_t>(1, num_rows / 4));
+        }
+
+        std::unordered_map<uint32_t, uint32_t> local_degree_counts;
+        if (need_unique_degree) {
+            local_degree_counts.reserve(std::max<uint32_t>(1, num_rows / 8));
+        }
+
+        auto update_candidate = [&](BestHitCandidate& cand,
+                                    float bits,
+                                    float damage_score_v,
+                                    uint32_t tidx,
+                                    float fident,
+                                    float evalue,
+                                    size_t qstart_0,
+                                    size_t tstart_0,
+                                    size_t qlen_v,
+                                    size_t tlen_v,
+                                    size_t aln_len_on_target_v,
+                                    uint32_t row_in_group) {
+            if (bits > cand.bits) {
+                cand.bits_second = cand.bits;
+                cand.bits = bits;
+                cand.damage_score = damage_score_v;
+                cand.ref_idx = tidx;
+                cand.fident = fident;
+                cand.evalue = evalue;
+                cand.qstart_0 = qstart_0;
+                cand.tstart_0 = tstart_0;
+                cand.qlen = qlen_v;
+                cand.tlen = tlen_v;
+                cand.aln_len_on_target = aln_len_on_target_v;
+                cand.best_rg = rg_idx;
+                cand.best_row = row_in_group;
+            } else if (bits > cand.bits_second) {
+                cand.bits_second = bits;
+            }
+        };
+
+        for (uint32_t i = 0; i < num_rows; ++i) {
+            local_total++;
+
+            const float fident = static_cast<float>(identity_q[i]) / 65535.0f;
+            const float bits = bit_score[i];
+            const float evalue_log10_row = evalue_log10[i];
+            if (fident < aln_min_identity) {
+                local_filtered_identity++;
+                continue;
+            }
+            if (bits < aln_min_bits) {
+                local_filtered_bits++;
+                continue;
+            }
+            if (evalue_log10_row > aln_max_evalue_log10) {
+                local_filtered_evalue++;
+                continue;
+            }
+
+            const uint32_t ridx = read_idx[i];
+            const uint32_t tidx = ref_idx[i];
+            const size_t qstart_0 = (qstart[i] > 0) ? static_cast<size_t>(qstart[i] - 1) : 0;
+            const size_t tstart_0 = (tstart[i] > 0) ? static_cast<size_t>(tstart[i] - 1) : 0;
+            const size_t tlen_v = static_cast<size_t>(tlen[i]);
+            const size_t qlen_v = static_cast<size_t>(qlen[i]);
+            const uint16_t aln_len_v = aln_len[i];
+
+            if (need_unique_degree) {
+                auto it_deg = local_degree_counts.find(ridx);
+                if (it_deg == local_degree_counts.end()) {
+                    local_degree_counts.emplace(ridx, 1u);
+                } else {
+                    it_deg->second += 1u;
                 }
             }
 
-            // Grow if needed
-            if (em_aln_count >= em_alignments.size()) {
-                em_alignments.resize(em_alignments.size() * 2);
+            if (use_em) {
+                agp::CompactAlignment ca{};
+                ca.read_idx = ridx;
+                ca.ref_idx = tidx;
+                ca.bit_score = bits;
+                const float ds = std::clamp(damage_score[i], 0.0f, 1.0f);
+                ca.damage_score = ds;
+                const float ll_a = dmg_ll_a ? dmg_ll_a[i] : 0.0f;
+                const float ll_m = dmg_ll_m ? dmg_ll_m[i] : 0.0f;
+                ca.damage_ll_a = ll_a;
+                ca.damage_ll_m = ll_m;
+                if (!local_em_has_rows) {
+                    local_em_has_rows = true;
+                    local_em_first_read = ridx;
+                    local_em_first_ds = ds;
+                }
+                local_em_last_read = ridx;
+                local_em_last_ds = ds;
+                auto [it_ds, inserted_ds] = local_em_read_damage.try_emplace(ridx, ds);
+                if (!inserted_ds && std::fabs(it_ds->second - ds) > 1e-6f) {
+                    local_em_intra_read_variation = true;
+                }
+                ca.aln_start = static_cast<uint16_t>(std::min(tstart_0, size_t(65535)));
+                ca.aln_end = static_cast<uint16_t>(
+                    std::min(tstart_0 + static_cast<size_t>(aln_len_v), size_t(65535)));
+                ca.identity_q = identity_q[i];
+                ca.flags = tlen[i];  // pass true reference length hint to EM builder
+                local_em.push_back(ca);
+                local_em_n++;
+                local_em_sum += ds;
+                local_em_sumsq += static_cast<double>(ds) * static_cast<double>(ds);
+                const double llbf = static_cast<double>(ll_a) - static_cast<double>(ll_m);
+                local_em_ll_n++;
+                if (std::fabs(llbf) > 1e-9) local_em_ll_nonzero++;
+                local_em_llbf_sum += llbf;
+                local_em_llbf_sumsq += llbf * llbf;
+                if (ds > 0.0f) local_em_nonzero++;
+                local_em_min = std::min(local_em_min, ds);
+                local_em_max = std::max(local_em_max, ds);
             }
 
-            agp::CompactAlignment& ca = em_alignments[em_aln_count++];
-            ca.read_idx = ridx;
-            ca.ref_idx = tidx;
-            ca.bit_score = bits;
-            ca.damage_score = ds;
-            ca.aln_start = static_cast<uint16_t>(std::min(tstart_0, size_t(65535)));
-            ca.aln_end = static_cast<uint16_t>(std::min(tstart_0 + taln.size(), size_t(65535)));
-            ca.identity_q = static_cast<uint16_t>(fident * 65535.0f);
-            ca.flags = 0;
+            const float evalue = evalue_from_log10(evalue_log10_row);
+            if (local_sorted_hits) {
+                if (local_best_sorted.empty() || local_best_sorted.back().first != ridx) {
+                    BestHitCandidate cand;
+                    cand.bits = bits;
+                    cand.bits_second = 0.0f;
+                    cand.damage_score = std::clamp(damage_score[i], 0.0f, 1.0f);
+                    cand.ref_idx = tidx;
+                    cand.fident = fident;
+                    cand.evalue = evalue;
+                    cand.qstart_0 = qstart_0;
+                    cand.tstart_0 = tstart_0;
+                    cand.qlen = qlen_v;
+                    cand.tlen = tlen_v;
+                    cand.aln_len_on_target = static_cast<size_t>(aln_len_v);
+                    cand.best_rg = rg_idx;
+                    cand.best_row = i;
+                    local_best_sorted.emplace_back(ridx, cand);
+                } else {
+                    update_candidate(local_best_sorted.back().second,
+                                     bits, std::clamp(damage_score[i], 0.0f, 1.0f),
+                                     tidx, fident, evalue,
+                                     qstart_0, tstart_0, qlen_v, tlen_v,
+                                     static_cast<size_t>(aln_len_v), i);
+                }
+            } else {
+                auto [it, inserted] = local_best_unsorted.try_emplace(ridx);
+                if (inserted) {
+                    BestHitCandidate cand;
+                    cand.bits = bits;
+                    cand.bits_second = 0.0f;
+                    cand.damage_score = std::clamp(damage_score[i], 0.0f, 1.0f);
+                    cand.ref_idx = tidx;
+                    cand.fident = fident;
+                    cand.evalue = evalue;
+                    cand.qstart_0 = qstart_0;
+                    cand.tstart_0 = tstart_0;
+                    cand.qlen = qlen_v;
+                    cand.tlen = tlen_v;
+                    cand.aln_len_on_target = static_cast<size_t>(aln_len_v);
+                    cand.best_rg = rg_idx;
+                    cand.best_row = i;
+                    it->second = cand;
+                } else {
+                    update_candidate(it->second,
+                                     bits, std::clamp(damage_score[i], 0.0f, 1.0f),
+                                     tidx, fident, evalue,
+                                     qstart_0, tstart_0, qlen_v, tlen_v,
+                                     static_cast<size_t>(aln_len_v), i);
+                }
+            }
         }
 
-        // Track best hit per query (highest bit_score) and second-best
-        auto it = best_hits.find(query_id);
-        if (it == best_hits.end()) {
-            best_hits[query_id] = BestHitData{
-                bits, 0.0f, target_id, tidx, fident, evalue,
-                qstart_0, tstart_0, qlen, tlen,
-                qaln, taln
-            };
-        } else if (bits > it->second.bits) {
-            it->second.bits_second = it->second.bits;  // demote current best
-            it->second.bits = bits;
-            it->second.target_id = target_id;
-            it->second.ref_idx = tidx;
-            it->second.fident = fident;
-            it->second.evalue = evalue;
-            it->second.qstart_0 = qstart_0;
-            it->second.tstart_0 = tstart_0;
-            it->second.qlen = qlen;
-            it->second.tlen = tlen;
-            it->second.qaln = qaln;
-            it->second.taln = taln;
-        } else if (bits > it->second.bits_second) {
-            it->second.bits_second = bits;  // new second-best
+        total_alignments.fetch_add(local_total, std::memory_order_relaxed);
+        filtered_identity.fetch_add(local_filtered_identity, std::memory_order_relaxed);
+        filtered_bits.fetch_add(local_filtered_bits, std::memory_order_relaxed);
+        filtered_evalue.fetch_add(local_filtered_evalue, std::memory_order_relaxed);
+
+        auto merge_candidate = [&](uint32_t ridx, const BestHitCandidate& cand) {
+            const size_t shard = static_cast<size_t>(ridx) & (kBestHitShards - 1);
+            std::lock_guard<std::mutex> lock(best_hit_mutexes[shard]);
+            BestHitData& hit = best_hits[ridx];
+
+            if (!hit.has || cand.bits > hit.bits) {
+                const float prev_best = hit.has ? hit.bits : 0.0f;
+                hit.has = true;
+                hit.bits = cand.bits;
+                hit.bits_second = std::max(cand.bits_second, std::max(hit.bits_second, prev_best));
+                hit.damage_score = cand.damage_score;
+                hit.ref_idx = cand.ref_idx;
+                hit.fident = cand.fident;
+                hit.evalue = cand.evalue;
+                hit.qstart_0 = cand.qstart_0;
+                hit.tstart_0 = cand.tstart_0;
+                hit.qlen = cand.qlen;
+                hit.tlen = cand.tlen;
+                hit.aln_len_on_target = cand.aln_len_on_target;
+                hit.best_rg = cand.best_rg;
+                hit.best_row = cand.best_row;
+            } else {
+                hit.bits_second = std::max(hit.bits_second, std::max(cand.bits, cand.bits_second));
+            }
+        };
+
+        if (local_sorted_hits) {
+            for (const auto& kv : local_best_sorted) {
+                merge_candidate(kv.first, kv.second);
+            }
+        } else {
+            for (const auto& kv : local_best_unsorted) {
+                merge_candidate(kv.first, kv.second);
+            }
+        }
+
+        if (need_unique_degree) {
+            for (const auto& kv : local_degree_counts) {
+                const uint32_t ridx = kv.first;
+                const uint32_t add = kv.second;
+                const size_t shard = static_cast<size_t>(ridx) & (kBestHitShards - 1);
+                std::lock_guard<std::mutex> lock(best_hit_mutexes[shard]);
+                read_degree[ridx] += add;
+            }
+        }
+
+        if (use_em && !local_em.empty()) {
+            size_t em_shard = 0;
+#ifdef _OPENMP
+            em_shard = static_cast<size_t>(omp_get_thread_num());
+#endif
+            if (em_shard >= em_alignments_by_thread.size()) em_shard = 0;
+            auto& dst = em_alignments_by_thread[em_shard];
+            dst.insert(dst.end(), local_em.begin(), local_em.end());
+
+            std::lock_guard<std::mutex> lock(em_damage_stats_mutex);
+            em_damage_n += local_em_n;
+            em_damage_nonzero += local_em_nonzero;
+            em_damage_sum += local_em_sum;
+            em_damage_sumsq += local_em_sumsq;
+            em_damage_ll_n += local_em_ll_n;
+            em_damage_ll_nonzero += local_em_ll_nonzero;
+            em_damage_llbf_sum += local_em_llbf_sum;
+            em_damage_llbf_sumsq += local_em_llbf_sumsq;
+            em_damage_min = std::min(em_damage_min, local_em_min);
+            em_damage_max = std::max(em_damage_max, local_em_max);
+            if (rg_idx < em_damage_boundaries.size()) {
+                em_damage_boundaries[rg_idx] = {
+                    local_em_has_rows,
+                    local_em_intra_read_variation,
+                    local_em_first_read,
+                    local_em_last_read,
+                    local_em_first_ds,
+                    local_em_last_ds
+                };
+            }
+        }
+    });
+
+    bool em_damage_varies_within_read = false;
+    if (use_em) {
+        RgDamageBoundary prev{};
+        bool have_prev = false;
+        for (const auto& b : em_damage_boundaries) {
+            if (!b.has_rows) continue;
+            if (b.intra_read_variation) {
+                em_damage_varies_within_read = true;
+                break;
+            }
+            if (have_prev && prev.last_read == b.first_read &&
+                std::fabs(prev.last_ds - b.first_ds) > 1e-6f) {
+                em_damage_varies_within_read = true;
+                break;
+            }
+            prev = b;
+            have_prev = true;
         }
     }
-    in.close();
+
+    if (use_em) {
+        size_t em_total = 0;
+        for (const auto& shard : em_alignments_by_thread) {
+            em_total += shard.size();
+        }
+        em_alignments.clear();
+        em_alignments.reserve(em_total);
+        for (auto& shard : em_alignments_by_thread) {
+            em_alignments.insert(em_alignments.end(), shard.begin(), shard.end());
+        }
+    }
+    const auto pass1_end = std::chrono::steady_clock::now();
+    if (verbose) {
+        std::cerr << "Pass 1 runtime: "
+                  << agp::log_utils::format_elapsed(pass1_start, pass1_end) << "\n";
+    }
+
+    // Pass 2: fetch alignment strings only for selected best hits.
+    const auto pass2_start = std::chrono::steady_clock::now();
+    std::vector<std::vector<std::pair<uint32_t, uint32_t>>> best_rows_by_rg(reader.num_row_groups());
+    std::vector<uint32_t> selected_row_groups;
+    selected_row_groups.reserve(reader.num_row_groups());
+    size_t selected_best_hits = 0;
+    for (uint32_t ridx = 0; ridx < n_reads; ++ridx) {
+        const auto& hit = best_hits[ridx];
+        if (!hit.has || hit.best_rg == UINT32_MAX || hit.best_rg >= best_rows_by_rg.size()) continue;
+        if (best_rows_by_rg[hit.best_rg].empty()) {
+            selected_row_groups.push_back(hit.best_rg);
+        }
+        best_rows_by_rg[hit.best_rg].emplace_back(hit.best_row, ridx);
+        selected_best_hits++;
+    }
+    for (auto& rows : best_rows_by_rg) {
+        std::sort(rows.begin(), rows.end());
+    }
+    std::sort(selected_row_groups.begin(), selected_row_groups.end());
+
+    if (selected_best_hits > 0) {
+        reader.set_columns({agp::ColumnID::QALN, agp::ColumnID::TALN});
+        std::atomic<size_t> loaded_best_hit_strings{0};
+        reader.parallel_scan_selected(selected_row_groups, [&]( 
+            uint32_t rg_idx, uint32_t num_rows,
+            const uint32_t*, const uint32_t*,
+            const float*, const float*, const float*,
+            const uint16_t*, const uint16_t*,
+            const float*, const float*,
+            const uint16_t*, const uint16_t*,
+            const uint16_t*, const uint16_t*,
+            const uint16_t*, const uint16_t*,
+            const uint16_t*, const uint16_t*,
+            const uint16_t*, const uint16_t*)
+        {
+            const auto& rows = best_rows_by_rg[rg_idx];
+            if (rows.empty()) return;
+            size_t local_loaded = 0;
+
+            for (const auto& row_pair : rows) {
+                const uint32_t row_in_group = row_pair.first;
+                const uint32_t ridx = row_pair.second;
+                if (row_in_group >= num_rows) continue;
+
+                std::string_view qaln_sv = reader.get_qaln(rg_idx, row_in_group);
+                std::string_view taln_sv = reader.get_taln(rg_idx, row_in_group);
+
+                BestHitData& hit = best_hits[ridx];
+                hit.qaln.assign(qaln_sv.begin(), qaln_sv.end());
+                hit.taln.assign(taln_sv.begin(), taln_sv.end());
+                size_t aln_len_target = 0;
+                for (char c : hit.taln) {
+                    if (c != '-') ++aln_len_target;
+                }
+                hit.aln_len_on_target = aln_len_target;
+                local_loaded++;
+            }
+            loaded_best_hit_strings.fetch_add(local_loaded, std::memory_order_relaxed);
+        });
+
+        if (verbose && loaded_best_hit_strings.load(std::memory_order_relaxed) != selected_best_hits) {
+            std::cerr << "Warning: Loaded " << loaded_best_hit_strings.load(std::memory_order_relaxed)
+                      << "/" << selected_best_hits << " best-hit alignment strings from EMI.\n";
+        }
+    }
+    const auto pass2_end = std::chrono::steady_clock::now();
+    if (verbose) {
+        std::cerr << "Pass 2 runtime: "
+                  << agp::log_utils::format_elapsed(pass2_start, pass2_end)
+                  << " (" << selected_best_hits << " best-hit alignments)\n";
+    }
+
+    if (!blast8_unique_file.empty()) {
+        std::ofstream bf(blast8_unique_file);
+        if (!bf.is_open()) {
+            std::cerr << "Error: Cannot open BLAST8 unique file: " << blast8_unique_file << "\n";
+            return 1;
+        }
+
+        size_t written_unique = 0;
+        for (uint32_t ridx = 0; ridx < n_reads; ++ridx) {
+            if (need_unique_degree) {
+                if (ridx >= read_degree.size() || read_degree[ridx] != 1) continue;
+            }
+            const auto& hit = best_hits[ridx];
+            if (!hit.has) continue;
+
+            const std::string qid(reader.read_name(ridx));
+            const std::string sid(reader.ref_name(hit.ref_idx));
+
+            int aln_len = 0;
+            int mismatches = 0;
+            int gapopen = 0;
+            int q_aln_non_gap = 0;
+            int t_aln_non_gap = 0;
+            bool in_gap_q = false;
+            bool in_gap_t = false;
+
+            const size_t n = std::min(hit.qaln.size(), hit.taln.size());
+            for (size_t i = 0; i < n; ++i) {
+                const char q = hit.qaln[i];
+                const char t = hit.taln[i];
+                aln_len++;
+
+                if (q == '-') {
+                    if (!in_gap_q) {
+                        gapopen++;
+                        in_gap_q = true;
+                    }
+                } else {
+                    in_gap_q = false;
+                    q_aln_non_gap++;
+                }
+
+                if (t == '-') {
+                    if (!in_gap_t) {
+                        gapopen++;
+                        in_gap_t = true;
+                    }
+                } else {
+                    in_gap_t = false;
+                    t_aln_non_gap++;
+                }
+
+                if (q != '-' && t != '-' && q != t) mismatches++;
+            }
+
+            const int qstart1 = static_cast<int>(hit.qstart_0 + 1);
+            const int sstart1 = static_cast<int>(hit.tstart_0 + 1);
+            const int qend1 = (q_aln_non_gap > 0) ? (qstart1 + q_aln_non_gap - 1) : qstart1;
+            const int send1 = (t_aln_non_gap > 0) ? (sstart1 + t_aln_non_gap - 1) : sstart1;
+            const float pident = hit.fident * 100.0f;
+
+            // BLAST outfmt 6 style (qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore)
+            bf << qid << '\t' << sid << '\t'
+               << std::fixed << std::setprecision(3) << pident << '\t'
+               << aln_len << '\t' << mismatches << '\t' << gapopen << '\t'
+               << qstart1 << '\t' << qend1 << '\t'
+               << sstart1 << '\t' << send1 << '\t'
+               << std::scientific << std::setprecision(2) << hit.evalue << '\t'
+               << std::fixed << std::setprecision(1) << hit.bits << '\n';
+            written_unique++;
+        }
+
+        if (verbose) {
+            std::cerr << "Unique-mapper BLAST8 written to: " << blast8_unique_file
+                      << " (" << written_unique << " rows)\n";
+        }
+    }
+
+    if (d_max < 0.0f) {
+        if (damage_index && damage_index->d_max() > 0.0f) {
+            d_max = damage_index->d_max();
+            if (!lambda_set_by_user && damage_index->lambda() > 0.0f) {
+                lambda = damage_index->lambda();
+            }
+            if (verbose) {
+                std::cerr << "Using d_max from damage index header: " << std::fixed
+                          << std::setprecision(3) << d_max << "\n";
+                if (!lambda_set_by_user) {
+                    std::cerr << "Using lambda from damage index header: " << std::fixed
+                              << std::setprecision(3) << lambda << "\n";
+                }
+            }
+        } else if (reader.d_max() > 0.0f) {
+            d_max = reader.d_max();
+            if (!lambda_set_by_user && reader.lambda() > 0.0f) {
+                lambda = reader.lambda();
+            }
+            if (verbose) {
+                std::cerr << "Using d_max from EMI header: " << std::fixed
+                          << std::setprecision(3) << d_max << "\n";
+                if (!lambda_set_by_user) {
+                    std::cerr << "Using lambda from EMI header: " << std::fixed
+                              << std::setprecision(3) << lambda << "\n";
+                }
+            }
+        } else {
+            if (verbose) {
+                std::cerr << "Estimating d_max from EMI best hits...\n";
+            }
+            DamageEstimate est;
+            for (uint32_t ridx = 0; ridx < n_reads; ++ridx) {
+                const BestHitData& hit = best_hits[ridx];
+                if (!hit.has) continue;
+                std::string query_id(reader.read_name(ridx));
+                count_damage_for_estimate(query_id, hit.qaln, hit.taln, hit.qstart_0, hit.qlen, est);
+            }
+            d_max = est.estimate_d_max();
+            if (verbose) {
+                std::cerr << "  Terminal subs: " << est.terminal_damage << "/" << est.terminal_total
+                          << " (" << (est.terminal_total > 0 ? 100.0f * est.terminal_damage / est.terminal_total : 0) << "%)\n";
+                std::cerr << "  Interior subs: " << est.interior_damage << "/" << est.interior_total
+                          << " (" << (est.interior_total > 0 ? 100.0f * est.interior_damage / est.interior_total : 0) << "%)\n";
+                std::cerr << "  Estimated d_max: " << std::fixed << std::setprecision(3) << d_max << "\n";
+            }
+        }
+        if (verbose) std::cerr << "\n";
+    }
 
     if (verbose) {
-        size_t passed = total_alignments - filtered_identity - filtered_bits - filtered_evalue;
+        size_t total = total_alignments.load(std::memory_order_relaxed);
+        size_t filt_id = filtered_identity.load(std::memory_order_relaxed);
+        size_t filt_bits = filtered_bits.load(std::memory_order_relaxed);
+        size_t filt_eval = filtered_evalue.load(std::memory_order_relaxed);
+        size_t passed = total - filt_id - filt_bits - filt_eval;
         std::cerr << "Alignment pre-filtering:\n";
-        std::cerr << "  Total alignments: " << total_alignments << "\n";
-        if (filtered_identity > 0 || aln_min_identity > 0)
-            std::cerr << "  Filtered (identity < " << aln_min_identity << "): " << filtered_identity << "\n";
-        if (filtered_bits > 0 || aln_min_bits > 0)
-            std::cerr << "  Filtered (bits < " << aln_min_bits << "): " << filtered_bits << "\n";
-        if (filtered_evalue > 0 || aln_max_evalue < 1e9f)
-            std::cerr << "  Filtered (evalue > " << aln_max_evalue << "): " << filtered_evalue << "\n";
-        std::cerr << "  Passed: " << passed << " (" << (100.0 * passed / total_alignments) << "%)\n\n";
+        std::cerr << "  Total alignments: " << total << "\n";
+        if (filt_id > 0 || aln_min_identity > 0)
+            std::cerr << "  Filtered (identity < " << aln_min_identity << "): " << filt_id << "\n";
+        if (filt_bits > 0 || aln_min_bits > 0)
+            std::cerr << "  Filtered (bits < " << aln_min_bits << "): " << filt_bits << "\n";
+        if (filt_eval > 0 || aln_max_evalue < 1e9f)
+            std::cerr << "  Filtered (evalue > " << aln_max_evalue << "): " << filt_eval << "\n";
+        std::cerr << "  Passed: " << passed << " (" << (total > 0 ? 100.0 * passed / total : 0.0) << "%)\n\n";
     }
 
     // Process best hits into summaries
-    for (auto& [query_id, hit] : best_hits) {
+    const auto annotate_start = std::chrono::steady_clock::now();
+    for (uint32_t ridx = 0; ridx < n_reads; ++ridx) {
+        const auto& hit = best_hits[ridx];
+        if (!hit.has) continue;
+
+        std::string query_id(reader.read_name(ridx));
+        std::string target_id(reader.ref_name(hit.ref_idx));
         auto summary = annotate_alignment(
-            query_id, hit.target_id, hit.qaln, hit.taln,
+            query_id, target_id, hit.qaln, hit.taln,
             hit.qstart_0, hit.tstart_0, hit.qlen,
             hit.evalue, hit.bits, hit.fident, d_max, lambda);
 
         if (summary.total_mismatches > 0) {
+            summary.read_idx = ridx;
             filter_sites_by_distance(summary, max_dist);
             // Store alignment data for Bayesian scoring and corrected output
             summary.qlen = hit.qlen;
@@ -1201,6 +1994,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 ? hit.bits / static_cast<float>(summary.alnlen) : 0.0f;
             summary.length_bin = static_cast<uint8_t>(
                 agp::LengthBinStats::get_bin(hit.qlen));
+            // EMI always carries DAMAGE_SCORE. Use it as per-read p_read fallback so
+            // Bayesian scoring works in EMI-only workflows.
+            summary.p_read = std::clamp(hit.damage_score, 0.0f, 1.0f);
+            summary.has_p_read = true;
             // Look up synonymous damage and per-read p_damaged from index if available
             if (damage_index) {
                 if (const AgdRecord* rec = damage_index->find(query_id)) {
@@ -1214,20 +2011,33 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     summary.has_p_read = true;
                 }
             }
+            summary_index_by_read[ridx] = static_cast<int32_t>(summaries.size());
             summaries.push_back(std::move(summary));
         }
     }
+    const auto annotate_end = std::chrono::steady_clock::now();
+    if (verbose) {
+        std::cerr << "Annotation runtime: "
+                  << agp::log_utils::format_elapsed(annotate_start, annotate_end)
+                  << " (" << summaries.size() << " reads with mismatches)\n";
+    }
+
+    const size_t em_aln_count = em_alignments.size();
 
     // EM reassignment
     agp::EMState em_state;
-    agp::ReferenceStatsCollector stats_collector;
-    // Per-read EM results: query_id -> (gamma, gamma_ancient, best_hit)
-    std::unordered_map<std::string, std::tuple<float, float, bool>> em_read_results;
+    struct EmReadResult {
+        float gamma = 0.0f;             // Responsibility for the best-hit target in summaries
+        float gamma_ancient = 0.0f;     // Ancient responsibility for the same target
+        bool best_hit = false;          // True if best-hit target == EM best target
+        bool em_keep = true;            // Passes bam-filter-like posterior filter
+        float em_threshold = 0.0f;      // Applied per-read keep threshold
+        float em_margin = 0.0f;         // EM confidence margin: top1 - top2 responsibility
+        float em_ref_neff = 1.0f;       // Effective number of references: 1 / sum_j gamma_j^2
+    };
+    std::vector<EmReadResult> em_read_results(n_reads);
 
     if (use_em && em_aln_count > 0) {
-        uint32_t n_reads = static_cast<uint32_t>(read_names.size());
-        uint32_t n_refs = static_cast<uint32_t>(ref_names.size());
-
         if (verbose) {
             std::cerr << "\nEM reassignment:\n";
             std::cerr << "  Alignments: " << em_aln_count << "\n";
@@ -1235,7 +2045,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cerr << "  References: " << n_refs << "\n";
             std::cerr << "  Lambda_b: " << em_lambda_b << "\n";
             std::cerr << "  Max iters: " << em_max_iters << "\n";
-            std::cerr << "  Tolerance: " << em_tol << "\n";
+            std::cerr << "  Tolerance: " << std::scientific << em_tol << std::defaultfloat << "\n";
+            std::cerr << "  Param tolerance: " << std::scientific << std::setprecision(3)
+                      << std::sqrt(std::max(em_tol, 1e-15)) << std::defaultfloat << "\n";
+            std::cerr << "  Min prob keep: " << em_min_prob << "\n";
+            std::cerr << "  Prob fraction keep: " << em_prob_fraction << "\n";
+            std::cerr << "  Length normalization: on\n";
         }
 
         // Build CSR-format alignment data
@@ -1248,153 +2063,229 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         em_params.max_iters = em_max_iters;
         em_params.tol = em_tol;
         em_params.use_squarem = true;
-        em_params.use_damage = (damage_index != nullptr);
+        em_params.normalize_by_length = true;
+        if (verbose) {
+            std::cerr << "  Min iters: " << em_params.min_iters << "\n";
+            std::cerr << "  SQUAREM warmup iters: " << em_params.squarem_warmup_iters << "\n";
+        }
+        const double em_damage_mean =
+            (em_damage_n > 0) ? (em_damage_sum / static_cast<double>(em_damage_n)) : 0.0;
+        const double em_damage_var = (em_damage_n > 0)
+            ? std::max(0.0, (em_damage_sumsq / static_cast<double>(em_damage_n)) -
+                               (em_damage_mean * em_damage_mean))
+            : 0.0;
+        const double em_damage_std = std::sqrt(em_damage_var);
+        const double em_llbf_mean =
+            (em_damage_ll_n > 0) ? (em_damage_llbf_sum / static_cast<double>(em_damage_ll_n)) : 0.0;
+        const double em_llbf_var = (em_damage_ll_n > 0)
+            ? std::max(0.0, (em_damage_llbf_sumsq / static_cast<double>(em_damage_ll_n)) -
+                               (em_llbf_mean * em_llbf_mean))
+            : 0.0;
+        const double em_llbf_std = std::sqrt(em_llbf_var);
+        const float em_damage_min_print = (em_damage_n > 0) ? em_damage_min : 0.0f;
+        const float em_damage_max_print = (em_damage_n > 0) ? em_damage_max : 0.0f;
+        const bool emi_has_alignment_damage =
+            (em_damage_ll_n > 0) && (em_damage_ll_nonzero > 0);
+        const bool emi_has_damage_scores =
+            (em_damage_n > 0) && (em_damage_nonzero > 0) &&
+            ((em_damage_max - em_damage_min) > 1e-6f);
+        // Damage-aware reassignment needs within-read alignment-level variation.
+        // If DAMAGE_SCORE is constant for all alignments of a read, it only shifts
+        // read-level ancientness and cancels from ref responsibilities.
+        em_params.use_alignment_damage_likelihood = emi_has_alignment_damage;
+        if (em_params.use_alignment_damage_likelihood) {
+            em_params.use_damage = true;
+        } else {
+            em_params.use_damage = emi_has_damage_scores && em_damage_varies_within_read;
+        }
+        if (verbose) {
+            std::cerr << "  Damage term in EM: "
+                      << (em_params.use_damage ? "enabled" : "disabled")
+                      << "\n";
+            std::cerr << "  EMI damage_score stats: mean=" << std::fixed << std::setprecision(4)
+                      << em_damage_mean
+                      << " std=" << std::fixed << std::setprecision(4) << em_damage_std
+                      << " min=" << std::fixed << std::setprecision(4) << em_damage_min_print
+                      << " max=" << std::fixed << std::setprecision(4) << em_damage_max_print
+                      << " nonzero=" << em_damage_nonzero << "/" << em_damage_n << "\n";
+            std::cerr << "  Within-read DAMAGE_SCORE variation: "
+                      << (em_damage_varies_within_read ? "yes" : "no") << "\n";
+            std::cerr << "  Alignment damage logBF stats: mean="
+                      << std::fixed << std::setprecision(4) << em_llbf_mean
+                      << " std=" << std::fixed << std::setprecision(4) << em_llbf_std
+                      << " nonzero=" << em_damage_ll_nonzero << "/" << em_damage_ll_n << "\n";
+            if (!em_params.use_damage) {
+                if (!emi_has_damage_scores) {
+                    std::cerr << "  Reason: EMI damage scores are all zero or constant.\n";
+                } else if (!em_damage_varies_within_read) {
+                    std::cerr << "  Reason: DAMAGE_SCORE is per-read constant across candidate "
+                                 "references, so it cannot alter reassignment.\n";
+                } else {
+                    std::cerr << "  Reason: damage evidence not informative for reassignment.\n";
+                }
+            } else {
+                if (em_params.use_alignment_damage_likelihood) {
+                    std::cerr << "  Source: using alignment-level EMI damage likelihoods.\n";
+                } else {
+                    std::cerr << "  Source: using alignment-level EMI damage variation.\n";
+                }
+            }
+            std::cerr << "  EM iteration diagnostics:\n";
+        }
+
+        agp::EMProgressCallback em_progress;
+        if (verbose) {
+            em_progress = [&](const agp::EMIterationDiagnostics& d) {
+                const bool rel_valid = std::isfinite(d.rel_change) && d.iteration > 1;
+                std::cerr << "    iter " << d.iteration
+                          << " ll=" << std::fixed << std::setprecision(2) << d.log_likelihood
+                          << " obj=" << std::fixed << std::setprecision(2) << d.objective
+                          << " rel=";
+                if (rel_valid) {
+                    std::cerr << std::scientific << std::setprecision(3) << d.rel_change;
+                } else {
+                    std::cerr << "NA";
+                }
+                std::cerr << " dphi=" << std::scientific << std::setprecision(3)
+                          << d.param_change;
+                std::cerr
+                          << " mode=" << (d.squarem_active ? "SQUAREM" : "EM");
+                if (d.squarem_active) {
+                    std::cerr << " alpha=" << std::fixed << std::setprecision(3) << d.alpha
+                              << " fallback=" << (d.fallback_to_em ? "1" : "0");
+                }
+                std::cerr << std::defaultfloat << "\n";
+            };
+        }
+
+        const auto em_start = std::chrono::steady_clock::now();
 
         // Run EM with SQUAREM acceleration
-        em_state = agp::squarem_em(aln_data, em_params, &stats_collector);
+        em_state = agp::squarem_em(aln_data, em_params, nullptr, em_progress);
+        const auto em_end = std::chrono::steady_clock::now();
 
         if (verbose) {
             std::cerr << "  Converged in " << em_state.iterations << " iterations\n";
             std::cerr << "  Log-likelihood: " << std::fixed << std::setprecision(2)
                       << em_state.log_likelihood << "\n";
-            if (em_params.use_damage) {
+            if (em_params.use_damage && !em_params.use_alignment_damage_likelihood) {
                 std::cerr << "  Estimated pi (ancient fraction): "
                           << std::fixed << std::setprecision(4) << em_state.pi << "\n";
+            } else if (em_params.use_alignment_damage_likelihood) {
+                std::cerr << "  Estimated pi (ancient fraction): n/a (per-read priors used)\n";
             }
+            std::cerr << "  Runtime: "
+                      << agp::log_utils::format_elapsed(em_start, em_end) << "\n";
         }
 
         // Extract best assignments and build per-read lookup
-        auto best = agp::reassign_reads(aln_data, em_state, 0.01);
+        auto best = agp::reassign_reads(aln_data, em_state, 0.0);
 
-        // Build per-read lookup: for each read, find its gamma for the best hit
-        // Summaries use best-hit-per-read (by bit_score), so we map read_idx -> gamma of best assignment
+        // Build per-read lookup: extract gamma for the best-hit target used in summaries,
+        // while tracking whether EM would have reassigned this read elsewhere.
         for (uint32_t r = 0; r < n_reads; ++r) {
-            std::string_view rname = read_names.get(r);
-            std::string rname_str(rname);
-
             uint32_t start = aln_data.read_offsets[r];
             uint32_t end = aln_data.read_offsets[r + 1];
 
-            // Find gamma for the best alignment per read (by EM assignment)
-            float best_gamma = 0.0f;
-            float best_gamma_ancient = 0.0f;
-            uint32_t best_ref = best[r].first;
+            float best_hit_gamma = 0.0f;
+            float best_hit_gamma_ancient = 0.0f;
+            uint32_t em_best_ref = best[r].first;
             bool bitscore_best_matches_em = false;
+            float top1 = 0.0f, top2 = 0.0f;
+            double sum_sq = 0.0;
 
             for (uint32_t j = start; j < end; ++j) {
-                if (aln_data.alignments[j].ref_idx == best_ref) {
-                    best_gamma = static_cast<float>(em_state.gamma[j]);
-                    if (em_params.use_damage && !em_state.gamma_ancient.empty()) {
-                        best_gamma_ancient = static_cast<float>(em_state.gamma_ancient[j]);
-                    }
-                    break;
+                const double g = em_state.gamma[j];
+                sum_sq += g * g;
+                if (g > static_cast<double>(top1)) {
+                    top2 = top1;
+                    top1 = static_cast<float>(g);
+                } else if (g > static_cast<double>(top2)) {
+                    top2 = static_cast<float>(g);
                 }
             }
 
             // Check if the best-by-bitscore hit matches the EM-assigned best
-            auto bh_it = best_hits.find(rname_str);
-            if (bh_it != best_hits.end() && bh_it->second.ref_idx == best_ref) {
-                bitscore_best_matches_em = true;
-            }
-
-            em_read_results[rname_str] = {best_gamma, best_gamma_ancient, bitscore_best_matches_em};
-        }
-
-        // Aggregate per-target short protein metrics for gene summary
-        struct GeneMetrics {
-            float sum_delta_bits = 0.0f;
-            float sum_bpa = 0.0f;
-            uint32_t count = 0;
-            std::array<uint32_t, 4> bin_counts{};
-        };
-        std::unordered_map<std::string, GeneMetrics> gene_metrics;
-        for (const auto& s : summaries) {
-            auto& gm = gene_metrics[s.target_id];
-            gm.sum_delta_bits += s.delta_bits;
-            gm.sum_bpa += s.bpa;
-            gm.count++;
-            gm.bin_counts[s.length_bin]++;
-        }
-
-        // Write gene summary
-        if (!gene_summary_file.empty()) {
-            agp::FilterThresholds thresh;
-            thresh.min_reads = min_reads;
-            thresh.min_breadth = min_breadth;
-            thresh.min_depth = min_depth;
-            thresh.min_positional_score = min_positional_score;
-            thresh.min_terminal_ratio = min_terminal_ratio;
-
-            auto ref_stats = stats_collector.finalize_filtered(
-                static_cast<float>(em_state.pi), thresh);
-
-            // Replace numeric ref_idx IDs with actual names
-            for (auto& s : ref_stats) {
-                uint32_t idx = static_cast<uint32_t>(std::stoul(s.ref_id));
-                if (idx < ref_names.size()) {
-                    s.ref_id = std::string(ref_names.get(idx));
+            const auto& bh = best_hits[r];
+            float keep_thr = std::max(
+                static_cast<float>(em_min_prob),
+                static_cast<float>(em_prob_fraction) * top1);
+            bool em_keep = true;
+            if (bh.has) {
+                const uint32_t best_hit_ref = bh.ref_idx;
+                bitscore_best_matches_em = (best_hit_ref == em_best_ref);
+                for (uint32_t j = start; j < end; ++j) {
+                    if (aln_data.alignments[j].ref_idx == best_hit_ref) {
+                        best_hit_gamma = static_cast<float>(em_state.gamma[j]);
+                        if (em_params.use_damage && !em_state.gamma_ancient.empty()) {
+                            best_hit_gamma_ancient = static_cast<float>(em_state.gamma_ancient[j]);
+                        }
+                        break;
+                    }
                 }
+                em_keep = (best_hit_gamma >= keep_thr);
+            } else {
+                em_keep = false;
             }
 
-            std::ofstream gf(gene_summary_file);
-            if (!gf.is_open()) {
-                std::cerr << "Error: Cannot open gene summary file: " << gene_summary_file << "\n";
-                return 1;
-            }
-
-            gf << "gene_id\tn_reads\tn_effective\tn_ancient\tn_modern\t"
-                  "breadth\tdepth_mean\tavg_identity\tenrichment\t"
-                  "start_diversity\tstart_span\tpositional_score\t"
-                  "terminal_ratio\tn_unique_starts\tis_ancient\t"
-                  "avg_delta_bits\tavg_bpa\tlength_bin\n";
-
-            for (const auto& s : ref_stats) {
-                bool is_ancient = s.damage_enrichment > 0.0f;
-                gf << s.ref_id
-                   << '\t' << s.n_reads
-                   << '\t' << std::fixed << std::setprecision(2) << s.n_effective
-                   << '\t' << std::setprecision(2) << s.n_ancient
-                   << '\t' << std::setprecision(2) << s.n_modern
-                   << '\t' << std::setprecision(4) << s.breadth
-                   << '\t' << std::setprecision(2) << s.depth_mean
-                   << '\t' << std::setprecision(4) << s.avg_identity
-                   << '\t' << std::setprecision(4) << s.damage_enrichment
-                   << '\t' << std::setprecision(4) << s.start_diversity
-                   << '\t' << std::setprecision(4) << s.start_span
-                   << '\t' << std::setprecision(4) << s.positional_score
-                   << '\t' << std::setprecision(4) << s.terminal_ratio
-                   << '\t' << s.n_unique_starts
-                   << '\t' << (is_ancient ? 1 : 0);
-                auto gm_it = gene_metrics.find(s.ref_id);
-                if (gm_it != gene_metrics.end() && gm_it->second.count > 0) {
-                    const auto& gm = gm_it->second;
-                    gf << '\t' << std::setprecision(1) << (gm.sum_delta_bits / gm.count)
-                       << '\t' << std::setprecision(3) << (gm.sum_bpa / gm.count)
-                       << '\t' << static_cast<int>(std::max_element(
-                              gm.bin_counts.begin(),
-                              gm.bin_counts.end()) - gm.bin_counts.begin());
-                } else {
-                    gf << "\t.\t.\t.";
-                }
-                gf << '\n';
-            }
-
-            if (verbose) {
-                std::cerr << "Gene summary written to: " << gene_summary_file
-                          << " (" << ref_stats.size() << " genes after filtering)\n";
-            }
+            em_read_results[r] = {
+                best_hit_gamma,
+                best_hit_gamma_ancient,
+                bitscore_best_matches_em,
+                em_keep,
+                keep_thr,
+                std::max(0.0f, top1 - top2),
+                (sum_sq > 0.0) ? static_cast<float>(1.0 / sum_sq) : 0.0f
+            };
         }
 
         if (verbose) {
             // Filtering stats
             size_t multi = 0, unique = 0;
+            size_t reassigned = 0;
+            size_t kept_total = 0, kept_multi = 0;
+            size_t fail_abs = 0, fail_frac = 0;
+            double margin_sum = 0.0;
+            double neff_sum = 0.0;
+            size_t margin_n = 0;
             for (uint32_t r = 0; r < n_reads; ++r) {
                 uint32_t deg = aln_data.read_offsets[r + 1] - aln_data.read_offsets[r];
                 if (deg > 1) multi++;
                 else unique++;
+                const auto& er = em_read_results[r];
+                if (!er.best_hit) reassigned++;
+                if (er.em_keep) {
+                    kept_total++;
+                    if (deg > 1) kept_multi++;
+                } else {
+                    if (er.gamma < static_cast<float>(em_min_prob)) fail_abs++;
+                    else fail_frac++;
+                }
+                if (deg > 0) {
+                    margin_sum += er.em_margin;
+                    neff_sum += er.em_ref_neff;
+                    margin_n++;
+                }
             }
             std::cerr << "  Unique mappers: " << unique << "\n";
             std::cerr << "  Multi-mappers: " << multi << "\n\n";
+            std::cerr << "  EM keep filter (best-hit target): kept "
+                      << kept_total << "/" << n_reads
+                      << " (" << std::fixed << std::setprecision(2)
+                      << (n_reads > 0 ? 100.0 * static_cast<double>(kept_total) / static_cast<double>(n_reads) : 0.0)
+                      << "%), kept multi " << kept_multi << "/" << multi << "\n";
+            std::cerr << "    failed abs(min_prob): " << fail_abs
+                      << ", failed frac(max*prob_fraction): " << fail_frac << "\n";
+            if (margin_n > 0) {
+                const double reassigned_pct =
+                    100.0 * static_cast<double>(reassigned) / static_cast<double>(margin_n);
+                std::cerr << "  Reassigned vs bitscore-best: " << std::fixed << std::setprecision(2)
+                          << reassigned_pct << "%\n";
+                std::cerr << "  Mean EM margin (top1-top2): " << std::fixed << std::setprecision(4)
+                          << (margin_sum / static_cast<double>(margin_n)) << "\n";
+                std::cerr << "  Mean EM effective refs/read: " << std::fixed << std::setprecision(4)
+                          << (neff_sum / static_cast<double>(margin_n)) << "\n\n";
+            }
         }
     }
 
@@ -1410,8 +2301,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
 
     if (verbose) {
-        std::cerr << "Proteins with mismatches: " << summaries.size() << "\n";
-        std::cerr << "Proteins with damage-consistent sites: " << proteins_with_damage << "\n";
+        std::cerr << "Reads with mismatches: " << summaries.size() << "\n";
+        std::cerr << "Reads with damage-consistent sites: " << proteins_with_damage << "\n";
         std::cerr << "Total damage-consistent sites: " << total_sites << "\n";
         std::cerr << "  C->T class: " << total_ct << "\n";
         std::cerr << "  G->A class: " << total_ga << "\n";
@@ -1419,24 +2310,73 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
 
     // Bayesian scoring setup
-    // 1. Create decay lookup table for position-weighted hazards
-    agp::ExpDecayLUT decay_lut(lambda, 300);
-
-    // 2. Estimate q_modern from low p_read reads (likely undamaged)
-    // Use reads with p_read < 0.20 as modern proxy (p_read is bimodal: ~0 or ~0.5+)
+    // Estimate q_modern from likely-undamaged reads using AA opportunity accounting.
     std::vector<std::pair<uint32_t, uint32_t>> modern_proxy;
+    double p_read_sum_all = 0.0;
+    size_t p_read_n_all = 0;
+    double p_read_sum_low = 0.0;
+    size_t p_read_n_low = 0;
+    float p_read_tail_cut = 0.20f;
+    std::vector<float> p_read_values;
+    p_read_values.reserve(summaries.size());
+
     for (const auto& s : summaries) {
-        if (s.has_p_read && s.p_read < 0.20f && !s.qaln.empty()) {
-            auto ev = agp::compute_site_evidence(s.qaln, s.taln, s.qstart_0, s.qlen, d_max, decay_lut);
-            modern_proxy.emplace_back(ev.m, ev.k);
+        if (!s.has_p_read) continue;
+        const float p = std::clamp(s.p_read, 0.0f, 1.0f);
+        p_read_sum_all += p;
+        p_read_n_all++;
+        p_read_values.push_back(p);
+    }
+
+    float q20 = 0.20f;
+    float q35 = 0.35f;
+    if (!p_read_values.empty()) {
+        std::vector<float> qbuf = p_read_values;
+        q20 = quantile_inplace(qbuf, 0.20);
+        qbuf = p_read_values;
+        q35 = quantile_inplace(qbuf, 0.35);
+    }
+    p_read_tail_cut = std::clamp(q20, 0.02f, 0.35f);
+
+    auto collect_modern_proxy = [&](float cutoff) {
+        p_read_sum_low = 0.0;
+        p_read_n_low = 0;
+        modern_proxy.clear();
+        for (const auto& s : summaries) {
+            if (!s.has_p_read) continue;
+            const float p = std::clamp(s.p_read, 0.0f, 1.0f);
+            if (p > cutoff) continue;
+            p_read_sum_low += p;
+            p_read_n_low++;
+            if (s.aa_m_opportunities > 0) {
+                modern_proxy.emplace_back(s.aa_m_opportunities, s.aa_k_hits);
+            }
+        }
+    };
+
+    collect_modern_proxy(p_read_tail_cut);
+    if (modern_proxy.empty() && p_read_n_all > 0) {
+        const float widened_cut = std::clamp(q35, p_read_tail_cut, 0.50f);
+        if (widened_cut > p_read_tail_cut + 1e-6f) {
+            p_read_tail_cut = widened_cut;
+            collect_modern_proxy(p_read_tail_cut);
         }
     }
+
     agp::ModernBaseline modern_est = agp::estimate_modern_baseline(modern_proxy);
+    const float empirical_pi0 = std::clamp(
+        static_cast<float>(
+            (p_read_n_low > 0)
+                ? (p_read_sum_low / static_cast<double>(p_read_n_low))
+                : ((p_read_n_all > 0)
+                    ? (p_read_sum_all / static_cast<double>(p_read_n_all))
+                    : 0.10)),
+        0.01f, 0.99f);
 
     // Set up scoring parameters with empirical Bayes approach
     agp::BayesianScoreParams score_params;
     score_params.pi = 0.10f;             // Prior P(ancient) - conservative
-    score_params.pi0 = 0.10f;            // Prior used in p_read calculation
+    score_params.pi0 = empirical_pi0;    // Empirical baseline for terminal evidence transform
     score_params.q_modern = modern_est.q_modern;
     score_params.w0 = 0.3f;              // Temper absence evidence (robustness)
     score_params.terminal_threshold = 0.50f;
@@ -1456,9 +2396,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         score_params.damage_informative = damage_index->damage_informative();
         score_params.channel_b_valid = damage_index->channel_b_valid();
         damage_detectability = agp::compute_damage_detectability(
-            damage_index->d_max(), damage_index->stop_decay_llr(),
-            damage_index->terminal_shift(), damage_index->damage_validated(),
-            damage_index->damage_artifact());
+            damage_index->d_max(), damage_index->damage_validated(),
+            damage_index->damage_artifact(), damage_index->channel_b_valid(),
+            damage_index->stop_decay_llr(), damage_index->terminal_shift());
     }
 
     if (verbose) {
@@ -1466,6 +2406,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         std::cerr << "  Modern proxy reads: " << modern_est.n_reads << "\n";
         std::cerr << "  Pooled opportunities: " << modern_est.M0 << "\n";
         std::cerr << "  Pooled hits: " << modern_est.K0 << "\n";
+        std::cerr << "  p_read baseline (pi0): " << std::fixed << std::setprecision(4)
+                  << score_params.pi0 << " (low-tail n=" << p_read_n_low
+                  << ", all n=" << p_read_n_all
+                  << ", tail_cut=" << std::fixed << std::setprecision(4) << p_read_tail_cut
+                  << ")\n";
         std::cerr << "  Estimated q_modern: " << std::fixed << std::setprecision(5)
                   << modern_est.q_modern << "\n";
         std::cerr << "  Tempering w0: " << score_params.w0 << "\n";
@@ -1563,14 +2508,14 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     *out << "query_id\ttarget_id\tevalue\tbits\tfident\talnlen\t"
             "total_mismatches\tdamage_consistent\tnon_damage\t"
             "ct_sites\tga_sites\thigh_conf\tdamage_fraction\t"
-            "max_p_damage\tp_damaged\tp_read\tposterior\t"
+            "max_p_damage\tp_damaged\tp_read\tposterior\tis_damaged\t"
             "classification\tlogBF_terminal\tlogBF_sites\tlogBF_identity\t"
             "m_opportunities\tk_hits\tq_eff\ttier\tdamage_class\t"
             "syn_5prime\tsyn_3prime\t"
             "delta_bits\tbpa\tlength_bin\tz_bpa\t"
             "damage_informative";
     if (use_em) {
-        *out << "\tgamma\tgamma_ancient\tbest_hit";
+        *out << "\tgamma\tgamma_ancient\tbest_hit\tem_keep\tem_keep_threshold\tem_margin\tem_ref_neff";
     }
     *out << "\n";
 
@@ -1581,25 +2526,17 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     for (size_t si = 0; si < summaries.size(); ++si) {
         const auto& s = summaries[si];
         // Compute Bayesian score with decomposition
-        float posterior = s.p_damaged;  // fallback if no alignment data
+        float posterior = s.p_damaged;  // fallback when AGD p_read is unavailable
         agp::BayesianScoreOutput bayes_out{};
+        bayes_out.informative = score_params.damage_informative;
 
         if (s.has_p_read) {
-            // Use ct_sites + ga_sites as damage evidence (correctly computed from AA substitutions)
-            // The compute_site_evidence function was broken - it expected nucleotides but got amino acids
+            // AA-level evidence from alignment opportunities and damage-consistent hits.
             agp::SiteEvidence ev{};
-            ev.k = static_cast<uint32_t>(s.ct_sites + s.ga_sites);  // damage-consistent hits
-            ev.m = static_cast<uint32_t>(s.alnlen);  // opportunities ~ alignment length
-
-            // Compute log-likelihood contribution for hits
-            // Each damage site at terminal position has ~d_max probability
-            // log(q_ancient / q_modern) where q_ancient ~ d_max, q_modern ~ 0.005
-            constexpr float Q_BASELINE = 0.005f;
-            if (ev.k > 0 && d_max > Q_BASELINE) {
-                float avg_q_ancient = d_max * 0.5f + Q_BASELINE;  // average over positions
-                ev.sum_log_qA_hits = static_cast<float>(ev.k) * std::log(avg_q_ancient / Q_BASELINE);
-            }
-            ev.sum_qA = d_max * 0.3f * static_cast<float>(ev.m);  // rough average damage rate
+            ev.k = s.aa_k_hits;
+            ev.m = s.aa_m_opportunities;
+            ev.sum_qA = s.aa_sum_qA;
+            ev.sum_log_qA_hits = s.aa_sum_log_qA_hits;
             ev.q_eff = (ev.m > 0) ? (ev.sum_qA / static_cast<float>(ev.m)) : 0.0f;
 
             // Compute Bayesian score (with optional identity evidence)
@@ -1627,12 +2564,15 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         read_posteriors[si] = posterior;
         read_classifications[si] = classification;
 
+        std::string is_damaged = ".";
         if (bayes_out.informative) {
             *out << std::fixed << std::setprecision(4) << posterior << "\t";
+            is_damaged = (posterior >= threshold) ? "1" : "0";
         } else {
             *out << "NA\t";
         }
-        *out << agp::classification_name(classification) << "\t";
+        *out << is_damaged << "\t"
+             << agp::classification_name(classification) << "\t";
         *out
              << std::fixed << std::setprecision(3) << bayes_out.logBF_terminal << "\t"
              << std::fixed << std::setprecision(3) << bayes_out.logBF_sites << "\t"
@@ -1650,138 +2590,205 @@ int cmd_damage_annotate(int argc, char* argv[]) {
              << (bayes_out.informative ? 1 : 0);
 
         if (use_em) {
-            auto it = em_read_results.find(s.query_id);
-            if (it != em_read_results.end()) {
-                auto& [gamma, gamma_anc, best] = it->second;
-                *out << "\t" << std::fixed << std::setprecision(4) << gamma
-                     << "\t" << std::fixed << std::setprecision(4) << gamma_anc
-                     << "\t" << (best ? 1 : 0);
+            if (s.read_idx < em_read_results.size()) {
+                const auto& em = em_read_results[s.read_idx];
+                *out << "\t" << std::scientific << std::setprecision(6) << em.gamma
+                     << "\t" << std::scientific << std::setprecision(6) << em.gamma_ancient
+                     << "\t" << (em.best_hit ? 1 : 0)
+                     << "\t" << (em.em_keep ? 1 : 0)
+                     << "\t" << std::fixed << std::setprecision(6) << em.em_threshold
+                     << "\t" << std::fixed << std::setprecision(4) << em.em_margin
+                     << "\t" << std::fixed << std::setprecision(4) << em.em_ref_neff;
             } else {
-                *out << "\t.\t.\t.";
+                *out << "\t.\t.\t.\t.\t.\t.\t.";
             }
         }
         *out << "\n";
     }
 
-    // Write gene summary (supports both best-hit and EM-weighted modes)
-    if (!gene_summary_file.empty()) {
-        std::unordered_map<std::string, GeneSummaryAccumulator> gene_agg;
+    std::unordered_map<std::string, GeneSummaryAccumulator> gene_agg;
+    bool have_gene_agg = false;
 
-        for (size_t i = 0; i < summaries.size(); ++i) {
-            const auto& s = summaries[i];
-            auto& acc = gene_agg[s.target_id];
+    // Build/write gene summary (supports both best-hit and EM-weighted modes)
+    const bool need_gene_aggregation =
+        !gene_summary_file.empty() || !functional_summary_file.empty() ||
+        !anvio_ko_file.empty() || !combined_output_file.empty() ||
+        !protein_summary_file.empty() || !protein_filtered_file.empty();
+    if (need_gene_aggregation) {
+        gene_agg.clear();
+
+        for (uint32_t ridx = 0; ridx < n_reads; ++ridx) {
+            const auto& hit = best_hits[ridx];
+            if (!hit.has) continue;
+            if (use_em) {
+                if (ridx >= em_read_results.size() || !em_read_results[ridx].em_keep) {
+                    continue;
+                }
+            }
+            const std::string target_id(reader.ref_name(hit.ref_idx));
+            auto& acc = gene_agg[target_id];
             if (acc.tlen == 0) {
-                acc.target_id = s.target_id;
-                acc.tlen = static_cast<uint32_t>(s.tlen);
+                acc.target_id = target_id;
+                acc.tlen = static_cast<uint32_t>(hit.tlen);
                 if (acc.tlen > 0) {
                     acc.coverage.assign(acc.tlen, 0.0f);
                 }
             }
-            size_t aln_on_target = 0;
-            for (char c : s.taln) {
-                if (c != '-') ++aln_on_target;
-            }
 
-            // Get gamma weight: 1.0 for best-hit mode, actual gamma for EM mode
-            float gamma = 1.0f;
-            if (use_em) {
-                auto it = em_read_results.find(s.query_id);
-                if (it != em_read_results.end()) {
-                    gamma = std::get<0>(it->second);  // gamma from EM
+            const float gamma = use_em ? em_read_results[ridx].gamma : 1.0f;
+            acc.add_assignment(hit.fident, hit.tstart_0, hit.aln_len_on_target, gamma);
+
+            const int32_t summary_idx = (ridx < summary_index_by_read.size())
+                ? summary_index_by_read[ridx]
+                : -1;
+            if (summary_idx >= 0) {
+                const size_t si = static_cast<size_t>(summary_idx);
+                if (si < read_posteriors.size() && si < read_classifications.size()) {
+                    acc.add_damage_observation(read_classifications[si], read_posteriors[si], gamma);
+                }
+            }
+        }
+
+        // Auto-calibrate spurious hit thresholds if requested
+        if (auto_calibrate_spurious) {
+            std::vector<float> calib_pos_scores;
+            std::vector<float> calib_term_ratios;
+            calib_pos_scores.reserve(gene_agg.size() / 10);
+            calib_term_ratios.reserve(gene_agg.size() / 10);
+
+            // Collect scores from well-supported genes (calibration set)
+            for (const auto& [tid, acc] : gene_agg) {
+                if (acc.n_reads >= 10 && acc.n_unique_starts() >= 3) {
+                    calib_pos_scores.push_back(acc.positional_score());
+                    calib_term_ratios.push_back(acc.terminal_middle_ratio());
                 }
             }
 
-            acc.add_read(read_classifications[i], read_posteriors[i],
-                         s.fident, s.tstart_0, aln_on_target, gamma);
-        }
+            if (calib_pos_scores.size() >= 100) {
+                // Compute 5th percentile for each metric
+                std::sort(calib_pos_scores.begin(), calib_pos_scores.end());
+                std::sort(calib_term_ratios.begin(), calib_term_ratios.end());
 
-        std::ofstream gf(gene_summary_file);
-        if (!gf.is_open()) {
-            std::cerr << "Error: Cannot open gene summary file: " << gene_summary_file << "\n";
-            return 1;
-        }
+                const size_t idx_5pct = calib_pos_scores.size() / 20;  // 5th percentile
+                float calib_min_pos = calib_pos_scores[idx_5pct];
+                float calib_min_term = calib_term_ratios[idx_5pct];
 
-        // Full gene-level stats including coverage, damage, alignment, and diversity metrics
-        gf << "target_id\tn_reads\teff_reads\tn_ancient\tn_modern\tn_undetermined\t"
-              "ancient_frac\tci_low\tci_high\tmean_posterior\tmean_identity\t"
-              "breadth\tabundance\tdepth_std\tdepth_evenness\t"
-              "n_unique_starts\tstart_diversity\tstart_span\tpositional_score\t"
-              "avg_aln_len\tstd_aln_len\n";
+                // Apply floor to terminal ratio (min 0.05)
+                calib_min_term = std::max(0.05f, calib_min_term);
 
-        for (const auto& [tid, acc] : gene_agg) {
-            if (acc.n_reads < min_reads) continue;
-            float b = acc.breadth();
-            if (b < min_breadth) continue;
-            float abundance = acc.depth_mean();  // Gamma-weighted depth = abundance
-            if (abundance < min_depth) continue;
+                // Override if auto-calibration yields stricter thresholds
+                if (calib_min_pos > min_positional_score) {
+                    min_positional_score = calib_min_pos;
+                }
+                if (calib_min_term > min_terminal_ratio) {
+                    min_terminal_ratio = calib_min_term;
+                }
 
-            // Gamma-weighted ancient/modern counts
-            float n_ancient = static_cast<float>(acc.n_ancient_conf + acc.n_ancient_likely);
-            float n_modern = static_cast<float>(acc.n_modern_conf);
-            float n_undet = static_cast<float>(acc.n_undetermined);
-
-            // Wilson CI uses integer counts (actual reads for CI calculation)
-            uint32_t n_anc_int = static_cast<uint32_t>(std::round(n_ancient));
-            auto [ci_lo, ci_hi] = wilson_ci(n_anc_int, acc.n_reads);
-
-            gf << acc.target_id
-               << '\t' << acc.n_reads
-               << '\t' << std::fixed << std::setprecision(2) << acc.eff_reads()
-               << '\t' << std::setprecision(2) << n_ancient
-               << '\t' << std::setprecision(2) << n_modern
-               << '\t' << std::setprecision(2) << n_undet
-               << '\t' << std::setprecision(4) << acc.ancient_frac()
-               << '\t' << std::setprecision(4) << ci_lo
-               << '\t' << std::setprecision(4) << ci_hi
-               << '\t' << std::setprecision(4) << acc.avg_posterior()
-               << '\t' << std::setprecision(4) << acc.avg_fident()
-               << '\t' << std::setprecision(4) << b
-               << '\t' << std::setprecision(4) << abundance
-               << '\t' << std::setprecision(4) << acc.depth_std()
-               << '\t' << std::setprecision(4) << acc.depth_evenness()
-               << '\t' << acc.n_unique_starts()
-               << '\t' << std::setprecision(4) << acc.start_diversity()
-               << '\t' << std::setprecision(4) << acc.start_span()
-               << '\t' << std::setprecision(4) << acc.positional_score()
-               << '\t' << std::setprecision(2) << acc.avg_aln_len()
-               << '\t' << std::setprecision(2) << acc.std_aln_len()
-               << '\n';
-        }
-
-        if (verbose) {
-            size_t total = gene_agg.size();
-            size_t passed = 0;
-            for (const auto& [tid, acc] : gene_agg) {
-                if (acc.n_reads >= min_reads && acc.breadth() >= min_breadth
-                    && acc.depth_mean() >= min_depth)
-                    ++passed;
+                if (verbose) {
+                    std::cerr << "Auto-calibration (n=" << calib_pos_scores.size() << " genes):\n"
+                              << "  min_positional_score: " << std::fixed << std::setprecision(4) << min_positional_score << "\n"
+                              << "  min_terminal_ratio: " << std::fixed << std::setprecision(4) << min_terminal_ratio << "\n";
+                }
+            } else if (verbose) {
+                std::cerr << "Auto-calibration: insufficient calibration set ("
+                          << calib_pos_scores.size() << " genes, need >= 100)\n";
             }
-            std::cerr << "Gene summary written to: " << gene_summary_file
-                      << " (" << passed << "/" << total << " genes after filtering)\n";
         }
 
-        // Functional profiling (aggregate gene stats by function)
-        bool do_functional = !kegg_map_file.empty() || !cazyme_map_file.empty() || !viral_map_file.empty();
+        if (!gene_summary_file.empty()) {
+            std::ofstream gf(gene_summary_file);
+            if (!gf.is_open()) {
+                std::cerr << "Error: Cannot open gene summary file: " << gene_summary_file << "\n";
+                return 1;
+            }
+
+            // Full gene-level stats including coverage, damage, alignment, and diversity metrics
+            gf << "target_id\tn_reads\teff_reads\tn_damage_reads\teff_damage_reads\t"
+                  "n_ancient\tn_modern\tn_undetermined\t"
+                  "ancient_frac\tci_low\tci_high\tmean_posterior\tmean_identity\t"
+                  "breadth\tabundance\tdepth_std\tdepth_evenness\t"
+                  "n_unique_starts\tstart_diversity\tstart_span\tpositional_score\t"
+                  "terminal_middle_ratio\tavg_aln_len\tstd_aln_len\n";
+
+            for (const auto& [tid, acc] : gene_agg) {
+                if (acc.n_reads < min_reads) continue;
+                float b = acc.breadth();
+                if (b < min_breadth) continue;
+                float abundance = acc.depth_mean();  // Gamma-weighted depth = abundance
+                if (abundance < min_depth) continue;
+                const float pos_score = acc.positional_score();
+                if (pos_score < min_positional_score) continue;
+                const float term_ratio = acc.terminal_middle_ratio();
+                if (term_ratio < min_terminal_ratio) continue;
+
+                // Gamma-weighted ancient/modern counts
+                float n_ancient = static_cast<float>(acc.n_ancient_conf + acc.n_ancient_likely);
+                float n_modern = static_cast<float>(acc.n_modern_conf);
+                float n_undet = static_cast<float>(acc.n_undetermined);
+
+                const double n_eff_class = static_cast<double>(n_ancient + n_modern);
+                auto [ci_lo, ci_hi] = wilson_ci_effective(n_ancient, n_eff_class);
+
+                gf << acc.target_id
+                   << '\t' << acc.n_reads
+                   << '\t' << std::fixed << std::setprecision(2) << acc.eff_reads()
+                   << '\t' << acc.n_damage_reads
+                   << '\t' << std::setprecision(2) << acc.n_damage_reads_eff
+                   << '\t' << std::setprecision(2) << n_ancient
+                   << '\t' << std::setprecision(2) << n_modern
+                   << '\t' << std::setprecision(2) << n_undet
+                   << '\t' << std::setprecision(4) << acc.ancient_frac()
+                   << '\t' << std::setprecision(4) << ci_lo
+                   << '\t' << std::setprecision(4) << ci_hi
+                   << '\t' << std::setprecision(4) << acc.avg_posterior()
+                   << '\t' << std::setprecision(4) << acc.avg_fident()
+                   << '\t' << std::setprecision(4) << b
+                   << '\t' << std::setprecision(4) << abundance
+                   << '\t' << std::setprecision(4) << acc.depth_std()
+                   << '\t' << std::setprecision(4) << acc.depth_evenness()
+                   << '\t' << acc.n_unique_starts()
+                   << '\t' << std::setprecision(4) << acc.start_diversity()
+                   << '\t' << std::setprecision(4) << acc.start_span()
+                   << '\t' << std::setprecision(4) << pos_score
+                   << '\t' << std::setprecision(4) << term_ratio
+                   << '\t' << std::setprecision(2) << acc.avg_aln_len()
+                   << '\t' << std::setprecision(2) << acc.std_aln_len()
+                   << '\n';
+            }
+
+            if (verbose) {
+                size_t total = gene_agg.size();
+                size_t passed = 0;
+                for (const auto& [tid, acc] : gene_agg) {
+                    if (acc.n_reads >= min_reads && acc.breadth() >= min_breadth
+                        && acc.depth_mean() >= min_depth
+                        && acc.positional_score() >= min_positional_score
+                        && acc.terminal_middle_ratio() >= min_terminal_ratio)
+                        ++passed;
+                }
+                std::cerr << "Gene summary written to: " << gene_summary_file
+                          << " (" << passed << "/" << total << " genes after filtering)\n";
+            }
+        }
+
+        have_gene_agg = true;
+
+        // Functional profiling (aggregate gene stats by mapped group)
+        bool do_functional = !map_file.empty();
         if (do_functional) {
-            // Load mapping files
-            auto kegg_map = kegg_map_file.empty() ? std::unordered_map<std::string, std::string>{}
-                          : load_mapping_file(kegg_map_file, verbose);
-            auto cazyme_map = cazyme_map_file.empty() ? std::unordered_map<std::string, std::string>{}
-                            : load_mapping_file(cazyme_map_file, verbose);
-            auto viral_map = viral_map_file.empty() ? std::unordered_map<std::string, std::string>{}
-                           : load_mapping_file(viral_map_file, verbose);
+            // Load mapping file: gene_id -> group
+            auto group_map = load_mapping_file(map_file, verbose);
 
-            // Accumulators by function
-            std::unordered_map<std::string, FunctionalAccumulator> kegg_acc;    // KO -> stats
-            std::unordered_map<std::string, FunctionalAccumulator> cazyme_fam_acc;  // Family -> stats
-            std::unordered_map<std::string, FunctionalAccumulator> cazyme_cls_acc;  // Class -> stats
-            std::unordered_map<std::string, FunctionalAccumulator> viral_acc;   // VOG -> stats
+            // Accumulator by group
+            std::unordered_map<std::string, FunctionalAccumulator> group_acc;
 
-            // Aggregate gene stats by function
+            // Aggregate gene stats by group
             for (const auto& [tid, acc] : gene_agg) {
                 // Skip filtered genes
                 float abundance = acc.depth_mean();  // EM-weighted abundance
-                if (acc.n_reads < min_reads || acc.breadth() < min_breadth || abundance < min_depth)
+                if (acc.n_reads < min_reads || acc.breadth() < min_breadth || abundance < min_depth
+                    || acc.positional_score() < min_positional_score
+                    || acc.terminal_middle_ratio() < min_terminal_ratio)
                     continue;
 
                 // Use effective reads (gamma-weighted) for proper abundance estimation
@@ -1790,50 +2797,17 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 float gene_modern = static_cast<float>(acc.n_modern_conf);
                 float gene_undetermined = static_cast<float>(acc.n_undetermined);
 
-                // KEGG
-                auto kegg_it = kegg_map.find(tid);
-                if (kegg_it != kegg_map.end()) {
-                    auto& fa = kegg_acc[kegg_it->second];
+                auto map_it = group_map.find(tid);
+                if (map_it != group_map.end()) {
+                    auto& fa = group_acc[map_it->second];
                     if (fa.function_id.empty()) {
-                        fa.function_id = kegg_it->second;
-                        fa.db_type = "KEGG";
+                        fa.function_id = map_it->second;
+                        fa.db_type = "MAP";
                     }
-                    fa.add_gene(eff_reads, gene_ancient, gene_modern, gene_undetermined, acc.avg_posterior());
-                }
-
-                // CAZyme
-                auto cazyme_it = cazyme_map.find(tid);
-                if (cazyme_it != cazyme_map.end()) {
-                    const std::string& family = cazyme_it->second;
-                    // Family level
-                    auto& fam_acc = cazyme_fam_acc[family];
-                    if (fam_acc.function_id.empty()) {
-                        fam_acc.function_id = family;
-                        fam_acc.db_type = "CAZyme";
-                    }
-                    fam_acc.add_gene(eff_reads, gene_ancient, gene_modern, gene_undetermined, acc.avg_posterior());
-
-                    // Class level (GH, GT, PL, CE, AA, CBM)
-                    std::string cls = cazyme_class_from_family(family);
-                    if (!cls.empty()) {
-                        auto& cls_acc = cazyme_cls_acc[cls];
-                        if (cls_acc.function_id.empty()) {
-                            cls_acc.function_id = cls;
-                            cls_acc.db_type = "CAZyme_class";
-                        }
-                        cls_acc.add_gene(eff_reads, gene_ancient, gene_modern, gene_undetermined, acc.avg_posterior());
-                    }
-                }
-
-                // Viral
-                auto viral_it = viral_map.find(tid);
-                if (viral_it != viral_map.end()) {
-                    auto& va = viral_acc[viral_it->second];
-                    if (va.function_id.empty()) {
-                        va.function_id = viral_it->second;
-                        va.db_type = "Viral";
-                    }
-                    va.add_gene(eff_reads, gene_ancient, gene_modern, gene_undetermined, acc.avg_posterior());
+                    const float gene_mean_post = acc.avg_posterior();
+                    const bool gene_is_damaged = (gene_mean_post >= threshold);
+                    fa.add_gene(eff_reads, gene_ancient, gene_modern, gene_undetermined,
+                                gene_mean_post, gene_is_damaged);
                 }
             }
 
@@ -1844,32 +2818,47 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     std::cerr << "Error: Cannot open functional summary file: " << functional_summary_file << "\n";
                 } else {
                     ff << "db\tfunction_id\tlevel\tn_genes\tn_reads\tn_ancient\tn_modern\tn_undetermined\t"
-                       << "ancient_frac\tci_low\tci_high\tmean_posterior\n";
+                       << "ancient_frac\tci_low\tci_high\tmean_posterior\t"
+                       << "n_damaged_genes\tdamaged_gene_frac\tdamage_enrichment\n";
 
-                    auto write_acc = [&ff](const std::unordered_map<std::string, FunctionalAccumulator>& accs,
-                                           const std::string& level) {
+                    uint32_t global_genes = 0;
+                    uint32_t global_damaged_genes = 0;
+                    for (const auto& [fid, fa] : group_acc) {
+                        global_genes += fa.n_genes;
+                        global_damaged_genes += fa.n_damaged_genes;
+                    }
+                    const float global_damaged_frac = (global_genes > 0)
+                        ? static_cast<float>(global_damaged_genes) / static_cast<float>(global_genes)
+                        : 0.0f;
+
+                    auto write_acc = [&ff, global_damaged_frac](
+                        const std::unordered_map<std::string, FunctionalAccumulator>& accs,
+                        const std::string& level) {
                         for (const auto& [fid, fa] : accs) {
                             float frac = fa.ancient_frac();
-                            auto [ci_low, ci_high] = wilson_ci(
-                                static_cast<uint32_t>(fa.n_ancient),
-                                static_cast<uint32_t>(fa.n_ancient + fa.n_modern));
+                            auto [ci_low, ci_high] = wilson_ci_effective(
+                                static_cast<double>(fa.n_ancient),
+                                static_cast<double>(fa.n_ancient + fa.n_modern));
+                            const float damaged_frac = fa.damaged_gene_frac();
+                            const float enrichment = (global_damaged_frac > 0.0f)
+                                ? (damaged_frac / global_damaged_frac)
+                                : 0.0f;
                             ff << fa.db_type << '\t' << fa.function_id << '\t' << level << '\t'
                                << fa.n_genes << '\t' << fa.n_reads << '\t'
                                << std::fixed << std::setprecision(1) << fa.n_ancient << '\t'
                                << fa.n_modern << '\t' << fa.n_undetermined << '\t'
                                << std::setprecision(4) << frac << '\t' << ci_low << '\t' << ci_high << '\t'
-                               << fa.mean_posterior() << '\n';
+                               << fa.mean_posterior() << '\t'
+                               << fa.n_damaged_genes << '\t'
+                               << damaged_frac << '\t'
+                               << enrichment << '\n';
                         }
                     };
 
-                    write_acc(kegg_acc, "KO");
-                    write_acc(cazyme_fam_acc, "family");
-                    write_acc(cazyme_cls_acc, "class");
-                    write_acc(viral_acc, "VOG");
+                    write_acc(group_acc, "group");
 
                     if (verbose) {
-                        size_t total_funcs = kegg_acc.size() + cazyme_fam_acc.size() +
-                                             cazyme_cls_acc.size() + viral_acc.size();
+                        size_t total_funcs = group_acc.size();
                         std::cerr << "Functional summary written to: " << functional_summary_file
                                   << " (" << total_funcs << " functions)\n";
                     }
@@ -1879,7 +2868,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             // Write Anvi'o-compatible gene abundance (for anvi-estimate-metabolism --enzymes-txt)
             // Format: gene_id  enzyme_accession  source  coverage  detection
             // Where coverage = EM-weighted abundance (gamma-weighted depth), detection = breadth
-            if (!anvio_ko_file.empty() && !kegg_map.empty()) {
+            if (!anvio_ko_file.empty() && !group_map.empty()) {
                 std::ofstream af(anvio_ko_file);
                 if (!af.is_open()) {
                     std::cerr << "Error: Cannot open Anvi'o KO file: " << anvio_ko_file << "\n";
@@ -1889,49 +2878,107 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     for (const auto& [tid, acc] : gene_agg) {
                         // Skip filtered genes
                         float abundance = acc.depth_mean();  // EM-weighted abundance
-                        if (acc.n_reads < min_reads || acc.breadth() < min_breadth || abundance < min_depth)
+                        if (acc.n_reads < min_reads || acc.breadth() < min_breadth || abundance < min_depth
+                            || acc.positional_score() < min_positional_score
+                            || acc.terminal_middle_ratio() < min_terminal_ratio)
                             continue;
-                        // Look up KO for this gene
-                        auto it = kegg_map.find(tid);
-                        if (it == kegg_map.end()) continue;
-                        std::string ko = it->second;
-                        // Strip "ko:" prefix if present
-                        if (ko.size() > 3 && ko.substr(0, 3) == "ko:") {
-                            ko = ko.substr(3);
-                        }
+                        // Look up mapped group for this gene
+                        auto it = group_map.find(tid);
+                        if (it == group_map.end()) continue;
                         // coverage = EM-weighted abundance (sum of gamma-weighted depth)
-                        af << tid << '\t' << ko << '\t' << "AGP" << '\t'
+                        af << tid << '\t' << it->second << '\t' << annotation_source << '\t'
                            << std::fixed << std::setprecision(4) << abundance << '\t'
                            << std::setprecision(4) << acc.breadth() << '\n';
                         ++n_written;
                     }
                     if (verbose) {
                         std::cerr << "Anvi'o gene abundance written to: " << anvio_ko_file
-                                  << " (" << n_written << " genes with KO annotations)\n";
+                                  << " (" << n_written << " genes with mapping annotations)\n";
                     }
                 }
             }
         }
     }
 
-    // Write per-protein aggregated summary (aggregates across all reads per target)
-    if (!protein_summary_file.empty()) {
-        std::unordered_map<std::string, ProteinAggregate> protein_agg;
+    std::unordered_map<std::string, ProteinAggregate> protein_agg;
+    bool have_protein_agg = false;
 
-        // Aggregate from summaries (read-level) and sites (for terminal counts)
+    // Build/write per-protein aggregated summary (aggregates across all reads per target)
+    if (!protein_summary_file.empty() || !protein_filtered_file.empty() || !combined_output_file.empty()) {
+        protein_agg.clear();
+
+        // Assignment channel: aggregate all EM-kept best-hit reads for abundance/patterns.
+        // Damage channel: aggregate mismatch-evidence summaries for damage statistics.
         constexpr size_t TERMINAL_CODONS = 3;  // First 3 codons = 9 nt
 
+        for (uint32_t ridx = 0; ridx < n_reads; ++ridx) {
+            const auto& hit = best_hits[ridx];
+            if (!hit.has) continue;
+            if (use_em) {
+                if (ridx >= em_read_results.size() || !em_read_results[ridx].em_keep) {
+                    continue;
+                }
+            }
+
+            const std::string target_id(reader.ref_name(hit.ref_idx));
+            auto& agg = protein_agg[target_id];
+            if (agg.protein_id.empty()) agg.protein_id = target_id;
+            if (agg.tlen == 0) agg.tlen = static_cast<uint32_t>(hit.tlen);
+            const float gamma = use_em ? em_read_results[ridx].gamma : 1.0f;
+            agg.n_reads++;
+            agg.n_reads_eff += gamma;
+            agg.sum_delta_bits += gamma * (hit.bits - hit.bits_second);
+            const float bpa = (hit.aln_len_on_target > 0)
+                ? (hit.bits / static_cast<float>(hit.aln_len_on_target))
+                : 0.0f;
+            agg.sum_bpa += gamma * bpa;
+            const uint8_t length_bin = static_cast<uint8_t>(agp::LengthBinStats::get_bin(hit.qlen));
+            agg.length_bin_counts[length_bin]++;
+            agg.unique_starts.insert(static_cast<uint32_t>(hit.tstart_0));
+            if (hit.tstart_0 < agg.min_start) agg.min_start = static_cast<uint32_t>(hit.tstart_0);
+            if (hit.tstart_0 > agg.max_start) agg.max_start = static_cast<uint32_t>(hit.tstart_0);
+
+            // Mapping pattern metrics (lightweight, no per-position vector needed)
+            const size_t aln_on_target = hit.aln_len_on_target;
+            agg.sum_aln_len += static_cast<double>(gamma) * static_cast<double>(aln_on_target);
+            agg.sum_aln_len_sq += static_cast<double>(gamma) * static_cast<double>(aln_on_target) *
+                                  static_cast<double>(aln_on_target);
+            const size_t tlen = std::max<size_t>(1, static_cast<size_t>(hit.tlen));
+            const size_t window = std::min(std::max<size_t>(1, tlen / 10), tlen / 2);
+            const size_t start = std::min(static_cast<size_t>(hit.tstart_0), tlen);
+            const size_t end = std::min(start + aln_on_target, tlen);
+            if (end > start) {
+                const size_t left_end = window;
+                const size_t right_start = (tlen > window) ? (tlen - window) : 0;
+                const size_t left_overlap = (start < left_end) ? (std::min(end, left_end) - start) : 0;
+                const size_t right_overlap = (end > right_start && start < tlen)
+                    ? (end - std::max(start, right_start)) : 0;
+                size_t middle_overlap = 0;
+                if (right_start > left_end) {
+                    const size_t mid_start = std::max(start, left_end);
+                    const size_t mid_end = std::min(end, right_start);
+                    if (mid_end > mid_start) middle_overlap = mid_end - mid_start;
+                }
+                agg.terminal_cov += static_cast<double>(gamma) *
+                                    static_cast<double>(left_overlap + right_overlap);
+                agg.middle_cov += static_cast<double>(gamma) * static_cast<double>(middle_overlap);
+            }
+        }
+
         for (const auto& s : summaries) {
+            if (use_em) {
+                if (s.read_idx >= em_read_results.size() || !em_read_results[s.read_idx].em_keep) {
+                    continue;
+                }
+            }
             auto& agg = protein_agg[s.target_id];
             if (agg.protein_id.empty()) agg.protein_id = s.target_id;
-            agg.n_reads++;
-            if (s.p_damaged > 0.0f) agg.n_damaged++;
+            if (agg.tlen == 0) agg.tlen = static_cast<uint32_t>(s.tlen);
+            agg.n_damage_reads++;
+            if (s.p_damaged > 0.5f) agg.n_damaged++;
             agg.total_damage_sites += s.damage_consistent;
             if (s.p_damaged > agg.max_p_damaged) agg.max_p_damaged = s.p_damaged;
             agg.sum_p_damaged += s.p_damaged;
-            agg.sum_delta_bits += s.delta_bits;
-            agg.sum_bpa += s.bpa;
-            agg.length_bin_counts[s.length_bin]++;
 
             // Collect per-read observation for Beta-Binomial model
             // info = sum of p_damage at sites (informativeness for weighting)
@@ -1944,7 +2991,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             read_obs.log_lr = 0.0f;  // Could compute from damage_fraction vs expected
             read_obs.info = info;
             read_obs.n_sites = static_cast<int>(s.damage_consistent);
-            read_obs.is_damaged = s.p_damaged > 0.5f || s.damage_consistent > 0;
+            read_obs.is_damaged = s.p_damaged > 0.5f;
             agg.read_obs.push_back(read_obs);
 
             // Count terminal sites from per-read sites
@@ -1980,10 +3027,21 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             }
         }
 
-        std::ofstream pf(protein_summary_file);
-        if (!pf.is_open()) {
-            std::cerr << "Error: Cannot open protein summary file: " << protein_summary_file << "\n";
-            return 1;
+        std::ofstream pf;
+        if (!protein_summary_file.empty()) {
+            pf.open(protein_summary_file);
+            if (!pf.is_open()) {
+                std::cerr << "Error: Cannot open protein summary file: " << protein_summary_file << "\n";
+                return 1;
+            }
+        }
+        std::ofstream pff;
+        if (!protein_filtered_file.empty()) {
+            pff.open(protein_filtered_file);
+            if (!pff.is_open()) {
+                std::cerr << "Error: Cannot open protein filtered file: " << protein_filtered_file << "\n";
+                return 1;
+            }
         }
 
         // D_aa calculation constants (derived from observed AA susceptibility):
@@ -1994,16 +3052,74 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         constexpr float P_NONSYNONYMOUS = 0.70f;
 
         // Extended header with proper statistical outputs
-        pf << "protein_id\tn_reads\tn_damaged\tdamage_sites\t"
-              "terminal_5\tterminal_3\t"
-              "max_p_damaged\tmean_p_damaged\tfrac_damaged\t"
-              "p_protein_damaged\tdelta_mle\tci_lower\tci_upper\t"
-              "lrt_pvalue\tlog_bf\td_aa\t"
-              "avg_delta_bits\tavg_bpa\tlength_bin\n";
+        const std::string protein_header =
+            "protein_id\tn_reads\teff_reads\tn_damage_reads\tn_damaged\tdamage_sites\t"
+            "terminal_5\tterminal_3\t"
+            "max_p_damaged\tmean_p_damaged\tfrac_damaged\tfrac_damaged_all\t"
+            "p_protein_damaged\tcombined_score\tdelta_mle\tci_lower\tci_upper\t"
+            "lrt_pvalue\tlog_bf\td_aa\t"
+            "avg_delta_bits\tavg_bpa\tlength_bin\t"
+            "n_unique_starts\tstart_diversity\tstart_span\tpositional_score\t"
+            "terminal_middle_ratio\tavg_aln_len\tstd_aln_len\t"
+            "assign_n_reads\tassign_eff_reads\tassign_n_damage_reads\tassign_eff_damage_reads\t"
+            "assign_n_ancient\tassign_n_modern\tassign_n_undetermined\t"
+            "assign_ancient_frac\tassign_ci_low\tassign_ci_high\t"
+            "assign_mean_posterior\tassign_mean_identity\t"
+            "assign_breadth\tassign_abundance\tassign_depth_std\tassign_depth_evenness\t"
+            "pass_mapping_filter\tfilter_fail\n";
+        if (pf.is_open()) pf << protein_header;
+        if (pff.is_open()) pff << protein_header;
 
+        size_t filtered_written = 0;
         for (const auto& [id, agg] : protein_agg) {
-            float mean_p = agg.n_reads > 0 ? agg.sum_p_damaged / agg.n_reads : 0.0f;
-            float frac = agg.n_reads > 0 ? static_cast<float>(agg.n_damaged) / agg.n_reads : 0.0f;
+            float mean_p = agg.n_damage_reads > 0
+                ? (agg.sum_p_damaged / static_cast<float>(agg.n_damage_reads))
+                : 0.0f;
+            float frac = agg.n_damage_reads > 0
+                ? static_cast<float>(agg.n_damaged) / static_cast<float>(agg.n_damage_reads)
+                : 0.0f;
+            float frac_all = agg.n_reads > 0
+                ? static_cast<float>(agg.n_damaged) / static_cast<float>(agg.n_reads)
+                : 0.0f;
+            uint32_t assign_n_reads = 0;
+            float assign_eff_reads = 0.0f;
+            uint32_t assign_n_damage_reads = 0;
+            float assign_eff_damage_reads = 0.0f;
+            float assign_n_ancient = 0.0f;
+            float assign_n_modern = 0.0f;
+            float assign_n_undetermined = 0.0f;
+            float assign_ancient_frac = 0.0f;
+            float assign_ci_low = 0.0f;
+            float assign_ci_high = 0.0f;
+            float assign_mean_posterior = 0.0f;
+            float assign_mean_identity = 0.0f;
+            float assign_breadth = 0.0f;
+            float assign_abundance = 0.0f;
+            float assign_depth_std = 0.0f;
+            float assign_depth_evenness = 0.0f;
+
+            auto git = gene_agg.find(id);
+            if (git != gene_agg.end()) {
+                const auto& g = git->second;
+                assign_n_reads = g.n_reads;
+                assign_eff_reads = g.eff_reads();
+                assign_n_damage_reads = g.n_damage_reads;
+                assign_eff_damage_reads = static_cast<float>(g.n_damage_reads_eff);
+                assign_n_ancient = static_cast<float>(g.n_ancient_conf + g.n_ancient_likely);
+                assign_n_modern = static_cast<float>(g.n_modern_conf);
+                assign_n_undetermined = static_cast<float>(g.n_undetermined);
+                assign_ancient_frac = g.ancient_frac();
+                const double n_eff_class = static_cast<double>(assign_n_ancient + assign_n_modern);
+                auto [ci_lo, ci_hi] = wilson_ci_effective(assign_n_ancient, n_eff_class);
+                assign_ci_low = ci_lo;
+                assign_ci_high = ci_hi;
+                assign_mean_posterior = g.avg_posterior();
+                assign_mean_identity = g.avg_fident();
+                assign_breadth = g.breadth();
+                assign_abundance = g.depth_mean();
+                assign_depth_std = g.depth_std();
+                assign_depth_evenness = g.depth_evenness();
+            }
 
             // ================================================================
             // PROPER STATISTICAL INFERENCE: Beta-Binomial model
@@ -2017,6 +3133,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             float ci_upper = static_cast<float>(result.ci_upper);
             float lrt_pvalue = static_cast<float>(result.p_value);
             float log_bf = static_cast<float>(result.log_bayes_factor);
+            float combined_score = p_protein_damaged;
 
             // D_aa: AA-level damage amplitude (0-1)
             // D_aa = observed_terminal_sites / expected_if_fully_damaged
@@ -2025,45 +3142,377 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 ? static_cast<float>(agg.terminal_5 + agg.terminal_3)
                 : static_cast<float>(agg.terminal_5);
             float n_ends = use_both_ends ? 2.0f : 1.0f;
-            float expected = static_cast<float>(agg.n_reads) * n_ends *
+            float expected = static_cast<float>(agg.n_reads_eff) * n_ends *
                             TERMINAL_CODONS * P_SUSCEPTIBLE * P_NONSYNONYMOUS;
             float d_aa = (expected > 0.0f) ? std::min(1.0f, observed / expected) : 0.0f;
 
-            pf << agg.protein_id << "\t"
-               << agg.n_reads << "\t"
-               << agg.n_damaged << "\t"
-               << agg.total_damage_sites << "\t"
-               << agg.terminal_5 << "\t"
-               << agg.terminal_3 << "\t"
-               << std::fixed << std::setprecision(4) << agg.max_p_damaged << "\t"
-               << std::fixed << std::setprecision(4) << mean_p << "\t"
-               << std::fixed << std::setprecision(4) << frac << "\t"
-               << std::fixed << std::setprecision(4) << p_protein_damaged << "\t"
-               << std::fixed << std::setprecision(4) << delta_mle << "\t"
-               << std::fixed << std::setprecision(4) << ci_lower << "\t"
-               << std::fixed << std::setprecision(4) << ci_upper << "\t"
-               << std::scientific << std::setprecision(3) << lrt_pvalue << "\t"
-               << std::fixed << std::setprecision(2) << log_bf << "\t"
-               << std::fixed << std::setprecision(4) << d_aa << "\t"
-               << std::fixed << std::setprecision(1)
-               << (agg.n_reads > 0 ? agg.sum_delta_bits / agg.n_reads : 0.0f) << "\t"
-               << std::fixed << std::setprecision(3)
-               << (agg.n_reads > 0 ? agg.sum_bpa / agg.n_reads : 0.0f) << "\t"
-               << static_cast<int>(std::max_element(
-                      agg.length_bin_counts.begin(),
-                      agg.length_bin_counts.end()) - agg.length_bin_counts.begin())
-               << "\n";
+            const float pos_score = agg.positional_score();
+            const float start_div = agg.start_diversity();
+            const float term_ratio = agg.terminal_middle_ratio();
+            const bool pass_mapping_filter =
+                (agg.n_reads >= min_reads) &&
+                (pos_score >= min_positional_score) &&
+                (term_ratio >= min_terminal_ratio);
+            std::string filter_fail = ".";
+            if (!pass_mapping_filter) {
+                filter_fail.clear();
+                auto add_fail = [&filter_fail](const char* token) {
+                    if (!filter_fail.empty()) filter_fail.push_back(',');
+                    filter_fail += token;
+                };
+                if (agg.n_reads < min_reads) add_fail("min_reads");
+                if (pos_score < min_positional_score) add_fail("min_positional_score");
+                if (term_ratio < min_terminal_ratio) add_fail("min_terminal_ratio");
+                if (filter_fail.empty()) filter_fail = "unknown";
+            }
+
+            std::ostringstream row;
+            row << agg.protein_id << "\t"
+                << agg.n_reads << "\t"
+                << std::fixed << std::setprecision(2) << agg.n_reads_eff << "\t"
+                << agg.n_damage_reads << "\t"
+                << agg.n_damaged << "\t"
+                << agg.total_damage_sites << "\t"
+                << agg.terminal_5 << "\t"
+                << agg.terminal_3 << "\t"
+                << std::fixed << std::setprecision(4) << agg.max_p_damaged << "\t"
+                << std::fixed << std::setprecision(4) << mean_p << "\t"
+                << std::fixed << std::setprecision(4) << frac << "\t"
+                << std::fixed << std::setprecision(4) << frac_all << "\t"
+                << std::fixed << std::setprecision(4) << p_protein_damaged << "\t"
+                << std::fixed << std::setprecision(4) << combined_score << "\t"
+                << std::fixed << std::setprecision(4) << delta_mle << "\t"
+                << std::fixed << std::setprecision(4) << ci_lower << "\t"
+                << std::fixed << std::setprecision(4) << ci_upper << "\t"
+                << std::scientific << std::setprecision(3) << lrt_pvalue << "\t"
+                << std::fixed << std::setprecision(2) << log_bf << "\t"
+                << std::fixed << std::setprecision(4) << d_aa << "\t"
+                << std::fixed << std::setprecision(1)
+                << (agg.n_reads_eff > 0.0 ? agg.sum_delta_bits / static_cast<float>(agg.n_reads_eff) : 0.0f) << "\t"
+                << std::fixed << std::setprecision(3)
+                << (agg.n_reads_eff > 0.0 ? agg.sum_bpa / static_cast<float>(agg.n_reads_eff) : 0.0f) << "\t"
+                << static_cast<int>(std::max_element(
+                       agg.length_bin_counts.begin(),
+                       agg.length_bin_counts.end()) - agg.length_bin_counts.begin()) << "\t"
+                << agg.unique_starts.size() << "\t"
+                << std::fixed << std::setprecision(4) << start_div << "\t"
+                << std::fixed << std::setprecision(4) << agg.start_span() << "\t"
+                << std::fixed << std::setprecision(4) << pos_score << "\t"
+                << std::fixed << std::setprecision(4) << term_ratio << "\t"
+                << std::fixed << std::setprecision(2) << agg.avg_aln_len() << "\t"
+                << std::fixed << std::setprecision(2) << agg.std_aln_len() << "\t"
+                << assign_n_reads << "\t"
+                << std::fixed << std::setprecision(2) << assign_eff_reads << "\t"
+                << assign_n_damage_reads << "\t"
+                << std::fixed << std::setprecision(2) << assign_eff_damage_reads << "\t"
+                << std::fixed << std::setprecision(2) << assign_n_ancient << "\t"
+                << std::fixed << std::setprecision(2) << assign_n_modern << "\t"
+                << std::fixed << std::setprecision(2) << assign_n_undetermined << "\t"
+                << std::fixed << std::setprecision(4) << assign_ancient_frac << "\t"
+                << std::fixed << std::setprecision(4) << assign_ci_low << "\t"
+                << std::fixed << std::setprecision(4) << assign_ci_high << "\t"
+                << std::fixed << std::setprecision(4) << assign_mean_posterior << "\t"
+                << std::fixed << std::setprecision(4) << assign_mean_identity << "\t"
+                << std::fixed << std::setprecision(4) << assign_breadth << "\t"
+                << std::fixed << std::setprecision(4) << assign_abundance << "\t"
+                << std::fixed << std::setprecision(4) << assign_depth_std << "\t"
+                << std::fixed << std::setprecision(4) << assign_depth_evenness << "\t"
+                << (pass_mapping_filter ? 1 : 0) << "\t"
+                << filter_fail << "\n";
+
+            if (pf.is_open()) pf << row.str();
+            if (pff.is_open() && pass_mapping_filter) {
+                pff << row.str();
+                ++filtered_written;
+            }
         }
 
         if (verbose) {
-            std::cerr << "Protein summary written to: " << protein_summary_file
-                      << " (" << protein_agg.size() << " proteins)\n";
+            if (pf.is_open()) {
+                std::cerr << "Protein summary written to: " << protein_summary_file
+                          << " (" << protein_agg.size() << " proteins)\n";
+            }
+            if (pff.is_open()) {
+                std::cerr << "Filtered proteins written to: " << protein_filtered_file
+                          << " (" << filtered_written << " proteins passed mapping filters)\n";
+            }
+        }
+
+        have_protein_agg = true;
+    }
+
+    if (!combined_output_file.empty()) {
+        std::ofstream cof(combined_output_file);
+        if (!cof.is_open()) {
+            std::cerr << "Error: Cannot open combined output file: " << combined_output_file << "\n";
+            return 1;
+        }
+
+        std::unordered_map<std::string, std::string> combined_group_map;
+        if (!map_file.empty()) {
+            combined_group_map = load_mapping_file(map_file, false);
+        }
+
+        bool use_both_ends_combined = true;
+        if (have_protein_agg) {
+            size_t total_5 = 0;
+            size_t total_3 = 0;
+            for (const auto& kv : protein_agg) {
+                total_5 += kv.second.terminal_5;
+                total_3 += kv.second.terminal_3;
+            }
+            if (lib_type == "ss") {
+                use_both_ends_combined = false;
+            } else if (lib_type == "ds") {
+                use_both_ends_combined = true;
+            } else {
+                float ratio = (total_5 > 0) ? static_cast<float>(total_3) / total_5 : 0.0f;
+                use_both_ends_combined = (ratio > 0.3f);
+            }
+        }
+
+        cof << "target_id\tgroup_id\tannotation_source\tgene_present\tprotein_present\t"
+               "n_reads\teff_reads\tabundance\tbreadth\tmean_identity\tmean_posterior\t"
+               "protein_n_damage_reads\tprotein_mean_p_damaged\tprotein_p_protein_damaged\tprotein_d_aa\t"
+               "positional_score\tterminal_middle_ratio\tpass_mapping_filter\tfilter_fail\n";
+
+        std::vector<std::string> target_ids;
+        target_ids.reserve(gene_agg.size() + protein_agg.size());
+        std::unordered_set<std::string> seen_ids;
+        seen_ids.reserve(gene_agg.size() + protein_agg.size());
+
+        if (have_protein_agg) {
+            for (const auto& kv : protein_agg) {
+                if (seen_ids.insert(kv.first).second) target_ids.push_back(kv.first);
+            }
+        }
+        if (have_gene_agg) {
+            for (const auto& kv : gene_agg) {
+                if (seen_ids.insert(kv.first).second) target_ids.push_back(kv.first);
+            }
+        }
+
+        size_t combined_written = 0;
+        for (const auto& tid : target_ids) {
+            const auto git = gene_agg.find(tid);
+            const auto pit = protein_agg.find(tid);
+            const bool gene_present = (git != gene_agg.end());
+            const bool protein_present = (pit != protein_agg.end());
+
+            uint32_t gene_n_reads = 0;
+            float gene_eff_reads = 0.0f;
+            float gene_n_ancient = 0.0f;
+            float gene_n_modern = 0.0f;
+            float gene_n_undetermined = 0.0f;
+            float gene_ancient_frac = 0.0f;
+            float gene_ci_low = 0.0f;
+            float gene_ci_high = 0.0f;
+            float gene_mean_posterior = 0.0f;
+            float gene_mean_identity = 0.0f;
+            float gene_breadth = 0.0f;
+            float gene_abundance = 0.0f;
+            float gene_depth_std = 0.0f;
+            float gene_depth_evenness = 0.0f;
+            uint32_t gene_n_unique_starts = 0;
+            float gene_start_diversity = 0.0f;
+            float gene_start_span = 0.0f;
+            float gene_pos_score = 0.0f;
+            float gene_term_ratio = 0.0f;
+            float gene_avg_aln_len = 0.0f;
+            float gene_std_aln_len = 0.0f;
+            bool pass_gene_filter = false;
+            std::string gene_filter_fail = "missing";
+            if (gene_present) {
+                const auto& g = git->second;
+                gene_n_reads = g.n_reads;
+                gene_eff_reads = g.eff_reads();
+                gene_n_ancient = static_cast<float>(g.n_ancient_conf + g.n_ancient_likely);
+                gene_n_modern = static_cast<float>(g.n_modern_conf);
+                gene_n_undetermined = static_cast<float>(g.n_undetermined);
+                gene_ancient_frac = g.ancient_frac();
+                const double n_eff_class = static_cast<double>(gene_n_ancient + gene_n_modern);
+                auto ci = wilson_ci_effective(gene_n_ancient, n_eff_class);
+                gene_ci_low = ci.first;
+                gene_ci_high = ci.second;
+                gene_mean_posterior = g.avg_posterior();
+                gene_mean_identity = g.avg_fident();
+                gene_breadth = g.breadth();
+                gene_abundance = g.depth_mean();
+                gene_depth_std = g.depth_std();
+                gene_depth_evenness = g.depth_evenness();
+                gene_n_unique_starts = g.n_unique_starts();
+                gene_start_diversity = g.start_diversity();
+                gene_start_span = g.start_span();
+                gene_pos_score = g.positional_score();
+                gene_term_ratio = g.terminal_middle_ratio();
+                gene_avg_aln_len = g.avg_aln_len();
+                gene_std_aln_len = g.std_aln_len();
+
+                std::string fail;
+                auto add_fail = [&fail](const char* token) {
+                    if (!fail.empty()) fail.push_back(',');
+                    fail += token;
+                };
+                if (g.n_reads < min_reads) add_fail("min_reads");
+                if (gene_breadth < min_breadth) add_fail("min_breadth");
+                if (gene_abundance < min_depth) add_fail("min_depth");
+                if (gene_pos_score < min_positional_score) add_fail("min_positional_score");
+                if (gene_term_ratio < min_terminal_ratio) add_fail("min_terminal_ratio");
+
+                pass_gene_filter =
+                    fail.empty();
+                gene_filter_fail = fail.empty() ? "." : fail;
+            }
+
+            uint32_t protein_n_reads = 0;
+            uint32_t protein_n_damage_reads = 0;
+            uint32_t protein_n_damaged = 0;
+            uint32_t protein_damage_sites = 0;
+            uint32_t protein_terminal_5 = 0;
+            uint32_t protein_terminal_3 = 0;
+            float protein_mean_p = 0.0f;
+            float protein_max_p = 0.0f;
+            float protein_frac_damaged = 0.0f;
+            float protein_p_protein_damaged = 0.0f;
+            float protein_delta_mle = 0.0f;
+            float protein_ci_lower = 0.0f;
+            float protein_ci_upper = 0.0f;
+            float protein_lrt_pvalue = 1.0f;
+            float protein_log_bf = 0.0f;
+            float protein_d_aa = 0.0f;
+            float protein_avg_delta_bits = 0.0f;
+            float protein_avg_bpa = 0.0f;
+            int protein_length_bin = 0;
+            uint32_t protein_n_unique_starts = 0;
+            float protein_start_diversity = 0.0f;
+            float protein_start_span = 0.0f;
+            float protein_pos_score = 0.0f;
+            float protein_term_ratio = 0.0f;
+            float protein_avg_aln_len = 0.0f;
+            float protein_std_aln_len = 0.0f;
+            bool pass_mapping_filter = false;
+            std::string protein_filter_fail = "missing";
+            if (protein_present) {
+                const auto& p = pit->second;
+                protein_n_reads = static_cast<uint32_t>(p.n_reads);
+                protein_n_damage_reads = static_cast<uint32_t>(p.n_damage_reads);
+                protein_n_damaged = static_cast<uint32_t>(p.n_damaged);
+                protein_damage_sites = static_cast<uint32_t>(p.total_damage_sites);
+                protein_terminal_5 = static_cast<uint32_t>(p.terminal_5);
+                protein_terminal_3 = static_cast<uint32_t>(p.terminal_3);
+                protein_mean_p = (p.n_damage_reads > 0)
+                    ? (p.sum_p_damaged / static_cast<float>(p.n_damage_reads))
+                    : 0.0f;
+                protein_max_p = p.max_p_damaged;
+                protein_frac_damaged = (p.n_damage_reads > 0)
+                    ? static_cast<float>(p.n_damaged) / static_cast<float>(p.n_damage_reads)
+                    : 0.0f;
+                ProteinDamageResult result = fit_protein_damage(p.read_obs);
+                protein_p_protein_damaged = static_cast<float>(result.p_damaged);
+                protein_delta_mle = static_cast<float>(result.delta_max);
+                protein_ci_lower = static_cast<float>(result.ci_lower);
+                protein_ci_upper = static_cast<float>(result.ci_upper);
+                protein_lrt_pvalue = static_cast<float>(result.p_value);
+                protein_log_bf = static_cast<float>(result.log_bayes_factor);
+                constexpr float TERMINAL_CODONS_COMBINED = 3.0f;
+                constexpr float P_SUSCEPTIBLE_COMBINED = 0.25f;
+                constexpr float P_NONSYNONYMOUS_COMBINED = 0.70f;
+                const float observed = use_both_ends_combined
+                    ? static_cast<float>(p.terminal_5 + p.terminal_3)
+                    : static_cast<float>(p.terminal_5);
+                const float n_ends = use_both_ends_combined ? 2.0f : 1.0f;
+                const float expected = static_cast<float>(p.n_reads_eff) * n_ends *
+                    TERMINAL_CODONS_COMBINED * P_SUSCEPTIBLE_COMBINED * P_NONSYNONYMOUS_COMBINED;
+                protein_d_aa = (expected > 0.0f) ? std::min(1.0f, observed / expected) : 0.0f;
+                protein_avg_delta_bits = (p.n_reads_eff > 0.0)
+                    ? (p.sum_delta_bits / static_cast<float>(p.n_reads_eff)) : 0.0f;
+                protein_avg_bpa = (p.n_reads_eff > 0.0)
+                    ? (p.sum_bpa / static_cast<float>(p.n_reads_eff)) : 0.0f;
+                protein_length_bin = static_cast<int>(std::max_element(
+                    p.length_bin_counts.begin(), p.length_bin_counts.end()) - p.length_bin_counts.begin());
+                protein_n_unique_starts = static_cast<uint32_t>(p.unique_starts.size());
+                protein_start_diversity = p.start_diversity();
+                protein_start_span = p.start_span();
+                protein_pos_score = p.positional_score();
+                protein_term_ratio = p.terminal_middle_ratio();
+                protein_avg_aln_len = p.avg_aln_len();
+                protein_std_aln_len = p.std_aln_len();
+
+                std::string fail;
+                auto add_fail = [&fail](const char* token) {
+                    if (!fail.empty()) fail.push_back(',');
+                    fail += token;
+                };
+                if (p.n_reads < min_reads) add_fail("min_reads");
+                if (protein_pos_score < min_positional_score) add_fail("min_positional_score");
+                if (protein_term_ratio < min_terminal_ratio) add_fail("min_terminal_ratio");
+                pass_mapping_filter = fail.empty();
+                protein_filter_fail = fail.empty() ? "." : fail;
+            }
+
+            std::string group_id = ".";
+            auto gm_it = combined_group_map.find(tid);
+            if (gm_it != combined_group_map.end()) {
+                group_id = gm_it->second;
+            }
+            std::string filter_fail;
+            auto append_fail = [&filter_fail](const std::string& token) {
+                if (token.empty()) return;
+                if (!filter_fail.empty()) filter_fail.push_back(',');
+                filter_fail += token;
+            };
+            if (!gene_present) append_fail("no_gene");
+            if (!protein_present) append_fail("no_protein");
+            if (gene_filter_fail != "." && gene_filter_fail != "missing") append_fail(gene_filter_fail);
+            if (protein_filter_fail != "." && protein_filter_fail != "missing") append_fail(protein_filter_fail);
+            if (filter_fail.empty()) filter_fail = ".";
+            const bool pass_mapping_filter_final =
+                gene_present && protein_present && pass_gene_filter && pass_mapping_filter;
+            const uint32_t combined_n_reads = protein_present ? protein_n_reads : gene_n_reads;
+            const float combined_pos_score = protein_present ? protein_pos_score : gene_pos_score;
+            const float combined_term_ratio = protein_present ? protein_term_ratio : gene_term_ratio;
+
+            cof << tid << '\t' << group_id << '\t' << annotation_source << '\t'
+                << (gene_present ? 1 : 0) << '\t'
+                << (protein_present ? 1 : 0) << '\t'
+                << combined_n_reads << '\t'
+                << std::fixed << std::setprecision(2) << gene_eff_reads << '\t'
+                << std::setprecision(4) << gene_abundance << '\t'
+                << std::setprecision(4) << gene_breadth << '\t'
+                << std::setprecision(4) << gene_mean_identity << '\t'
+                << std::setprecision(4) << gene_mean_posterior << '\t'
+                << protein_n_damage_reads << '\t'
+                << std::setprecision(4) << protein_mean_p << '\t'
+                << std::setprecision(4) << protein_p_protein_damaged << '\t'
+                << std::setprecision(4) << protein_d_aa << '\t'
+                << std::setprecision(4) << combined_pos_score << '\t'
+                << std::setprecision(4) << combined_term_ratio << '\t'
+                << (pass_mapping_filter_final ? 1 : 0) << '\t'
+                << filter_fail << '\n';
+            combined_written++;
+        }
+
+        if (verbose) {
+            std::cerr << "Combined output written to: " << combined_output_file
+                      << " (" << combined_written << " targets)\n";
         }
     }
 
     if (verbose) {
-        std::cerr << "\nSummary: " << summaries.size() << " reads analyzed, "
-                  << proteins_with_damage << " with damage-consistent sites\n";
+        size_t assigned_kept_reads = 0;
+        for (uint32_t ridx = 0; ridx < n_reads; ++ridx) {
+            if (!best_hits[ridx].has) continue;
+            if (use_em) {
+                if (ridx >= em_read_results.size() || !em_read_results[ridx].em_keep) continue;
+            }
+            assigned_kept_reads++;
+        }
+        std::cerr << "\nSummary: assigned_reads=" << assigned_kept_reads
+                  << ", mismatch_reads=" << summaries.size()
+                  << ", reads_with_damage_sites=" << proteins_with_damage << "\n";
+        const auto run_end = std::chrono::steady_clock::now();
+        std::cerr << "Runtime: "
+                  << agp::log_utils::format_elapsed(run_start, run_end) << "\n";
     }
 
     return 0;
@@ -2075,7 +3524,7 @@ namespace {
         DamageAnnotateRegistrar() {
             SubcommandRegistry::instance().register_command(
                 "damage-annotate",
-                "Post-mapping damage annotation from MMseqs2 alignments",
+                "Post-mapping damage annotation from EMI alignments",
                 cmd_damage_annotate, 40);
         }
     } damage_annotate_registrar;
