@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.18)
 project(AncientGenePredictor VERSION 0.3.0 LANGUAGES CXX)
+include(CTest)
 
 # Git-based version detection
 find_package(Git QUIET)
@@ -146,10 +147,7 @@ set(AGP_SUBCOMMAND_SOURCES
     src/cli/cmd_sample_damage.cpp     # cmd_sample_damage
     src/cli/cmd_damage_annotate.cpp   # cmd_damage_annotate
     src/cli/cmd_damage_profile.cpp    # cmd_damage_profile
-    src/cli/cmd_em_prepare.cpp        # cmd_em_prepare
-    src/cli/cmd_em_solve.cpp          # cmd_em_solve
     src/cli/cmd_hits2emi.cpp          # hits2emi (TSV to columnar)
-    src/cli/cmd_em_solve2.cpp         # cmd_em_solve2 (columnar)
 )
 
 # Main executable with subcommands
@@ -172,6 +170,10 @@ endif()
 # Legacy standalone validation tool (for backwards compatibility)
 add_executable(agp-validate-standalone src/validate.cpp ${AGP_CORE_SOURCES})
 target_link_libraries(agp-validate-standalone ${ZLIB_LIBRARIES})
+if(ZSTD_FOUND)
+    target_include_directories(agp-validate-standalone PRIVATE ${ZSTD_INCLUDE_DIRS})
+    target_link_libraries(agp-validate-standalone ${ZSTD_LIBRARIES})
+endif()
 target_compile_definitions(agp-validate-standalone PRIVATE AGP_STANDALONE_VALIDATE)
 
 # Error analysis tool
@@ -181,6 +183,28 @@ target_link_libraries(agp-analyze-errors ${ZLIB_LIBRARIES})
 # Damage prediction benchmark
 add_executable(agp-benchmark-damage src/cli/benchmark_damage.cpp)
 target_link_libraries(agp-benchmark-damage ${ZLIB_LIBRARIES})
+
+# Streaming EM comparison test
+add_executable(test-streaming-em tests/test_streaming_em.cpp ${AGP_CORE_SOURCES})
+target_link_libraries(test-streaming-em ${ZLIB_LIBRARIES})
+if(ZSTD_FOUND)
+    target_include_directories(test-streaming-em PRIVATE ${ZSTD_INCLUDE_DIRS})
+    target_link_libraries(test-streaming-em ${ZSTD_LIBRARIES})
+endif()
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(test-streaming-em OpenMP::OpenMP_CXX)
+endif()
+
+if(BUILD_TESTING)
+    add_executable(
+        agp-damage-annotate-regressions
+        tests/test_damage_annotate_regressions.cpp
+    )
+    add_test(
+        NAME damage_annotate_regressions
+        COMMAND agp-damage-annotate-regressions $<TARGET_FILE:agp>
+    )
+endif()
 
 # Install
 install(TARGETS agp DESTINATION bin)

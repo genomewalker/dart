@@ -27,15 +27,16 @@ int SubcommandRegistry::run_command(const std::string& name, int argc, char* arg
     auto it = handlers_.find(name);
     if (it == handlers_.end()) {
         std::cerr << "Unknown command: " << name << "\n";
+        std::cerr << "Run 'agp --help' for usage information.\n";
         return 1;
     }
     return it->second(argc, argv);
 }
 
 void SubcommandRegistry::print_help(const char* program_name) const {
-    std::cerr << "Ancient Gene Predictor v" << AGP_VERSION << "\n\n";
-    std::cerr << "Usage: " << program_name << " <command> [options]\n\n";
-    std::cerr << "Commands:\n";
+    std::cout << "Ancient Gene Predictor v" << AGP_VERSION << "\n\n";
+    std::cout << "Usage: " << program_name << " <command> [options]\n\n";
+    std::cout << "Commands:\n";
 
     // Sort by workflow order
     auto sorted = command_list_;
@@ -50,14 +51,14 @@ void SubcommandRegistry::print_help(const char* program_name) const {
     }
 
     for (const auto& cmd : sorted) {
-        std::cerr << "  " << cmd.name;
+        std::cout << "  " << cmd.name;
         for (size_t i = cmd.name.length(); i < max_len + 2; ++i) {
-            std::cerr << ' ';
+            std::cout << ' ';
         }
-        std::cerr << cmd.description << "\n";
+        std::cout << cmd.description << "\n";
     }
 
-    std::cerr << "\nFor help on a specific command: " << program_name << " <command> --help\n";
+    std::cout << "\nFor help on a specific command: " << program_name << " <command> --help\n";
 }
 
 }  // namespace cli

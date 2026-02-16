@@ -1,11 +1,11 @@
 #pragma once
 /**
  * @file em_index.hpp
- * @brief Binary index format for EM processing
+ * @brief Legacy binary index format for standalone EM processing.
  *
- * Two-phase workflow:
- * 1. em-prepare: TSV + AGD → binary .emi file (slow, once)
- * 2. em-solve: mmap .emi → run EM (fast, repeatable)
+ * Current CLI workflow uses:
+ * 1. hits2emi: TSV + optional AGD -> columnar .emi
+ * 2. damage-annotate: reads .emi and runs integrated EM reassignment
  *
  * File format (.emi):
  * - Header (72 bytes)

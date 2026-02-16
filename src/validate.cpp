@@ -19,6 +19,7 @@
 #include "cli/subcommand.hpp"
 #endif
 #include "agp/codon_tables.hpp"
+#include "agp/log_utils.hpp"
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -39,6 +40,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <chrono>
 
 // Ground truth for a single read
 struct GroundTruth {
@@ -970,21 +972,23 @@ void print_report(const Metrics& m) {
 }
 
 static void validate_print_usage(const char* prog) {
-    std::cerr << "AGP Unified Validator\n\n";
-    std::cerr << "Usage: " << prog << " <fastq.gz> <aa-damage.tsv.gz> <predictions.gff> [proteins.faa] [corrected.faa] [--csv output.csv]\n\n";
-    std::cerr << "Arguments:\n";
-    std::cerr << "  fastq.gz          Input FASTQ file (gzipped)\n";
-    std::cerr << "  aa-damage.tsv.gz  Ground truth from aMGSIM\n";
-    std::cerr << "  predictions.gff   AGP/FGS GFF3 output\n";
-    std::cerr << "  proteins.faa      Protein FASTA (optional, for sequence identity)\n";
-    std::cerr << "  corrected.faa     Damage-corrected protein FASTA (optional)\n";
-    std::cerr << "  --csv output.csv  Output per-read details to CSV (optional)\n\n";
-    std::cerr << "Supports both AGP and FragGeneScan GFF formats.\n\n";
-    std::cerr << "Example:\n";
-    std::cerr << "  " << prog << " reads.fq.gz ground_truth.tsv.gz agp.gff agp.faa agp_corrected.faa --csv details.csv\n";
+    std::cout << "AGP Unified Validator\n\n";
+    std::cout << "Usage: " << prog << " <fastq.gz> <aa-damage.tsv.gz> <predictions.gff> [proteins.faa] [corrected.faa] [--csv output.csv]\n\n";
+    std::cout << "Arguments:\n";
+    std::cout << "  fastq.gz          Input FASTQ file (gzipped)\n";
+    std::cout << "  aa-damage.tsv.gz  Ground truth from aMGSIM\n";
+    std::cout << "  predictions.gff   AGP/FGS GFF3 output\n";
+    std::cout << "  proteins.faa      Protein FASTA (optional, for sequence identity)\n";
+    std::cout << "  corrected.faa     Damage-corrected protein FASTA (optional)\n";
+    std::cout << "  --csv output.csv  Output per-read details to CSV (optional)\n\n";
+    std::cout << "Supports both AGP and FragGeneScan GFF formats.\n\n";
+    std::cout << "Example:\n";
+    std::cout << "  " << prog << " reads.fq.gz ground_truth.tsv.gz agp.gff agp.faa agp_corrected.faa --csv details.csv\n";
 }
 
 static int validate_main(int argc, char* argv[]) {
+    const auto run_start = std::chrono::steady_clock::now();
+
     // Handle help flag
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -994,6 +998,7 @@ static int validate_main(int argc, char* argv[]) {
     }
 
     if (argc < 4) {
+        std::cerr << "Error: missing required positional arguments.\n";
         validate_print_usage(argv[0]);
         return 1;
     }
@@ -1020,6 +1025,7 @@ static int validate_main(int argc, char* argv[]) {
     Metrics m;
 
     // Load data
+    const auto load_start = std::chrono::steady_clock::now();
     std::cerr << "Loading ground truth..." << std::endl;
     auto ground_truth = load_ground_truth(truth_path);
     m.coding_reads = ground_truth.size();
@@ -1043,12 +1049,20 @@ static int validate_main(int argc, char* argv[]) {
         corrected_proteins = load_proteins(corrected_path);
         std::cerr << "  Loaded corrected proteins for " << corrected_proteins.size() << " reads\n";
     }
+    const auto load_end = std::chrono::steady_clock::now();
+    std::cerr << "  Loading runtime: "
+              << agp::log_utils::format_elapsed(load_start, load_end) << "\n";
 
+    const auto count_start = std::chrono::steady_clock::now();
     std::cerr << "Counting total reads..." << std::endl;
     m.total_reads = count_fastq_reads(fastq_path);
     std::cerr << "  Total reads: " << m.total_reads << "\n";
+    const auto count_end = std::chrono::steady_clock::now();
+    std::cerr << "  Read counting runtime: "
+              << agp::log_utils::format_elapsed(count_start, count_end) << "\n";
 
     // Evaluate predictions
+    const auto eval_start = std::chrono::steady_clock::now();
     std::cerr << "Evaluating..." << std::endl;
 
     std::unordered_set<std::string> predicted_ids;
@@ -1276,6 +1290,11 @@ static int validate_main(int argc, char* argv[]) {
 
     // Print report
     print_report(m);
+    const auto eval_end = std::chrono::steady_clock::now();
+    std::cerr << "Evaluation runtime: "
+              << agp::log_utils::format_elapsed(eval_start, eval_end) << "\n";
+    std::cerr << "Total runtime: "
+              << agp::log_utils::format_elapsed(run_start, eval_end) << "\n";
 
     return 0;
 }

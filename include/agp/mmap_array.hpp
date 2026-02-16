@@ -263,21 +263,23 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// CompactAlignment: cache-friendly 24-byte alignment record
+// CompactAlignment: cache-friendly 32-byte alignment record
 // ---------------------------------------------------------------------------
 
 struct CompactAlignment {
     uint32_t read_idx;       // Index into read name StringTable
     uint32_t ref_idx;        // Index into reference name StringTable
     float    bit_score;      // Alignment bit score
-    float    damage_score;   // From AGD index lookup
+    float    damage_score;   // Per-read p_damaged prior
+    float    damage_ll_a;    // log P(alignment damage evidence | ancient)
+    float    damage_ll_m;    // log P(alignment damage evidence | modern)
     uint16_t aln_start;     // Alignment start on reference
     uint16_t aln_end;       // Alignment end on reference
     uint16_t identity_q;    // Identity * 65535 (quantized to [0,1])
     uint16_t flags;          // Reserved for future use
 };
-static_assert(sizeof(CompactAlignment) == 24,
-              "CompactAlignment must be 24 bytes for cache efficiency");
+static_assert(sizeof(CompactAlignment) == 32,
+              "CompactAlignment must be 32 bytes");
 
 // ---------------------------------------------------------------------------
 // StringTable: deduplicated string storage

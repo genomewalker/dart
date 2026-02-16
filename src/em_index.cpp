@@ -1,7 +1,7 @@
 // EM on pre-indexed alignment data
 //
 // Uses mmap for zero-copy access to alignment records.
-// All parsing done once in em-prepare, then em-solve is pure compute.
+// Kept for legacy standalone EM routines; main workflow is hits2emi -> damage-annotate.
 
 #include "agp/em_index.hpp"
 

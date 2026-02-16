@@ -14,9 +14,7 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstring>
 #include <iostream>
-#include <numeric>
 #include <vector>
 
 #ifdef _OPENMP
@@ -40,6 +38,7 @@ AlignmentData build_alignment_data(
     data.num_reads = num_reads;
     data.num_refs = num_refs;
     data.read_offsets.resize(num_reads + 1, 0);
+    data.ref_lengths.assign(num_refs, 0);
 
     // Count alignments per read
     for (size_t i = 0; i < n_alns; ++i) {
@@ -64,7 +63,19 @@ AlignmentData build_alignment_data(
         a.ref_idx = ca.ref_idx;
         a.bit_score = ca.bit_score;
         a.damage_score = ca.damage_score;
+        a.damage_ll_a = ca.damage_ll_a;
+        a.damage_ll_m = ca.damage_ll_m;
         a.fident = static_cast<float>(ca.identity_q) / 65535.0f;
+        const uint32_t tlen_hint = static_cast<uint32_t>(ca.flags);
+        const uint32_t end_hint = static_cast<uint32_t>(ca.aln_end);
+        const uint32_t ref_len = (tlen_hint > 0) ? tlen_hint : end_hint;
+        data.ref_lengths[a.ref_idx] = std::max(data.ref_lengths[a.ref_idx], ref_len);
+    }
+
+    data.ref_log_len_half.resize(num_refs, 0.0f);
+    for (uint32_t t = 0; t < num_refs; ++t) {
+        const double len = static_cast<double>(std::max(data.ref_lengths[t], 1u));
+        data.ref_log_len_half[t] = static_cast<float>(0.5 * std::log(len));
     }
 
     return data;
@@ -81,12 +92,16 @@ static double e_step_parallel(
     double* gamma)
 {
     double ll = 0.0;
-
-    #pragma omp parallel reduction(+:ll)
+#ifdef _OPENMP
+    const int n_threads = std::max(1, omp_get_max_threads());
+    std::vector<double> ll_partial(static_cast<size_t>(n_threads), 0.0);
+#pragma omp parallel
     {
         std::vector<double> log_scores;
+        double ll_local = 0.0;
+        const int tid = omp_get_thread_num();
 
-        #pragma omp for schedule(dynamic, 256)
+#pragma omp for schedule(static, 256)
         for (uint32_t r = 0; r < data.num_reads; ++r) {
             const uint32_t start = data.read_offsets[r];
             const uint32_t end = data.read_offsets[r + 1];
@@ -96,7 +111,8 @@ static double e_step_parallel(
             // Unique mappers: skip computation
             if (deg == 1) {
                 gamma[start] = 1.0;
-                ll += std::log(std::max(weights[data.alignments[start].ref_idx], params.min_weight))
+                ll_local += std::log(std::max(weights[data.alignments[start].ref_idx], params.min_weight))
+                    + length_log_penalty(data, params, data.alignments[start].ref_idx)
                     + params.lambda_b * static_cast<double>(data.alignments[start].bit_score);
                 continue;
             }
@@ -106,18 +122,53 @@ static double e_step_parallel(
             for (uint32_t j = 0; j < deg; ++j) {
                 const auto& aln = data.alignments[start + j];
                 log_scores[j] = std::log(std::max(weights[aln.ref_idx], params.min_weight))
+                               + length_log_penalty(data, params, aln.ref_idx)
                                + params.lambda_b * static_cast<double>(aln.bit_score);
             }
 
             double lse = log_sum_exp(log_scores.data(), deg);
-            ll += lse;
+            ll_local += lse;
 
             for (uint32_t j = 0; j < deg; ++j) {
                 double diff = log_scores[j] - lse;
-                gamma[start + j] = (diff > -100.0) ? std::exp(diff) : 0.0;
+                gamma[start + j] = (diff > -700.0) ? std::exp(diff) : 0.0;
             }
         }
+
+        ll_partial[static_cast<size_t>(tid)] = ll_local;
     }
+    for (double v : ll_partial) ll += v;
+#else
+    std::vector<double> log_scores;
+    for (uint32_t r = 0; r < data.num_reads; ++r) {
+        const uint32_t start = data.read_offsets[r];
+        const uint32_t end = data.read_offsets[r + 1];
+        const uint32_t deg = end - start;
+        if (deg == 0) continue;
+
+        if (deg == 1) {
+            gamma[start] = 1.0;
+            ll += std::log(std::max(weights[data.alignments[start].ref_idx], params.min_weight))
+                + length_log_penalty(data, params, data.alignments[start].ref_idx)
+                + params.lambda_b * static_cast<double>(data.alignments[start].bit_score);
+            continue;
+        }
+
+        log_scores.resize(deg);
+        for (uint32_t j = 0; j < deg; ++j) {
+            const auto& aln = data.alignments[start + j];
+            log_scores[j] = std::log(std::max(weights[aln.ref_idx], params.min_weight))
+                           + length_log_penalty(data, params, aln.ref_idx)
+                           + params.lambda_b * static_cast<double>(aln.bit_score);
+        }
+        double lse = log_sum_exp(log_scores.data(), deg);
+        ll += lse;
+        for (uint32_t j = 0; j < deg; ++j) {
+            double diff = log_scores[j] - lse;
+            gamma[start + j] = (diff > -700.0) ? std::exp(diff) : 0.0;
+        }
+    }
+#endif
 
     return ll;
 }
@@ -139,12 +190,16 @@ static double e_step_damage_parallel(
     const double pi_a = std::clamp(pi_ancient, eps, 1.0 - eps);
     const double log_pi_a = std::log(pi_a);
     const double log_pi_m = std::log(1.0 - pi_a);
-
-    #pragma omp parallel reduction(+:ll)
+#ifdef _OPENMP
+    const int n_threads = std::max(1, omp_get_max_threads());
+    std::vector<double> ll_partial(static_cast<size_t>(n_threads), 0.0);
+#pragma omp parallel
     {
         std::vector<double> log_scores;
+        double ll_local = 0.0;
+        const int tid = omp_get_thread_num();
 
-        #pragma omp for schedule(dynamic, 256)
+#pragma omp for schedule(static, 256)
         for (uint32_t r = 0; r < data.num_reads; ++r) {
             const uint32_t start = data.read_offsets[r];
             const uint32_t end = data.read_offsets[r + 1];
@@ -156,30 +211,78 @@ static double e_step_damage_parallel(
             for (uint32_t j = 0; j < deg; ++j) {
                 const auto& aln = data.alignments[start + j];
                 double log_w = std::log(std::max(weights[aln.ref_idx], params.min_weight));
+                log_w += length_log_penalty(data, params, aln.ref_idx);
                 double score_contrib = params.lambda_b * static_cast<double>(aln.bit_score);
 
-                double ds = std::clamp(static_cast<double>(aln.damage_score), eps, 1.0 - eps);
-                double log_p_ds_ancient = std::log(ds);
-                double log_p_ds_modern = std::log(1.0 - ds);
-
-                log_scores[2 * j]     = log_w + score_contrib + log_pi_a + log_p_ds_ancient;
-                log_scores[2 * j + 1] = log_w + score_contrib + log_pi_m + log_p_ds_modern;
+                if (params.use_alignment_damage_likelihood) {
+                    const double p_read = std::clamp(static_cast<double>(aln.damage_score), eps, 1.0 - eps);
+                    log_scores[2 * j]     = log_w + score_contrib + std::log(p_read) + aln.damage_ll_a;
+                    log_scores[2 * j + 1] = log_w + score_contrib + std::log(1.0 - p_read) + aln.damage_ll_m;
+                } else {
+                    double ds = std::clamp(static_cast<double>(aln.damage_score), eps, 1.0 - eps);
+                    double log_p_ds_ancient = std::log(ds);
+                    double log_p_ds_modern = std::log(1.0 - ds);
+                    log_scores[2 * j]     = log_w + score_contrib + log_pi_a + log_p_ds_ancient;
+                    log_scores[2 * j + 1] = log_w + score_contrib + log_pi_m + log_p_ds_modern;
+                }
             }
 
             double lse = log_sum_exp(log_scores.data(), 2 * deg);
-            ll += lse;
+            ll_local += lse;
 
             for (uint32_t j = 0; j < deg; ++j) {
                 double diff_a = log_scores[2 * j] - lse;
                 double diff_m = log_scores[2 * j + 1] - lse;
-                double g_a = (diff_a > -100.0) ? std::exp(diff_a) : 0.0;
-                double g_m = (diff_m > -100.0) ? std::exp(diff_m) : 0.0;
+                double g_a = (diff_a > -700.0) ? std::exp(diff_a) : 0.0;
+                double g_m = (diff_m > -700.0) ? std::exp(diff_m) : 0.0;
 
                 gamma[start + j] = g_a + g_m;
                 gamma_ancient[start + j] = g_a;
             }
         }
+
+        ll_partial[static_cast<size_t>(tid)] = ll_local;
     }
+    for (double v : ll_partial) ll += v;
+#else
+    std::vector<double> log_scores;
+    for (uint32_t r = 0; r < data.num_reads; ++r) {
+        const uint32_t start = data.read_offsets[r];
+        const uint32_t end = data.read_offsets[r + 1];
+        const uint32_t deg = end - start;
+        if (deg == 0) continue;
+
+        log_scores.resize(2 * deg);
+        for (uint32_t j = 0; j < deg; ++j) {
+            const auto& aln = data.alignments[start + j];
+            double log_w = std::log(std::max(weights[aln.ref_idx], params.min_weight));
+            log_w += length_log_penalty(data, params, aln.ref_idx);
+            double score_contrib = params.lambda_b * static_cast<double>(aln.bit_score);
+            if (params.use_alignment_damage_likelihood) {
+                const double p_read = std::clamp(static_cast<double>(aln.damage_score), eps, 1.0 - eps);
+                log_scores[2 * j]     = log_w + score_contrib + std::log(p_read) + aln.damage_ll_a;
+                log_scores[2 * j + 1] = log_w + score_contrib + std::log(1.0 - p_read) + aln.damage_ll_m;
+            } else {
+                double ds = std::clamp(static_cast<double>(aln.damage_score), eps, 1.0 - eps);
+                double log_p_ds_ancient = std::log(ds);
+                double log_p_ds_modern = std::log(1.0 - ds);
+                log_scores[2 * j]     = log_w + score_contrib + log_pi_a + log_p_ds_ancient;
+                log_scores[2 * j + 1] = log_w + score_contrib + log_pi_m + log_p_ds_modern;
+            }
+        }
+
+        double lse = log_sum_exp(log_scores.data(), 2 * deg);
+        ll += lse;
+        for (uint32_t j = 0; j < deg; ++j) {
+            double diff_a = log_scores[2 * j] - lse;
+            double diff_m = log_scores[2 * j + 1] - lse;
+            double g_a = (diff_a > -700.0) ? std::exp(diff_a) : 0.0;
+            double g_m = (diff_m > -700.0) ? std::exp(diff_m) : 0.0;
+            gamma[start + j] = g_a + g_m;
+            gamma_ancient[start + j] = g_a;
+        }
+    }
+#endif
 
     return ll;
 }
@@ -190,40 +293,49 @@ static double e_step_damage_parallel(
 
 static void m_step_parallel(
     const AlignmentData& data,
+    const EMParams& params,
     const double* gamma,
-    double min_weight,
     double* out_weights)
 {
     const uint32_t T = data.num_refs;
-    const double N = static_cast<double>(data.num_reads);
 
-    std::memset(out_weights, 0, T * sizeof(double));
+#ifdef _OPENMP
+    const int n_threads = std::max(1, omp_get_max_threads());
+#else
+    const int n_threads = 1;
+#endif
+    std::vector<double> partial(static_cast<size_t>(n_threads) * T, 0.0);
 
-    #pragma omp parallel
+#pragma omp parallel
     {
-        std::vector<double> local(T, 0.0);
+#ifdef _OPENMP
+        const int tid = omp_get_thread_num();
+#else
+        const int tid = 0;
+#endif
+        double* local = partial.data() + static_cast<size_t>(tid) * T;
 
-        #pragma omp for schedule(static)
+#pragma omp for schedule(static)
         for (size_t i = 0; i < data.alignments.size(); ++i) {
             local[data.alignments[i].ref_idx] += gamma[i];
         }
-
-        #pragma omp critical
-        {
-            for (uint32_t t = 0; t < T; ++t) {
-                out_weights[t] += local[t];
-            }
-        }
     }
 
-    // Normalize
+    // MAP M-step with symmetric Dirichlet(alpha_prior).
     double sum = 0.0;
+    const double prior_offset = params.alpha_prior - 1.0;
     for (uint32_t t = 0; t < T; ++t) {
-        out_weights[t] = std::max(out_weights[t] / N, min_weight);
+        double w = prior_offset;
+        for (int tid = 0; tid < n_threads; ++tid) {
+            w += partial[static_cast<size_t>(tid) * T + t];
+        }
+
+        out_weights[t] = std::max(w, params.min_weight);
         sum += out_weights[t];
     }
+
     double inv_sum = 1.0 / sum;
-    #pragma omp simd
+#pragma omp simd
     for (uint32_t t = 0; t < T; ++t) {
         out_weights[t] *= inv_sum;
     }
@@ -236,33 +348,50 @@ static void m_step_parallel(
 EMState squarem_em(
     const AlignmentData& data,
     const EMParams& params,
-    ReferenceStatsCollector* stats_collector)
+    ReferenceStatsCollector* stats_collector,
+    const EMProgressCallback& progress_cb)
 {
     const uint32_t T = data.num_refs;
     const size_t A = data.alignments.size();
 
     EMState state;
-    state.weights.assign(T, 1.0 / static_cast<double>(T));
     state.gamma.resize(A, 0.0);
-
     if (params.use_damage) {
         state.gamma_ancient.resize(A, 0.0);
     }
+    if (T == 0) {
+        state.log_likelihood = 0.0;
+        state.iterations = 0;
+        return state;
+    }
+    state.weights.assign(T, 1.0 / static_cast<double>(T));
 
     // SQUAREM scratch buffers
     std::vector<double> w0(T), w1(T), w2(T), r_buf(T), v_buf(T);
+    std::vector<double> prev_weights(T);
     std::vector<double> gamma_scratch(A);
     std::vector<double> gamma_ancient_scratch;
     if (params.use_damage) {
         gamma_ancient_scratch.resize(A, 0.0);
     }
 
-    double prev_ll = -std::numeric_limits<double>::infinity();
+    double prev_obj = -std::numeric_limits<double>::infinity();
+    double step_min = params.squarem_step_min0;
+    double step_max0 = params.squarem_step_max0;
+    if (step_max0 < step_min) std::swap(step_max0, step_min);
+    double step_max = step_max0;
+    const double mstep = std::max(params.squarem_mstep, 1.0000001);
+    const double param_tol = std::sqrt(std::max(params.tol, 1e-15));
 
     for (uint32_t iter = 0; iter < params.max_iters; ++iter) {
         double ll;
+        double objective;
+        bool fallback_to_em = false;
+        double alpha_used = 1.0;
+        std::copy(state.weights.begin(), state.weights.end(), prev_weights.begin());
 
-        if (params.use_squarem) {
+        const bool squarem_active = params.use_squarem && (iter >= params.squarem_warmup_iters);
+        if (squarem_active) {
             // Save current weights
             std::copy(state.weights.begin(), state.weights.end(), w0.begin());
 
@@ -273,7 +402,7 @@ EMState squarem_em(
             } else {
                 e_step_parallel(data, params, w0.data(), gamma_scratch.data());
             }
-            m_step_parallel(data, gamma_scratch.data(), params.min_weight, w1.data());
+            m_step_parallel(data, params, gamma_scratch.data(), w1.data());
 
             // Second EM step: w1 -> w2
             if (params.use_damage) {
@@ -282,10 +411,28 @@ EMState squarem_em(
             } else {
                 e_step_parallel(data, params, w1.data(), gamma_scratch.data());
             }
-            m_step_parallel(data, gamma_scratch.data(), params.min_weight, w2.data());
+            m_step_parallel(data, params, gamma_scratch.data(), w2.data());
 
-            // SQUAREM extrapolation: modifies w0 in-place
-            squarem_step(w0.data(), w1.data(), w2.data(), r_buf.data(), v_buf.data(), T);
+            // SQUAREM extrapolation with textbook step rules.
+            double sr2 = 0.0, sv2 = 0.0, srv = 0.0;
+            squarem_build_directions(
+                w0.data(), w1.data(), w2.data(), r_buf.data(), v_buf.data(), T, sr2, sv2, srv);
+            double alpha = squarem_step_length(params.squarem_method, sr2, sv2, srv);
+            alpha = std::clamp(alpha, step_min, step_max);
+            alpha_used = alpha;
+            squarem_extrapolate(w0.data(), r_buf.data(), v_buf.data(), T, alpha, params.min_weight);
+
+            // Stabilization step from canonical SQUAREM.
+            if (std::abs(alpha - 1.0) > 0.01) {
+                if (params.use_damage) {
+                    e_step_damage_parallel(data, params, w0.data(), state.pi,
+                        gamma_scratch.data(), gamma_ancient_scratch.data());
+                } else {
+                    e_step_parallel(data, params, w0.data(), gamma_scratch.data());
+                }
+                m_step_parallel(data, params, gamma_scratch.data(), w1.data());
+                std::copy(w1.begin(), w1.end(), w0.begin());
+            }
 
             // Evaluate at accelerated point
             if (params.use_damage) {
@@ -294,9 +441,15 @@ EMState squarem_em(
             } else {
                 ll = e_step_parallel(data, params, w0.data(), state.gamma.data());
             }
+            objective = em_objective_from_ll(params, w0.data(), T, ll);
 
-            // Safeguard: fall back to w2 if acceleration worsened likelihood
-            if (ll < prev_ll && iter > 0) {
+            // Objective safeguard: revert to EM two-step point when acceleration is non-monotone.
+            const bool non_monotone =
+                (iter > 0) &&
+                std::isfinite(params.squarem_objfn_inc) &&
+                (objective < (prev_obj - params.squarem_objfn_inc));
+            if (non_monotone) {
+                fallback_to_em = true;
                 std::copy(w2.begin(), w2.end(), state.weights.begin());
                 if (params.use_damage) {
                     ll = e_step_damage_parallel(data, params, state.weights.data(), state.pi,
@@ -304,8 +457,26 @@ EMState squarem_em(
                 } else {
                     ll = e_step_parallel(data, params, state.weights.data(), state.gamma.data());
                 }
+                objective = em_objective_from_ll(params, state.weights.data(), T, ll);
+
+                const bool at_upper =
+                    std::abs(alpha - step_max) <= (1e-12 * (1.0 + std::abs(step_max)));
+                if (at_upper) {
+                    step_max = std::max(step_max0, step_max / mstep);
+                }
             } else {
                 std::copy(w0.begin(), w0.end(), state.weights.begin());
+            }
+
+            const bool at_upper =
+                std::abs(alpha - step_max) <= (1e-12 * (1.0 + std::abs(step_max)));
+            if (at_upper) {
+                step_max = mstep * step_max;
+            }
+            const bool at_lower =
+                std::abs(alpha - step_min) <= (1e-12 * (1.0 + std::abs(step_min)));
+            if (step_min < 0.0 && at_lower) {
+                step_min = mstep * step_min;
             }
         } else {
             // Plain EM
@@ -315,7 +486,8 @@ EMState squarem_em(
             } else {
                 ll = e_step_parallel(data, params, state.weights.data(), state.gamma.data());
             }
-            m_step_parallel(data, state.gamma.data(), params.min_weight, state.weights.data());
+            objective = em_objective_from_ll(params, state.weights.data(), T, ll);
+            m_step_parallel(data, params, state.gamma.data(), state.weights.data());
         }
 
         // Update global ancient fraction from damage responsibilities
@@ -335,12 +507,40 @@ EMState squarem_em(
         state.log_likelihood = ll;
         state.iterations = iter + 1;
 
-        // Convergence check: relative log-likelihood change
+        // Convergence check: relative objective change (LL + prior term when enabled)
+        double rel_change = std::numeric_limits<double>::infinity();
         if (iter > 0) {
-            double rel_change = std::abs(ll - prev_ll) / (std::abs(prev_ll) + 1e-15);
-            if (rel_change < params.tol) break;
+            rel_change = std::abs(objective - prev_obj) / (std::abs(prev_obj) + 1e-15);
         }
-        prev_ll = ll;
+        double param_change_sq = 0.0;
+#pragma omp parallel for reduction(+:param_change_sq) schedule(static)
+        for (uint32_t t = 0; t < T; ++t) {
+            const double d = state.weights[t] - prev_weights[t];
+            param_change_sq += d * d;
+        }
+        const double param_change = std::sqrt(param_change_sq);
+
+        if (progress_cb) {
+            EMIterationDiagnostics diag;
+            diag.iteration = iter + 1;
+            diag.log_likelihood = ll;
+            diag.objective = objective;
+            diag.rel_change = rel_change;
+            diag.param_change = param_change;
+            diag.squarem_active = squarem_active;
+            diag.fallback_to_em = fallback_to_em;
+            diag.alpha = alpha_used;
+            diag.step_min = step_min;
+            diag.step_max = step_max;
+            progress_cb(diag);
+        }
+        if (iter > 0 &&
+            (iter + 1) >= params.min_iters &&
+            rel_change <= params.tol &&
+            param_change <= param_tol) {
+            break;
+        }
+        prev_obj = objective;
     }
 
     // Populate reference stats from final responsibilities
@@ -389,12 +589,401 @@ std::vector<std::pair<uint32_t, float>> reassign_reads(
             }
         }
 
-        if (best_gamma >= gamma_threshold) {
-            result[r] = {best_ref, static_cast<float>(best_gamma)};
-        }
+        float out_gamma = (best_gamma >= gamma_threshold)
+            ? static_cast<float>(best_gamma) : 0.0f;
+        result[r] = {best_ref, out_gamma};
     }
 
     return result;
+}
+
+} // namespace agp
+
+// ---------------------------------------------------------------------------
+// Streaming/Chunked EM: Memory-efficient implementation
+// ---------------------------------------------------------------------------
+//
+// Instead of storing O(num_alignments) gamma values, we:
+// 1. Process row groups one at a time
+// 2. Compute E-step locally, accumulate M-step sums to ref_sums
+// 3. Discard per-alignment gamma after accumulating
+// 4. After convergence, compute gamma on-demand in streaming_em_finalize
+//
+// Memory: O(num_refs) + O(row_group_size) instead of O(num_alignments)
+// For 584M alignments with 10M refs: ~80MB instead of ~18GB
+
+#include "agp/columnar_index.hpp"
+#include <atomic>
+
+namespace {
+
+// Per-row-group E-step: compute gamma and accumulate to ref_sums
+// Returns partial log-likelihood for this row group
+double streaming_e_step_rowgroup(
+    uint32_t num_rows,
+    const uint32_t* read_idx,
+    const uint32_t* ref_idx,
+    const float* bit_score,
+    const float* damage_score,
+    const double* weights,
+    uint32_t /*num_refs*/,
+    const agp::EMParams& params,
+    double pi_ancient,
+    std::vector<double>& ref_sums,        // Accumulated gamma per ref (output)
+    std::vector<double>& ref_sums_ancient // Accumulated gamma_ancient per ref (output)
+) {
+    const double eps = 1e-12;
+    const double pi_a = std::clamp(pi_ancient, eps, 1.0 - eps);
+    double ll = 0.0;
+
+    // Group alignments by read for normalization
+    // Since row groups are sorted by read_idx, we can process in order
+    uint32_t row = 0;
+    while (row < num_rows) {
+        const uint32_t current_read = read_idx[row];
+        uint32_t read_start = row;
+
+        // Find all alignments for this read in this row group
+        while (row < num_rows && read_idx[row] == current_read) {
+            ++row;
+        }
+        uint32_t deg = row - read_start;
+
+        if (deg == 0) continue;
+
+        // Compute log-scores for E-step
+        thread_local std::vector<double> log_scores;
+        if (params.use_damage) {
+            log_scores.resize(2 * deg);
+            for (uint32_t j = 0; j < deg; ++j) {
+                uint32_t idx = read_start + j;
+                double log_w = std::log(std::max(weights[ref_idx[idx]], params.min_weight));
+                double score_contrib = params.lambda_b * static_cast<double>(bit_score[idx]);
+                double ds = std::clamp(static_cast<double>(damage_score[idx]), eps, 1.0 - eps);
+
+                log_scores[2 * j]     = log_w + score_contrib + std::log(pi_a) + std::log(ds);
+                log_scores[2 * j + 1] = log_w + score_contrib + std::log(1.0 - pi_a) + std::log(1.0 - ds);
+            }
+
+            double lse = agp::log_sum_exp(log_scores.data(), 2 * deg);
+            ll += lse;
+
+            // Accumulate to ref_sums
+            for (uint32_t j = 0; j < deg; ++j) {
+                uint32_t idx = read_start + j;
+                double diff_a = log_scores[2 * j] - lse;
+                double diff_m = log_scores[2 * j + 1] - lse;
+                double g_ancient = (diff_a > -700.0) ? std::exp(diff_a) : 0.0;
+                double g_modern  = (diff_m > -700.0) ? std::exp(diff_m) : 0.0;
+                double g_total = g_ancient + g_modern;
+
+                ref_sums[ref_idx[idx]] += g_total;
+                ref_sums_ancient[ref_idx[idx]] += g_ancient;
+            }
+        } else {
+            log_scores.resize(deg);
+            for (uint32_t j = 0; j < deg; ++j) {
+                uint32_t idx = read_start + j;
+                log_scores[j] = std::log(std::max(weights[ref_idx[idx]], params.min_weight))
+                              + params.lambda_b * static_cast<double>(bit_score[idx]);
+            }
+
+            double lse = agp::log_sum_exp(log_scores.data(), deg);
+            ll += lse;
+
+            for (uint32_t j = 0; j < deg; ++j) {
+                uint32_t idx = read_start + j;
+                double diff = log_scores[j] - lse;
+                double g_val = (diff > -700.0) ? std::exp(diff) : 0.0;
+                ref_sums[ref_idx[idx]] += g_val;
+            }
+        }
+    }
+
+    return ll;
+}
+
+// M-step from accumulated ref_sums
+void streaming_m_step(
+    const std::vector<double>& ref_sums,
+    std::vector<double>& weights,
+    const agp::EMParams& params
+) {
+    const uint32_t T = static_cast<uint32_t>(weights.size());
+    const double prior_offset = params.alpha_prior - 1.0;
+
+    double sum = 0.0;
+    for (uint32_t t = 0; t < T; ++t) {
+        weights[t] = std::max(ref_sums[t] + prior_offset, params.min_weight);
+        sum += weights[t];
+    }
+
+    double inv_sum = 1.0 / sum;
+    for (uint32_t t = 0; t < T; ++t) {
+        weights[t] *= inv_sum;
+    }
+}
+
+} // anonymous namespace
+
+namespace agp {
+
+StreamingEMResult streaming_em(
+    ColumnarIndexReader& reader,
+    const EMParams& params,
+    const EMProgressCallback& progress_cb)
+{
+    StreamingEMResult result;
+    result.num_reads = reader.num_reads();
+    result.num_refs = reader.num_refs();
+    result.num_alignments = reader.num_alignments();
+
+    const uint32_t T = result.num_refs;
+    const uint32_t num_row_groups = reader.num_row_groups();
+
+    if (T == 0 || num_row_groups == 0) {
+        result.log_likelihood = 0.0;
+        result.iterations = 0;
+        return result;
+    }
+
+    // Initialize weights uniformly - O(T) memory
+    result.weights.assign(T, 1.0 / static_cast<double>(T));
+    result.pi = 0.1;
+
+    // Thread-local accumulators for parallel row group processing
+    const int num_threads =
+#ifdef _OPENMP
+        omp_get_max_threads();
+#else
+        1;
+#endif
+
+    std::vector<std::vector<double>> thread_ref_sums(num_threads);
+    std::vector<std::vector<double>> thread_ref_sums_ancient(num_threads);
+    for (int t = 0; t < num_threads; ++t) {
+        thread_ref_sums[t].resize(T, 0.0);
+        if (params.use_damage) {
+            thread_ref_sums_ancient[t].resize(T, 0.0);
+        }
+    }
+
+    double prev_ll = -std::numeric_limits<double>::infinity();
+
+    for (uint32_t iter = 0; iter < params.max_iters; ++iter) {
+        // Clear accumulators
+        for (int t = 0; t < num_threads; ++t) {
+            std::fill(thread_ref_sums[t].begin(), thread_ref_sums[t].end(), 0.0);
+            if (params.use_damage) {
+                std::fill(thread_ref_sums_ancient[t].begin(), thread_ref_sums_ancient[t].end(), 0.0);
+            }
+        }
+
+        std::atomic<double> total_ll{0.0};
+
+        // E-step: process row groups in parallel, accumulate to thread-local ref_sums
+        #pragma omp parallel
+        {
+#ifdef _OPENMP
+            const int tid = omp_get_thread_num();
+#else
+            const int tid = 0;
+#endif
+            auto& local_ref_sums = thread_ref_sums[tid];
+            auto& local_ref_sums_ancient = thread_ref_sums_ancient[tid];
+            double local_ll = 0.0;
+
+            reader.parallel_scan([&](
+                uint32_t /*rg_idx*/,
+                uint32_t num_rows,
+                const uint32_t* read_idx,
+                const uint32_t* ref_idx,
+                const float* bit_score,
+                const float* damage_score,
+                const float* /*evalue_log10*/,
+                const uint16_t* /*dmg_k*/,
+                const uint16_t* /*dmg_m*/,
+                const float* /*dmg_ll_a*/,
+                const float* /*dmg_ll_m*/,
+                const uint16_t* /*identity_q*/,
+                const uint16_t* /*aln_len*/,
+                const uint16_t* /*qstart*/,
+                const uint16_t* /*qend*/,
+                const uint16_t* /*tstart*/,
+                const uint16_t* /*tend*/,
+                const uint16_t* /*tlen*/,
+                const uint16_t* /*qlen*/,
+                const uint16_t* /*mismatch*/,
+                const uint16_t* /*gapopen*/
+            ) {
+                local_ll += streaming_e_step_rowgroup(
+                    num_rows, read_idx, ref_idx, bit_score, damage_score,
+                    result.weights.data(), T, params, result.pi,
+                    local_ref_sums, local_ref_sums_ancient
+                );
+            });
+
+            // Atomic add to total
+            double expected = total_ll.load();
+            while (!total_ll.compare_exchange_weak(expected, expected + local_ll)) {}
+        }
+
+        // Merge thread-local accumulators
+        std::vector<double> ref_sums(T, 0.0);
+        std::vector<double> ref_sums_ancient(T, 0.0);
+        for (int t = 0; t < num_threads; ++t) {
+            for (uint32_t r = 0; r < T; ++r) {
+                ref_sums[r] += thread_ref_sums[t][r];
+            }
+            if (params.use_damage) {
+                for (uint32_t r = 0; r < T; ++r) {
+                    ref_sums_ancient[r] += thread_ref_sums_ancient[t][r];
+                }
+            }
+        }
+
+        // M-step: update weights from accumulated sums
+        streaming_m_step(ref_sums, result.weights, params);
+
+        // Update pi from accumulated ancient sums
+        if (params.use_damage) {
+            double sum_ancient = 0.0, sum_total = 0.0;
+            for (uint32_t r = 0; r < T; ++r) {
+                sum_ancient += ref_sums_ancient[r];
+                sum_total += ref_sums[r];
+            }
+            if (sum_total > 0.0) {
+                result.pi = std::clamp(sum_ancient / sum_total, 0.01, 0.99);
+            }
+        }
+
+        result.log_likelihood = total_ll.load();
+        result.iterations = iter + 1;
+
+        // Progress callback
+        if (progress_cb) {
+            EMIterationDiagnostics diag;
+            diag.iteration = iter;
+            diag.log_likelihood = result.log_likelihood;
+            diag.objective = result.log_likelihood;
+            diag.rel_change = std::abs(result.log_likelihood - prev_ll) / (std::abs(prev_ll) + 1e-15);
+            progress_cb(diag);
+        }
+
+        // Convergence check
+        if (iter > 0) {
+            double rel_change = std::abs(result.log_likelihood - prev_ll) / (std::abs(prev_ll) + 1e-15);
+            if (rel_change < params.tol && (iter + 1) >= params.min_iters) {
+                break;
+            }
+        }
+        prev_ll = result.log_likelihood;
+    }
+
+    return result;
+}
+
+void streaming_em_finalize(
+    ColumnarIndexReader& reader,
+    const StreamingEMResult& result,
+    const EMParams& params,
+    StreamingGammaCallback callback)
+{
+    const double eps = 1e-12;
+    const double pi_a = std::clamp(result.pi, eps, 1.0 - eps);
+
+    // Process each row group and compute final gamma
+    reader.parallel_scan([&](
+        uint32_t rg_idx,
+        uint32_t num_rows,
+        const uint32_t* read_idx,
+        const uint32_t* ref_idx,
+        const float* bit_score,
+        const float* damage_score,
+        const float* /*evalue_log10*/,
+        const uint16_t* /*dmg_k*/,
+        const uint16_t* /*dmg_m*/,
+        const float* /*dmg_ll_a*/,
+        const float* /*dmg_ll_m*/,
+        const uint16_t* /*identity_q*/,
+        const uint16_t* /*aln_len*/,
+        const uint16_t* /*qstart*/,
+        const uint16_t* /*qend*/,
+        const uint16_t* /*tstart*/,
+        const uint16_t* /*tend*/,
+        const uint16_t* /*tlen*/,
+        const uint16_t* /*qlen*/,
+        const uint16_t* /*mismatch*/,
+        const uint16_t* /*gapopen*/
+    ) {
+        // Allocate per-row-group buffers (renamed to avoid conflict with std::tgamma)
+        std::vector<float> g_vals(num_rows);
+        std::vector<float> g_ancient_vals;
+        if (params.use_damage) {
+            g_ancient_vals.resize(num_rows);
+        }
+
+        // Compute gamma for each alignment
+        thread_local std::vector<double> log_scores;
+        uint32_t row = 0;
+        while (row < num_rows) {
+            const uint32_t current_read = read_idx[row];
+            uint32_t read_start = row;
+
+            while (row < num_rows && read_idx[row] == current_read) {
+                ++row;
+            }
+            uint32_t deg = row - read_start;
+
+            if (params.use_damage) {
+                log_scores.resize(2 * deg);
+                for (uint32_t j = 0; j < deg; ++j) {
+                    uint32_t idx = read_start + j;
+                    double log_w = std::log(std::max(result.weights[ref_idx[idx]], params.min_weight));
+                    double score_contrib = params.lambda_b * static_cast<double>(bit_score[idx]);
+                    double ds = std::clamp(static_cast<double>(damage_score[idx]), eps, 1.0 - eps);
+
+                    log_scores[2 * j]     = log_w + score_contrib + std::log(pi_a) + std::log(ds);
+                    log_scores[2 * j + 1] = log_w + score_contrib + std::log(1.0 - pi_a) + std::log(1.0 - ds);
+                }
+
+                double lse = log_sum_exp(log_scores.data(), 2 * deg);
+
+                for (uint32_t j = 0; j < deg; ++j) {
+                    uint32_t idx = read_start + j;
+                    double diff_a = log_scores[2 * j] - lse;
+                    double diff_m = log_scores[2 * j + 1] - lse;
+                    double g_ancient = (diff_a > -700.0) ? std::exp(diff_a) : 0.0;
+                    double g_modern  = (diff_m > -700.0) ? std::exp(diff_m) : 0.0;
+
+                    g_vals[idx] = static_cast<float>(g_ancient + g_modern);
+                    g_ancient_vals[idx] = static_cast<float>(g_ancient);
+                }
+            } else {
+                log_scores.resize(deg);
+                for (uint32_t j = 0; j < deg; ++j) {
+                    uint32_t idx = read_start + j;
+                    log_scores[j] = std::log(std::max(result.weights[ref_idx[idx]], params.min_weight))
+                                  + params.lambda_b * static_cast<double>(bit_score[idx]);
+                }
+
+                double lse = log_sum_exp(log_scores.data(), deg);
+
+                for (uint32_t j = 0; j < deg; ++j) {
+                    uint32_t idx = read_start + j;
+                    double diff = log_scores[j] - lse;
+                    g_vals[idx] = static_cast<float>((diff > -700.0) ? std::exp(diff) : 0.0);
+                }
+            }
+        }
+
+        // Call user callback with computed gamma
+        callback(
+            rg_idx, num_rows, read_idx, ref_idx,
+            g_vals.data(),
+            params.use_damage ? g_ancient_vals.data() : nullptr
+        );
+    });
 }
 
 } // namespace agp

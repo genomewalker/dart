@@ -20,6 +20,9 @@
 
 #include "agp/columnar_index.hpp"
 #include "agp/fast_tsv.hpp"
+#include "agp/damage_index_reader.hpp"
+#include "agp/damage_alignment_evidence.hpp"
+#include "agp/log_utils.hpp"
 
 #include <algorithm>
 #include <array>
@@ -34,6 +37,8 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <exception>
+#include <limits>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -350,6 +355,31 @@ struct Morsel {
  */
 class SpillingStringDict {
 public:
+    struct TransparentStringHash {
+        using is_transparent = void;
+        size_t operator()(std::string_view sv) const noexcept {
+            return std::hash<std::string_view>{}(sv);
+        }
+        size_t operator()(const std::string& s) const noexcept {
+            return std::hash<std::string_view>{}(s);
+        }
+        size_t operator()(const char* s) const noexcept {
+            return std::hash<std::string_view>{}(s ? std::string_view(s) : std::string_view{});
+        }
+    };
+
+    struct TransparentStringEq {
+        using is_transparent = void;
+        bool operator()(std::string_view a, std::string_view b) const noexcept {
+            return a == b;
+        }
+        bool operator()(const std::string& a, const std::string& b) const noexcept {
+            return a == b;
+        }
+    };
+
+    using StringToIdMap = std::unordered_map<std::string, uint32_t, TransparentStringHash, TransparentStringEq>;
+
     SpillingStringDict(const std::string& name, size_t memory_cap = DICT_MEMORY_CAP / 2)
         : name_(name), memory_cap_(memory_cap) {
         // Create temp directory
@@ -370,7 +400,7 @@ public:
         uint64_t h = hash_sv(sv);
 
         // Check in-memory map first
-        auto it = in_memory_.find(std::string(sv));
+        auto it = in_memory_.find(sv);
         if (it != in_memory_.end()) return false;
 
         // Check if we've seen this in spilled data (bloom filter approximation)
@@ -396,9 +426,9 @@ public:
      * @brief Finalize dictionary - merge all spilled files + in-memory
      * @return Final dictionary with sequential IDs
      */
-    std::pair<std::vector<std::string>, std::unordered_map<std::string, uint32_t>> finalize() {
+    std::pair<std::vector<std::string>, StringToIdMap> finalize() {
         std::vector<std::string> names;
-        std::unordered_map<std::string, uint32_t> lookup;
+        StringToIdMap lookup;
 
         if (spill_count_ == 0) {
             // No spilling - just convert in-memory map
@@ -543,7 +573,7 @@ private:
     size_t memory_cap_;
     std::filesystem::path temp_dir_;
 
-    std::unordered_map<std::string, uint32_t> in_memory_;
+    StringToIdMap in_memory_;
     size_t memory_used_ = 0;
     uint32_t next_id_ = 0;
     uint64_t total_count_ = 0;
@@ -968,9 +998,10 @@ public:
         bool verbose = false;
         bool compress = true;  // Use ZSTD compression (if available)
         int compression_level = 3;  // ZSTD level (1-19, 3 = good balance)
-        bool skip_alignments = false;  // Skip qaln/taln strings (faster, EM doesn't need them)
+        bool skip_alignments = false;  // Skip qaln/taln strings (faster, but damage-annotate needs them)
         size_t memory_limit = 16ULL * 1024 * 1024 * 1024;  // 16GB default memory cap
         bool force_streaming = false;  // Force streaming even for small files
+        std::string damage_index_path; // Optional .agd, embed per-read p_damaged into DAMAGE_SCORE
     };
 
     /**
@@ -983,7 +1014,7 @@ public:
      * - Memory usage: ~4-5GB regardless of file size
      *
      * @param tsv_path Input TSV file (16-column MMseqs2 format, optionally .gz)
-     * @param output_path Output .emi2 file
+     * @param output_path Output .emi file
      * @param config Configuration options
      * @return Number of alignments written
      */
@@ -1087,7 +1118,9 @@ public:
         auto scan_ms = std::chrono::duration_cast<std::chrono::milliseconds>(scan_end - scan_start).count();
 
         if (config.verbose) {
-            std::cerr << "Lines: " << n_lines << " (scan: " << scan_ms << " ms), building dictionary...\n";
+            std::cerr << "Lines: " << n_lines << " (scan: "
+                      << agp::log_utils::format_duration_ms(scan_ms)
+                      << "), building dictionary...\n";
         }
 
         auto pass_start = std::chrono::high_resolution_clock::now();
@@ -1155,6 +1188,24 @@ public:
             local_ref_seen[t].clear_release();
         }
 
+        // Build read-order list by first appearance across file chunks.
+        // local_read_uniques[tid] preserves first-seen order within each contiguous chunk.
+        size_t est_read_uniques = 0;
+        for (const auto& v : local_read_uniques) est_read_uniques += v.size();
+        std::vector<std::string_view> read_first_seen_order;
+        read_first_seen_order.reserve(est_read_uniques);
+        FlatSVU32Map read_first_seen_set;
+        read_first_seen_set.reserve(std::max<size_t>(1024, est_read_uniques));
+        for (int tid = 0; tid < n_threads; ++tid) {
+            for (std::string_view sv : local_read_uniques[tid]) {
+                uint64_t h = FlatSVU32Map::hash_sv(sv);
+                if (read_first_seen_set.try_emplace(sv, 0u, h)) {
+                    read_first_seen_order.push_back(sv);
+                }
+            }
+        }
+        read_first_seen_set.clear_release();
+
         // Merge into global dictionaries
         constexpr size_t READ_SHARDS = 1024;
         constexpr size_t REF_SHARDS = 256;
@@ -1163,11 +1214,58 @@ public:
 
         std::vector<std::string_view> read_names = std::move(read_dict.names);
         std::vector<std::string_view> ref_names = std::move(ref_dict.names);
+        std::vector<uint32_t> read_old_to_new(
+            read_names.size(), std::numeric_limits<uint32_t>::max());
+        std::vector<uint32_t> read_new_to_old;
+        read_new_to_old.reserve(read_names.size());
+
+        // Remap read IDs by first appearance in input so row-group local sorting
+        // can preserve global (read_idx, bit_score DESC) ordering for grouped inputs.
+        for (std::string_view sv : read_first_seen_order) {
+            uint32_t old_idx = dict_lookup(read_dict, sv);
+            uint32_t& mapped = read_old_to_new[old_idx];
+            if (mapped == std::numeric_limits<uint32_t>::max()) {
+                mapped = static_cast<uint32_t>(read_new_to_old.size());
+                read_new_to_old.push_back(old_idx);
+            }
+        }
+        std::vector<std::string_view>().swap(read_first_seen_order);
+        if (read_new_to_old.size() != read_names.size()) {
+            throw std::runtime_error("Read-ID remap incomplete while building EMI");
+        }
+        std::vector<std::string_view> read_names_ordered(read_names.size());
+        for (uint32_t new_idx = 0; new_idx < read_new_to_old.size(); ++new_idx) {
+            read_names_ordered[new_idx] = read_names[read_new_to_old[new_idx]];
+        }
+        read_names.swap(read_names_ordered);
+
+        std::vector<float> read_damage_by_idx;
+        if (!config.damage_index_path.empty()) {
+            DamageIndexReader damage_reader(config.damage_index_path);
+            if (!damage_reader.is_valid()) {
+                throw std::runtime_error("Cannot open damage index: " + config.damage_index_path);
+            }
+            read_damage_by_idx.resize(read_names.size(), 0.0f);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int64_t i = 0; i < static_cast<int64_t>(read_names.size()); ++i) {
+                const auto ridx = static_cast<size_t>(i);
+                if (const AgdRecord* rec = damage_reader.find(read_names[ridx])) {
+                    read_damage_by_idx[ridx] = static_cast<float>(rec->p_damaged_q) / 255.0f;
+                }
+            }
+            if (config.verbose) {
+                std::cerr << "  Embedded per-read damage scores from " << config.damage_index_path
+                          << " into EMI DAMAGE_SCORE\n";
+            }
+        }
 
         auto dict_end = std::chrono::high_resolution_clock::now();
         auto dict_ms = std::chrono::duration_cast<std::chrono::milliseconds>(dict_end - pass_start).count();
         if (config.verbose) {
-            std::cerr << "  Dictionary: " << dict_ms << " ms (" << read_names.size() << " reads, "
+            std::cerr << "  Dictionary: " << agp::log_utils::format_duration_ms(dict_ms)
+                      << " (" << read_names.size() << " reads, "
                       << ref_names.size() << " refs, " << n_threads << " threads)\n";
         }
 
@@ -1211,12 +1309,14 @@ public:
         header.row_group_size = static_cast<uint32_t>(rg_size);
         header.d_max = config.d_max;
         header.lambda = config.lambda;
+        header.flags = 0;
 
         out.write(reinterpret_cast<const char*>(&header), sizeof(header));
 
         header.row_group_dir_offset = out.tellp();
         std::vector<RowGroupMeta> row_groups(num_row_groups);
         out.write(reinterpret_cast<const char*>(row_groups.data()), row_groups.size() * sizeof(RowGroupMeta));
+        std::vector<RowGroupReadIndex> row_group_read_index(num_row_groups);
 
         header.string_dict_offset = out.tellp();
         uint32_t read_names_count = static_cast<uint32_t>(read_name_offsets.size());
@@ -1240,6 +1340,11 @@ public:
 
         // CSR offset building: count alignments per read
         std::vector<uint32_t> read_counts(header.num_reads, 0);
+        uint64_t global_row_cursor = 0;
+        bool globally_sorted_by_read_then_score = true;
+        bool has_prev_sort_key = false;
+        uint32_t prev_read_idx = 0;
+        float prev_bit_score = 0.0f;
 
         // Row-group buffers
         std::vector<uint32_t> rg_read_idx(rg_size);
@@ -1247,12 +1352,25 @@ public:
         std::vector<float> rg_bit_score(rg_size);
         std::vector<float> rg_damage_score(rg_size);
         std::vector<float> rg_evalue_log10(rg_size);
+        std::vector<uint16_t> rg_dmg_k(rg_size);
+        std::vector<uint16_t> rg_dmg_m(rg_size);
+        std::vector<float> rg_dmg_ll_a(rg_size);
+        std::vector<float> rg_dmg_ll_m(rg_size);
         std::vector<uint16_t> rg_identity_q(rg_size);
         std::vector<uint16_t> rg_aln_len(rg_size);
+        std::vector<uint16_t> rg_qstart(rg_size);
+        std::vector<uint16_t> rg_qend(rg_size);
         std::vector<uint16_t> rg_tstart(rg_size);
         std::vector<uint16_t> rg_tend(rg_size);
         std::vector<uint16_t> rg_tlen(rg_size);
         std::vector<uint16_t> rg_qlen(rg_size);
+        std::vector<uint16_t> rg_mismatch(rg_size);
+        std::vector<uint16_t> rg_gapopen(rg_size);
+        std::vector<uint32_t> perm_tmp_u32(rg_size);
+        std::vector<float> perm_tmp_f32(rg_size);
+        std::vector<uint16_t> perm_tmp_u16(rg_size);
+        std::vector<uint32_t> perm_qaln_offsets(rg_size + 1);
+        std::vector<uint32_t> perm_taln_offsets(rg_size + 1);
         std::vector<uint32_t> rg_qaln_offsets(rg_size + 1);
         std::vector<char> rg_qaln_data;
         rg_qaln_data.reserve(rg_size * 50);
@@ -1305,11 +1423,20 @@ public:
 
                 std::string_view q(fields[0], lens[0]);
                 std::string_view t(fields[1], lens[1]);
-                rg_read_idx[local_idx] = dict_lookup(read_dict, q);
+                uint32_t old_read_idx = dict_lookup(read_dict, q);
+                uint32_t mapped_read_idx = read_old_to_new[old_read_idx];
+                rg_read_idx[local_idx] =
+                    (mapped_read_idx != std::numeric_limits<uint32_t>::max())
+                        ? mapped_read_idx
+                        : 0;
                 rg_ref_idx[local_idx] = dict_lookup(ref_dict, t);
 
                 float fident = fast_stof({fields[2], lens[2]});
                 uint32_t alnlen = fast_stou({fields[3], lens[3]});
+                uint32_t mismatch_v = fast_stou({fields[4], lens[4]});
+                uint32_t gapopen_v = fast_stou({fields[5], lens[5]});
+                uint32_t qstart_v = fast_stou({fields[6], lens[6]});
+                uint32_t qend_v = fast_stou({fields[7], lens[7]});
                 uint32_t tstart_v = fast_stou({fields[8], lens[8]});
                 uint32_t tend_v = fast_stou({fields[9], lens[9]});
                 float evalue = fast_stof({fields[10], lens[10]});
@@ -1318,14 +1445,24 @@ public:
                 uint32_t tlen_v = fast_stou({fields[13], lens[13]});
 
                 rg_bit_score[local_idx] = bits;
-                rg_damage_score[local_idx] = 0.0f;
+                rg_damage_score[local_idx] = read_damage_by_idx.empty()
+                    ? 0.0f
+                    : read_damage_by_idx[rg_read_idx[local_idx]];
                 rg_evalue_log10[local_idx] = (evalue > 0) ? std::log10(evalue) : -300.0f;
+                rg_dmg_k[local_idx] = 0;
+                rg_dmg_m[local_idx] = 0;
+                rg_dmg_ll_a[local_idx] = 0.0f;
+                rg_dmg_ll_m[local_idx] = 0.0f;
                 rg_identity_q[local_idx] = static_cast<uint16_t>(std::clamp(fident, 0.0f, 1.0f) * 65535.0f);
                 rg_aln_len[local_idx] = static_cast<uint16_t>(std::min(alnlen, 65535u));
+                rg_qstart[local_idx] = static_cast<uint16_t>(std::min(qstart_v, 65535u));
+                rg_qend[local_idx] = static_cast<uint16_t>(std::min(qend_v, 65535u));
                 rg_tstart[local_idx] = static_cast<uint16_t>(std::min(tstart_v, 65535u));
                 rg_tend[local_idx] = static_cast<uint16_t>(std::min(tend_v, 65535u));
                 rg_tlen[local_idx] = static_cast<uint16_t>(std::min(tlen_v, 65535u));
                 rg_qlen[local_idx] = static_cast<uint16_t>(std::min(qlen_v, 65535u));
+                rg_mismatch[local_idx] = static_cast<uint16_t>(std::min(mismatch_v, 65535u));
+                rg_gapopen[local_idx] = static_cast<uint16_t>(std::min(gapopen_v, 65535u));
             }
 
             // Parse string columns (sequential)
@@ -1335,13 +1472,18 @@ public:
                     const char* line_end = rg_line_starts[local_idx + 1];
                     if (line_end > p && *(line_end - 1) == '\n') --line_end;
 
-                    const char* fp = p;
-                    for (int f = 0; f < 14 && fp < line_end; ++f) {
-                        fp = simd_find_tab(fp, line_end) + 1;
+                    const char* qid_start = p;
+                    const char* qid_end = simd_find_tab(qid_start, line_end);
+                    std::string_view query_id(qid_start, static_cast<size_t>(qid_end - qid_start));
+
+                    const char* fp = (qid_end < line_end) ? (qid_end + 1) : line_end;
+                    for (int f = 1; f < 14 && fp < line_end; ++f) {
+                        const char* tab = simd_find_tab(fp, line_end);
+                        fp = (tab < line_end) ? (tab + 1) : line_end;
                     }
                     const char* qaln_start = fp;
                     const char* qaln_end = simd_find_tab(fp, line_end);
-                    fp = qaln_end + 1;
+                    fp = (qaln_end < line_end) ? (qaln_end + 1) : line_end;
                     const char* taln_start = fp;
                     const char* taln_end = simd_find_tab(fp, line_end);
 
@@ -1349,6 +1491,21 @@ public:
                     rg_qaln_data.insert(rg_qaln_data.end(), qaln_start, qaln_end);
                     rg_taln_offsets[local_idx] = static_cast<uint32_t>(rg_taln_data.size());
                     rg_taln_data.insert(rg_taln_data.end(), taln_start, taln_end);
+
+                    const std::string_view qaln_sv(qaln_start, static_cast<size_t>(qaln_end - qaln_start));
+                    const std::string_view taln_sv(taln_start, static_cast<size_t>(taln_end - taln_start));
+                    const auto dmg = compute_alignment_damage_evidence(
+                        query_id,
+                        qaln_sv,
+                        taln_sv,
+                        rg_qstart[local_idx],
+                        rg_qlen[local_idx],
+                        config.d_max,
+                        config.lambda);
+                    rg_dmg_k[local_idx] = dmg.k_hits;
+                    rg_dmg_m[local_idx] = dmg.m_sites;
+                    rg_dmg_ll_a[local_idx] = dmg.ll_ancient;
+                    rg_dmg_ll_m[local_idx] = dmg.ll_modern;
                 }
             }
             rg_qaln_offsets[rg_rows] = static_cast<uint32_t>(rg_qaln_data.size());
@@ -1366,57 +1523,93 @@ public:
                 return rg_bit_score[a] > rg_bit_score[b];  // Descending by score
             });
 
-            // Apply permutation to all columns
-            auto apply_perm = [&](auto& vec) {
-                using T = typename std::remove_reference<decltype(vec)>::type::value_type;
-                std::vector<T> temp(rg_rows);
-                for (uint32_t i = 0; i < rg_rows; ++i) temp[i] = vec[perm[i]];
-                std::copy(temp.begin(), temp.end(), vec.begin());
+            // Apply permutation with reusable scratch buffers (avoids per-column allocations)
+            auto apply_perm_u32 = [&](std::vector<uint32_t>& vec) {
+                for (uint32_t i = 0; i < rg_rows; ++i) perm_tmp_u32[i] = vec[perm[i]];
+                std::copy_n(perm_tmp_u32.data(), rg_rows, vec.data());
             };
-            apply_perm(rg_read_idx);
-            apply_perm(rg_ref_idx);
-            apply_perm(rg_bit_score);
-            apply_perm(rg_damage_score);
-            apply_perm(rg_evalue_log10);
-            apply_perm(rg_identity_q);
-            apply_perm(rg_aln_len);
-            apply_perm(rg_tstart);
-            apply_perm(rg_tend);
-            apply_perm(rg_tlen);
-            apply_perm(rg_qlen);
+            auto apply_perm_f32 = [&](std::vector<float>& vec) {
+                for (uint32_t i = 0; i < rg_rows; ++i) perm_tmp_f32[i] = vec[perm[i]];
+                std::copy_n(perm_tmp_f32.data(), rg_rows, vec.data());
+            };
+            auto apply_perm_u16 = [&](std::vector<uint16_t>& vec) {
+                for (uint32_t i = 0; i < rg_rows; ++i) perm_tmp_u16[i] = vec[perm[i]];
+                std::copy_n(perm_tmp_u16.data(), rg_rows, vec.data());
+            };
+            apply_perm_u32(rg_read_idx);
+            apply_perm_u32(rg_ref_idx);
+            apply_perm_f32(rg_bit_score);
+            apply_perm_f32(rg_damage_score);
+            apply_perm_f32(rg_evalue_log10);
+            apply_perm_u16(rg_dmg_k);
+            apply_perm_u16(rg_dmg_m);
+            apply_perm_f32(rg_dmg_ll_a);
+            apply_perm_f32(rg_dmg_ll_m);
+            apply_perm_u16(rg_identity_q);
+            apply_perm_u16(rg_aln_len);
+            apply_perm_u16(rg_qstart);
+            apply_perm_u16(rg_qend);
+            apply_perm_u16(rg_tstart);
+            apply_perm_u16(rg_tend);
+            apply_perm_u16(rg_tlen);
+            apply_perm_u16(rg_qlen);
+            apply_perm_u16(rg_mismatch);
+            apply_perm_u16(rg_gapopen);
 
             // Rebuild qaln/taln with permuted order
             if (!config.skip_alignments) {
-                std::vector<std::string> qaln_strs(rg_rows), taln_strs(rg_rows);
+                std::vector<char> perm_qaln_data;
+                std::vector<char> perm_taln_data;
+                perm_qaln_data.reserve(rg_qaln_data.size());
+                perm_taln_data.reserve(rg_taln_data.size());
                 for (uint32_t i = 0; i < rg_rows; ++i) {
                     uint32_t old_i = perm[i];
                     uint32_t q_start = rg_qaln_offsets[old_i];
                     uint32_t q_end = rg_qaln_offsets[old_i + 1];
                     uint32_t t_start = rg_taln_offsets[old_i];
                     uint32_t t_end = rg_taln_offsets[old_i + 1];
-                    qaln_strs[i] = std::string(rg_qaln_data.begin() + q_start, rg_qaln_data.begin() + q_end);
-                    taln_strs[i] = std::string(rg_taln_data.begin() + t_start, rg_taln_data.begin() + t_end);
+                    perm_qaln_offsets[i] = static_cast<uint32_t>(perm_qaln_data.size());
+                    perm_qaln_data.insert(
+                        perm_qaln_data.end(),
+                        rg_qaln_data.begin() + q_start,
+                        rg_qaln_data.begin() + q_end);
+                    perm_taln_offsets[i] = static_cast<uint32_t>(perm_taln_data.size());
+                    perm_taln_data.insert(
+                        perm_taln_data.end(),
+                        rg_taln_data.begin() + t_start,
+                        rg_taln_data.begin() + t_end);
                 }
-                rg_qaln_data.clear();
-                rg_taln_data.clear();
-                for (uint32_t i = 0; i < rg_rows; ++i) {
-                    rg_qaln_offsets[i] = static_cast<uint32_t>(rg_qaln_data.size());
-                    rg_qaln_data.insert(rg_qaln_data.end(), qaln_strs[i].begin(), qaln_strs[i].end());
-                    rg_taln_offsets[i] = static_cast<uint32_t>(rg_taln_data.size());
-                    rg_taln_data.insert(rg_taln_data.end(), taln_strs[i].begin(), taln_strs[i].end());
-                }
-                rg_qaln_offsets[rg_rows] = static_cast<uint32_t>(rg_qaln_data.size());
-                rg_taln_offsets[rg_rows] = static_cast<uint32_t>(rg_taln_data.size());
+                perm_qaln_offsets[rg_rows] = static_cast<uint32_t>(perm_qaln_data.size());
+                perm_taln_offsets[rg_rows] = static_cast<uint32_t>(perm_taln_data.size());
+                std::copy_n(perm_qaln_offsets.data(), rg_rows + 1, rg_qaln_offsets.data());
+                std::copy_n(perm_taln_offsets.data(), rg_rows + 1, rg_taln_offsets.data());
+                rg_qaln_data.swap(perm_qaln_data);
+                rg_taln_data.swap(perm_taln_data);
             }
 
             // Accumulate CSR counts (now sorted)
             for (uint32_t i = 0; i < rg_rows; ++i) {
+                if (!has_prev_sort_key) {
+                    has_prev_sort_key = true;
+                } else if (globally_sorted_by_read_then_score) {
+                    if (rg_read_idx[i] < prev_read_idx ||
+                        (rg_read_idx[i] == prev_read_idx && rg_bit_score[i] > prev_bit_score)) {
+                        globally_sorted_by_read_then_score = false;
+                    }
+                }
+                prev_read_idx = rg_read_idx[i];
+                prev_bit_score = rg_bit_score[i];
                 read_counts[rg_read_idx[i]]++;
             }
 
             // Write row-group
             row_groups[rg].num_rows = rg_rows;
             row_groups[rg].first_read_idx = rg_read_idx[0];
+            row_group_read_index[rg].first_read_idx = rg_read_idx[0];
+            row_group_read_index[rg].last_read_idx = rg_read_idx[rg_rows - 1];
+            row_group_read_index[rg].start_row = global_row_cursor;
+            row_group_read_index[rg].end_row_exclusive = global_row_cursor + rg_rows;
+            global_row_cursor += rg_rows;
 
             auto write_chunk = [&](ColumnID col, const void* chunk_data, size_t elem_size) {
                 auto& chunk = row_groups[rg].columns[static_cast<size_t>(col)];
@@ -1426,41 +1619,87 @@ public:
                 chunk.codec = Codec::NONE;
                 out.write(static_cast<const char*>(chunk_data), chunk.uncompressed_size);
             };
+            auto write_alignment_chunk = [&](ColumnID col,
+                                             const std::vector<uint32_t>& offsets,
+                                             const std::vector<char>& data) {
+                auto& chunk = row_groups[rg].columns[static_cast<size_t>(col)];
+                chunk.offset = out.tellp();
+
+                const size_t offsets_bytes = static_cast<size_t>(rg_rows + 1) * sizeof(uint32_t);
+                const size_t raw_bytes = offsets_bytes + data.size();
+                chunk.uncompressed_size = static_cast<uint32_t>(raw_bytes);
+
+#ifdef HAVE_ZSTD
+                if (config.compress && raw_bytes > 0) {
+                    std::vector<char> raw(raw_bytes);
+                    std::memcpy(raw.data(), offsets.data(), offsets_bytes);
+                    if (!data.empty()) {
+                        std::memcpy(raw.data() + offsets_bytes, data.data(), data.size());
+                    }
+                    auto compressed = compress_zstd(raw.data(), raw.size(), config.compression_level);
+                    if (compressed.size() < raw.size()) {
+                        chunk.compressed_size = static_cast<uint32_t>(compressed.size());
+                        chunk.codec = Codec::ZSTD;
+                        out.write(compressed.data(), static_cast<std::streamsize>(compressed.size()));
+                        return;
+                    }
+                }
+#endif
+                chunk.compressed_size = chunk.uncompressed_size;
+                chunk.codec = Codec::NONE;
+                out.write(reinterpret_cast<const char*>(offsets.data()),
+                          static_cast<std::streamsize>(offsets_bytes));
+                if (!data.empty()) {
+                    out.write(data.data(), static_cast<std::streamsize>(data.size()));
+                }
+            };
 
             write_chunk(ColumnID::READ_IDX, rg_read_idx.data(), sizeof(uint32_t));
             write_chunk(ColumnID::REF_IDX, rg_ref_idx.data(), sizeof(uint32_t));
             write_chunk(ColumnID::BIT_SCORE, rg_bit_score.data(), sizeof(float));
             write_chunk(ColumnID::DAMAGE_SCORE, rg_damage_score.data(), sizeof(float));
             write_chunk(ColumnID::EVALUE_LOG10, rg_evalue_log10.data(), sizeof(float));
+            write_chunk(ColumnID::DMG_K, rg_dmg_k.data(), sizeof(uint16_t));
+            write_chunk(ColumnID::DMG_M, rg_dmg_m.data(), sizeof(uint16_t));
+            write_chunk(ColumnID::DMG_LL_A, rg_dmg_ll_a.data(), sizeof(float));
+            write_chunk(ColumnID::DMG_LL_M, rg_dmg_ll_m.data(), sizeof(float));
             write_chunk(ColumnID::IDENTITY_Q, rg_identity_q.data(), sizeof(uint16_t));
             write_chunk(ColumnID::ALN_LEN, rg_aln_len.data(), sizeof(uint16_t));
+            write_chunk(ColumnID::QSTART, rg_qstart.data(), sizeof(uint16_t));
+            write_chunk(ColumnID::QEND, rg_qend.data(), sizeof(uint16_t));
             write_chunk(ColumnID::TSTART, rg_tstart.data(), sizeof(uint16_t));
             write_chunk(ColumnID::TEND, rg_tend.data(), sizeof(uint16_t));
             write_chunk(ColumnID::TLEN, rg_tlen.data(), sizeof(uint16_t));
             write_chunk(ColumnID::QLEN, rg_qlen.data(), sizeof(uint16_t));
+            write_chunk(ColumnID::MISMATCH, rg_mismatch.data(), sizeof(uint16_t));
+            write_chunk(ColumnID::GAPOPEN, rg_gapopen.data(), sizeof(uint16_t));
 
             if (!config.skip_alignments) {
-                auto& qaln_chunk = row_groups[rg].columns[static_cast<size_t>(ColumnID::QALN)];
-                qaln_chunk.offset = out.tellp();
-                out.write(reinterpret_cast<const char*>(rg_qaln_offsets.data()), (rg_rows + 1) * sizeof(uint32_t));
-                out.write(rg_qaln_data.data(), rg_qaln_data.size());
-                qaln_chunk.uncompressed_size = static_cast<uint32_t>((rg_rows + 1) * sizeof(uint32_t) + rg_qaln_data.size());
-                qaln_chunk.compressed_size = qaln_chunk.uncompressed_size;
-                qaln_chunk.codec = Codec::NONE;
-
-                auto& taln_chunk = row_groups[rg].columns[static_cast<size_t>(ColumnID::TALN)];
-                taln_chunk.offset = out.tellp();
-                out.write(reinterpret_cast<const char*>(rg_taln_offsets.data()), (rg_rows + 1) * sizeof(uint32_t));
-                out.write(rg_taln_data.data(), rg_taln_data.size());
-                taln_chunk.uncompressed_size = static_cast<uint32_t>((rg_rows + 1) * sizeof(uint32_t) + rg_taln_data.size());
-                taln_chunk.compressed_size = taln_chunk.uncompressed_size;
-                taln_chunk.codec = Codec::NONE;
+                write_alignment_chunk(ColumnID::QALN, rg_qaln_offsets, rg_qaln_data);
+                write_alignment_chunk(ColumnID::TALN, rg_taln_offsets, rg_taln_data);
             }
         }
 
         // Cleanup dictionaries
         for (auto& shard : read_dict.shard_maps) shard.clear_release();
         for (auto& shard : ref_dict.shard_maps) shard.clear_release();
+
+        if (!config.skip_alignments) {
+            header.flags |= EMI_FLAG_HAS_ALIGNMENT_STRINGS;
+        }
+        header.flags |= EMI_FLAG_HAS_ROW_GROUP_READ_INDEX;
+        if (globally_sorted_by_read_then_score) {
+            header.flags |= EMI_FLAG_SORTED_BY_READ_THEN_SCORE;
+        } else if (config.verbose) {
+            std::cerr << "Warning: EMI is not globally sorted by (read, bit_score). "
+                         "Input is likely not grouped by query.\n";
+        }
+
+        header.row_group_read_index_offset = out.tellp();
+        header.row_group_read_index_count = static_cast<uint32_t>(row_group_read_index.size());
+        header.row_group_read_index_entry_size = sizeof(RowGroupReadIndex);
+        out.write(reinterpret_cast<const char*>(row_group_read_index.data()),
+                  row_group_read_index.size() * sizeof(RowGroupReadIndex));
 
         // Build CSR offsets from counts (prefix sum)
         header.csr_offsets_offset = out.tellp();
@@ -1484,7 +1723,9 @@ public:
         if (config.verbose) {
             std::cerr << "Parsed: " << total_rows << " rows, "
                       << header.num_reads << " reads, "
-                      << header.num_refs << " refs ("
+                      << header.num_refs << " refs in "
+                      << agp::log_utils::format_duration_ms(total_ms)
+                      << " ("
                       << (total_rows * 1000 / std::max(1LL, static_cast<long long>(total_ms)))
                       << " rows/sec)\n";
         }
@@ -1525,72 +1766,136 @@ public:
         n_threads = omp_get_max_threads();
 #endif
 
-        // Use spilling dictionaries for memory-bounded operation
-        SpillingStringDict read_dict_builder("reads", config.memory_limit / 2);
-        SpillingStringDict ref_dict_builder("refs", config.memory_limit / 4);
+        // Use sharded spilling dictionaries for parallel inserts.
+        size_t num_shards = 1;
+        size_t target_shards = static_cast<size_t>(std::max(1, n_threads)) * 4;
+        while (num_shards < target_shards) num_shards <<= 1;
+        const size_t shard_mask = num_shards - 1;
+
+        size_t read_cap_total = std::max<size_t>(config.memory_limit / 2, 64ULL * 1024ULL * 1024ULL);
+        size_t ref_cap_total = std::max<size_t>(config.memory_limit / 4, 32ULL * 1024ULL * 1024ULL);
+        size_t read_cap_per_shard = std::max<size_t>(read_cap_total / num_shards, 8ULL * 1024ULL * 1024ULL);
+        size_t ref_cap_per_shard = std::max<size_t>(ref_cap_total / num_shards, 8ULL * 1024ULL * 1024ULL);
+
+        std::vector<std::unique_ptr<SpillingStringDict>> read_dict_shards;
+        std::vector<std::unique_ptr<SpillingStringDict>> ref_dict_shards;
+        read_dict_shards.reserve(num_shards);
+        ref_dict_shards.reserve(num_shards);
+        for (size_t s = 0; s < num_shards; ++s) {
+            read_dict_shards.emplace_back(std::make_unique<SpillingStringDict>(
+                "reads_" + std::to_string(s), read_cap_per_shard));
+            ref_dict_shards.emplace_back(std::make_unique<SpillingStringDict>(
+                "refs_" + std::to_string(s), ref_cap_per_shard));
+        }
+        std::vector<std::mutex> read_shard_mutex(num_shards);
+        std::vector<std::mutex> ref_shard_mutex(num_shards);
 
         uint64_t n_lines = 0;
-        std::mutex dict_mutex;
 
-        // Process file in morsels
-        std::vector<Morsel> morsel_pool(n_threads);
-        for (auto& m : morsel_pool) m.reserve(MORSEL_SIZE);
-
-        // Read and process morsels
         while (true) {
-            // Fill a morsel with lines
-            Morsel& morsel = morsel_pool[0];
-            morsel.clear();
-
+            std::vector<std::string> morsel_lines;
+            morsel_lines.reserve(MORSEL_SIZE);
             for (size_t i = 0; i < MORSEL_SIZE; ++i) {
                 std::string_view line = reader.next_line();
-                if (line.empty() && reader.bytes_read() > 0) {
-                    // Check if truly EOF (empty line at end)
-                    break;
-                }
+                if (line.empty() && reader.bytes_read() > 0) break;
                 if (line.empty()) break;
+                morsel_lines.emplace_back(line);
+            }
+            if (morsel_lines.empty()) break;
+            n_lines += morsel_lines.size();
 
-                // Parse first two fields for dictionary
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (size_t i = 0; i < morsel_lines.size(); ++i) {
+                const std::string& line = morsel_lines[i];
                 const char* p = line.data();
-                const char* end = p + line.size();
-                const char* tab1 = simd_find_tab(p, end);
-                if (tab1 >= end) continue;
-                const char* tab2 = simd_find_tab(tab1 + 1, end);
+                const char* line_end = p + line.size();
+                std::string_view q, t;
+                if (!parse_first_two_fields(p, line_end, q, t)) continue;
 
-                std::string_view query(p, static_cast<size_t>(tab1 - p));
-                std::string_view target(tab1 + 1, static_cast<size_t>(tab2 - tab1 - 1));
-
-                // Copy to owned strings for dictionary
-                morsel.queries.emplace_back(query);
-                morsel.targets.emplace_back(target);
-            }
-
-            if (morsel.queries.empty()) break;
-
-            n_lines += morsel.queries.size();
-
-            // Insert into dictionaries (thread-safe via mutex for now)
-            // Could parallelize with sharded insertion
-            {
-                std::lock_guard<std::mutex> lock(dict_mutex);
-                for (const auto& q : morsel.queries) {
-                    read_dict_builder.insert(q);
+                size_t q_shard = static_cast<size_t>(FlatSVU32Map::hash_sv(q)) & shard_mask;
+                {
+                    std::lock_guard<std::mutex> lock(read_shard_mutex[q_shard]);
+                    read_dict_shards[q_shard]->insert(q);
                 }
-                for (const auto& t : morsel.targets) {
-                    ref_dict_builder.insert(t);
+                size_t t_shard = static_cast<size_t>(FlatSVU32Map::hash_sv(t)) & shard_mask;
+                {
+                    std::lock_guard<std::mutex> lock(ref_shard_mutex[t_shard]);
+                    ref_dict_shards[t_shard]->insert(t);
                 }
             }
 
-            // Progress
             if (config.verbose && n_lines % 1000000 == 0) {
                 std::cerr << "\rPass 1: " << (n_lines / 1000000) << "M lines, "
                           << (reader.bytes_read() / (1024*1024)) << " MB read...";
             }
         }
 
-        // Finalize dictionaries
-        auto [read_names_vec_str, read_lookup] = read_dict_builder.finalize();
-        auto [ref_names_vec_str, ref_lookup] = ref_dict_builder.finalize();
+        // Finalize shards into global dictionaries.
+        std::vector<std::string> read_names_vec_str;
+        std::vector<std::string> ref_names_vec_str;
+        SpillingStringDict::StringToIdMap read_lookup;
+        SpillingStringDict::StringToIdMap ref_lookup;
+        size_t read_spill_total = 0;
+        size_t ref_spill_total = 0;
+
+        for (size_t s = 0; s < num_shards; ++s) {
+            read_spill_total += read_dict_shards[s]->spill_count();
+            ref_spill_total += ref_dict_shards[s]->spill_count();
+
+            auto [read_names_local, _read_lookup_local] = read_dict_shards[s]->finalize();
+            for (auto& name : read_names_local) {
+                uint32_t id = static_cast<uint32_t>(read_names_vec_str.size());
+                read_lookup.emplace(name, id);
+                read_names_vec_str.push_back(std::move(name));
+            }
+
+            auto [ref_names_local, _ref_lookup_local] = ref_dict_shards[s]->finalize();
+            for (auto& name : ref_names_local) {
+                uint32_t id = static_cast<uint32_t>(ref_names_vec_str.size());
+                ref_lookup.emplace(name, id);
+                ref_names_vec_str.push_back(std::move(name));
+            }
+        }
+
+        std::vector<uint32_t> read_old_to_new(
+            read_names_vec_str.size(), std::numeric_limits<uint32_t>::max());
+        std::vector<uint32_t> read_new_to_old;
+        read_new_to_old.reserve(read_names_vec_str.size());
+
+        // Remap read IDs by first appearance in input.
+        {
+            ChunkedFileReader remap_reader(tsv_path);
+            if (!remap_reader.valid()) {
+                throw std::runtime_error("Cannot open TSV for read remap: " + tsv_path);
+            }
+            remap_reader.skip_header_if_present();
+            while (true) {
+                std::string_view line = remap_reader.next_line();
+                if (line.empty()) break;
+                const char* p = line.data();
+                const char* line_end = p + line.size();
+                std::string_view q, t;
+                if (!parse_first_two_fields(p, line_end, q, t)) continue;
+                auto it = read_lookup.find(q);
+                if (it == read_lookup.end()) continue;
+                uint32_t old_idx = it->second;
+                uint32_t& mapped = read_old_to_new[old_idx];
+                if (mapped == std::numeric_limits<uint32_t>::max()) {
+                    mapped = static_cast<uint32_t>(read_new_to_old.size());
+                    read_new_to_old.push_back(old_idx);
+                }
+            }
+        }
+        if (read_new_to_old.size() != read_names_vec_str.size()) {
+            throw std::runtime_error("Read-ID remap incomplete while building EMI");
+        }
+        std::vector<std::string> read_names_ordered(read_names_vec_str.size());
+        for (uint32_t new_idx = 0; new_idx < read_new_to_old.size(); ++new_idx) {
+            read_names_ordered[new_idx] = std::move(read_names_vec_str[read_new_to_old[new_idx]]);
+        }
+        read_names_vec_str.swap(read_names_ordered);
 
         auto pass1_end = std::chrono::high_resolution_clock::now();
         auto pass1_ms = std::chrono::duration_cast<std::chrono::milliseconds>(pass1_end - pass1_start).count();
@@ -1599,10 +1904,10 @@ public:
             std::cerr << "\rPass 1: " << n_lines << " lines, "
                       << read_names_vec_str.size() << " reads, "
                       << ref_names_vec_str.size() << " refs"
-                      << " (" << pass1_ms << " ms)";
-            if (read_dict_builder.spill_count() > 0 || ref_dict_builder.spill_count() > 0) {
-                std::cerr << " [spilled: " << read_dict_builder.spill_count()
-                          << "+" << ref_dict_builder.spill_count() << " files]";
+                      << " (" << agp::log_utils::format_duration_ms(pass1_ms) << ")";
+            if (read_spill_total > 0 || ref_spill_total > 0) {
+                std::cerr << " [spilled: " << read_spill_total
+                          << "+" << ref_spill_total << " files]";
             }
             std::cerr << "\n";
         }
@@ -1655,6 +1960,7 @@ public:
         header.row_group_size = static_cast<uint32_t>(rg_size);
         header.d_max = config.d_max;
         header.lambda = config.lambda;
+        header.flags = 0;
 
         out.write(reinterpret_cast<const char*>(&header), sizeof(header));
 
@@ -1663,6 +1969,7 @@ public:
         std::vector<RowGroupMeta> row_groups(num_row_groups);
         out.write(reinterpret_cast<const char*>(row_groups.data()),
                   row_groups.size() * sizeof(RowGroupMeta));
+        std::vector<RowGroupReadIndex> row_group_read_index(num_row_groups);
 
         // Write string dictionaries
         header.string_dict_offset = out.tellp();
@@ -1682,6 +1989,28 @@ public:
         out.write(reinterpret_cast<const char*>(&ref_names_size), sizeof(ref_names_size));
         out.write(ref_names_data.data(), ref_names_data.size());
 
+        std::vector<float> read_damage_by_idx;
+        if (!config.damage_index_path.empty()) {
+            DamageIndexReader damage_reader(config.damage_index_path);
+            if (!damage_reader.is_valid()) {
+                throw std::runtime_error("Cannot open damage index: " + config.damage_index_path);
+            }
+            read_damage_by_idx.resize(header.num_reads, 0.0f);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int64_t i = 0; i < static_cast<int64_t>(read_names_vec_str.size()); ++i) {
+                const uint32_t ridx = static_cast<uint32_t>(i);
+                if (const AgdRecord* rec = damage_reader.find(read_names_vec_str[ridx])) {
+                    read_damage_by_idx[ridx] = static_cast<float>(rec->p_damaged_q) / 255.0f;
+                }
+            }
+            if (config.verbose) {
+                std::cerr << "Embedded per-read damage scores from " << config.damage_index_path
+                          << " into EMI DAMAGE_SCORE\n";
+            }
+        }
+
         // Release name vectors after writing (keep lookups for row-group processing)
         std::vector<uint32_t>().swap(read_name_offsets);
         std::vector<char>().swap(read_names_data);
@@ -1692,57 +2021,68 @@ public:
 
         // CSR offset building: count alignments per read
         std::vector<uint32_t> read_counts(header.num_reads, 0);
+        uint64_t global_row_cursor = 0;
+        bool globally_sorted_by_read_then_score = true;
+        bool has_prev_sort_key = false;
+        uint32_t prev_read_idx = 0;
+        float prev_bit_score = 0.0f;
+        struct RowGroupTask {
+            size_t rg_idx = 0;
+            std::vector<std::string> lines;
+        };
+        struct RowGroupResult {
+            size_t rg_idx = 0;
+            uint32_t rg_rows = 0;
+            std::vector<uint32_t> read_idx, ref_idx;
+            std::vector<float> bit_score, damage_score, evalue_log10;
+            std::vector<uint16_t> dmg_k, dmg_m;
+            std::vector<float> dmg_ll_a, dmg_ll_m;
+            std::vector<uint16_t> identity_q, aln_len, qstart, qend, tstart, tend, tlen, qlen;
+            std::vector<uint16_t> mismatch, gapopen;
+            std::vector<uint32_t> qaln_offsets, taln_offsets;
+            std::vector<char> qaln_data, taln_data;
+            std::vector<std::pair<uint32_t, uint32_t>> read_runs;
+            uint32_t first_read_idx = 0;
+            uint32_t last_read_idx = 0;
+        };
 
-        // Pre-allocate row-group sized buffers (reused for each row-group)
-        std::vector<uint32_t> rg_read_idx(rg_size);
-        std::vector<uint32_t> rg_ref_idx(rg_size);
-        std::vector<float> rg_bit_score(rg_size);
-        std::vector<float> rg_damage_score(rg_size);
-        std::vector<float> rg_evalue_log10(rg_size);
-        std::vector<uint16_t> rg_identity_q(rg_size);
-        std::vector<uint16_t> rg_aln_len(rg_size);
-        std::vector<uint16_t> rg_tstart(rg_size);
-        std::vector<uint16_t> rg_tend(rg_size);
-        std::vector<uint16_t> rg_tlen(rg_size);
-        std::vector<uint16_t> rg_qlen(rg_size);
-        std::vector<uint32_t> rg_qaln_offsets(rg_size + 1);
-        std::vector<char> rg_qaln_data;
-        rg_qaln_data.reserve(rg_size * 50);
-        std::vector<uint32_t> rg_taln_offsets(rg_size + 1);
-        std::vector<char> rg_taln_data;
-        rg_taln_data.reserve(rg_size * 50);
+        auto process_row_group = [&](RowGroupTask&& task) -> RowGroupResult {
+            RowGroupResult res;
+            res.rg_idx = task.rg_idx;
+            res.rg_rows = static_cast<uint32_t>(task.lines.size());
+            const uint32_t rg_rows = res.rg_rows;
 
-        // Storage for parsed lines in current row-group (owned copies)
-        std::vector<std::string> rg_lines(rg_size);
-
-        // Process each row-group by streaming through file
-        uint64_t lines_processed = 0;
-
-        for (size_t rg = 0; rg < num_row_groups; ++rg) {
-            size_t rg_start = rg * rg_size;
-            size_t rg_end = std::min(rg_start + rg_size, static_cast<size_t>(n_lines));
-            uint32_t rg_rows = static_cast<uint32_t>(rg_end - rg_start);
-
-            // Clear string buffers for this row-group
-            rg_qaln_data.clear();
-            rg_taln_data.clear();
-
-            // Read lines for this row-group (streaming, no mmap)
-            for (uint32_t i = 0; i < rg_rows; ++i) {
-                std::string_view line = reader.next_line();
-                rg_lines[i] = std::string(line);  // Copy to owned storage
+            res.read_idx.resize(rg_rows);
+            res.ref_idx.resize(rg_rows);
+            res.bit_score.resize(rg_rows);
+            res.damage_score.resize(rg_rows);
+            res.evalue_log10.resize(rg_rows);
+            res.dmg_k.resize(rg_rows, 0);
+            res.dmg_m.resize(rg_rows, 0);
+            res.dmg_ll_a.resize(rg_rows, 0.0f);
+            res.dmg_ll_m.resize(rg_rows, 0.0f);
+            res.identity_q.resize(rg_rows);
+            res.aln_len.resize(rg_rows);
+            res.qstart.resize(rg_rows);
+            res.qend.resize(rg_rows);
+            res.tstart.resize(rg_rows);
+            res.tend.resize(rg_rows);
+            res.tlen.resize(rg_rows);
+            res.qlen.resize(rg_rows);
+            res.mismatch.resize(rg_rows);
+            res.gapopen.resize(rg_rows);
+            res.qaln_offsets.resize(rg_rows + 1, 0);
+            res.taln_offsets.resize(rg_rows + 1, 0);
+            if (!config.skip_alignments) {
+                res.qaln_data.reserve(rg_rows * 50);
+                res.taln_data.reserve(rg_rows * 50);
             }
 
-            // Fill numeric columns (parallel within row-group)
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
             for (uint32_t local_idx = 0; local_idx < rg_rows; ++local_idx) {
-                const std::string& line = rg_lines[local_idx];
+                const std::string& line = task.lines[local_idx];
                 const char* p = line.data();
                 const char* line_end = p + line.size();
 
-                // Parse all 16 fields
                 const char* fields[16];
                 size_t lens[16];
                 const char* fp = p;
@@ -1755,171 +2095,406 @@ public:
 
                 std::string_view q(fields[0], lens[0]);
                 std::string_view t(fields[1], lens[1]);
-
-                // Lookup in dictionary
-                auto it_q = read_lookup.find(std::string(q));
-                auto it_t = ref_lookup.find(std::string(t));
-                rg_read_idx[local_idx] = (it_q != read_lookup.end()) ? it_q->second : 0;
-                rg_ref_idx[local_idx] = (it_t != ref_lookup.end()) ? it_t->second : 0;
+                auto it_q = read_lookup.find(q);
+                auto it_t = ref_lookup.find(t);
+                uint32_t old_read_idx = (it_q != read_lookup.end()) ? it_q->second : 0;
+                if (old_read_idx < read_old_to_new.size()) {
+                    uint32_t mapped = read_old_to_new[old_read_idx];
+                    res.read_idx[local_idx] =
+                        (mapped != std::numeric_limits<uint32_t>::max()) ? mapped : 0;
+                } else {
+                    res.read_idx[local_idx] = 0;
+                }
+                res.ref_idx[local_idx] = (it_t != ref_lookup.end()) ? it_t->second : 0;
 
                 float fident = fast_stof({fields[2], lens[2]});
-                uint32_t alnlen = fast_stou({fields[3], lens[3]});
-                uint32_t tstart = fast_stou({fields[8], lens[8]});
-                uint32_t tend = fast_stou({fields[9], lens[9]});
+                uint32_t alnlen_v = fast_stou({fields[3], lens[3]});
+                uint32_t mismatch_v = fast_stou({fields[4], lens[4]});
+                uint32_t gapopen_v = fast_stou({fields[5], lens[5]});
+                uint32_t qstart_v = fast_stou({fields[6], lens[6]});
+                uint32_t qend_v = fast_stou({fields[7], lens[7]});
+                uint32_t tstart_v = fast_stou({fields[8], lens[8]});
+                uint32_t tend_v = fast_stou({fields[9], lens[9]});
                 float evalue = fast_stof({fields[10], lens[10]});
                 float bits = fast_stof({fields[11], lens[11]});
-                uint32_t qlen_val = fast_stou({fields[12], lens[12]});
-                uint32_t tlen_val = fast_stou({fields[13], lens[13]});
+                uint32_t qlen_v = fast_stou({fields[12], lens[12]});
+                uint32_t tlen_v = fast_stou({fields[13], lens[13]});
 
-                rg_bit_score[local_idx] = bits;
-                rg_damage_score[local_idx] = 0.0f;
-                rg_evalue_log10[local_idx] = (evalue > 0) ? std::log10(evalue) : -300.0f;
-                rg_identity_q[local_idx] = static_cast<uint16_t>(std::clamp(fident, 0.0f, 1.0f) * 65535.0f);
-                rg_aln_len[local_idx] = static_cast<uint16_t>(std::min(alnlen, 65535u));
-                rg_tstart[local_idx] = static_cast<uint16_t>(std::min(tstart, 65535u));
-                rg_tend[local_idx] = static_cast<uint16_t>(std::min(tend, 65535u));
-                rg_tlen[local_idx] = static_cast<uint16_t>(std::min(tlen_val, 65535u));
-                rg_qlen[local_idx] = static_cast<uint16_t>(std::min(qlen_val, 65535u));
-            }
+                res.bit_score[local_idx] = bits;
+                res.damage_score[local_idx] = read_damage_by_idx.empty()
+                    ? 0.0f
+                    : ((res.read_idx[local_idx] < read_damage_by_idx.size())
+                        ? read_damage_by_idx[res.read_idx[local_idx]]
+                        : 0.0f);
+                res.evalue_log10[local_idx] = (evalue > 0) ? std::log10(evalue) : -300.0f;
+                res.identity_q[local_idx] = static_cast<uint16_t>(std::clamp(fident, 0.0f, 1.0f) * 65535.0f);
+                res.aln_len[local_idx] = static_cast<uint16_t>(std::min(alnlen_v, 65535u));
+                res.qstart[local_idx] = static_cast<uint16_t>(std::min(qstart_v, 65535u));
+                res.qend[local_idx] = static_cast<uint16_t>(std::min(qend_v, 65535u));
+                res.tstart[local_idx] = static_cast<uint16_t>(std::min(tstart_v, 65535u));
+                res.tend[local_idx] = static_cast<uint16_t>(std::min(tend_v, 65535u));
+                res.tlen[local_idx] = static_cast<uint16_t>(std::min(tlen_v, 65535u));
+                res.qlen[local_idx] = static_cast<uint16_t>(std::min(qlen_v, 65535u));
+                res.mismatch[local_idx] = static_cast<uint16_t>(std::min(mismatch_v, 65535u));
+                res.gapopen[local_idx] = static_cast<uint16_t>(std::min(gapopen_v, 65535u));
 
-            // Fill string columns (sequential, uses owned line copies)
-            if (!config.skip_alignments) {
-                for (uint32_t local_idx = 0; local_idx < rg_rows; ++local_idx) {
-                    const std::string& line = rg_lines[local_idx];
-                    const char* p = line.data();
-                    const char* line_end = p + line.size();
+                if (!config.skip_alignments) {
+                    const char* qaln_start = fields[14];
+                    const char* qaln_end = fields[14] + lens[14];
+                    const char* taln_start = fields[15];
+                    const char* taln_end = fields[15] + lens[15];
+                    const std::string_view qaln_sv(qaln_start, lens[14]);
+                    const std::string_view taln_sv(taln_start, lens[15]);
+                    const auto dmg = compute_alignment_damage_evidence(
+                        q, qaln_sv, taln_sv,
+                        res.qstart[local_idx],
+                        res.qlen[local_idx],
+                        config.d_max, config.lambda);
+                    res.dmg_k[local_idx] = dmg.k_hits;
+                    res.dmg_m[local_idx] = dmg.m_sites;
+                    res.dmg_ll_a[local_idx] = dmg.ll_ancient;
+                    res.dmg_ll_m[local_idx] = dmg.ll_modern;
 
-                    const char* fp = p;
-                    for (int f = 0; f < 14 && fp < line_end; ++f) {
-                        fp = simd_find_tab(fp, line_end) + 1;
-                    }
-                    const char* qaln_start = fp;
-                    const char* qaln_end = simd_find_tab(fp, line_end);
-                    fp = (qaln_end < line_end) ? qaln_end + 1 : line_end;
-                    const char* taln_start = fp;
-                    const char* taln_end = simd_find_tab(fp, line_end);
-
-                    rg_qaln_offsets[local_idx] = static_cast<uint32_t>(rg_qaln_data.size());
-                    rg_qaln_data.insert(rg_qaln_data.end(), qaln_start, qaln_end);
-                    rg_taln_offsets[local_idx] = static_cast<uint32_t>(rg_taln_data.size());
-                    rg_taln_data.insert(rg_taln_data.end(), taln_start, taln_end);
+                    res.qaln_offsets[local_idx] = static_cast<uint32_t>(res.qaln_data.size());
+                    res.qaln_data.insert(res.qaln_data.end(), qaln_start, qaln_end);
+                    res.taln_offsets[local_idx] = static_cast<uint32_t>(res.taln_data.size());
+                    res.taln_data.insert(res.taln_data.end(), taln_start, taln_end);
                 }
             }
-            rg_qaln_offsets[rg_rows] = static_cast<uint32_t>(rg_qaln_data.size());
-            rg_taln_offsets[rg_rows] = static_cast<uint32_t>(rg_taln_data.size());
+            if (!config.skip_alignments) {
+                res.qaln_offsets[rg_rows] = static_cast<uint32_t>(res.qaln_data.size());
+                res.taln_offsets[rg_rows] = static_cast<uint32_t>(res.taln_data.size());
+            }
 
-            lines_processed += rg_rows;
-
-            // Sort row-group by (read_idx, bit_score DESC) for correct CSR offsets
-            // CSR requires alignments to be grouped by read, and within each read
-            // the best hit (highest bit_score) must come first for damage-annotate
             std::vector<uint32_t> perm(rg_rows);
             std::iota(perm.begin(), perm.end(), 0);
             std::sort(perm.begin(), perm.end(), [&](uint32_t a, uint32_t b) {
-                if (rg_read_idx[a] != rg_read_idx[b]) {
-                    return rg_read_idx[a] < rg_read_idx[b];
-                }
-                return rg_bit_score[a] > rg_bit_score[b];  // Descending by score
+                if (res.read_idx[a] != res.read_idx[b]) return res.read_idx[a] < res.read_idx[b];
+                return res.bit_score[a] > res.bit_score[b];
             });
 
-            // Apply permutation to all numeric columns
-            auto apply_perm = [&](auto& vec) {
-                using T = typename std::remove_reference<decltype(vec)>::type::value_type;
-                std::vector<T> temp(rg_rows);
-                for (uint32_t i = 0; i < rg_rows; ++i) temp[i] = vec[perm[i]];
-                std::copy(temp.begin(), temp.end(), vec.begin());
+            std::vector<uint32_t> tmp_u32(rg_rows);
+            std::vector<float> tmp_f32(rg_rows);
+            std::vector<uint16_t> tmp_u16(rg_rows);
+            auto apply_perm_u32 = [&](std::vector<uint32_t>& vec) {
+                for (uint32_t i = 0; i < rg_rows; ++i) tmp_u32[i] = vec[perm[i]];
+                std::copy_n(tmp_u32.data(), rg_rows, vec.data());
             };
-            apply_perm(rg_read_idx);
-            apply_perm(rg_ref_idx);
-            apply_perm(rg_bit_score);
-            apply_perm(rg_damage_score);
-            apply_perm(rg_evalue_log10);
-            apply_perm(rg_identity_q);
-            apply_perm(rg_aln_len);
-            apply_perm(rg_tstart);
-            apply_perm(rg_tend);
-            apply_perm(rg_tlen);
-            apply_perm(rg_qlen);
+            auto apply_perm_f32 = [&](std::vector<float>& vec) {
+                for (uint32_t i = 0; i < rg_rows; ++i) tmp_f32[i] = vec[perm[i]];
+                std::copy_n(tmp_f32.data(), rg_rows, vec.data());
+            };
+            auto apply_perm_u16 = [&](std::vector<uint16_t>& vec) {
+                for (uint32_t i = 0; i < rg_rows; ++i) tmp_u16[i] = vec[perm[i]];
+                std::copy_n(tmp_u16.data(), rg_rows, vec.data());
+            };
+            apply_perm_u32(res.read_idx);
+            apply_perm_u32(res.ref_idx);
+            apply_perm_f32(res.bit_score);
+            apply_perm_f32(res.damage_score);
+            apply_perm_f32(res.evalue_log10);
+            apply_perm_u16(res.dmg_k);
+            apply_perm_u16(res.dmg_m);
+            apply_perm_f32(res.dmg_ll_a);
+            apply_perm_f32(res.dmg_ll_m);
+            apply_perm_u16(res.identity_q);
+            apply_perm_u16(res.aln_len);
+            apply_perm_u16(res.qstart);
+            apply_perm_u16(res.qend);
+            apply_perm_u16(res.tstart);
+            apply_perm_u16(res.tend);
+            apply_perm_u16(res.tlen);
+            apply_perm_u16(res.qlen);
+            apply_perm_u16(res.mismatch);
+            apply_perm_u16(res.gapopen);
 
-            // Rebuild qaln/taln with permuted order
             if (!config.skip_alignments) {
-                std::vector<std::string> qaln_strs(rg_rows), taln_strs(rg_rows);
+                std::vector<uint32_t> perm_qaln_offsets(rg_rows + 1, 0);
+                std::vector<uint32_t> perm_taln_offsets(rg_rows + 1, 0);
+                std::vector<char> perm_qaln_data;
+                std::vector<char> perm_taln_data;
+                perm_qaln_data.reserve(res.qaln_data.size());
+                perm_taln_data.reserve(res.taln_data.size());
                 for (uint32_t i = 0; i < rg_rows; ++i) {
                     uint32_t old_idx = perm[i];
-                    uint32_t start = rg_qaln_offsets[old_idx];
-                    uint32_t end = rg_qaln_offsets[old_idx + 1];
-                    qaln_strs[i] = std::string(rg_qaln_data.begin() + start, rg_qaln_data.begin() + end);
-
-                    start = rg_taln_offsets[old_idx];
-                    end = rg_taln_offsets[old_idx + 1];
-                    taln_strs[i] = std::string(rg_taln_data.begin() + start, rg_taln_data.begin() + end);
+                    uint32_t q_start = res.qaln_offsets[old_idx];
+                    uint32_t q_end = res.qaln_offsets[old_idx + 1];
+                    uint32_t t_start = res.taln_offsets[old_idx];
+                    uint32_t t_end = res.taln_offsets[old_idx + 1];
+                    perm_qaln_offsets[i] = static_cast<uint32_t>(perm_qaln_data.size());
+                    perm_qaln_data.insert(perm_qaln_data.end(), res.qaln_data.begin() + q_start, res.qaln_data.begin() + q_end);
+                    perm_taln_offsets[i] = static_cast<uint32_t>(perm_taln_data.size());
+                    perm_taln_data.insert(perm_taln_data.end(), res.taln_data.begin() + t_start, res.taln_data.begin() + t_end);
                 }
-                rg_qaln_data.clear();
-                rg_taln_data.clear();
-                for (uint32_t i = 0; i < rg_rows; ++i) {
-                    rg_qaln_offsets[i] = static_cast<uint32_t>(rg_qaln_data.size());
-                    rg_qaln_data.insert(rg_qaln_data.end(), qaln_strs[i].begin(), qaln_strs[i].end());
-                    rg_taln_offsets[i] = static_cast<uint32_t>(rg_taln_data.size());
-                    rg_taln_data.insert(rg_taln_data.end(), taln_strs[i].begin(), taln_strs[i].end());
-                }
-                rg_qaln_offsets[rg_rows] = static_cast<uint32_t>(rg_qaln_data.size());
-                rg_taln_offsets[rg_rows] = static_cast<uint32_t>(rg_taln_data.size());
+                perm_qaln_offsets[rg_rows] = static_cast<uint32_t>(perm_qaln_data.size());
+                perm_taln_offsets[rg_rows] = static_cast<uint32_t>(perm_taln_data.size());
+                res.qaln_offsets.swap(perm_qaln_offsets);
+                res.taln_offsets.swap(perm_taln_offsets);
+                res.qaln_data.swap(perm_qaln_data);
+                res.taln_data.swap(perm_taln_data);
             }
 
-            // Accumulate CSR counts
+            if (rg_rows > 0) {
+                res.first_read_idx = res.read_idx[0];
+                res.last_read_idx = res.read_idx[rg_rows - 1];
+                uint32_t cur = res.read_idx[0];
+                uint32_t run = 1;
+                for (uint32_t i = 1; i < rg_rows; ++i) {
+                    if (res.read_idx[i] == cur) {
+                        ++run;
+                    } else {
+                        res.read_runs.emplace_back(cur, run);
+                        cur = res.read_idx[i];
+                        run = 1;
+                    }
+                }
+                res.read_runs.emplace_back(cur, run);
+            }
+            return res;
+        };
+
+        // Pipeline queues
+        std::mutex task_mutex;
+        std::condition_variable task_cv;
+        std::deque<RowGroupTask> task_queue;
+        bool producer_done = false;
+
+        std::mutex result_mutex;
+        std::condition_variable result_cv;
+        std::unordered_map<size_t, RowGroupResult> ready_results;
+
+        std::atomic<bool> stop_pipeline{false};
+        std::exception_ptr pipeline_error = nullptr;
+        std::mutex error_mutex;
+        auto set_pipeline_error = [&](std::exception_ptr ep) {
+            std::lock_guard<std::mutex> lock(error_mutex);
+            if (!pipeline_error) pipeline_error = ep;
+            stop_pipeline.store(true, std::memory_order_relaxed);
+            task_cv.notify_all();
+            result_cv.notify_all();
+        };
+
+        const size_t worker_count = std::max<size_t>(1, static_cast<size_t>(n_threads));
+        const size_t max_inflight = std::max<size_t>(4, worker_count * 2);
+
+        std::thread producer([&] {
+            try {
+                for (size_t rg = 0; rg < num_row_groups; ++rg) {
+                    if (stop_pipeline.load(std::memory_order_relaxed)) break;
+                    size_t rg_start = rg * rg_size;
+                    size_t rg_end = std::min(rg_start + rg_size, static_cast<size_t>(n_lines));
+                    uint32_t rg_rows = static_cast<uint32_t>(rg_end - rg_start);
+
+                    RowGroupTask task;
+                    task.rg_idx = rg;
+                    task.lines.resize(rg_rows);
+                    for (uint32_t i = 0; i < rg_rows; ++i) {
+                        std::string_view line = reader.next_line();
+                        task.lines[i] = std::string(line);
+                    }
+
+                    std::unique_lock<std::mutex> lock(task_mutex);
+                    task_cv.wait(lock, [&] {
+                        return stop_pipeline.load(std::memory_order_relaxed) || task_queue.size() < max_inflight;
+                    });
+                    if (stop_pipeline.load(std::memory_order_relaxed)) break;
+                    task_queue.push_back(std::move(task));
+                    lock.unlock();
+                    task_cv.notify_all();
+                }
+            } catch (...) {
+                set_pipeline_error(std::current_exception());
+            }
+            {
+                std::lock_guard<std::mutex> lock(task_mutex);
+                producer_done = true;
+            }
+            task_cv.notify_all();
+        });
+
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count);
+        for (size_t wi = 0; wi < worker_count; ++wi) {
+            workers.emplace_back([&] {
+                try {
+                    while (true) {
+                        RowGroupTask task;
+                        {
+                            std::unique_lock<std::mutex> lock(task_mutex);
+                            task_cv.wait(lock, [&] {
+                                return stop_pipeline.load(std::memory_order_relaxed) ||
+                                       !task_queue.empty() || producer_done;
+                            });
+                            if (stop_pipeline.load(std::memory_order_relaxed)) break;
+                            if (task_queue.empty()) {
+                                if (producer_done) break;
+                                continue;
+                            }
+                            task = std::move(task_queue.front());
+                            task_queue.pop_front();
+                        }
+                        task_cv.notify_all();
+
+                        RowGroupResult result = process_row_group(std::move(task));
+                        {
+                            std::unique_lock<std::mutex> lock(result_mutex);
+                            result_cv.wait(lock, [&] {
+                                return stop_pipeline.load(std::memory_order_relaxed) ||
+                                       ready_results.size() < max_inflight;
+                            });
+                            if (stop_pipeline.load(std::memory_order_relaxed)) break;
+                            ready_results.emplace(result.rg_idx, std::move(result));
+                        }
+                        result_cv.notify_all();
+                    }
+                } catch (...) {
+                    set_pipeline_error(std::current_exception());
+                }
+            });
+        }
+
+        uint64_t lines_processed = 0;
+        for (size_t next_rg = 0; next_rg < num_row_groups; ++next_rg) {
+            RowGroupResult rg_result;
+            {
+                std::unique_lock<std::mutex> lock(result_mutex);
+                result_cv.wait(lock, [&] {
+                    return stop_pipeline.load(std::memory_order_relaxed) ||
+                           ready_results.find(next_rg) != ready_results.end();
+                });
+                if (stop_pipeline.load(std::memory_order_relaxed) &&
+                    ready_results.find(next_rg) == ready_results.end()) {
+                    break;
+                }
+                auto it = ready_results.find(next_rg);
+                if (it == ready_results.end()) continue;
+                rg_result = std::move(it->second);
+                ready_results.erase(it);
+            }
+            result_cv.notify_all();
+
+            const uint32_t rg_rows = rg_result.rg_rows;
+            lines_processed += rg_rows;
+
             for (uint32_t i = 0; i < rg_rows; ++i) {
-                read_counts[rg_read_idx[i]]++;
+                if (!has_prev_sort_key) {
+                    has_prev_sort_key = true;
+                } else if (globally_sorted_by_read_then_score) {
+                    if (rg_result.read_idx[i] < prev_read_idx ||
+                        (rg_result.read_idx[i] == prev_read_idx &&
+                         rg_result.bit_score[i] > prev_bit_score)) {
+                        globally_sorted_by_read_then_score = false;
+                    }
+                }
+                prev_read_idx = rg_result.read_idx[i];
+                prev_bit_score = rg_result.bit_score[i];
+            }
+            for (const auto& run : rg_result.read_runs) {
+                read_counts[run.first] += run.second;
             }
 
-            // Write row-group to file
-            row_groups[rg].num_rows = rg_rows;
-            row_groups[rg].first_read_idx = rg_read_idx[0];
+            row_groups[next_rg].num_rows = rg_rows;
+            row_groups[next_rg].first_read_idx = rg_result.first_read_idx;
+            row_group_read_index[next_rg].first_read_idx = rg_result.first_read_idx;
+            row_group_read_index[next_rg].last_read_idx = rg_result.last_read_idx;
+            row_group_read_index[next_rg].start_row = global_row_cursor;
+            row_group_read_index[next_rg].end_row_exclusive = global_row_cursor + rg_rows;
+            global_row_cursor += rg_rows;
 
             auto write_chunk = [&](ColumnID col, const void* chunk_data, size_t elem_size) {
-                auto& chunk = row_groups[rg].columns[static_cast<size_t>(col)];
+                auto& chunk = row_groups[next_rg].columns[static_cast<size_t>(col)];
                 chunk.offset = out.tellp();
                 chunk.uncompressed_size = static_cast<uint32_t>(elem_size * rg_rows);
                 chunk.compressed_size = chunk.uncompressed_size;
                 chunk.codec = Codec::NONE;
                 out.write(static_cast<const char*>(chunk_data), chunk.uncompressed_size);
             };
+            auto write_alignment_chunk = [&](ColumnID col,
+                                             const std::vector<uint32_t>& offsets,
+                                             const std::vector<char>& data) {
+                auto& chunk = row_groups[next_rg].columns[static_cast<size_t>(col)];
+                chunk.offset = out.tellp();
 
-            write_chunk(ColumnID::READ_IDX, rg_read_idx.data(), sizeof(uint32_t));
-            write_chunk(ColumnID::REF_IDX, rg_ref_idx.data(), sizeof(uint32_t));
-            write_chunk(ColumnID::BIT_SCORE, rg_bit_score.data(), sizeof(float));
-            write_chunk(ColumnID::DAMAGE_SCORE, rg_damage_score.data(), sizeof(float));
-            write_chunk(ColumnID::EVALUE_LOG10, rg_evalue_log10.data(), sizeof(float));
-            write_chunk(ColumnID::IDENTITY_Q, rg_identity_q.data(), sizeof(uint16_t));
-            write_chunk(ColumnID::ALN_LEN, rg_aln_len.data(), sizeof(uint16_t));
-            write_chunk(ColumnID::TSTART, rg_tstart.data(), sizeof(uint16_t));
-            write_chunk(ColumnID::TEND, rg_tend.data(), sizeof(uint16_t));
-            write_chunk(ColumnID::TLEN, rg_tlen.data(), sizeof(uint16_t));
-            write_chunk(ColumnID::QLEN, rg_qlen.data(), sizeof(uint16_t));
+                const size_t offsets_bytes = static_cast<size_t>(rg_rows + 1) * sizeof(uint32_t);
+                const size_t raw_bytes = offsets_bytes + data.size();
+                chunk.uncompressed_size = static_cast<uint32_t>(raw_bytes);
 
-            // Write string columns (combined offsets + data in QALN/TALN columns)
+#ifdef HAVE_ZSTD
+                if (config.compress && raw_bytes > 0) {
+                    std::vector<char> raw(raw_bytes);
+                    std::memcpy(raw.data(), offsets.data(), offsets_bytes);
+                    if (!data.empty()) {
+                        std::memcpy(raw.data() + offsets_bytes, data.data(), data.size());
+                    }
+                    auto compressed = compress_zstd(raw.data(), raw.size(), config.compression_level);
+                    if (compressed.size() < raw.size()) {
+                        chunk.compressed_size = static_cast<uint32_t>(compressed.size());
+                        chunk.codec = Codec::ZSTD;
+                        out.write(compressed.data(), static_cast<std::streamsize>(compressed.size()));
+                        return;
+                    }
+                }
+#endif
+                chunk.compressed_size = chunk.uncompressed_size;
+                chunk.codec = Codec::NONE;
+                out.write(reinterpret_cast<const char*>(offsets.data()),
+                          static_cast<std::streamsize>(offsets_bytes));
+                if (!data.empty()) {
+                    out.write(data.data(), static_cast<std::streamsize>(data.size()));
+                }
+            };
+
+            write_chunk(ColumnID::READ_IDX, rg_result.read_idx.data(), sizeof(uint32_t));
+            write_chunk(ColumnID::REF_IDX, rg_result.ref_idx.data(), sizeof(uint32_t));
+            write_chunk(ColumnID::BIT_SCORE, rg_result.bit_score.data(), sizeof(float));
+            write_chunk(ColumnID::DAMAGE_SCORE, rg_result.damage_score.data(), sizeof(float));
+            write_chunk(ColumnID::EVALUE_LOG10, rg_result.evalue_log10.data(), sizeof(float));
+            write_chunk(ColumnID::DMG_K, rg_result.dmg_k.data(), sizeof(uint16_t));
+            write_chunk(ColumnID::DMG_M, rg_result.dmg_m.data(), sizeof(uint16_t));
+            write_chunk(ColumnID::DMG_LL_A, rg_result.dmg_ll_a.data(), sizeof(float));
+            write_chunk(ColumnID::DMG_LL_M, rg_result.dmg_ll_m.data(), sizeof(float));
+            write_chunk(ColumnID::IDENTITY_Q, rg_result.identity_q.data(), sizeof(uint16_t));
+            write_chunk(ColumnID::ALN_LEN, rg_result.aln_len.data(), sizeof(uint16_t));
+            write_chunk(ColumnID::QSTART, rg_result.qstart.data(), sizeof(uint16_t));
+            write_chunk(ColumnID::QEND, rg_result.qend.data(), sizeof(uint16_t));
+            write_chunk(ColumnID::TSTART, rg_result.tstart.data(), sizeof(uint16_t));
+            write_chunk(ColumnID::TEND, rg_result.tend.data(), sizeof(uint16_t));
+            write_chunk(ColumnID::TLEN, rg_result.tlen.data(), sizeof(uint16_t));
+            write_chunk(ColumnID::QLEN, rg_result.qlen.data(), sizeof(uint16_t));
+            write_chunk(ColumnID::MISMATCH, rg_result.mismatch.data(), sizeof(uint16_t));
+            write_chunk(ColumnID::GAPOPEN, rg_result.gapopen.data(), sizeof(uint16_t));
+
             if (!config.skip_alignments) {
-                auto& qaln_chunk = row_groups[rg].columns[static_cast<size_t>(ColumnID::QALN)];
-                qaln_chunk.offset = out.tellp();
-                out.write(reinterpret_cast<const char*>(rg_qaln_offsets.data()), (rg_rows + 1) * sizeof(uint32_t));
-                out.write(rg_qaln_data.data(), rg_qaln_data.size());
-                qaln_chunk.uncompressed_size = static_cast<uint32_t>((rg_rows + 1) * sizeof(uint32_t) + rg_qaln_data.size());
-                qaln_chunk.compressed_size = qaln_chunk.uncompressed_size;
-                qaln_chunk.codec = Codec::NONE;
-
-                auto& taln_chunk = row_groups[rg].columns[static_cast<size_t>(ColumnID::TALN)];
-                taln_chunk.offset = out.tellp();
-                out.write(reinterpret_cast<const char*>(rg_taln_offsets.data()), (rg_rows + 1) * sizeof(uint32_t));
-                out.write(rg_taln_data.data(), rg_taln_data.size());
-                taln_chunk.uncompressed_size = static_cast<uint32_t>((rg_rows + 1) * sizeof(uint32_t) + rg_taln_data.size());
-                taln_chunk.compressed_size = taln_chunk.uncompressed_size;
-                taln_chunk.codec = Codec::NONE;
+                write_alignment_chunk(ColumnID::QALN, rg_result.qaln_offsets, rg_result.qaln_data);
+                write_alignment_chunk(ColumnID::TALN, rg_result.taln_offsets, rg_result.taln_data);
             }
 
-            // Progress
-            if (config.verbose && (rg + 1) % 10 == 0) {
+            if (config.verbose && (next_rg + 1) % 10 == 0) {
                 std::cerr << "\rPass 2: " << lines_processed << "/" << n_lines << " rows...";
             }
         }
+
+        producer.join();
+        for (auto& w : workers) w.join();
+        if (pipeline_error) std::rethrow_exception(pipeline_error);
+
+        // Build CSR offsets from counts (prefix sum)
+        if (!config.skip_alignments) {
+            header.flags |= EMI_FLAG_HAS_ALIGNMENT_STRINGS;
+        }
+        header.flags |= EMI_FLAG_HAS_ROW_GROUP_READ_INDEX;
+        if (globally_sorted_by_read_then_score) {
+            header.flags |= EMI_FLAG_SORTED_BY_READ_THEN_SCORE;
+        } else if (config.verbose) {
+            std::cerr << "Warning: EMI is not globally sorted by (read, bit_score). "
+                         "Input is likely not grouped by query.\n";
+        }
+
+        header.row_group_read_index_offset = out.tellp();
+        header.row_group_read_index_count = static_cast<uint32_t>(row_group_read_index.size());
+        header.row_group_read_index_entry_size = sizeof(RowGroupReadIndex);
+        out.write(reinterpret_cast<const char*>(row_group_read_index.data()),
+                  row_group_read_index.size() * sizeof(RowGroupReadIndex));
 
         // Build CSR offsets from counts (prefix sum)
         header.csr_offsets_offset = out.tellp();
@@ -1945,9 +2520,10 @@ public:
         auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(pass2_end - total_start).count();
 
         if (config.verbose) {
-            std::cerr << "\rPass 2: " << total_rows << " rows written (" << pass2_ms << " ms)\n";
+            std::cerr << "\rPass 2: " << total_rows << " rows written ("
+                      << agp::log_utils::format_duration_ms(pass2_ms) << ")\n";
             std::cerr << "Total: " << (total_rows * 1000 / std::max(1LL, static_cast<long long>(total_ms)))
-                      << " rows/sec, " << total_ms << " ms\n";
+                      << " rows/sec, " << agp::log_utils::format_duration_ms(total_ms) << "\n";
         }
 
         return total_rows;
