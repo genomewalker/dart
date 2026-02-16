@@ -972,6 +972,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
     // EM reassignment options (enabled by default for abundance estimation)
     bool use_em = true;
+    bool em_streaming = false;       // Use streaming EM (O(num_refs) memory instead of O(num_alns))
     uint32_t em_max_iters = 100;
     double em_lambda_b = 3.0;
     double em_tol = 1e-4;
@@ -1048,6 +1049,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             em_min_prob = std::stod(argv[++i]);
         } else if (strcmp(argv[i], "--em-prob-fraction") == 0 && i + 1 < argc) {
             em_prob_fraction = std::stod(argv[++i]);
+        } else if (strcmp(argv[i], "--em-streaming") == 0) {
+            em_streaming = true;
         } else if (strcmp(argv[i], "--gene-summary") == 0 && i + 1 < argc) {
             gene_summary_file = argv[++i];
         } else if (strcmp(argv[i], "--min-breadth") == 0 && i + 1 < argc) {
@@ -1129,6 +1132,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cout << "  --em-tol FLOAT    Convergence tolerance (default: 1e-4)\n";
             std::cout << "  --em-min-prob FLOAT     Min EM posterior to keep (default: 1e-6)\n";
             std::cout << "  --em-prob-fraction FLOAT Keep if gamma >= fraction*max_gamma(read) (default: 0.3)\n";
+            std::cout << "  --em-streaming    Use streaming EM (low memory, ~2.5x slower)\n";
             std::cout << "  --min-positional-score FLOAT  Min read start diversity (default: 0)\n";
             std::cout << "                       Filters spurious matches where all reads hit same position\n";
             std::cout << "                       Score = sqrt(diversity * span), range 0-1\n";
@@ -2037,7 +2041,137 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     };
     std::vector<EmReadResult> em_read_results(n_reads);
 
-    if (use_em && em_aln_count > 0) {
+    if (use_em && em_streaming) {
+        // Streaming EM path - O(num_refs) memory instead of O(num_alignments)
+        if (verbose) {
+            std::cerr << "\nEM reassignment (streaming mode):\n";
+            std::cerr << "  Alignments: " << reader.num_alignments() << " (from EMI)\n";
+            std::cerr << "  Reads: " << n_reads << "\n";
+            std::cerr << "  References: " << n_refs << "\n";
+            std::cerr << "  Lambda_b: " << em_lambda_b << "\n";
+            std::cerr << "  Max iters: " << em_max_iters << "\n";
+            std::cerr << "  Note: Streaming mode uses all EMI alignments (ignores pre-filters)\n";
+        }
+
+        agp::EMParams em_params;
+        em_params.lambda_b = em_lambda_b;
+        em_params.max_iters = em_max_iters;
+        em_params.tol = em_tol;
+        em_params.use_squarem = false;  // Streaming doesn't support SQUAREM yet
+        em_params.use_damage = true;
+
+        const auto em_start = std::chrono::steady_clock::now();
+        // Reset column selection - previous code may have limited columns
+        reader.set_all_columns();
+
+        if (verbose) {
+            std::cerr << "  Starting streaming EM...\n";
+            std::cerr << std::flush;
+        }
+
+        auto streaming_result = agp::streaming_em(reader, em_params,
+            [verbose](const agp::EMIterationDiagnostics& d) {
+                if (verbose && (d.iteration % 10 == 0 || d.iteration < 5)) {
+                    std::cerr << "    iter " << d.iteration
+                              << " ll=" << std::fixed << std::setprecision(2) << d.log_likelihood
+                              << "\n";
+                    std::cerr << std::flush;
+                }
+            });
+
+        const auto em_end = std::chrono::steady_clock::now();
+
+        if (verbose) {
+            std::cerr << "  Converged in " << streaming_result.iterations << " iterations\n";
+            std::cerr << "  Log-likelihood: " << std::fixed << std::setprecision(2)
+                      << streaming_result.log_likelihood << "\n";
+            std::cerr << "  Pi (ancient): " << std::fixed << std::setprecision(4)
+                      << streaming_result.pi << "\n";
+            std::cerr << "  Memory: O(" << n_refs << " refs) vs O("
+                      << reader.num_alignments() << " alignments)\n";
+            std::cerr << "  Runtime: "
+                      << agp::log_utils::format_elapsed(em_start, em_end) << "\n";
+        }
+
+        // Copy weights to em_state for downstream use
+        em_state.weights = streaming_result.weights;
+        em_state.pi = streaming_result.pi;
+        em_state.log_likelihood = streaming_result.log_likelihood;
+        em_state.iterations = streaming_result.iterations;
+
+        // Compute per-read stats via streaming finalize
+        // Process gamma per row group without storing all values
+        // Note: parallel_scan runs in parallel, need mutex for shared updates
+        std::vector<float> read_top1(n_reads, 0.0f);
+        std::vector<float> read_top2(n_reads, 0.0f);
+        std::vector<double> read_sum_sq(n_reads, 0.0);
+        std::mutex finalize_mtx;
+
+        agp::streaming_em_finalize(reader, streaming_result, em_params,
+            [&](uint32_t /*rg_idx*/, uint32_t num_rows,
+                const uint32_t* read_idx, const uint32_t* ref_idx,
+                const float* gamma, const float* gamma_ancient)
+            {
+                // Collect updates locally first, then apply with lock
+                struct ReadUpdate {
+                    uint32_t r;
+                    float g;
+                    float g_a;
+                    uint32_t ref;
+                };
+                std::vector<ReadUpdate> updates;
+                updates.reserve(num_rows);
+
+                for (uint32_t i = 0; i < num_rows; ++i) {
+                    updates.push_back({
+                        read_idx[i],
+                        gamma[i],
+                        gamma_ancient ? gamma_ancient[i] : 0.0f,
+                        ref_idx[i]
+                    });
+                }
+
+                // Apply updates under lock
+                std::lock_guard<std::mutex> lock(finalize_mtx);
+                for (const auto& u : updates) {
+                    if (u.r >= n_reads) continue;  // bounds check
+
+                    read_sum_sq[u.r] += static_cast<double>(u.g) * u.g;
+                    if (u.g > read_top1[u.r]) {
+                        read_top2[u.r] = read_top1[u.r];
+                        read_top1[u.r] = u.g;
+                    } else if (u.g > read_top2[u.r]) {
+                        read_top2[u.r] = u.g;
+                    }
+
+                    // Check if this is the best-hit ref for this read
+                    const auto& bh = best_hits[u.r];
+                    if (bh.has && u.ref == bh.ref_idx) {
+                        em_read_results[u.r].gamma = u.g;
+                        em_read_results[u.r].gamma_ancient = u.g_a;
+                    }
+                }
+            });
+
+        // Finalize per-read stats
+        for (uint32_t r = 0; r < n_reads; ++r) {
+            float keep_thr = std::max(
+                static_cast<float>(em_min_prob),
+                static_cast<float>(em_prob_fraction) * read_top1[r]);
+
+            em_read_results[r].em_threshold = keep_thr;
+            em_read_results[r].em_margin = std::max(0.0f, read_top1[r] - read_top2[r]);
+            em_read_results[r].em_ref_neff = (read_sum_sq[r] > 0.0)
+                ? static_cast<float>(1.0 / read_sum_sq[r]) : 0.0f;
+            em_read_results[r].em_keep = (em_read_results[r].gamma >= keep_thr);
+            // best_hit: we don't track EM-best ref in streaming mode, leave as false
+        }
+
+        if (verbose) {
+            std::cerr << "  Streaming finalize complete\n\n";
+        }
+
+    } else if (use_em && em_aln_count > 0) {
         if (verbose) {
             std::cerr << "\nEM reassignment:\n";
             std::cerr << "  Alignments: " << em_aln_count << "\n";
