@@ -16,6 +16,7 @@
 #include <vector>
 #include <algorithm>
 #include <mutex>
+#include <chrono>
 
 // Build AlignmentData from ColumnarIndexReader for original EM
 agp::AlignmentData build_from_reader(agp::ColumnarIndexReader& reader) {
@@ -131,11 +132,14 @@ int main(int argc, char* argv[]) {
 
     // Run streaming EM
     std::cerr << "\n--- Running Streaming EM ---\n";
+    auto t0 = std::chrono::high_resolution_clock::now();
     auto streaming_result = agp::streaming_em(reader, params, [](const agp::EMIterationDiagnostics& d) {
         if (d.iteration % 10 == 0 || d.iteration < 5) {
             std::cerr << "  Iter " << d.iteration << ": LL=" << d.log_likelihood << "\n";
         }
     });
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double streaming_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
     // Build alignment data for original EM
     std::cerr << "\n--- Building AlignmentData ---\n";
@@ -144,11 +148,19 @@ int main(int argc, char* argv[]) {
 
     // Run original EM
     std::cerr << "\n--- Running Original EM ---\n";
+    auto t2 = std::chrono::high_resolution_clock::now();
     auto original_result = agp::em_solve(data, params);
+    auto t3 = std::chrono::high_resolution_clock::now();
+    double original_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
 
     // Compare results
     std::cerr << "\n=== COMPARISON ===\n";
     std::cerr << std::setprecision(10);
+
+    std::cerr << "Time:\n";
+    std::cerr << "  Streaming: " << streaming_ms << " ms\n";
+    std::cerr << "  Original:  " << original_ms << " ms\n";
+    std::cerr << "  Speedup:   " << (original_ms / streaming_ms) << "x\n";
 
     std::cerr << "Iterations:\n";
     std::cerr << "  Streaming: " << streaming_result.iterations << "\n";

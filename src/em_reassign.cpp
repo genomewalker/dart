@@ -626,7 +626,7 @@ double streaming_e_step_rowgroup(
     const float* bit_score,
     const float* damage_score,
     const double* weights,
-    uint32_t /*num_refs*/,
+    uint32_t num_refs,
     const agp::EMParams& params,
     double pi_ancient,
     std::vector<double>& ref_sums,        // Accumulated gamma per ref (output)
@@ -636,9 +636,15 @@ double streaming_e_step_rowgroup(
     const double pi_a = std::clamp(pi_ancient, eps, 1.0 - eps);
     double ll = 0.0;
 
+    // Check pointers
+    if (!read_idx || !ref_idx || !bit_score || !damage_score || !weights) {
+        return 0.0;
+    }
+
     // Group alignments by read for normalization
     // Since row groups are sorted by read_idx, we can process in order
     uint32_t row = 0;
+    uint32_t reads_processed = 0;
     while (row < num_rows) {
         const uint32_t current_read = read_idx[row];
         uint32_t read_start = row;
@@ -648,6 +654,7 @@ double streaming_e_step_rowgroup(
             ++row;
         }
         uint32_t deg = row - read_start;
+        ++reads_processed;
 
         if (deg == 0) continue;
 
@@ -677,8 +684,10 @@ double streaming_e_step_rowgroup(
                 double g_modern  = (diff_m > -700.0) ? std::exp(diff_m) : 0.0;
                 double g_total = g_ancient + g_modern;
 
-                ref_sums[ref_idx[idx]] += g_total;
-                ref_sums_ancient[ref_idx[idx]] += g_ancient;
+                uint32_t ri = ref_idx[idx];
+                if (ri >= num_refs) continue;
+                ref_sums[ri] += g_total;
+                ref_sums_ancient[ri] += g_ancient;
             }
         } else {
             log_scores.resize(deg);
@@ -752,12 +761,17 @@ StreamingEMResult streaming_em(
     result.pi = 0.1;
 
     // Thread-local accumulators for parallel row group processing
-    const int num_threads =
+    // Use a reasonable upper bound that won't cause OOM
+    int num_threads = 1;
 #ifdef _OPENMP
-        omp_get_max_threads();
-#else
-        1;
+    #pragma omp parallel
+    {
+        #pragma omp single
+        num_threads = omp_get_num_threads();
+    }
 #endif
+    // Cap at reasonable value to prevent excessive memory use
+    num_threads = std::min(num_threads, 256);
 
     std::vector<std::vector<double>> thread_ref_sums(num_threads);
     std::vector<std::vector<double>> thread_ref_sums_ancient(num_threads);
@@ -781,52 +795,51 @@ StreamingEMResult streaming_em(
 
         std::atomic<double> total_ll{0.0};
 
-        // E-step: process row groups in parallel, accumulate to thread-local ref_sums
-        #pragma omp parallel
-        {
+        // E-step: process row groups in parallel via parallel_scan
+        // parallel_scan already creates OMP parallel region internally,
+        // so we use thread-local storage inside the callback
+        reader.parallel_scan([&](
+            uint32_t /*rg_idx*/,
+            uint32_t num_rows,
+            const uint32_t* read_idx,
+            const uint32_t* ref_idx,
+            const float* bit_score,
+            const float* damage_score,
+            const float* /*evalue_log10*/,
+            const uint16_t* /*dmg_k*/,
+            const uint16_t* /*dmg_m*/,
+            const float* /*dmg_ll_a*/,
+            const float* /*dmg_ll_m*/,
+            const uint16_t* /*identity_q*/,
+            const uint16_t* /*aln_len*/,
+            const uint16_t* /*qstart*/,
+            const uint16_t* /*qend*/,
+            const uint16_t* /*tstart*/,
+            const uint16_t* /*tend*/,
+            const uint16_t* /*tlen*/,
+            const uint16_t* /*qlen*/,
+            const uint16_t* /*mismatch*/,
+            const uint16_t* /*gapopen*/
+        ) {
 #ifdef _OPENMP
-            const int tid = omp_get_thread_num();
+            int tid = omp_get_thread_num();
+            if (tid >= num_threads) tid = 0;  // Safety bounds check
 #else
             const int tid = 0;
 #endif
             auto& local_ref_sums = thread_ref_sums[tid];
             auto& local_ref_sums_ancient = thread_ref_sums_ancient[tid];
-            double local_ll = 0.0;
 
-            reader.parallel_scan([&](
-                uint32_t /*rg_idx*/,
-                uint32_t num_rows,
-                const uint32_t* read_idx,
-                const uint32_t* ref_idx,
-                const float* bit_score,
-                const float* damage_score,
-                const float* /*evalue_log10*/,
-                const uint16_t* /*dmg_k*/,
-                const uint16_t* /*dmg_m*/,
-                const float* /*dmg_ll_a*/,
-                const float* /*dmg_ll_m*/,
-                const uint16_t* /*identity_q*/,
-                const uint16_t* /*aln_len*/,
-                const uint16_t* /*qstart*/,
-                const uint16_t* /*qend*/,
-                const uint16_t* /*tstart*/,
-                const uint16_t* /*tend*/,
-                const uint16_t* /*tlen*/,
-                const uint16_t* /*qlen*/,
-                const uint16_t* /*mismatch*/,
-                const uint16_t* /*gapopen*/
-            ) {
-                local_ll += streaming_e_step_rowgroup(
-                    num_rows, read_idx, ref_idx, bit_score, damage_score,
-                    result.weights.data(), T, params, result.pi,
-                    local_ref_sums, local_ref_sums_ancient
-                );
-            });
+            double local_ll = streaming_e_step_rowgroup(
+                num_rows, read_idx, ref_idx, bit_score, damage_score,
+                result.weights.data(), T, params, result.pi,
+                local_ref_sums, local_ref_sums_ancient
+            );
 
             // Atomic add to total
             double expected = total_ll.load();
             while (!total_ll.compare_exchange_weak(expected, expected + local_ll)) {}
-        }
+        });
 
         // Merge thread-local accumulators
         std::vector<double> ref_sums(T, 0.0);
