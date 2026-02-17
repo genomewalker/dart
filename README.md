@@ -394,129 +394,6 @@ After database search, `damage-annotate` identifies damage-consistent amino acid
 
 Positional probability weights these substitutions: sites near termini (where damage is expected) score higher than interior sites.
 
-### EM reassignment in `damage-annotate`
-
-`damage-annotate` runs EM by default to resolve multi-mapping alignments from EMI. This probabilistic reassignment improves abundance estimation when reads map ambiguously to multiple reference proteins.
-
-**Problem:** A read may align to multiple reference proteins with similar scores. Best-hit assignment arbitrarily picks one, biasing abundance toward longer references or those with more database entries.
-
-**Solution:** Expectation-Maximization iteratively estimates:
-1. **Reference abundances** (φ_j): fraction of reads from each reference
-2. **Assignment probabilities** (γ_ij): probability read i originated from reference j
-
-#### Mathematical formulation
-
-**E-step:** Compute responsibility γ_ij for each read-reference pair:
-
-$$\gamma_{ij} = \frac{\phi_j \cdot L(i,j)}{\sum_{k \in R_i} \phi_k \cdot L(i,k)}$$
-
-Where $L(i,j)$ is the likelihood of observing read i given reference j:
-
-$$L(i,j) = \exp\left(\frac{S_{ij}}{\lambda}\right) \cdot p_{\text{read},i}^{\alpha}$$
-
-- $S_{ij}$ is the bit score (or identity-derived score)
-- $\lambda$ is the temperature parameter (default: 3.0, controls sharpness)
-- $p_{\text{read},i}$ is the pre-mapping damage probability from AGD
-- $\alpha$ is the damage weight (default: 1.0)
-
-**M-step:** Update reference abundances with MAP prior:
-
-$$\phi_j = \frac{\alpha_0 + \sum_i \gamma_{ij}}{J \cdot \alpha_0 + N}$$
-
-Where $\alpha_0$ is a small pseudocount (default: 0.01) that prevents collapse to zero.
-
-**SQUAREM acceleration:** Standard EM converges slowly. We use Squared Iterative Methods (SQUAREM) to accelerate:
-
-$$\phi^{(k+1)} = \phi^{(k-1)} + 2\alpha \cdot r + \alpha^2 \cdot v$$
-
-Where $r = \phi^{(k)} - \phi^{(k-1)}$ and $v = (\phi^{(k+1)}_{\text{EM}} - \phi^{(k)}) - r$. The step size $\alpha$ is adaptively chosen with safeguards to ensure monotonic log-likelihood increase.
-
-**Convergence:** Iterations stop when relative change in log-likelihood falls below tolerance:
-
-$$\frac{|\ell^{(k)} - \ell^{(k-1)}|}{|\ell^{(k-1)}|} < \epsilon$$
-
-Default tolerance $\epsilon = 10^{-4}$, typically converges in 5-15 iterations.
-
-#### Filtering after EM
-
-Reads are kept if their assignment passes both filters:
-1. **Absolute filter:** $\gamma_{ij} \geq \gamma_{\min}$ (default: $10^{-6}$)
-2. **Relative filter:** $\gamma_{ij} \geq f \cdot \max_k(\gamma_{ik})$ (default: $f = 0.3$)
-
-This keeps reads confidently assigned while filtering low-probability assignments.
-
-#### Streaming EM for large datasets
-
-When datasets exceed available RAM, `damage-annotate` automatically switches to streaming mode:
-
-1. **Chunked iteration:** EMI file is processed in memory-bounded chunks
-2. **Sufficient statistics:** Each chunk accumulates $\sum_i \gamma_{ij}$ per reference
-3. **Global M-step:** Reference abundances updated from aggregated statistics
-4. **Memory complexity:** O(num_references) instead of O(num_reads × num_refs)
-
-Streaming mode is triggered automatically when EMI size exceeds `--memory` budget (default: 10% of available RAM).
-
-Use `--no-em` only when you explicitly want deterministic non-EM assignment (e.g., for debugging or comparison).
-
-### Protein-level aggregation
-
-After EM reassignment, `damage-annotate` aggregates read-level evidence into protein-level summaries. Two parallel channels are maintained:
-
-#### Assignment channel (abundance metrics)
-
-Computed from all EM-assigned reads (regardless of mismatch content):
-
-| Metric | Formula | Description |
-|--------|---------|-------------|
-| `assign_n_reads` | $\sum_i \mathbb{1}[\text{kept}_i]$ | Raw read count |
-| `assign_eff_reads` | $\sum_i \gamma_{ij}$ | Effective reads (EM-weighted) |
-| `assign_abundance` | $\phi_j \cdot N$ | Estimated abundance |
-| `assign_breadth` | $\frac{\text{covered positions}}{\text{reference length}}$ | Coverage breadth |
-| `assign_mean_identity` | $\frac{\sum_i \gamma_{ij} \cdot \text{fident}_i}{\sum_i \gamma_{ij}}$ | Weighted mean identity |
-
-#### Damage channel (damage evidence)
-
-Computed only from reads with at least one mismatch in the alignment (damage-informative reads):
-
-| Metric | Formula | Description |
-|--------|---------|-------------|
-| `n_damage_reads` | $\sum_i \mathbb{1}[\text{has\_mismatch}_i]$ | Reads with mismatches |
-| `damage_sites` | $\sum_i (ct_i + ga_i)$ | Total damage-consistent sites |
-| `terminal_5` | $\sum_i \mathbb{1}[\text{5' damage}]$ | 5' terminal damage count |
-| `terminal_3` | $\sum_i \mathbb{1}[\text{3' damage}]$ | 3' terminal damage count |
-| `mean_p_damaged` | $\frac{\sum_i p_{\text{posterior},i}}{n}$ | Mean posterior damage probability |
-| `frac_damaged` | $\frac{\sum_i \mathbb{1}[p_i \geq \tau]}{n}$ | Fraction above threshold |
-
-#### Protein damage score
-
-The protein-level damage probability combines evidence across all assigned reads:
-
-$$P(\text{protein damaged}) = 1 - \prod_{i \in \text{reads}_j} (1 - p_{\text{posterior},i})^{\gamma_{ij}}$$
-
-This is the probability that at least one read shows authentic damage, weighted by assignment confidence.
-
-#### Statistical testing
-
-For proteins with sufficient coverage, a likelihood ratio test compares:
-- **H0:** Damage rate equals background ($\delta = \delta_{\text{bg}}$)
-- **H1:** Damage rate elevated ($\delta > \delta_{\text{bg}}$)
-
-$$\text{LRT} = 2 \cdot \left[ \ell(\hat{\delta}_{\text{MLE}}) - \ell(\delta_{\text{bg}}) \right]$$
-
-The p-value is computed from χ²(1) distribution. Confidence intervals for $\delta$ use profile likelihood.
-
-#### Filtering criteria
-
-Proteins pass to `--protein-filtered` output if they meet quality thresholds:
-
-| Filter | Default | Description |
-|--------|---------|-------------|
-| `--min-reads` | 3 | Minimum supporting reads |
-| `--min-positional-score` | auto-calibrated | Minimum positional damage score |
-| `--min-terminal-ratio` | 0.05 | Minimum terminal/middle coverage ratio |
-
-Auto-calibration estimates thresholds from the data distribution to achieve target FDR.
-
 ## Performance
 
 Benchmarked on synthetic ancient DNA from the KapK community with known damage patterns and source proteins.
@@ -569,13 +446,7 @@ AGP validation uses two complementary datasets: (1) synthetic reads from the Kap
 
 ### Protein-level damage classification
 
-After database search, the `damage-annotate` command computes a Bayesian posterior probability for each protein hit:
-
-$$\text{logit}(P_{\text{posterior}}) = \text{logit}(\pi) + \log BF_{\text{terminal}} + \log BF_{\text{sites}} + \log BF_{\text{identity}}$$
-
-Where *π* is the prior probability of ancient origin, *BF_terminal* is the Bayes factor from terminal nucleotide patterns (p_read), *BF_sites* is the Bayes factor from damage-consistent amino acid substitutions (R→W, H→Y, Q→*, etc.), and *BF_identity* is the Bayes factor from alignment identity.
-
-We validated on 4.36M proteins from 10 synthetic KapK samples with known damage status from simulation:
+After database search, `damage-annotate` computes a Bayesian posterior combining terminal patterns (p_read), damage-consistent amino acid substitutions, and alignment identity. Validated on 4.36M proteins from 10 synthetic KapK samples:
 
 | Metric | Value |
 |--------|-------|
@@ -624,97 +495,48 @@ Correlation r = 0.81 across the full 0–55% damage range. The +4.4% bias reflec
 
 ### Damage model
 
-Post-mortem deamination follows exponential decay from fragment termini:
+Post-mortem deamination causes C→T substitutions at 5' ends and G→A at 3' ends, following exponential decay from fragment termini. The decay rate (λ = 0.2–0.5) determines how quickly damage decreases with distance from the terminus—typically a half-life of 1–4 positions.
 
-$$\delta(p) = d_{\text{max}} \cdot e^{-\lambda p}$$
+### Two-channel validation
 
-Where $d_{\text{max}}$ is maximum damage at terminus, $\lambda$ is decay constant (0.2–0.5), and $p$ is position from terminus. Half-life: $t_{1/2} = \ln(2) / \lambda \approx 1.4\text{–}3.5$ positions.
+AGP uses two independent signals to distinguish real damage from compositional artifacts:
 
-### Channel A: Nucleotide frequencies
+**Channel A (nucleotide frequencies):** Measures T/(T+C) enrichment at terminal positions. Elevated ratios suggest damage, but can also arise from AT-rich organisms.
 
-Measures thymine enrichment at 5' terminal positions:
+**Channel B (stop codon conversion):** Tracks CAA→TAA, CAG→TAG, CGA→TGA conversions. This can *only* be elevated by real C→T damage—it's the "smoking gun" that validates Channel A.
 
-$$r_A(p) = \frac{T_p}{T_p + C_p}$$
-
-Expected ratio under damage:
-
-$$\mathbb{E}[r_A(p)] = b_T + (1 - b_T) \cdot d_{\text{max}} \cdot e^{-\lambda p}$$
-
-Where $b_T$ is baseline T/(T+C) from interior positions. Log-likelihood ratio for decay vs. constant:
-
-$$\text{LLR}_A = \sum_{p=0}^{P} \left[ \log \mathcal{L}(k_p | n_p, r_{\text{exp}}(p)) - \log \mathcal{L}(k_p | n_p, b_T) \right]$$
-
-### Channel B: Stop codon conversion
-
-Real C→T damage converts CAA→TAA, CAG→TAG, CGA→TGA. Stop conversion rate:
-
-$$r_B(p) = \frac{\text{stops}_p}{\text{stops}_p + \text{preimage}_p}$$
-
-Fit via weighted least squares: $y_p = a + c \cdot e^{-\lambda p}$
-
-Decision: If $c > 0$ and $\text{LLR}_B > 0$ → **VALIDATED**
+Decision logic: If Channel A fires AND Channel B confirms → real damage. If Channel A fires BUT Channel B is flat → compositional artifact (rejected).
 
 ### Per-read damage scoring
 
-Posterior probability for each read using Bayes' rule. At terminal position $i$ with observed base $B$:
-
-$$P(B=T | \text{damage}) = b_{TC} + (1 - b_{TC}) \cdot d_{\text{max}} \cdot e^{-\lambda i}$$
-
-$$P(B=T | \text{no damage}) = b_{TC}$$
-
-Log-likelihood ratio accumulation across terminal positions:
-
-$$\text{LLR} = \sum_{i \in \text{terminal}} \log \frac{P(B_i | \text{damage})}{P(B_i | \text{no damage})}$$
-
-Base posterior via logistic transform:
-
-$$P_{\text{base}}(\text{damage}) = \sigma\left(\text{logit}(\pi_0) + \text{LLR}\right)$$
-
-Reported read-level score with Channel B modulation ($\gamma_B \in \{0, 0.5, 1\}$):
-
-$$p_{\text{read}} = \gamma_B \cdot P_{\text{base}}(\text{damage})$$
+Each read gets a damage probability (p_read) based on its terminal nucleotide pattern. The score accumulates evidence across terminal positions: observing T where C would be expected under no-damage increases the score. Channel B modulates this score—if sample-level damage isn't validated, p_read is suppressed.
 
 ### Stop codon rescue
 
-For a stop codon at position p from 5' terminus, the probability it arose from damage:
-
-$$P(\text{damage} \mid \text{stop}) = \frac{P(\text{stop} \mid \text{damage}) \cdot P(\text{damage})}{P(\text{stop})}$$
-
-Where:
-- P(stop | damage) = probability of convertible precursor (CAA, CAG, CGA)
-- P(damage) = δ(p) from the damage model
-- P(stop) = observed stop frequency at that position
-
-High P(damage | stop) triggers X-masking in `--fasta-aa-masked` output.
+Stop codons near the 5' terminus may be damage artifacts (CAA/CAG→TAA/TAG, CGA→TGA). AGP estimates the probability each stop arose from damage based on position and sample damage rate. High-probability damage stops are X-masked in the search protein output, allowing downstream tools to find the underlying gene.
 
 ### Frame scoring
 
-Frame selection combines multiple signals with learned weights:
-
-| Signal | Weight |
-|--------|--------|
-| Codon usage bias | 0.15 |
-| Stop codon penalty | 0.28 |
-| Dicodon/hexamer patterns | 0.13 |
-| Amino acid composition | 0.10 |
-| GC3 content | 0.05 |
-| Damage-frame consistency | variable |
-
-In damage-aware mode, stop penalties are weighted by (1 - P_damage), reducing penalties for likely damage-induced stops.
+Frame selection combines codon usage, hexamer patterns, amino acid composition, and stop codon penalties. In damage-aware mode, stop penalties are reduced for likely damage-induced stops based on position and sample damage rate.
 
 ### Bayesian damage score
 
-The per-protein damage score uses Bayesian log-odds fusion to integrate pre-mapping and post-mapping evidence:
-
-$$\text{logit}(P_{\text{posterior}}) = \text{logit}(\pi) + \log BF_{\text{terminal}} + \log BF_{\text{sites}} + \log BF_{\text{identity}}$$
-
-Where:
-- $\pi$ is the prior probability of damage (from sample-level estimate)
-- $BF_{\text{terminal}}$ is the Bayes factor from terminal nucleotide patterns (p_read)
-- $BF_{\text{sites}}$ is the Bayes factor from damage-consistent amino acid substitutions (R→W, H→Y, Q→*, etc.)
-- $BF_{\text{identity}}$ is the Bayes factor from alignment identity: $\log BF = k \times (\text{fident} - 0.90)$ where $k = 20$
+The per-protein damage score combines three evidence sources in log-odds space:
+- **Terminal evidence:** p_read from nucleotide patterns
+- **Site evidence:** damage-consistent amino acid substitutions (R→W, H→Y, Q→*, etc.)
+- **Identity evidence:** alignment quality (ancient proteins tend to match references better)
 
 The output is a posterior probability that supports 3-state classification (damaged/uncertain/non-damaged).
+
+### EM reassignment
+
+When a read aligns to multiple references with similar scores, best-hit assignment arbitrarily picks one. EM instead distributes each read probabilistically based on alignment quality and estimated reference abundances. The algorithm iterates E-step (compute assignment probabilities) and M-step (update abundances) until convergence, typically 5-15 iterations with SQUAREM acceleration.
+
+Reads are kept if assignment probability exceeds both absolute (10⁻⁶) and relative (30% of best) thresholds. For large datasets, streaming mode processes chunks while maintaining O(num_references) memory.
+
+### Protein-level aggregation
+
+After EM, read evidence is aggregated per protein: abundance metrics (read counts, coverage) from all assigned reads, and damage metrics (substitution counts, terminal ratios, mean posterior) from reads with mismatches. The protein damage score is the probability that at least one read shows authentic damage, weighted by assignment confidence.
 
 ### Domain-specific models
 
