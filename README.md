@@ -495,48 +495,100 @@ Correlation r = 0.81 across the full 0–55% damage range. The +4.4% bias reflec
 
 ### Damage model
 
-Post-mortem deamination causes C→T substitutions at 5' ends and G→A at 3' ends, following exponential decay from fragment termini. The decay rate (λ = 0.2–0.5) determines how quickly damage decreases with distance from the terminus—typically a half-life of 1–4 positions.
+Post-mortem deamination causes C→T substitutions at 5' ends and G→A at 3' ends, following exponential decay from fragment termini:
+
+$$\delta(p) = d_{\max} \cdot e^{-\lambda p}$$
+
+Where $d_{\max}$ is maximum damage at terminus, $\lambda$ is decay constant (0.2–0.5), and $p$ is position from terminus. Half-life: $t_{1/2} = \ln(2) / \lambda \approx 1.4\text{–}3.5$ positions.
 
 ### Two-channel validation
 
 AGP uses two independent signals to distinguish real damage from compositional artifacts:
 
-**Channel A (nucleotide frequencies):** Measures T/(T+C) enrichment at terminal positions. Elevated ratios suggest damage, but can also arise from AT-rich organisms.
+**Channel A (nucleotide frequencies):** Measures T/(T+C) enrichment at terminal positions:
 
-**Channel B (stop codon conversion):** Tracks CAA→TAA, CAG→TAG, CGA→TGA conversions. This can *only* be elevated by real C→T damage—it's the "smoking gun" that validates Channel A.
+$$r_A(p) = \frac{T_p}{T_p + C_p}$$
 
-Decision logic: If Channel A fires AND Channel B confirms → real damage. If Channel A fires BUT Channel B is flat → compositional artifact (rejected).
+Expected ratio under damage: $\mathbb{E}[r_A(p)] = b_T + (1 - b_T) \cdot d_{\max} \cdot e^{-\lambda p}$, where $b_T$ is baseline T/(T+C) from interior positions.
+
+**Channel B (stop codon conversion):** Tracks CAA→TAA, CAG→TAG, CGA→TGA conversions. Stop conversion rate:
+
+$$r_B(p) = \frac{\text{stops}_p}{\text{stops}_p + \text{preimage}_p}$$
+
+Decision logic: If Channel A fires AND Channel B confirms ($c > 0$, $\text{LLR}_B > 0$) → validated damage. If Channel A fires BUT Channel B is flat → compositional artifact (rejected).
 
 ### Per-read damage scoring
 
-Each read gets a damage probability (p_read) based on its terminal nucleotide pattern. The score accumulates evidence across terminal positions: observing T where C would be expected under no-damage increases the score. Channel B modulates this score—if sample-level damage isn't validated, p_read is suppressed.
+Each read gets a damage probability based on terminal nucleotide patterns. At position $i$ with observed base $B$:
+
+$$P(B=T \mid \text{damage}) = b_{TC} + (1 - b_{TC}) \cdot d_{\max} \cdot e^{-\lambda i}$$
+$$P(B=T \mid \text{no damage}) = b_{TC}$$
+
+Log-likelihood ratio across terminal positions:
+
+$$\text{LLR} = \sum_{i \in \text{terminal}} \log \frac{P(B_i \mid \text{damage})}{P(B_i \mid \text{no damage})}$$
+
+Final read-level score with Channel B modulation ($\gamma_B \in \{0, 0.5, 1\}$):
+
+$$p_{\text{read}} = \gamma_B \cdot \sigma(\text{logit}(\pi_0) + \text{LLR})$$
 
 ### Stop codon rescue
 
-Stop codons near the 5' terminus may be damage artifacts (CAA/CAG→TAA/TAG, CGA→TGA). AGP estimates the probability each stop arose from damage based on position and sample damage rate. High-probability damage stops are X-masked in the search protein output, allowing downstream tools to find the underlying gene.
+For a stop codon at position $p$ from 5' terminus, the probability it arose from damage:
+
+$$P(\text{damage} \mid \text{stop}) = \frac{P(\text{stop} \mid \text{damage}) \cdot P(\text{damage})}{P(\text{stop})}$$
+
+Where P(stop | damage) depends on convertible precursors (CAA, CAG, CGA) and P(damage) = δ(p). High-probability damage stops are X-masked in search output.
 
 ### Frame scoring
 
-Frame selection combines codon usage, hexamer patterns, amino acid composition, and stop codon penalties. In damage-aware mode, stop penalties are reduced for likely damage-induced stops based on position and sample damage rate.
+Frame selection combines multiple signals:
+
+| Signal | Weight |
+|--------|--------|
+| Codon usage bias | 0.15 |
+| Stop codon penalty | 0.28 |
+| Dicodon/hexamer patterns | 0.13 |
+| Amino acid composition | 0.10 |
+| GC3 content | 0.05 |
+| Damage-frame consistency | variable |
+
+In damage-aware mode, stop penalties are weighted by $(1 - P_{\text{damage}})$, reducing penalties for likely damage-induced stops.
 
 ### Bayesian damage score
 
-The per-protein damage score combines three evidence sources in log-odds space:
-- **Terminal evidence:** p_read from nucleotide patterns
-- **Site evidence:** damage-consistent amino acid substitutions (R→W, H→Y, Q→*, etc.)
-- **Identity evidence:** alignment quality (ancient proteins tend to match references better)
+The per-protein damage score combines evidence in log-odds space:
 
-The output is a posterior probability that supports 3-state classification (damaged/uncertain/non-damaged).
+$$\text{logit}(P_{\text{posterior}}) = \text{logit}(\pi) + \log BF_{\text{terminal}} + \log BF_{\text{sites}} + \log BF_{\text{identity}}$$
+
+Where:
+- $BF_{\text{terminal}}$: Bayes factor from terminal patterns (p_read)
+- $BF_{\text{sites}}$: Bayes factor from damage-consistent AA substitutions (R→W, H→Y, Q→*, etc.)
+- $BF_{\text{identity}}$: Bayes factor from alignment identity: $\log BF = 20 \times (\text{fident} - 0.90)$
 
 ### EM reassignment
 
-When a read aligns to multiple references with similar scores, best-hit assignment arbitrarily picks one. EM instead distributes each read probabilistically based on alignment quality and estimated reference abundances. The algorithm iterates E-step (compute assignment probabilities) and M-step (update abundances) until convergence, typically 5-15 iterations with SQUAREM acceleration.
+EM resolves multi-mapping by distributing reads probabilistically across candidate references.
 
-Reads are kept if assignment probability exceeds both absolute (10⁻⁶) and relative (30% of best) thresholds. For large datasets, streaming mode processes chunks while maintaining O(num_references) memory.
+**E-step:** Compute responsibility $\gamma_{ij}$ for each read-reference pair:
+
+$$\gamma_{ij} = \frac{\phi_j \cdot L(i,j)}{\sum_{k \in R_i} \phi_k \cdot L(i,k)}$$
+
+Where likelihood $L(i,j) = \exp(S_{ij}/\lambda) \cdot p_{\text{read},i}^{\alpha}$ combines alignment score and damage probability.
+
+**M-step:** Update reference abundances:
+
+$$\phi_j = \frac{\alpha_0 + \sum_i \gamma_{ij}}{J \cdot \alpha_0 + N}$$
+
+Convergence typically takes 5-15 iterations with SQUAREM acceleration. Reads are kept if $\gamma_{ij} \geq 10^{-6}$ and $\gamma_{ij} \geq 0.3 \cdot \max_k(\gamma_{ik})$.
 
 ### Protein-level aggregation
 
-After EM, read evidence is aggregated per protein: abundance metrics (read counts, coverage) from all assigned reads, and damage metrics (substitution counts, terminal ratios, mean posterior) from reads with mismatches. The protein damage score is the probability that at least one read shows authentic damage, weighted by assignment confidence.
+After EM, the protein-level damage probability combines evidence across reads:
+
+$$P(\text{protein damaged}) = 1 - \prod_{i \in \text{reads}_j} (1 - p_{\text{posterior},i})^{\gamma_{ij}}$$
+
+This is the probability that at least one read shows authentic damage, weighted by assignment confidence.
 
 ### Domain-specific models
 
