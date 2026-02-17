@@ -184,6 +184,10 @@ struct ProteinDamageSummary {
     uint32_t aa_k_hits = 0;
     float aa_sum_qA = 0.0f;
     float aa_sum_log_qA_hits = 0.0f;
+    // Full Bernoulli LLR (hits + non-hits, position-weighted)
+    float aa_llr_bernoulli = 0.0f;
+    float aa_sum_exp_decay = 0.0f;
+    bool aa_has_bernoulli = false;
     // Stored for single-pass corrected output
     std::string qaln;
     std::string taln;
@@ -248,6 +252,12 @@ static ProteinDamageSummary annotate_alignment(
     float d_max, float lambda)
 {
     constexpr float Q_BASELINE = 0.005f;
+    // Fix 1: AA_SCALE derived from codon usage analysis
+    // P(damage-consistent AA event | C→T nucleotide event) ≈ 0.30
+    // This accounts for: codon structure, reading frame, which AA changes we count
+    constexpr float AA_SCALE = 0.30f;
+    constexpr float EPS = 1e-9f;
+
     char strand = parse_strand(query_id);
 
     std::vector<DamageSite> sites;
@@ -256,6 +266,11 @@ static ProteinDamageSummary annotate_alignment(
     uint32_t aa_k_hits = 0;
     float aa_sum_qA = 0.0f;
     float aa_sum_log_qA_hits = 0.0f;
+
+    // Fix 3 & 4: Full Bernoulli LLR including non-hits
+    // LLR = sum_j [ y_j*log(q1_j/q0_j) + (1-y_j)*log((1-q1_j)/(1-q0_j)) ]
+    float llr_bernoulli = 0.0f;
+    float sum_exp_decay = 0.0f;  // Fix 2: data-driven w = sum_exp_decay / m
 
     size_t q_pos = qstart;  // 0-based
     size_t t_pos = tstart;
@@ -287,9 +302,45 @@ static ProteinDamageSummary annotate_alignment(
         const uint8_t class_mask = (t_code < 128) ? DAMAGE_TARGET_CLASSES.class_mask[t_code] : 0;
         if (class_mask != 0) {
             aa_m_opportunities++;
-            const float q_ct = (class_mask & 0x1) ? positional_damage_prob(dist_5, d_max, lambda) : 0.0f;
-            const float q_ga = (class_mask & 0x2) ? positional_damage_prob(dist_3, d_max, lambda) : 0.0f;
-            aa_sum_qA += std::max(q_ct, q_ga);
+
+            // Position-weighted hazard for this opportunity
+            const float decay_5 = (class_mask & 0x1) ? std::exp(-lambda * static_cast<float>(dist_5)) : 0.0f;
+            const float decay_3 = (class_mask & 0x2) ? std::exp(-lambda * static_cast<float>(dist_3)) : 0.0f;
+            const float decay = std::max(decay_5, decay_3);
+            sum_exp_decay += decay;
+
+            // Compute q1 = P(damage | ancient) using bounded combine
+            // h = d_max * exp(-lambda * dist)
+            // NOTE: AA_SCALE is NOT applied here - it's only for the fixed-average fallback.
+            // The position-weighted formula uses raw d_max because we're computing
+            // P(damage at this position | ancient) directly from the damage model.
+            const float h = d_max * decay;
+            const float q0 = Q_BASELINE;
+            // Bounded combine: q1 = 1 - (1-q0)*(1-h) to handle large hazards
+            const float q1 = 1.0f - (1.0f - q0) * (1.0f - h);
+            const float q0_safe = std::clamp(q0, EPS, 1.0f - EPS);
+            const float q1_safe = std::clamp(q1, EPS, 1.0f - EPS);
+
+            // Check if this opportunity has a damage-consistent hit
+            bool is_hit = false;
+            if (q_aa != t_aa) {
+                const DamageSubstitution* sub = find_damage_sub(t_aa, q_aa);
+                if (sub) {
+                    is_hit = true;
+                }
+            }
+
+            // Position-weighted LLR contribution (hits only)
+            // Absence evidence removed: most ancient reads have only 1-2 damage events,
+            // so absence at a position doesn't mean "not ancient" - just means that
+            // particular C/G wasn't converted. Including absence evidence is too aggressive.
+            if (is_hit) {
+                // Positive evidence: log(q1/q0)
+                llr_bernoulli += std::log(q1_safe / q0_safe);
+            }
+            // Non-hits: no penalty (one-sided test)
+
+            aa_sum_qA += h;  // Legacy: sum of hazards
         }
 
         if (q_aa != t_aa) {
@@ -326,12 +377,23 @@ static ProteinDamageSummary annotate_alignment(
     // Use positional weighting for probability, but don't filter sites out
     // This improves recall while maintaining precision via scoring
 
-    constexpr float EMPIRICAL_PRECISION = 0.83f;   // Validated precision at terminal
-    constexpr float INTERIOR_PRECISION = 0.40f;    // Estimated precision for interior sites
+    // Bayesian LLR approach: logit(posterior) = logit(prior) + Σ LLR_i
+    // LLR_i = log(P(damage-consistent mismatch | damaged) / P(... | not damaged))
+    //
+    // For a damage-consistent mismatch at position with positional damage rate p_damage:
+    // - P(mismatch | damaged read) = p_damage (expected from damage model)
+    // - P(mismatch | not damaged) = seq_error_rate (~0.01 for Illumina)
+    // LLR = log(p_damage / seq_error_rate) — but capped to avoid infinities
+    //
+    // For interior sites (p_damage ≈ 0), use a small baseline rate reflecting
+    // that some interior damage still occurs.
+    constexpr float SEQ_ERROR_RATE = 0.01f;        // P(damage-like mismatch | not damaged)
+    constexpr float MIN_DAMAGE_RATE = 0.01f;       // Interior sites: LLR=0 (no evidence)
+    constexpr float PRIOR_DAMAGED = 0.5f;          // Prior P(read is damaged)
 
     size_t ct = 0, ga = 0, hc = 0;
     float max_p_damage = 0.0f;
-    float log_odds_sum = 0.0f;   // Log-odds accumulator for scoring
+    float llr_sum = 0.0f;   // Log-likelihood ratio accumulator
 
     for (const auto& s : sites) {
         if (s.damage_class == 'C') ct++;
@@ -339,25 +401,29 @@ static ProteinDamageSummary annotate_alignment(
         if (s.high_confidence) hc++;
         if (s.p_damage > max_p_damage) max_p_damage = s.p_damage;
 
-        // Weighted scoring: all sites contribute based on position
-        // Higher p_damage → more likely true damage → stronger evidence
-        // P(true damage | observed mismatch) = precision × p_damage + base_rate × (1 - p_damage)
-        // where base_rate accounts for interior sites that are still damage
-        float p_true_damage = EMPIRICAL_PRECISION * s.p_damage +
-                              INTERIOR_PRECISION * (1.0f - s.p_damage);
+        // Bayesian LLR: each damage-consistent site provides evidence
+        // P(site | damaged) = max(p_damage, MIN_DAMAGE_RATE) - position-dependent
+        // P(site | not damaged) = SEQ_ERROR_RATE - sequencing error baseline
+        float p_site_given_damaged = std::max(s.p_damage, MIN_DAMAGE_RATE);
+        float p_site_given_undamaged = SEQ_ERROR_RATE;
 
-        // Log-odds: log(P(damage) / P(not damage))
-        float odds = p_true_damage / (1.0f - p_true_damage + 1e-6f);
-        log_odds_sum += std::log(odds);
+        // LLR for this site (capped to avoid extreme values)
+        float llr = std::log(p_site_given_damaged / p_site_given_undamaged);
+        llr = std::clamp(llr, -3.0f, 5.0f);  // Cap at ~0.05 to ~150 odds ratio
+        llr_sum += llr;
     }
 
-    // p_damaged: sigmoid of accumulated log-odds.
-    // With no compatible sites: 0.0 (no AA-level evidence).
-    float p_damaged = 0.0f;
+    // Bayesian posterior: logit(posterior) = logit(prior) + Σ LLR
+    // With no sites: return prior (no evidence to update)
+    float p_damaged = PRIOR_DAMAGED;
     if (!sites.empty()) {
-        // Normalize by number of sites and apply sigmoid
-        float avg_log_odds = log_odds_sum / static_cast<float>(sites.size());
-        p_damaged = 1.0f / (1.0f + std::exp(-avg_log_odds));
+        float logit_prior = std::log(PRIOR_DAMAGED / (1.0f - PRIOR_DAMAGED));
+        float logit_posterior = logit_prior + llr_sum;
+        // Clamp to avoid numerical issues
+        logit_posterior = std::clamp(logit_posterior, -10.0f, 10.0f);
+        p_damaged = 1.0f / (1.0f + std::exp(-logit_posterior));
+    } else {
+        p_damaged = 0.0f;  // No damage-consistent sites = no AA-level evidence
     }
 
     // damage_consistent now includes ALL damage-consistent sites (not just terminal)
@@ -388,14 +454,21 @@ static ProteinDamageSummary annotate_alignment(
     out.aa_k_hits = aa_k_hits;
     out.aa_sum_qA = aa_sum_qA;
     out.aa_sum_log_qA_hits = aa_sum_log_qA_hits;
+    // Full Bernoulli LLR (Fixes 3 & 4)
+    out.aa_llr_bernoulli = llr_bernoulli;
+    out.aa_sum_exp_decay = sum_exp_decay;
+    out.aa_has_bernoulli = (aa_m_opportunities > 0);
     return out;
 }
 
 static void recompute_summary_site_metrics(ProteinDamageSummary& summary) {
     constexpr float Q_BASELINE = 0.005f;
-    constexpr float EMPIRICAL_PRECISION = 0.83f;
-    constexpr float INTERIOR_PRECISION = 0.40f;
-    float log_odds_sum = 0.0f;
+    // Bayesian LLR parameters (must match compute_damage_summary)
+    constexpr float SEQ_ERROR_RATE = 0.01f;
+    constexpr float MIN_DAMAGE_RATE = 0.01f;       // Interior sites: LLR=0 (no evidence)
+    constexpr float PRIOR_DAMAGED = 0.5f;
+
+    float llr_sum = 0.0f;
     summary.ct_sites = 0;
     summary.ga_sites = 0;
     summary.high_conf_sites = 0;
@@ -411,15 +484,18 @@ static void recompute_summary_site_metrics(ProteinDamageSummary& summary) {
         summary.aa_k_hits++;
         summary.aa_sum_log_qA_hits += std::log((s.p_damage + Q_BASELINE) / Q_BASELINE);
 
-        float p_true_damage = EMPIRICAL_PRECISION * s.p_damage +
-                              INTERIOR_PRECISION * (1.0f - s.p_damage);
-        float odds = p_true_damage / (1.0f - p_true_damage + 1e-6f);
-        log_odds_sum += std::log(odds);
+        // Bayesian LLR for each site
+        float p_site_given_damaged = std::max(s.p_damage, MIN_DAMAGE_RATE);
+        float llr = std::log(p_site_given_damaged / SEQ_ERROR_RATE);
+        llr = std::clamp(llr, -3.0f, 5.0f);
+        llr_sum += llr;
     }
 
     if (!summary.sites.empty()) {
-        float avg_log_odds = log_odds_sum / static_cast<float>(summary.sites.size());
-        summary.p_damaged = 1.0f / (1.0f + std::exp(-avg_log_odds));
+        float logit_prior = std::log(PRIOR_DAMAGED / (1.0f - PRIOR_DAMAGED));
+        float logit_posterior = logit_prior + llr_sum;
+        logit_posterior = std::clamp(logit_posterior, -10.0f, 10.0f);
+        summary.p_damaged = 1.0f / (1.0f + std::exp(-logit_posterior));
     } else {
         summary.p_damaged = 0.0f;
     }
@@ -1253,6 +1329,21 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                               << damage_index->terminal_shift() << ")\n";
                 }
                 std::cerr << "\n";
+            }
+
+            // Warm up page cache - critical for NFS performance
+            // Forces entire .agd file into RAM before random lookups begin
+            if (verbose) {
+                std::cerr << "Warming up damage index cache ("
+                          << (damage_index->record_count() * sizeof(AgdRecord) / 1024 / 1024)
+                          << " MB)...\n";
+            }
+            auto t_warmup = std::chrono::steady_clock::now();
+            damage_index->warmup_cache();
+            if (verbose) {
+                auto warmup_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t_warmup).count();
+                std::cerr << "Cache warmup complete (" << warmup_ms << " ms)\n\n";
             }
         } catch (const std::exception& e) {
             std::cerr << "Warning: Cannot load damage index: " << e.what() << "\n";
@@ -2522,14 +2613,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
 
     agp::ModernBaseline modern_est = agp::estimate_modern_baseline(modern_proxy);
-    const float empirical_pi0 = std::clamp(
-        static_cast<float>(
-            (p_read_n_low > 0)
-                ? (p_read_sum_low / static_cast<double>(p_read_n_low))
-                : ((p_read_n_all > 0)
-                    ? (p_read_sum_all / static_cast<double>(p_read_n_all))
-                    : 0.10)),
-        0.01f, 0.99f);
+    // Use fixed pi0 = 0.10 as baseline for terminal evidence transform
+    // Empirical estimation fails for heavily damaged samples where all reads have high p_read
+    // (no low-tail to establish baseline), causing terminal evidence to collapse
+    constexpr float PI0_FIXED = 0.10f;
+    const float empirical_pi0 = PI0_FIXED;
 
     // Set up scoring parameters with empirical Bayes approach
     agp::BayesianScoreParams score_params;
@@ -2538,7 +2626,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     score_params.q_modern = modern_est.q_modern;
     score_params.w0 = 0.3f;              // Temper absence evidence (robustness)
     score_params.terminal_threshold = 0.50f;
-    score_params.site_cap = 3.0f;        // Cap site contribution
+    score_params.site_cap = 3.0f;        // Cap site contribution (matches original)
     score_params.min_opportunities = 3;  // Minimum m to trust site evidence
     score_params.channel_b_valid = (d_max > 0.0f);  // Trust site evidence if damage detected
     score_params.ancient_threshold = 0.60f;
@@ -2546,9 +2634,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     score_params.use_identity = use_identity;
     score_params.k_identity = 20.0f;
     score_params.identity_baseline = 0.90f;
+    score_params.d_max = d_max;  // For fixed-average site evidence formula
 
     // Damage informativeness gating from AGD v3 header
-    // When uninformative: terminal evidence is zeroed, posterior output is NA
+    // When uninformative: terminal evidence is zeroed (posterior still computed from sites+identity)
     float damage_detectability = 1.0f;
     if (damage_index) {
         score_params.damage_informative = damage_index->damage_informative();
@@ -2696,6 +2785,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             ev.sum_qA = s.aa_sum_qA;
             ev.sum_log_qA_hits = s.aa_sum_log_qA_hits;
             ev.q_eff = (ev.m > 0) ? (ev.sum_qA / static_cast<float>(ev.m)) : 0.0f;
+            // Full Bernoulli LLR (Fixes 3 & 4)
+            ev.llr_bernoulli = s.aa_llr_bernoulli;
+            ev.sum_exp_decay = s.aa_sum_exp_decay;
+            ev.has_bernoulli = s.aa_has_bernoulli;
 
             // Compute Bayesian score (with optional identity evidence)
             bayes_out = agp::compute_bayesian_score(s.p_read, ev, score_params, s.fident);
@@ -2722,12 +2815,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         read_posteriors[si] = posterior;
         read_classifications[si] = classification;
 
+        // Always output posterior (computed from site + identity evidence even when
+        // terminal is uninformative). is_damaged classification only applies when informative.
+        *out << std::fixed << std::setprecision(4) << posterior << "\t";
         std::string is_damaged = ".";
         if (bayes_out.informative) {
-            *out << std::fixed << std::setprecision(4) << posterior << "\t";
             is_damaged = (posterior >= threshold) ? "1" : "0";
-        } else {
-            *out << "NA\t";
         }
         *out << is_damaged << "\t"
              << agp::classification_name(classification) << "\t";

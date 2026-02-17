@@ -42,7 +42,11 @@ DamageIndexReader::DamageIndexReader(const std::string& path) {
         throw std::runtime_error("Failed to mmap damage index: " + path);
     }
 
-    // Advise kernel for random access pattern
+    // Prefetch entire file into page cache before random access
+    // This is critical for NFS performance - avoids per-lookup network round-trips
+    madvise(data_, file_size_, MADV_WILLNEED);
+
+    // Then tell kernel we'll do random access (no sequential readahead needed)
     madvise(data_, file_size_, MADV_RANDOM);
 
     // Parse header
@@ -166,6 +170,22 @@ const AgdRecord* DamageIndexReader::get_record(size_t idx) const {
         return nullptr;
     }
     return &records_[idx];
+}
+
+size_t DamageIndexReader::warmup_cache() const {
+    if (!is_valid() || file_size_ == 0) return 0;
+
+    // Touch every page to force it into page cache
+    // This is critical for NFS where MADV_WILLNEED may be ignored
+    const char* ptr = reinterpret_cast<const char*>(data_);
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) return 0;
+
+    volatile size_t sum = 0;  // volatile prevents optimizer from removing the loop
+    for (size_t offset = 0; offset < file_size_; offset += static_cast<size_t>(page_size)) {
+        sum += static_cast<unsigned char>(ptr[offset]);
+    }
+    return sum;
 }
 
 // -----------------------------------------------------------------------------
