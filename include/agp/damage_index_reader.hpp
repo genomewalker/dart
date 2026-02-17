@@ -129,6 +129,17 @@ public:
      */
     const AgdRecord* get_record(size_t idx) const;
 
+    /**
+     * @brief Synchronously warm up the page cache.
+     *
+     * Touches every page in the mmap'd region to force it into RAM.
+     * Critical for NFS performance where MADV_WILLNEED may not be effective.
+     * Call this before starting random lookups.
+     *
+     * @return Sum of bytes read (for preventing optimizer elimination)
+     */
+    size_t warmup_cache() const;
+
 private:
     void* data_ = nullptr;          // mmap'd file data
     size_t file_size_ = 0;          // Total file size

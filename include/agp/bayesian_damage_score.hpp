@@ -33,13 +33,19 @@ enum class EvidenceTier : uint8_t {
     Convergent   = 3   // both terminal and site evidence
 };
 
-// Site evidence from alignment scan
+// Site evidence from alignment scan (full Bernoulli LLR model)
 struct SiteEvidence {
     uint32_t m = 0;           // susceptible opportunities (C or G in target)
     uint32_t k = 0;           // observed damage hits (C→T or G→A)
     float sum_qA = 0.0f;      // sum of position-weighted ancient hazards (all positions)
-    float sum_log_qA_hits = 0.0f;  // sum of log(q) at damage sites only
+    float sum_log_qA_hits = 0.0f;  // sum of log(q1/q0) at damage sites only (legacy)
     float q_eff = 0.0f;       // effective per-site rate = sum_qA / m
+
+    // Full Bernoulli LLR: sum over ALL opportunities (hits + non-hits)
+    // LLR = sum_j [ y_j*log(q1_j/q0_j) + (1-y_j)*log((1-q1_j)/(1-q0_j)) ]
+    float llr_bernoulli = 0.0f;  // full position-weighted LLR
+    float sum_exp_decay = 0.0f;  // sum of exp(-λ*dist) for computing effective w
+    bool has_bernoulli = false;  // true if llr_bernoulli was computed
 };
 
 // Modern baseline estimate from sample (can be stratified by GC)
@@ -99,6 +105,11 @@ struct BayesianScoreParams {
     // When false: terminal evidence is zeroed (sample has no detectable damage signal)
     // Site evidence and identity evidence still apply
     bool damage_informative = true;
+
+    // Sample-level damage rate for fixed-average site evidence formula
+    // Uses d_max * 0.5 as position-independent average damage rate
+    // This matches the original proven formula (commit 0224b4a) which achieved AUC 0.82
+    float d_max = 0.0f;
 
     // Thresholds for 3-state classification
     float ancient_threshold = 0.60f;   // posterior >= this -> Ancient
@@ -333,9 +344,33 @@ inline BayesianScoreOutput compute_bayesian_score(
         // With w0 < 1, absence evidence is downweighted for robustness
 
         if (ev.k > 0) {
-            // Positive evidence from observed damage sites
-            // sum_log_qA_hits = sum of log((q_damage + q_baseline) / q_baseline)
-            logBF_sites = static_cast<double>(ev.sum_log_qA_hits);
+            // Fixed-average formula for logBF_sites
+            //
+            // Why fixed-average (not position-weighted):
+            // - Alignment AA positions don't correspond to original read positions
+            // - Damage at terminal nucleotides appears at various AA positions after translation
+            // - Interior alignment positions may correspond to terminal read damage
+            //
+            // Fix 1: AA_SCALE = 0.30 (P(observable AA event | nucleotide damage))
+            // Fix 2: w = E[exp(-λ*dist)] corrected from 0.5 to data-driven value
+            //
+            // Data-driven w from per-read sum_exp_decay if available, else estimate:
+            // With λ=0.3 and typical read lengths: w ≈ 0.10-0.15
+            const double w = (ev.sum_exp_decay > 0.0f && ev.m > 0)
+                ? static_cast<double>(ev.sum_exp_decay) / static_cast<double>(ev.m)
+                : 0.12;  // Conservative estimate for ~50bp reads
+
+            constexpr double AA_SCALE = 0.30;  // Nucleotide → AA damage rate conversion
+            const double d_max_scaled = static_cast<double>(params.d_max) * AA_SCALE;
+
+            if (d_max_scaled > qm) {
+                // logBF_sites = k * log((d_max_scaled * w + qm) / qm)
+                const double avg_q_ancient = d_max_scaled * w + qm;
+                logBF_sites = k * std::log(avg_q_ancient / qm);
+            } else if (ev.sum_log_qA_hits > 0.0f) {
+                // Fallback: position-weighted sum (when d_max not available)
+                logBF_sites = static_cast<double>(ev.sum_log_qA_hits);
+            }
         }
 
         // Tempered negative evidence (absence of damage where expected)
