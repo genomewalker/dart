@@ -1,0 +1,147 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="480" height="420" viewBox="0 0 480 420" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .bg { fill: #ffffff; }
+      .box { fill: #ffffff; stroke: #2d2d2d; stroke-width: 1; }
+      .box-input { fill: #e3eef7; stroke: #2d2d2d; stroke-width: 1; }
+      .box-process { fill: #f5f5f5; stroke: #2d2d2d; stroke-width: 1; }
+      .box-key { fill: #fdf4dc; stroke: #2d2d2d; stroke-width: 1; }
+      .box-output { fill: #e4f2e4; stroke: #2d2d2d; stroke-width: 1; }
+      .arrow { fill: none; stroke: #2d2d2d; stroke-width: 0.9; marker-end: url(#arr); }
+      .arrow-bend { fill: none; stroke: #2d2d2d; stroke-width: 0.9; }
+      .arrow-data { fill: none; stroke: #888; stroke-width: 0.7; stroke-dasharray: 3,2; marker-end: url(#arr-g); }
+      .title { font-family: Helvetica, Arial, sans-serif; font-size: 10px; fill: #1a1a1a; text-anchor: middle; font-weight: 600; }
+      .label { font-family: Helvetica, Arial, sans-serif; font-size: 9px; fill: #2a2a2a; text-anchor: middle; }
+      .sub { font-family: Helvetica, Arial, sans-serif; font-size: 7.5px; fill: #555; text-anchor: middle; }
+      .row-label { font-family: Helvetica, Arial, sans-serif; font-size: 8px; fill: #888; font-weight: 500; }
+    </style>
+    <marker id="arr" markerWidth="5" markerHeight="4" refX="4" refY="2" orient="auto">
+      <polygon points="0 0, 5 2, 0 4" fill="#2d2d2d"/>
+    </marker>
+    <marker id="arr-g" markerWidth="4" markerHeight="3" refX="3" refY="1.5" orient="auto">
+      <polygon points="0 0, 4 1.5, 0 3" fill="#888"/>
+    </marker>
+  </defs>
+
+  <rect width="480" height="420" class="bg"/>
+
+  <!-- ===== ROW 1: Input → Pass 1 (left to right) ===== -->
+  <text x="20" y="25" class="row-label">Pass 1: Sample Profiling</text>
+
+  <rect x="20" y="35" width="65" height="35" rx="3" class="box-input"/>
+  <text x="52" y="50" class="title">FASTQ</text>
+  <text x="52" y="62" class="sub">aDNA reads</text>
+
+  <path d="M 87 52 L 105 52" class="arrow"/>
+
+  <rect x="108" y="35" width="70" height="35" rx="3" class="box-process"/>
+  <text x="143" y="50" class="label">Channel A</text>
+  <text x="143" y="62" class="sub">T/(T+C) terminal</text>
+
+  <path d="M 180 52 L 198 52" class="arrow"/>
+
+  <rect x="201" y="35" width="70" height="35" rx="3" class="box-process"/>
+  <text x="236" y="50" class="label">Channel B</text>
+  <text x="236" y="62" class="sub">stop conversion</text>
+
+  <path d="M 273 52 L 291 52" class="arrow"/>
+
+  <rect x="294" y="35" width="55" height="35" rx="3" class="box-process"/>
+  <text x="321" y="50" class="label">Validate</text>
+  <text x="321" y="62" class="sub">both channels</text>
+
+  <path d="M 351 52 L 369 52" class="arrow"/>
+
+  <rect x="372" y="35" width="70" height="35" rx="3" class="box-key"/>
+  <text x="407" y="50" class="title">Profile</text>
+  <text x="407" y="62" class="sub">d_max, λ</text>
+
+  <!-- ===== Bend down ===== -->
+  <path d="M 407 72 L 407 95" class="arrow-bend"/>
+  <path d="M 407 95 L 407 115" class="arrow" style="marker-end: url(#arr);"/>
+
+  <!-- ===== ROW 2: Pass 2 (right to left) ===== -->
+  <text x="20" y="110" class="row-label">Pass 2: Gene Prediction</text>
+
+  <rect x="372" y="120" width="70" height="35" rx="3" class="box-process"/>
+  <text x="407" y="135" class="label">Damage model</text>
+  <text x="407" y="147" class="sub">position decay</text>
+
+  <path d="M 370 137 L 352 137" class="arrow"/>
+
+  <rect x="279" y="120" width="70" height="35" rx="3" class="box-process"/>
+  <text x="314" y="135" class="label">Frame select</text>
+  <text x="314" y="147" class="sub">damage-aware</text>
+
+  <path d="M 277 137 L 259 137" class="arrow"/>
+
+  <rect x="176" y="120" width="80" height="35" rx="3" class="box-key"/>
+  <text x="216" y="135" class="title">Bayesian</text>
+  <text x="216" y="147" class="sub">p_read per read</text>
+
+  <path d="M 174 137 L 156 137" class="arrow"/>
+
+  <rect x="88" y="120" width="65" height="35" rx="3" class="box-output"/>
+  <text x="120" y="135" class="label">GFF3</text>
+  <text x="120" y="147" class="sub">predictions</text>
+
+  <path d="M 86 137 L 68 137" class="arrow"/>
+
+  <rect x="20" y="112" width="45" height="50" rx="3" class="box-output"/>
+  <text x="42" y="130" class="label">FASTA</text>
+  <text x="42" y="142" class="label">.agd</text>
+  <text x="42" y="154" class="sub">index</text>
+
+  <!-- ===== Bend down ===== -->
+  <path d="M 42 164 L 42 187" class="arrow-bend"/>
+  <path d="M 42 187 L 42 207" class="arrow"/>
+
+  <!-- ===== ROW 3: Search (left to right) ===== -->
+  <text x="20" y="200" class="row-label">Search</text>
+
+  <rect x="20" y="210" width="75" height="35" rx="3" class="box-process"/>
+  <text x="57" y="225" class="title">MMseqs2</text>
+  <text x="57" y="237" class="sub">VTML20</text>
+
+  <rect x="20" y="255" width="75" height="30" rx="3" class="box-input"/>
+  <text x="57" y="268" class="label">Reference DB</text>
+  <text x="57" y="279" class="sub">KEGG, UniRef</text>
+
+  <path d="M 57 287 L 57 297 L 42 297 L 42 247" class="arrow"/>
+
+  <path d="M 97 227 L 115 227" class="arrow"/>
+
+  <rect x="118" y="210" width="65" height="35" rx="3" class="box-output"/>
+  <text x="150" y="225" class="label">Hits TSV</text>
+  <text x="150" y="237" class="sub">alignments</text>
+
+  <path d="M 185 227 L 203 227" class="arrow"/>
+
+  <rect x="206" y="205" width="95" height="45" rx="3" class="box-key"/>
+  <text x="253" y="222" class="title">damage-annotate</text>
+  <text x="253" y="235" class="sub">Bayesian scoring</text>
+  <text x="253" y="246" class="sub">+ .agd index</text>
+
+  <!-- .agd feeds annotation -->
+  <path d="M 67 137 L 67 180 L 230 180 L 230 203" class="arrow-data"/>
+
+  <path d="M 303 227 L 321 227" class="arrow"/>
+
+  <rect x="324" y="210" width="95" height="35" rx="3" class="box-output"/>
+  <text x="371" y="225" class="title">Annotated TSV</text>
+  <text x="371" y="237" class="sub">p_damaged / protein</text>
+
+  <!-- ===== Bend down ===== -->
+  <path d="M 371 247 L 371 270" class="arrow-bend"/>
+  <path d="M 371 270 L 371 290" class="arrow"/>
+
+  <!-- ===== ROW 4: Final output (right to left) ===== -->
+  <text x="324" y="285" class="row-label">Output</text>
+
+  <rect x="304" y="295" width="115" height="45" rx="3" class="box-output"/>
+  <text x="361" y="313" class="title">Per-protein damage</text>
+  <text x="361" y="326" class="label">p_damaged score</text>
+  <text x="361" y="338" class="sub">evidence tier classification</text>
+
+</svg>
