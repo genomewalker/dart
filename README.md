@@ -1,4 +1,4 @@
-# AGP: Damage-Aware Gene prediction from ancienT mEtagenomics Reads
+# AGP: Damage-aware gene prediction from ancient metagenomic reads
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
