@@ -8,10 +8,10 @@
  * 2. damage-annotate: reads .emi and runs integrated EM reassignment
  *
  * File format (.emi):
- * - Header (72 bytes)
- * - String table (names, null-separated)
- * - Alignment records (fixed 16 bytes each)
- * - CSR offsets (4 bytes each)
+ * - Header (72 bytes, see EMIHeader)
+ * - String table (read names then ref names, null-separated)
+ * - Alignment records (32 bytes each, see EMIAlignment)
+ * - CSR offsets (8 bytes each, uint64_t)
  */
 
 #include <cstdint>
