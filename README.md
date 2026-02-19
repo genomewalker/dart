@@ -611,12 +611,12 @@ $|\mathcal{S}|$ is the number of distinct alignment start positions, $n$ is the 
               reference protein (100 aa)
               |------------------------------------------|
 
-Spurious      ▼▼▼▼▼▼▼▼▼▼▼
+Spurious      ^^^^^^^^^^^
 (motif hit)   reads pile up near one position
               w_span = 0.12,  d_uniq = 0.55
               s_pos = sqrt(0.12 * 0.55) = 0.26   FAIL
 
-Authentic     ▼   ▼  ▼    ▼   ▼    ▼   ▼   ▼  ▼    ▼
+Authentic     ^   ^  ^    ^   ^    ^   ^   ^  ^    ^
 (real gene)   reads start at many positions across protein
               w_span = 0.88,  d_uniq = 1.00
               s_pos = sqrt(0.88 * 1.00) = 0.94   PASS
@@ -634,13 +634,13 @@ where the terminal zone width is $e = \mathrm{clamp}(\lfloor L/10 \rfloor,\; 1,\
      reference protein
      |-- edge --|----------- middle -----------|-- edge --|
 
-Spurious    depth:  ▁▁           ▃▅████████▅▃           ▁▁
-(interior           c_term ~ 0.5,  c_mid ~ 7
- domain)            rho = 0.5 / 7 = 0.07   FAIL
+Spurious (interior domain):
+     |..........|##############################|..........|
+     c_term ~ 0.5,  c_mid ~ 7,  rho = 0.5 / 7 = 0.07   FAIL
 
-Authentic   depth:  ████        ████████████████        ████
-(real gene)         c_term ~ 8,  c_mid ~ 9
-                    rho = 8 / 9 = 0.89   PASS
+Authentic (real gene):
+     |##########|##############################|##########|
+     c_term ~ 8,  c_mid ~ 9,  rho = 8 / 9 = 0.89   PASS
 ```
 
 The two filters are complementary: the positional score catches reads piled at any single location on the protein, while the terminal ratio catches reads that collectively avoid both ends.
