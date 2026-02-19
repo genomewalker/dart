@@ -70,7 +70,16 @@ The final output is a per-protein Bayesian posterior: the probability that a pro
 
 ## Installation
 
-Requires C++20 compiler (GCC 10+ or Clang 12+), CMake 3.18+, and zlib.
+Requires C++20 compiler (GCC 10+ or Clang 12+), CMake 3.18+, zlib, and zstd.
+
+The easiest way to get all build dependencies is via conda:
+
+```bash
+conda env create -f environment.yml
+conda activate agp
+```
+
+Then build:
 
 ```bash
 git clone https://github.com/genomewalker/agp.git
