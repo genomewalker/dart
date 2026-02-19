@@ -7,7 +7,7 @@ AGP translates ancient DNA (aDNA) reads into proteins for functional annotation.
 ## Overview
 
 <p align="center">
-<img src="docs/agp_pipeline.svg" width="700" alt="AGP pipeline — three-row overview">
+<img src="docs/agp_pipeline.svg" width="700" alt="AGP pipeline: three-row overview">
 </p>
 
 The pipeline runs in three stages. **Pass 1** scans all reads to measure the sample's damage level. **Pass 2** translates reads into proteins using that damage estimate to rescue genes that would otherwise be missed. **Functional annotation** searches those proteins against databases and scores each hit for authentic ancient damage.
@@ -20,27 +20,27 @@ DNA degrades after death. The most common change is **deamination**: cytosines (
 
 This causes two practical problems for bioinformatics:
 
-1. **False stop codons.** A C→T change at certain codon positions turns a coding codon into a stop codon (e.g., CAA → TAA). Standard gene predictors see the stop and truncate or discard the gene — even though the *real* sequence had no stop there. A heavily damaged ancient sample can lose 30–50% of its genes this way.
+1. **False stop codons.** A C→T change at certain codon positions turns a coding codon into a stop codon (e.g., CAA → TAA). Standard gene predictors see the stop and truncate or discard the gene, even though the *real* sequence had no stop there. A heavily damaged ancient sample can lose 30–50% of its genes this way.
 
-2. **False positives.** Some modern samples happen to be rich in T at read termini due to biology, not damage. Naively measuring "how much T is at the ends" gives a false alarm. AGP uses a second, independent signal — stop codon conversion rates — to confirm whether the enrichment is real damage or just natural sequence composition.
+2. **False positives.** Some modern samples happen to be rich in T at read termini due to biology, not damage. Naively measuring "how much T is at the ends" gives a false alarm. AGP uses a second, independent signal (stop codon conversion rates) to confirm whether the enrichment is real damage or just natural sequence composition.
 
 ---
 
 ## How it works
 
-### Step 1 — Measure damage without a reference genome
+### Step 1: Measure damage without a reference genome
 
 AGP scans all reads *before* any gene prediction to estimate how damaged the sample is. It uses two independent signals:
 
-**Channel A — terminal nucleotide frequencies.** In a damaged sample, C→T events increase the fraction of T at read ends. AGP measures T/(T+C) at each position from the 5′ terminus and fits an exponential decay curve. The amplitude at position 0 is `d_max` (maximum damage rate), and the decay constant is `λ`.
+**Channel A: terminal nucleotide frequencies.** In a damaged sample, C→T events increase the fraction of T at read ends. AGP measures T/(T+C) at each position from the 5′ terminus and fits an exponential decay curve. The amplitude at position 0 is `d_max` (maximum damage rate), and the decay constant is `λ`.
 
-**Channel B — stop codon conversion.** Codons CAA, CAG, and CGA are one C→T change away from becoming stop codons. AGP counts these stop-codon conversions separately at terminal versus interior positions. Real damage produces *more* stops near the ends. Natural composition variation does not — it produces equally elevated stops everywhere.
+**Channel B: stop codon conversion.** Codons CAA, CAG, and CGA are one C→T change away from becoming stop codons. AGP counts these stop-codon conversions separately at terminal versus interior positions. Real damage produces *more* stops near the ends. Natural composition variation does not; it produces equally elevated stops everywhere.
 
 If Channel A fires but Channel B is flat, the sample is flagged as a **compositional artifact** and `d_max` is set to zero. This prevents false positives in AT-rich organisms where terminal T enrichment is biological rather than chemical.
 
-The output is a `SampleProfile` — a compact damage model with `d_max`, decay constant `λ`, library type (single- or double-stranded), and a `damage_validated` flag.
+The output is a `SampleProfile`: a compact damage model with `d_max`, decay constant `λ`, library type (single- or double-stranded), and a `damage_validated` flag.
 
-### Step 2 — Translate reads with damage awareness
+### Step 2: Translate reads with damage awareness
 
 Standard six-frame translation fails on ancient DNA because damage-induced stop codons break reading frames. AGP rescues genes in two ways:
 
@@ -48,9 +48,9 @@ Standard six-frame translation fails on ancient DNA because damage-induced stop 
 
 **Stop codon masking.** Stops with high damage probability are replaced by `X` in the output protein sequences (`--fasta-aa-masked`). This lets MMseqs2 search across the damaged position and match the true reference protein, recovering alignments that would otherwise fail.
 
-Every read is assigned `p_read` — the probability that its terminal pattern reflects authentic ancient damage — stored in a binary index (`.agd`) for use downstream.
+Every read is assigned `p_read`, the probability that its terminal pattern reflects authentic ancient damage, stored in a binary index (`.agd`) for use downstream.
 
-### Step 3 — Search and score damage authenticity
+### Step 3: Search and score damage authenticity
 
 Predicted proteins are searched against a reference database (KEGG, CAZy, viral proteins, etc.) with MMseqs2 [Steinegger & Söding 2017] using VTML20 [Müller & Vingron 2000], a low-divergence substitution matrix that penalises conservative amino acid changes less heavily than BLOSUM62, which suits the short, identity-preserving alignments typical of ancient DNA.
 
@@ -62,7 +62,7 @@ After search, `damage-annotate` scores each protein hit for authentic ancient da
 
 **Identity evidence (BF_identity).** Ancient proteins match their reference proteins *better* than modern spurious hits do, because they come from organisms genuinely related to the reference. Alignment identity above 0.90 provides modest positive evidence; low identity provides negative evidence.
 
-EM reassignment resolves multi-mapping reads — reads that hit multiple reference proteins — by distributing them probabilistically based on alignment scores and damage probability, converging in 5–15 iterations.
+EM reassignment resolves multi-mapping reads (reads that hit multiple reference proteins) by distributing them probabilistically based on alignment scores and damage probability, converging in 5–15 iterations.
 
 The final output is a per-protein Bayesian posterior: the probability that a protein's read support reflects authentic ancient DNA rather than modern contamination or noise.
 
@@ -105,7 +105,7 @@ Output (JSON):
 ### Full functional profiling pipeline
 
 ```bash
-# 1. Predict genes with damage model — produces proteins and damage index
+# 1. Predict genes with damage model (produces proteins and damage index)
 agp predict -i reads.fq.gz -o out.gff \
     --fasta-aa-masked search.faa \
     --damage-index out.agd \
@@ -260,7 +260,7 @@ agp damage-annotate --emi hits.emi -o out.tsv --preset strict  # maximize precis
 | `--min-terminal-ratio` | 0 | 0 | auto-calibrated |
 | `--min-damage-sites` | auto | 1 | 5 |
 
-Presets apply immediately in the argument list — individual flags placed after `--preset` override the preset value.
+Presets apply immediately in the argument list; individual flags placed after `--preset` override the preset value.
 
 #### Alignment pre-filters
 
@@ -308,7 +308,7 @@ Control which proteins appear in `--gene-summary` and `--protein-filtered` outpu
 --no-em               # disable EM entirely (use best-hit only)
 ```
 
-The EM filter keeps only reads where the best-hit protein's responsibility exceeds `--em-min-prob`. The default (1e-6) is effectively off — only use this to discard reads that are completely unassigned by EM.
+The EM filter keeps only reads where the best-hit protein's responsibility exceeds `--em-min-prob`. The default (1e-6) is effectively off; only use this to discard reads that are completely unassigned by EM.
 
 #### Classification threshold
 
@@ -316,7 +316,7 @@ The EM filter keeps only reads where the best-hit protein's responsibility excee
 --threshold FLOAT   # posterior cutoff for is_damaged column (default: 0.7)
 ```
 
-This controls only the `is_damaged` label in the output — it does not exclude any rows. To filter the output by damage score, post-filter on the `posterior` column.
+This controls only the `is_damaged` label in the output; it does not exclude any rows. To filter the output by damage score, post-filter on the `posterior` column.
 
 ---
 
@@ -417,7 +417,7 @@ Benchmarked on 18.3 million synthetic ancient DNA reads from the KapK community 
 AGP and BLASTX have equivalent functional recall (~68%), both far exceeding FGS-rs (19%). FGS-rs treats damage-induced stop codons as real stops, discarding most ancient reads. AGP produces 1.4% higher identity hits than BLASTX and runs ~1.5× faster. Throughput: ~35,000 sequences/second (8 threads, SIMD).
 
 <p align="center">
-<img src="docs/benchmark_comparison.png" width="700" alt="Method comparison — AGP, BLASTX, FGS-rs">
+<img src="docs/benchmark_comparison.png" width="700" alt="Method comparison: AGP, BLASTX, FGS-rs">
 </p>
 
 ### Read-level damage classification
@@ -436,7 +436,7 @@ AGP and BLASTX have equivalent functional recall (~68%), both far exceeding FGS-
 
 ### Protein damage classification
 
-After EM reassignment, `damage-annotate` computes `assign_mean_posterior` — the EM-weighted mean posterior across all reads assigned to a protein. Evaluated on 61,945 proteins (8 samples, ≥50 non-damaged proteins each):
+After EM reassignment, `damage-annotate` computes `assign_mean_posterior`, the EM-weighted mean posterior across all reads assigned to a protein. Evaluated on 61,945 proteins (8 samples, ≥50 non-damaged proteins each):
 
 | Group | AUC-ROC | P/R/F1 @ optimal τ |
 |-------|---------|---------------------|
@@ -445,12 +445,12 @@ After EM reassignment, `damage-annotate` computes `assign_mean_posterior` — th
 | Overall | 0.875 | |
 
 <p align="center">
-<img src="docs/protein_benchmark.png" width="800" alt="Protein damage classification — AUC 0.948 AT-rich">
+<img src="docs/protein_benchmark.png" width="800" alt="Protein damage classification: AUC 0.948 AT-rich">
 </p>
 
 Averaging over multiple reads per protein substantially improves discrimination (+10% AUC for AT-rich, +15% for GC-rich).
 
-**Note on GC-rich samples and threshold selection.** C→T deamination creates a T/(T+C) terminal enrichment proportional to `d_max × (1 − baseline_C)`. In GC-rich organisms (baseline C ~27%), this enrichment is inherently weak even at high damage rates — AGP correctly sets d_max ≈ 0, and discrimination relies on alignment identity and EM posterior evidence rather than a damage magnitude signal. Consequently, a single classification threshold appropriate for AT-rich samples (where `d_max > 0`) is not meaningful for GC-rich samples. We therefore report precision/recall/F1 for AT-rich samples only; GC-rich performance is captured by AUC-ROC (threshold-independent). In practice, AGP reports `d_max` per sample, allowing users to apply regime-specific thresholds.
+**Note on GC-rich samples and threshold selection.** C→T deamination creates a T/(T+C) terminal enrichment proportional to `d_max × (1 − baseline_C)`. In GC-rich organisms (baseline C ~27%), this enrichment is inherently weak even at high damage rates; AGP correctly sets d_max ≈ 0, and discrimination relies on alignment identity and EM posterior evidence rather than a damage magnitude signal. Consequently, a single classification threshold appropriate for AT-rich samples (where `d_max > 0`) is not meaningful for GC-rich samples. We therefore report precision/recall/F1 for AT-rich samples only; GC-rich performance is captured by AUC-ROC (threshold-independent). In practice, AGP reports `d_max` per sample, allowing users to apply regime-specific thresholds.
 
 **Recommended thresholds for real data:**
 - AT-rich samples (d_max > 0): τ = **0.70** at protein level, τ = **0.75** at read level
@@ -472,7 +472,7 @@ AGP estimates sample-wide damage without reference alignment. Validated against 
 <img src="docs/damage_validation_scatter.png" width="600" alt="AGP vs metaDMG validation">
 </p>
 
-Correlation r = 0.81 across the full 0–55% damage range. The +4.4% bias reflects different estimands: metaDMG analyses only aligned reads while AGP analyses all reads. Channel B prevents false positives — samples low_001–low_004 show elevated terminal T/(T+C) but negative Channel B LLR, correctly rejected as compositional artifacts.
+Correlation r = 0.81 across the full 0–55% damage range. The +4.4% bias reflects different estimands: metaDMG analyses only aligned reads while AGP analyses all reads. Channel B prevents false positives; samples low_001–low_004 show elevated terminal T/(T+C) but negative Channel B LLR, correctly rejected as compositional artifacts.
 
 ---
 
@@ -686,28 +686,28 @@ If you use AGP in your research, please cite:
 
 ## References
 
-- **Briggs et al. 2007** — Briggs AW, Stenzel U, Johnson PLF, Green RE, Kelso J, Prüfer K, Meyer M, Krause J, Ronan MT, Lachmann M, Pääbo S. Patterns of damage in genomic DNA sequences from a Neandertal. *PNAS* 104(37):14616–14621. [doi:10.1073/pnas.0704665104](https://doi.org/10.1073/pnas.0704665104)
+- **Briggs et al. 2007.** Briggs AW, Stenzel U, Johnson PLF, Green RE, Kelso J, Prüfer K, Meyer M, Krause J, Ronan MT, Lachmann M, Pääbo S. Patterns of damage in genomic DNA sequences from a Neandertal. *PNAS* 104(37):14616–14621. [doi:10.1073/pnas.0704665104](https://doi.org/10.1073/pnas.0704665104)
 
-- **Dempster et al. 1977** — Dempster AP, Laird NM, Rubin DB. Maximum likelihood from incomplete data via the EM algorithm. *J Royal Statistical Society B* 39(1):1–22. [doi:10.1111/j.2517-6161.1977.tb01600.x](https://doi.org/10.1111/j.2517-6161.1977.tb01600.x)
+- **Dempster et al. 1977.** Dempster AP, Laird NM, Rubin DB. Maximum likelihood from incomplete data via the EM algorithm. *J Royal Statistical Society B* 39(1):1–22. [doi:10.1111/j.2517-6161.1977.tb01600.x](https://doi.org/10.1111/j.2517-6161.1977.tb01600.x)
 
-- **Jónsson et al. 2013** — Jónsson H, Ginolhac A, Schubert M, Johnson PLF, Orlando L. mapDamage2.0: fast approximate Bayesian estimates of ancient DNA damage parameters. *Bioinformatics* 29(13):1682–1684. [doi:10.1093/bioinformatics/btt193](https://doi.org/10.1093/bioinformatics/btt193)
+- **Jónsson et al. 2013.** Jónsson H, Ginolhac A, Schubert M, Johnson PLF, Orlando L. mapDamage2.0: fast approximate Bayesian estimates of ancient DNA damage parameters. *Bioinformatics* 29(13):1682–1684. [doi:10.1093/bioinformatics/btt193](https://doi.org/10.1093/bioinformatics/btt193)
 
-- **Lindahl 1993** — Lindahl T. Instability and decay of the primary structure of DNA. *Nature* 362(6422):709–715. [doi:10.1038/362709a0](https://doi.org/10.1038/362709a0)
+- **Lindahl 1993.** Lindahl T. Instability and decay of the primary structure of DNA. *Nature* 362(6422):709–715. [doi:10.1038/362709a0](https://doi.org/10.1038/362709a0)
 
-- **Michelsen et al. 2022** — Michelsen C, Pedersen MW, Fernandez-Guerra A, Zhao L, Petersen TC, Korneliussen TS. metaDMG: a fast and accurate ancient DNA damage toolkit for metagenomic data. *bioRxiv* preprint. [doi:10.1101/2022.12.06.519264](https://doi.org/10.1101/2022.12.06.519264)
+- **Michelsen et al. 2022.** Michelsen C, Pedersen MW, Fernandez-Guerra A, Zhao L, Petersen TC, Korneliussen TS. metaDMG: a fast and accurate ancient DNA damage toolkit for metagenomic data. *bioRxiv* preprint. [doi:10.1101/2022.12.06.519264](https://doi.org/10.1101/2022.12.06.519264)
 
-- **Müller & Vingron 2000** — Müller T, Vingron M. Modeling amino acid replacement. *J Computational Biology* 7(6):761–776. [doi:10.1089/10665270050514918](https://doi.org/10.1089/10665270050514918)
+- **Müller & Vingron 2000.** Müller T, Vingron M. Modeling amino acid replacement. *J Computational Biology* 7(6):761–776. [doi:10.1089/10665270050514918](https://doi.org/10.1089/10665270050514918)
 
-- **Rho et al. 2010** — Rho M, Tang H, Ye Y. FragGeneScan: predicting genes in short and error-prone reads. *Nucleic Acids Research* 38(20):e191. [doi:10.1093/nar/gkq747](https://doi.org/10.1093/nar/gkq747)
+- **Rho et al. 2010.** Rho M, Tang H, Ye Y. FragGeneScan: predicting genes in short and error-prone reads. *Nucleic Acids Research* 38(20):e191. [doi:10.1093/nar/gkq747](https://doi.org/10.1093/nar/gkq747)
 
-- **Steinegger & Söding 2017** — Steinegger M, Söding J. MMseqs2 enables sensitive protein sequence searching for the analysis of massive data sets. *Nature Biotechnology* 35(11):1026–1028. [doi:10.1038/nbt.3988](https://doi.org/10.1038/nbt.3988)
+- **Steinegger & Söding 2017.** Steinegger M, Söding J. MMseqs2 enables sensitive protein sequence searching for the analysis of massive data sets. *Nature Biotechnology* 35(11):1026–1028. [doi:10.1038/nbt.3988](https://doi.org/10.1038/nbt.3988)
 
-- **Van der Jeugt et al. 2022** — Van der Jeugt F, Dawyndt P, Mesuere B. FragGeneScanRs: faster gene prediction for short reads. *BMC Bioinformatics* 23(1):198. [doi:10.1186/s12859-022-04736-5](https://doi.org/10.1186/s12859-022-04736-5)
+- **Van der Jeugt et al. 2022.** Van der Jeugt F, Dawyndt P, Mesuere B. FragGeneScanRs: faster gene prediction for short reads. *BMC Bioinformatics* 23(1):198. [doi:10.1186/s12859-022-04736-5](https://doi.org/10.1186/s12859-022-04736-5)
 
-- **Varadhan & Roland 2008** — Varadhan R, Roland C. Simple and globally convergent methods for accelerating the convergence of any EM algorithm. *Scandinavian J Statistics* 35(2):335–353. [doi:10.1111/j.1467-9469.2007.00585.x](https://doi.org/10.1111/j.1467-9469.2007.00585.x)
+- **Varadhan & Roland 2008.** Varadhan R, Roland C. Simple and globally convergent methods for accelerating the convergence of any EM algorithm. *Scandinavian J Statistics* 35(2):335–353. [doi:10.1111/j.1467-9469.2007.00585.x](https://doi.org/10.1111/j.1467-9469.2007.00585.x)
 
 ---
 
 ## License
 
-MIT License — see LICENSE file for details.
+MIT License; see LICENSE file for details.
