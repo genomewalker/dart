@@ -603,8 +603,9 @@ struct ProteinAggregate {
     std::unordered_set<uint32_t> unique_starts;
     uint32_t min_start = UINT32_MAX;
     uint32_t max_start = 0;
-    double terminal_cov = 0.0;  // Alignment overlap in terminal windows
-    double middle_cov = 0.0;    // Alignment overlap in middle region
+    double left_cov = 0.0;   // Alignment overlap in left terminal window
+    double right_cov = 0.0;  // Alignment overlap in right terminal window
+    double middle_cov = 0.0; // Alignment overlap in middle region
     double sum_aln_len = 0.0;
     double sum_aln_len_sq = 0.0;
 
@@ -633,7 +634,14 @@ struct ProteinAggregate {
         const size_t mid_len = (static_cast<size_t>(tlen) > term_len)
             ? (static_cast<size_t>(tlen) - term_len)
             : 0;
-        const double term_mean = terminal_cov / static_cast<double>(term_len);
+        // Use min(left_mean, right_mean) instead of their average.
+        // This catches one-sided domain hits where reads pile up on only one
+        // terminus: an N-terminal domain hit has right_mean ≈ 0, so min ≈ 0
+        // and rho_norm << 1, correctly flagging it.  For authentic full-length
+        // hits, left_mean ≈ right_mean so min ≈ average and rho_norm ≈ 1.
+        const double left_mean = left_cov / static_cast<double>(edge);
+        const double right_mean = right_cov / static_cast<double>(edge);
+        const double term_mean = std::min(left_mean, right_mean);
         if (mid_len == 0) {
             return term_mean > 0.0 ? std::numeric_limits<float>::infinity() : 0.0f;
         }
@@ -643,8 +651,8 @@ struct ProteinAggregate {
         }
         const float observed = static_cast<float>(term_mean / mid_mean);
         // Normalise by the expected ratio for a real gene given mean read length.
-        // Without this, the raw ratio depends on read length and protein length
-        // rather than just whether reads avoid the termini.
+        // expected_terminal_ratio averages both edges; for symmetric authentic
+        // genes, left_mean ≈ right_mean so min ≈ average and normalisation holds.
         if (n_reads > 0) {
             const uint32_t R = static_cast<uint32_t>(sum_aln_len / static_cast<double>(n_reads));
             const float expected = expected_terminal_ratio(tlen, R);
@@ -854,22 +862,25 @@ struct GeneSummaryAccumulator {
         edge = std::min(edge, n / 2);
         if (edge == 0) return 0.0f;
 
-        double term_sum = 0.0;
+        double left_sum = 0.0, right_sum = 0.0;
         double mid_sum = 0.0;
-        size_t term_n = 0;
         size_t mid_n = 0;
         for (size_t i = 0; i < n; ++i) {
-            if (i < edge || i >= n - edge) {
-                term_sum += coverage[i];
-                ++term_n;
+            if (i < edge) {
+                left_sum += coverage[i];
+            } else if (i >= n - edge) {
+                right_sum += coverage[i];
             } else {
                 mid_sum += coverage[i];
                 ++mid_n;
             }
         }
 
-        if (term_n == 0) return 0.0f;
-        const double term_mean = term_sum / static_cast<double>(term_n);
+        // Use min(left_mean, right_mean) so that one-sided domain hits
+        // (where only one terminus is covered) are correctly flagged.
+        const double left_mean = left_sum / static_cast<double>(edge);
+        const double right_mean = right_sum / static_cast<double>(edge);
+        const double term_mean = std::min(left_mean, right_mean);
         if (mid_n == 0) {
             return term_mean > 0.0 ? std::numeric_limits<float>::infinity() : 0.0f;
         }
@@ -3290,8 +3301,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     const size_t mid_end = std::min(end, right_start);
                     if (mid_end > mid_start) middle_overlap = mid_end - mid_start;
                 }
-                agg.terminal_cov += static_cast<double>(gamma) *
-                                    static_cast<double>(left_overlap + right_overlap);
+                agg.left_cov += static_cast<double>(gamma) * static_cast<double>(left_overlap);
+                agg.right_cov += static_cast<double>(gamma) * static_cast<double>(right_overlap);
                 agg.middle_cov += static_cast<double>(gamma) * static_cast<double>(middle_overlap);
             }
         }
