@@ -351,6 +351,10 @@ EMState squarem_em(
     ReferenceStatsCollector* stats_collector,
     const EMProgressCallback& progress_cb)
 {
+    if (params.alpha_prior <= 0.0) {
+        throw std::invalid_argument("EMParams::alpha_prior must be > 0 (use 1.0 for MLE)");
+    }
+
     const uint32_t T = data.num_refs;
     const size_t A = data.alignments.size();
 
@@ -422,8 +426,9 @@ EMState squarem_em(
             alpha_used = alpha;
             squarem_extrapolate(w0.data(), r_buf.data(), v_buf.data(), T, alpha, params.min_weight);
 
-            // Stabilization step from canonical SQUAREM.
-            if (std::abs(alpha - 1.0) > 0.01) {
+            // Stabilization step from canonical SQUAREM (Varadhan & Roland 2008).
+            // Always applied after extrapolation to maintain monotonicity guarantee.
+            {
                 if (params.use_damage) {
                     e_step_damage_parallel(data, params, w0.data(), state.pi,
                         gamma_scratch.data(), gamma_ancient_scratch.data());
@@ -627,6 +632,7 @@ double streaming_e_step_rowgroup(
     const float* damage_score,
     const float* dmg_ll_a,    // Alignment-level log P(evidence | ancient)
     const float* dmg_ll_m,    // Alignment-level log P(evidence | modern)
+    const uint16_t* tlen,     // Reference length per alignment (for normalize_by_length)
     const double* weights,
     uint32_t num_refs,
     const agp::EMParams& params,
@@ -670,6 +676,9 @@ double streaming_e_step_rowgroup(
             for (uint32_t j = 0; j < deg; ++j) {
                 uint32_t idx = read_start + j;
                 double log_w = std::log(std::max(weights[ref_idx[idx]], params.min_weight));
+                if (params.normalize_by_length && tlen && tlen[idx] > 0) {
+                    log_w -= 0.5 * std::log(static_cast<double>(tlen[idx]));
+                }
                 double score_contrib = params.lambda_b * static_cast<double>(bit_score[idx]);
 
                 if (use_aln_dmg) {
@@ -706,8 +715,11 @@ double streaming_e_step_rowgroup(
             log_scores.resize(deg);
             for (uint32_t j = 0; j < deg; ++j) {
                 uint32_t idx = read_start + j;
-                log_scores[j] = std::log(std::max(weights[ref_idx[idx]], params.min_weight))
-                              + params.lambda_b * static_cast<double>(bit_score[idx]);
+                double log_w = std::log(std::max(weights[ref_idx[idx]], params.min_weight));
+                if (params.normalize_by_length && tlen && tlen[idx] > 0) {
+                    log_w -= 0.5 * std::log(static_cast<double>(tlen[idx]));
+                }
+                log_scores[j] = log_w + params.lambda_b * static_cast<double>(bit_score[idx]);
             }
 
             double lse = agp::log_sum_exp(log_scores.data(), deg);
@@ -755,6 +767,10 @@ StreamingEMResult streaming_em(
     const EMParams& params,
     const EMProgressCallback& progress_cb)
 {
+    if (params.alpha_prior <= 0.0) {
+        throw std::invalid_argument("EMParams::alpha_prior must be > 0 (use 1.0 for MLE)");
+    }
+
     StreamingEMResult result;
     result.num_reads = reader.num_reads();
     result.num_refs = reader.num_refs();
@@ -829,7 +845,7 @@ StreamingEMResult streaming_em(
             const uint16_t* /*qend*/,
             const uint16_t* /*tstart*/,
             const uint16_t* /*tend*/,
-            const uint16_t* /*tlen*/,
+            const uint16_t* tlen,
             const uint16_t* /*qlen*/,
             const uint16_t* /*mismatch*/,
             const uint16_t* /*gapopen*/
@@ -845,7 +861,7 @@ StreamingEMResult streaming_em(
 
             double local_ll = streaming_e_step_rowgroup(
                 num_rows, read_idx, ref_idx, bit_score, damage_score,
-                dmg_ll_a, dmg_ll_m,
+                dmg_ll_a, dmg_ll_m, tlen,
                 result.weights.data(), T, params, result.pi,
                 local_ref_sums, local_ref_sums_ancient
             );
@@ -930,15 +946,15 @@ void streaming_em_finalize(
         const float* /*evalue_log10*/,
         const uint16_t* /*dmg_k*/,
         const uint16_t* /*dmg_m*/,
-        const float* /*dmg_ll_a*/,
-        const float* /*dmg_ll_m*/,
+        const float* dmg_ll_a,
+        const float* dmg_ll_m,
         const uint16_t* /*identity_q*/,
         const uint16_t* /*aln_len*/,
         const uint16_t* /*qstart*/,
         const uint16_t* /*qend*/,
         const uint16_t* /*tstart*/,
         const uint16_t* /*tend*/,
-        const uint16_t* /*tlen*/,
+        const uint16_t* tlen,
         const uint16_t* /*qlen*/,
         const uint16_t* /*mismatch*/,
         const uint16_t* /*gapopen*/
@@ -963,15 +979,25 @@ void streaming_em_finalize(
             uint32_t deg = row - read_start;
 
             if (params.use_damage) {
+                const bool use_aln_dmg = params.use_alignment_damage_likelihood && dmg_ll_a && dmg_ll_m;
                 log_scores.resize(2 * deg);
                 for (uint32_t j = 0; j < deg; ++j) {
                     uint32_t idx = read_start + j;
                     double log_w = std::log(std::max(result.weights[ref_idx[idx]], params.min_weight));
+                    if (params.normalize_by_length && tlen && tlen[idx] > 0) {
+                        log_w -= 0.5 * std::log(static_cast<double>(tlen[idx]));
+                    }
                     double score_contrib = params.lambda_b * static_cast<double>(bit_score[idx]);
-                    double ds = std::clamp(static_cast<double>(damage_score[idx]), eps, 1.0 - eps);
 
-                    log_scores[2 * j]     = log_w + score_contrib + std::log(pi_a) + std::log(ds);
-                    log_scores[2 * j + 1] = log_w + score_contrib + std::log(1.0 - pi_a) + std::log(1.0 - ds);
+                    if (use_aln_dmg) {
+                        double p_read = std::clamp(static_cast<double>(damage_score[idx]), eps, 1.0 - eps);
+                        log_scores[2 * j]     = log_w + score_contrib + std::log(p_read) + dmg_ll_a[idx];
+                        log_scores[2 * j + 1] = log_w + score_contrib + std::log(1.0 - p_read) + dmg_ll_m[idx];
+                    } else {
+                        double ds = std::clamp(static_cast<double>(damage_score[idx]), eps, 1.0 - eps);
+                        log_scores[2 * j]     = log_w + score_contrib + std::log(pi_a) + std::log(ds);
+                        log_scores[2 * j + 1] = log_w + score_contrib + std::log(1.0 - pi_a) + std::log(1.0 - ds);
+                    }
                 }
 
                 double lse = log_sum_exp(log_scores.data(), 2 * deg);
@@ -990,8 +1016,11 @@ void streaming_em_finalize(
                 log_scores.resize(deg);
                 for (uint32_t j = 0; j < deg; ++j) {
                     uint32_t idx = read_start + j;
-                    log_scores[j] = std::log(std::max(result.weights[ref_idx[idx]], params.min_weight))
-                                  + params.lambda_b * static_cast<double>(bit_score[idx]);
+                    double log_w = std::log(std::max(result.weights[ref_idx[idx]], params.min_weight));
+                    if (params.normalize_by_length && tlen && tlen[idx] > 0) {
+                        log_w -= 0.5 * std::log(static_cast<double>(tlen[idx]));
+                    }
+                    log_scores[j] = log_w + params.lambda_b * static_cast<double>(bit_score[idx]);
                 }
 
                 double lse = log_sum_exp(log_scores.data(), deg);

@@ -456,8 +456,9 @@ inline EMState em_solve(
             alpha = std::clamp(alpha, step_min, step_max);
             squarem_extrapolate(w0.data(), r_buf.data(), v_buf.data(), T, alpha, params.min_weight);
 
-            // Stabilization step from canonical SQUAREM.
-            if (std::abs(alpha - 1.0) > 0.01) {
+            // Stabilization step from canonical SQUAREM (Varadhan & Roland 2008).
+            // Always applied after extrapolation to maintain monotonicity guarantee.
+            {
                 if (params.use_damage) {
                     e_step_damage(data, params, w0.data(), state.pi, state.gamma.data(), state.gamma_ancient.data());
                 } else {
