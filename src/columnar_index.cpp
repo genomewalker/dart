@@ -462,9 +462,16 @@ void ColumnarIndexWriter::add_alignment(const AlignmentRecord& rec) {
     impl_->buf_taln_data.insert(impl_->buf_taln_data.end(), rec.taln.begin(), rec.taln.end());
     impl_->buf_taln_offsets.push_back(static_cast<uint32_t>(impl_->buf_taln_data.size()));
 
-    // Flush row group if full
+    // Flush row group at read boundaries to avoid splitting a read's alignments
+    // across groups, which would corrupt per-read normalization in streaming EM.
+    // If a single read has more than 2*ROW_GROUP_SIZE alignments (pathological),
+    // we allow a mid-read split rather than accumulating unboundedly.
     if (impl_->buf_ref_idx.size() >= ROW_GROUP_SIZE) {
-        impl_->flush_row_group();
+        const bool at_read_boundary = impl_->buf_read_idx.empty() ||
+                                      (rec.read_idx != impl_->buf_read_idx.back());
+        if (at_read_boundary || impl_->buf_ref_idx.size() >= 2 * ROW_GROUP_SIZE) {
+            impl_->flush_row_group();
+        }
     }
 }
 
