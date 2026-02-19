@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="580" height="200" viewBox="0 0 580 200" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .bg      { fill: #ffffff; }
+      .band1   { fill: #e1f5fe; stroke: none; }
+      .band2   { fill: #f3e5f5; stroke: none; }
+      .box     { fill: #ffffff; stroke: #2d2d2d; stroke-width: 0.9; }
+      .box-in  { fill: #e3eef7; stroke: #2d2d2d; stroke-width: 0.9; }
+      .box-key { fill: #fdf4dc; stroke: #2d2d2d; stroke-width: 0.9; }
+      .box-out { fill: #e4f2e4; stroke: #2d2d2d; stroke-width: 0.9; }
+      .arrow   { fill: none; stroke: #2d2d2d; stroke-width: 0.9; marker-end: url(#arr); }
+      .arrow-v { fill: none; stroke: #5b5b5b; stroke-width: 1.2; stroke-dasharray: 4,2; marker-end: url(#arr-b); }
+      .title   { font-family: Helvetica,Arial,sans-serif; font-size: 9px; fill: #1a1a1a; text-anchor: middle; font-weight: 600; }
+      .sub     { font-family: Helvetica,Arial,sans-serif; font-size: 7px; fill: #555; text-anchor: middle; }
+      .band-lbl{ font-family: Helvetica,Arial,sans-serif; font-size: 8px; fill: #444; font-weight: 600; }
+    </style>
+    <marker id="arr"   markerWidth="5" markerHeight="4" refX="4" refY="2" orient="auto"><polygon points="0 0,5 2,0 4" fill="#2d2d2d"/></marker>
+    <marker id="arr-b" markerWidth="5" markerHeight="4" refX="4" refY="2" orient="auto"><polygon points="0 0,5 2,0 4" fill="#5b5b5b"/></marker>
+  </defs>
+
+  <rect width="580" height="200" class="bg"/>
+
+  <!-- Pass 1 band -->
+  <rect x="5"  y="20" width="570" height="75" rx="4" class="band1"/>
+  <text x="14" y="34" class="band-lbl">Pass 1 · Sample damage profiling</text>
+
+  <!-- Pass 2 band -->
+  <rect x="5"  y="110" width="570" height="82" rx="4" class="band2"/>
+  <text x="14" y="124" class="band-lbl">Pass 2 · Gene prediction</text>
+
+  <!-- ===== PASS 1 nodes ===== -->
+  <!-- FASTQ -->
+  <rect x="15"  y="42" width="62" height="40" rx="3" class="box-in"/>
+  <text x="46"  y="57" class="title">FASTQ</text>
+  <text x="46"  y="69" class="sub">aDNA reads</text>
+
+  <path d="M 79 62 L 95 62" class="arrow"/>
+
+  <!-- Channel A -->
+  <rect x="97"  y="42" width="72" height="40" rx="3" class="box"/>
+  <text x="133" y="57" class="title">Channel A</text>
+  <text x="133" y="69" class="sub">T/(T+C) at 5'</text>
+
+  <path d="M 171 62 L 187 62" class="arrow"/>
+
+  <!-- Channel B -->
+  <rect x="189" y="42" width="72" height="40" rx="3" class="box"/>
+  <text x="225" y="57" class="title">Channel B</text>
+  <text x="225" y="69" class="sub">stop conversion</text>
+
+  <path d="M 263 62 L 279 62" class="arrow"/>
+
+  <!-- Fit decay -->
+  <rect x="281" y="42" width="80" height="40" rx="3" class="box"/>
+  <text x="321" y="57" class="title">Fit decay</text>
+  <text x="321" y="69" class="sub">d_max · e^(−λp)</text>
+
+  <path d="M 363 62 L 379 62" class="arrow"/>
+
+  <!-- Validate -->
+  <rect x="381" y="42" width="72" height="40" rx="3" class="box"/>
+  <text x="417" y="57" class="title">Validate</text>
+  <text x="417" y="69" class="sub">A ∧ B → real dmg</text>
+
+  <path d="M 455 62 L 471 62" class="arrow"/>
+
+  <!-- SampleProfile -->
+  <rect x="473" y="42" width="96" height="40" rx="3" class="box-key"/>
+  <text x="521" y="57" class="title">SampleProfile</text>
+  <text x="521" y="69" class="sub">d_max, λ, library</text>
+
+  <!-- vertical arrow Pass1 → Pass2 -->
+  <path d="M 521 84 L 521 100 L 46 100 L 46 110" class="arrow-v"/>
+
+  <!-- ===== PASS 2 nodes ===== -->
+  <!-- FASTQ (shared) -->
+  <rect x="15"  y="130" width="62" height="40" rx="3" class="box-in"/>
+  <text x="46"  y="145" class="title">FASTQ</text>
+  <text x="46"  y="157" class="sub">same reads</text>
+
+  <path d="M 79 150 L 95 150" class="arrow"/>
+
+  <!-- Frame select -->
+  <rect x="97"  y="130" width="85" height="40" rx="3" class="box"/>
+  <text x="139" y="145" class="title">Frame select</text>
+  <text x="139" y="157" class="sub">damage-aware</text>
+
+  <path d="M 184 150 L 200 150" class="arrow"/>
+
+  <!-- Score -->
+  <rect x="202" y="130" width="80" height="40" rx="3" class="box"/>
+  <text x="242" y="145" class="title">Score ORFs</text>
+  <text x="242" y="157" class="sub">codon + hexamer</text>
+
+  <path d="M 284 150 L 300 150" class="arrow"/>
+
+  <!-- Stop rescue -->
+  <rect x="302" y="130" width="80" height="40" rx="3" class="box"/>
+  <text x="342" y="145" class="title">Stop rescue</text>
+  <text x="342" y="157" class="sub">X-mask damage stops</text>
+
+  <path d="M 384 150 L 400 150" class="arrow"/>
+
+  <!-- Output -->
+  <rect x="402" y="130" width="80" height="40" rx="3" class="box-out"/>
+  <text x="442" y="145" class="title">GFF3 + FAA</text>
+  <text x="442" y="157" class="sub">+ index.agd</text>
+</svg>

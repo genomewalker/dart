@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="660" height="110" viewBox="0 0 660 110" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      .bg { fill: #ffffff; }
+      .box-input  { fill: #e3eef7; stroke: #2d2d2d; stroke-width: 1; }
+      .box-proc   { fill: #f5f5f5; stroke: #2d2d2d; stroke-width: 1; }
+      .box-file   { fill: #fdf4dc; stroke: #2d2d2d; stroke-width: 1; }
+      .box-out    { fill: #e4f2e4; stroke: #2d2d2d; stroke-width: 1; }
+      .arrow      { fill: none; stroke: #2d2d2d; stroke-width: 0.9; marker-end: url(#arr); }
+      .arrow-d    { fill: none; stroke: #888; stroke-width: 0.8; stroke-dasharray: 3,2; marker-end: url(#arr-g); }
+      .title      { font-family: Helvetica,Arial,sans-serif; font-size: 9.5px; fill: #1a1a1a; text-anchor: middle; font-weight: 600; }
+      .sub        { font-family: Helvetica,Arial,sans-serif; font-size: 7.5px; fill: #555; text-anchor: middle; }
+    </style>
+    <marker id="arr"   markerWidth="5" markerHeight="4" refX="4" refY="2" orient="auto"><polygon points="0 0,5 2,0 4" fill="#2d2d2d"/></marker>
+    <marker id="arr-g" markerWidth="4" markerHeight="3" refX="3" refY="1.5" orient="auto"><polygon points="0 0,4 1.5,0 3" fill="#888"/></marker>
+  </defs>
+
+  <rect width="660" height="110" class="bg"/>
+
+  <!-- nodes: x-centers at 45, 145, 255, 340, 430, 530, 620 -->
+
+  <!-- reads.fq.gz -->
+  <rect x="5"   y="35" width="80" height="38" rx="3" class="box-input"/>
+  <text x="45"  y="51" class="title">reads.fq.gz</text>
+  <text x="45"  y="64" class="sub">aDNA reads</text>
+
+  <path d="M 87 54 L 103 54" class="arrow"/>
+
+  <!-- agp predict -->
+  <rect x="105" y="35" width="80" height="38" rx="3" class="box-proc"/>
+  <text x="145" y="51" class="title">agp predict</text>
+  <text x="145" y="64" class="sub">frame select + score</text>
+
+  <path d="M 187 54 L 203 54" class="arrow"/>
+
+  <!-- proteins.faa / index.agd (two outputs stacked) -->
+  <rect x="205" y="18" width="70" height="28" rx="3" class="box-file"/>
+  <text x="240" y="30" class="title">proteins.faa</text>
+  <text x="240" y="40" class="sub">translated</text>
+
+  <rect x="205" y="54" width="70" height="28" rx="3" class="box-file"/>
+  <text x="240" y="66" class="title">index.agd</text>
+  <text x="240" y="76" class="sub">damage index</text>
+
+  <!-- proteins.faa → MMseqs2 -->
+  <path d="M 277 32 L 313 32" class="arrow"/>
+  <!-- index.agd → hits2emi (dashed) -->
+  <path d="M 277 68 L 417 68" class="arrow-d"/>
+
+  <!-- MMseqs2 search -->
+  <rect x="315" y="18" width="80" height="28" rx="3" class="box-proc"/>
+  <text x="355" y="30" class="title">MMseqs2</text>
+  <text x="355" y="40" class="sub">protein search</text>
+
+  <path d="M 397 32 L 413 32" class="arrow"/>
+
+  <!-- hits.tsv -->
+  <rect x="415" y="18" width="60" height="28" rx="3" class="box-file"/>
+  <text x="445" y="30" class="title">hits.tsv</text>
+  <text x="445" y="40" class="sub">raw alignments</text>
+
+  <!-- hits.tsv → hits2emi (down then right) -->
+  <path d="M 445 47 L 445 54" class="arrow"/>
+
+  <!-- agp hits2emi -->
+  <rect x="415" y="54" width="60" height="28" rx="3" class="box-proc"/>
+  <text x="445" y="66" class="title">hits2emi</text>
+  <text x="445" y="76" class="sub">columnar index</text>
+
+  <path d="M 477 68 L 493 68" class="arrow"/>
+
+  <!-- hits.emi -->
+  <rect x="495" y="54" width="60" height="28" rx="3" class="box-file"/>
+  <text x="525" y="66" class="title">hits.emi</text>
+  <text x="525" y="76" class="sub">EMI format</text>
+
+  <path d="M 557 68 L 573 68" class="arrow"/>
+
+  <!-- damage-annotate -->
+  <rect x="575" y="54" width="80" height="28" rx="3" class="box-proc"/>
+  <text x="615" y="66" class="title">damage-annotate</text>
+  <text x="615" y="76" class="sub">Bayesian scoring + EM</text>
+
+  <!-- output arrow down -->
+  <path d="M 615 84 L 615 95" class="arrow"/>
+  <rect x="575" y="87" width="80" height="20" rx="3" class="box-out"/>
+  <text x="615" y="100" class="title">annotated_hits.tsv</text>
+</svg>
