@@ -42,6 +42,10 @@ struct EMParams {
     double alpha_prior = 1.0;
     bool normalize_by_length = false;  // Apply -0.5*log(ref_length) in E-step scores
                                        // Penalizes longer references in a proper objective
+
+    // Optional initial weights for warm-starting EM (e.g., from coverage-aware outer loop).
+    // If non-empty, must have size == num_refs. EM initializes from these instead of uniform.
+    std::vector<double> initial_weights;
 };
 
 // Per-alignment record: one read mapping to one reference
@@ -53,6 +57,8 @@ struct Alignment {
     float damage_ll_a;           // alignment-level log P(evidence | ancient)
     float damage_ll_m;           // alignment-level log P(evidence | modern)
     float fident;                // alignment identity fraction (0-1)
+    uint16_t tstart = 0;         // 0-based alignment start on reference (for coverage-EM)
+    uint16_t aln_len = 0;        // alignment length on reference (for coverage-EM)
 };
 
 // Sparse alignment storage: CSR-like layout grouped by read

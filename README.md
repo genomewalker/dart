@@ -275,6 +275,8 @@ See [Output Formats](https://github.com/genomewalker/agp/wiki/Output-Formats) on
 
 ## Benchmark
 
+### Gene prediction
+
 Benchmarked on 18.3 million synthetic ancient DNA reads from the KapK community (10 samples). A prediction is correct if it matches any reference protein at ≥90% sequence identity.
 
 | Method | Recall | Precision | Avg Identity |
@@ -283,11 +285,35 @@ Benchmarked on 18.3 million synthetic ancient DNA reads from the KapK community 
 | MMseqs2 blastx [Steinegger & Söding 2017] | **68.5%** | 96.3% | 94.8% |
 | FGS-rs [Van der Jeugt et al. 2022] | 19.1% | 95.3% | 94.2% |
 
-AGP and BLASTX have equivalent functional recall (~68%), both far exceeding FGS-rs (19%), which treats damage-induced stop codons as real stops. AGP produces 1.4% higher identity hits than BLASTX and runs ~1.5× faster (~35,000 reads/s, 8 threads). Full damage classification benchmarks: [wiki/Benchmarks](https://github.com/genomewalker/agp/wiki/Benchmarks).
+AGP and BLASTX have equivalent functional recall (~68%), both far exceeding FGS-rs (19%), which treats damage-induced stop codons as real stops. AGP produces 1.4% higher identity hits than BLASTX and runs ~1.5× faster (~35,000 reads/s, 8 threads).
 
 <p align="center">
 <img src="docs/benchmark_comparison.png" width="700" alt="Method comparison: AGP, BLASTX, FGS-rs">
 </p>
+
+### Damage classification
+
+Protein-level damage classification benchmarked on the same 10 KapK synthetic samples. Each protein is labelled ancient or modern based on the origin of its supporting reads (≥80% purity, ≥5 reads). Score: `assign_mean_posterior` from `damage-annotate`.
+
+| Group | AUC-ROC |
+|-------|---------|
+| Overall | **0.873** |
+| AT-rich samples | **0.945** |
+| GC-rich samples | **0.934** |
+
+At the Youden-optimal threshold τ = 0.70: **Precision 99.2%, Recall 86.2%, F1 = 0.923**.
+
+<p align="center">
+<img src="docs/protein_benchmark.png" width="700" alt="Protein-level damage classification: ROC curves and precision/recall">
+</p>
+
+Read-level damage classification (per-read `posterior` score):
+
+<p align="center">
+<img src="docs/read_benchmark.png" width="700" alt="Read-level damage classification benchmark">
+</p>
+
+Full benchmark details: [wiki/Benchmarks](https://github.com/genomewalker/agp/wiki/Benchmarks).
 
 ---
 

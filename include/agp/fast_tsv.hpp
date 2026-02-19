@@ -48,11 +48,7 @@ public:
 
         data_ = static_cast<const char*>(
             mmap(nullptr, size_, PROT_READ,
-                 MAP_PRIVATE
-#ifdef MAP_POPULATE
-                 | MAP_POPULATE
-#endif
-                 , fd_, 0));
+                 MAP_PRIVATE, fd_, 0));
         if (data_ == MAP_FAILED) {
             close(fd_);
             fd_ = -1;

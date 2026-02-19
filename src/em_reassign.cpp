@@ -13,8 +13,10 @@
 #include "agp/damage_index_reader.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <iostream>
+#include <thread>
 #include <vector>
 
 #ifdef _OPENMP
@@ -66,6 +68,13 @@ AlignmentData build_alignment_data(
         a.damage_ll_a = ca.damage_ll_a;
         a.damage_ll_m = ca.damage_ll_m;
         a.fident = static_cast<float>(ca.identity_q) / 65535.0f;
+        a.tstart = ca.aln_start;
+        const uint32_t aln_end32 = static_cast<uint32_t>(ca.aln_end);
+        const uint32_t aln_start32 = static_cast<uint32_t>(ca.aln_start);
+        a.aln_len = static_cast<uint16_t>(
+            (aln_end32 > aln_start32)
+                ? std::min(aln_end32 - aln_start32, uint32_t(65535))
+                : 0u);
         const uint32_t tlen_hint = static_cast<uint32_t>(ca.flags);
         const uint32_t end_hint = static_cast<uint32_t>(ca.aln_end);
         const uint32_t ref_len = (tlen_hint > 0) ? tlen_hint : end_hint;
@@ -368,7 +377,14 @@ EMState squarem_em(
         state.iterations = 0;
         return state;
     }
-    state.weights.assign(T, 1.0 / static_cast<double>(T));
+    if (!params.initial_weights.empty() && params.initial_weights.size() == T) {
+        state.weights = params.initial_weights;
+        double sum = 0.0;
+        for (double w : state.weights) sum += w;
+        if (sum > 0.0) for (double& w : state.weights) w /= sum;
+    } else {
+        state.weights.assign(T, 1.0 / static_cast<double>(T));
+    }
 
     // SQUAREM scratch buffers
     std::vector<double> w0(T), w1(T), w2(T), r_buf(T), v_buf(T);
@@ -622,6 +638,19 @@ std::vector<std::pair<uint32_t, float>> reassign_reads(
 
 namespace {
 
+// Cache 0.5*log(len) for uint16 lengths to avoid repeated logs in streaming hot loops.
+inline double half_log_tlen(uint16_t len) {
+    static const std::array<double, 65536> lut = []() {
+        std::array<double, 65536> a{};
+        a[0] = 0.0;
+        for (size_t i = 1; i < a.size(); ++i) {
+            a[i] = 0.5 * std::log(static_cast<double>(i));
+        }
+        return a;
+    }();
+    return lut[len];
+}
+
 // Per-row-group E-step: compute gamma and accumulate to ref_sums
 // Returns partial log-likelihood for this row group
 double streaming_e_step_rowgroup(
@@ -633,7 +662,7 @@ double streaming_e_step_rowgroup(
     const float* dmg_ll_a,    // Alignment-level log P(evidence | ancient)
     const float* dmg_ll_m,    // Alignment-level log P(evidence | modern)
     const uint16_t* tlen,     // Reference length per alignment (for normalize_by_length)
-    const double* weights,
+    const double* log_weights,
     uint32_t num_refs,
     const agp::EMParams& params,
     double pi_ancient,
@@ -645,7 +674,7 @@ double streaming_e_step_rowgroup(
     double ll = 0.0;
 
     // Check pointers
-    if (!read_idx || !ref_idx || !bit_score || !damage_score || !weights) {
+    if (!read_idx || !ref_idx || !bit_score || !damage_score || !log_weights) {
         return 0.0;
     }
 
@@ -675,9 +704,9 @@ double streaming_e_step_rowgroup(
             log_scores.resize(2 * deg);
             for (uint32_t j = 0; j < deg; ++j) {
                 uint32_t idx = read_start + j;
-                double log_w = std::log(std::max(weights[ref_idx[idx]], params.min_weight));
+                double log_w = log_weights[ref_idx[idx]];
                 if (params.normalize_by_length && tlen && tlen[idx] > 0) {
-                    log_w -= 0.5 * std::log(static_cast<double>(tlen[idx]));
+                    log_w -= half_log_tlen(tlen[idx]);
                 }
                 double score_contrib = params.lambda_b * static_cast<double>(bit_score[idx]);
 
@@ -715,9 +744,9 @@ double streaming_e_step_rowgroup(
             log_scores.resize(deg);
             for (uint32_t j = 0; j < deg; ++j) {
                 uint32_t idx = read_start + j;
-                double log_w = std::log(std::max(weights[ref_idx[idx]], params.min_weight));
+                double log_w = log_weights[ref_idx[idx]];
                 if (params.normalize_by_length && tlen && tlen[idx] > 0) {
-                    log_w -= 0.5 * std::log(static_cast<double>(tlen[idx]));
+                    log_w -= half_log_tlen(tlen[idx]);
                 }
                 log_scores[j] = log_w + params.lambda_b * static_cast<double>(bit_score[idx]);
             }
@@ -785,8 +814,15 @@ StreamingEMResult streaming_em(
         return result;
     }
 
-    // Initialize weights uniformly - O(T) memory
-    result.weights.assign(T, 1.0 / static_cast<double>(T));
+    // Initialize weights - use initial_weights if provided, otherwise uniform
+    if (!params.initial_weights.empty() && params.initial_weights.size() == T) {
+        result.weights = params.initial_weights;
+        double sum = 0.0;
+        for (double w : result.weights) sum += w;
+        if (sum > 0.0) for (double& w : result.weights) w /= sum;
+    } else {
+        result.weights.assign(T, 1.0 / static_cast<double>(T));
+    }
     result.pi = 0.1;
 
     // Thread-local accumulators for parallel row group processing
@@ -799,8 +835,11 @@ StreamingEMResult streaming_em(
         num_threads = omp_get_num_threads();
     }
 #endif
-    // Cap at reasonable value to prevent excessive memory use
-    num_threads = std::min(num_threads, 256);
+    // Cap at hardware concurrency to prevent excessive memory use
+    const int hw_threads = static_cast<int>(std::thread::hardware_concurrency());
+    if (hw_threads > 0) {
+        num_threads = std::min(num_threads, hw_threads);
+    }
 
     std::vector<std::vector<double>> thread_ref_sums(num_threads);
     std::vector<std::vector<double>> thread_ref_sums_ancient(num_threads);
@@ -813,6 +852,11 @@ StreamingEMResult streaming_em(
 
     double prev_ll = -std::numeric_limits<double>::infinity();
 
+    // Pre-allocate buffers outside iteration loop
+    std::vector<double> log_weights(T, 0.0);
+    std::vector<double> ref_sums(T, 0.0);
+    std::vector<double> ref_sums_ancient(T, 0.0);
+
     for (uint32_t iter = 0; iter < params.max_iters; ++iter) {
         // Clear accumulators
         for (int t = 0; t < num_threads; ++t) {
@@ -820,6 +864,10 @@ StreamingEMResult streaming_em(
             if (params.use_damage) {
                 std::fill(thread_ref_sums_ancient[t].begin(), thread_ref_sums_ancient[t].end(), 0.0);
             }
+        }
+
+        for (uint32_t t = 0; t < T; ++t) {
+            log_weights[t] = std::log(std::max(result.weights[t], params.min_weight));
         }
 
         std::atomic<double> total_ll{0.0};
@@ -862,18 +910,18 @@ StreamingEMResult streaming_em(
             double local_ll = streaming_e_step_rowgroup(
                 num_rows, read_idx, ref_idx, bit_score, damage_score,
                 dmg_ll_a, dmg_ll_m, tlen,
-                result.weights.data(), T, params, result.pi,
+                log_weights.data(), T, params, result.pi,
                 local_ref_sums, local_ref_sums_ancient
             );
 
-            // Atomic add to total
-            double expected = total_ll.load();
-            while (!total_ll.compare_exchange_weak(expected, expected + local_ll)) {}
+            total_ll.fetch_add(local_ll, std::memory_order_relaxed);
         });
 
-        // Merge thread-local accumulators
-        std::vector<double> ref_sums(T, 0.0);
-        std::vector<double> ref_sums_ancient(T, 0.0);
+        // Merge thread-local accumulators into pre-allocated buffers
+        std::fill(ref_sums.begin(), ref_sums.end(), 0.0);
+        if (params.use_damage) {
+            std::fill(ref_sums_ancient.begin(), ref_sums_ancient.end(), 0.0);
+        }
         for (int t = 0; t < num_threads; ++t) {
             for (uint32_t r = 0; r < T; ++r) {
                 ref_sums[r] += thread_ref_sums[t][r];
@@ -934,6 +982,10 @@ void streaming_em_finalize(
 {
     const double eps = 1e-12;
     const double pi_a = std::clamp(result.pi, eps, 1.0 - eps);
+    std::vector<double> log_weights(result.weights.size(), 0.0);
+    for (size_t t = 0; t < result.weights.size(); ++t) {
+        log_weights[t] = std::log(std::max(result.weights[t], params.min_weight));
+    }
 
     // Process each row group and compute final gamma
     reader.parallel_scan([&](
@@ -983,9 +1035,9 @@ void streaming_em_finalize(
                 log_scores.resize(2 * deg);
                 for (uint32_t j = 0; j < deg; ++j) {
                     uint32_t idx = read_start + j;
-                    double log_w = std::log(std::max(result.weights[ref_idx[idx]], params.min_weight));
+                    double log_w = log_weights[ref_idx[idx]];
                     if (params.normalize_by_length && tlen && tlen[idx] > 0) {
-                        log_w -= 0.5 * std::log(static_cast<double>(tlen[idx]));
+                        log_w -= half_log_tlen(tlen[idx]);
                     }
                     double score_contrib = params.lambda_b * static_cast<double>(bit_score[idx]);
 
@@ -1016,9 +1068,9 @@ void streaming_em_finalize(
                 log_scores.resize(deg);
                 for (uint32_t j = 0; j < deg; ++j) {
                     uint32_t idx = read_start + j;
-                    double log_w = std::log(std::max(result.weights[ref_idx[idx]], params.min_weight));
+                    double log_w = log_weights[ref_idx[idx]];
                     if (params.normalize_by_length && tlen && tlen[idx] > 0) {
-                        log_w -= 0.5 * std::log(static_cast<double>(tlen[idx]));
+                        log_w -= half_log_tlen(tlen[idx]);
                     }
                     log_scores[j] = log_w + params.lambda_b * static_cast<double>(bit_score[idx]);
                 }
