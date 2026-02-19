@@ -543,6 +543,40 @@ static std::string generate_corrected_protein(
     return corrected;
 }
 
+// Expected terminal/middle coverage ratio for a uniformly-sampled gene.
+//
+// Short reads (length R) systematically under-cover protein termini: position p
+// can only be reached by reads starting in [max(0, p-R+1), min(p, L-R)], so
+// terminal positions have fewer covering read starts than interior positions.
+// This function computes the theoretical ratio for a real gene so that
+// terminal_middle_ratio() can be normalised to ~1.0 regardless of R or L.
+// Results are cached because (L, R) repeat frequently across proteins.
+static float expected_terminal_ratio(uint32_t L, uint32_t R) {
+    if (L < 4 || R == 0) return 1.0f;
+    R = std::min(R, L);
+
+    static std::unordered_map<uint64_t, float> cache;
+    const uint64_t key = (static_cast<uint64_t>(L) << 16) | R;
+    const auto it = cache.find(key);
+    if (it != cache.end()) return it->second;
+
+    const uint32_t edge = std::max(1u, std::min(L / 10u, L / 2u));
+    double term_sum = 0.0, mid_sum = 0.0;
+    uint32_t term_n = 0, mid_n = 0;
+    for (uint32_t p = 0; p < L; ++p) {
+        const uint32_t s_min = (p + 1 >= R) ? (p + 1 - R) : 0u;
+        const uint32_t s_max = (L >= R) ? std::min(p, L - R) : 0u;
+        const uint32_t cnt = (s_max >= s_min) ? (s_max - s_min + 1) : 0u;
+        if (p < edge || p >= L - edge) { term_sum += cnt; ++term_n; }
+        else                           { mid_sum  += cnt; ++mid_n;  }
+    }
+    const float ratio = (mid_n > 0 && mid_sum > 0.0)
+        ? static_cast<float>((term_sum / term_n) / (mid_sum / mid_n))
+        : 1.0f;
+    cache.emplace(key, ratio);
+    return ratio;
+}
+
 // Per-protein aggregated damage summary
 struct ProteinAggregate {
     std::string protein_id;
@@ -607,7 +641,16 @@ struct ProteinAggregate {
         if (mid_mean <= 0.0) {
             return term_mean > 0.0 ? std::numeric_limits<float>::infinity() : 0.0f;
         }
-        return static_cast<float>(term_mean / mid_mean);
+        const float observed = static_cast<float>(term_mean / mid_mean);
+        // Normalise by the expected ratio for a real gene given mean read length.
+        // Without this, the raw ratio depends on read length and protein length
+        // rather than just whether reads avoid the termini.
+        if (n_reads > 0) {
+            const uint32_t R = static_cast<uint32_t>(sum_aln_len / static_cast<double>(n_reads));
+            const float expected = expected_terminal_ratio(tlen, R);
+            if (expected > 0.01f) return observed / expected;
+        }
+        return observed;
     }
 
     float avg_aln_len() const {
@@ -797,8 +840,13 @@ struct GeneSummaryAccumulator {
         return std::sqrt(start_diversity() * start_span());
     }
 
-    // Terminal/middle coverage ratio.
-    // Low values indicate reads concentrated in the middle (typical spurious motif hits).
+    // Terminal/middle coverage ratio, normalised by the expected ratio for a
+    // real gene given mean read alignment length.  Raw ratio depends on both
+    // protein length and read length even for authentic genes (short reads
+    // under-cover termini geometrically); normalisation makes the metric
+    // comparable across proteins and datasets.  A value ~1.0 indicates
+    // terminal coverage consistent with a real gene; <<1.0 indicates reads
+    // avoiding both ends (typical interior domain / conserved motif hit).
     float terminal_middle_ratio() const {
         if (coverage.empty()) return 0.0f;
         const size_t n = coverage.size();
@@ -829,7 +877,13 @@ struct GeneSummaryAccumulator {
         if (mid_mean <= 0.0) {
             return term_mean > 0.0 ? std::numeric_limits<float>::infinity() : 0.0f;
         }
-        return static_cast<float>(term_mean / mid_mean);
+        const float observed = static_cast<float>(term_mean / mid_mean);
+        if (n_reads > 0) {
+            const uint32_t R = static_cast<uint32_t>(sum_aln_len / static_cast<double>(n_reads));
+            const float expected = expected_terminal_ratio(static_cast<uint32_t>(n), R);
+            if (expected > 0.01f) return observed / expected;
+        }
+        return observed;
     }
 
     // Effective read count (sum of gamma weights)

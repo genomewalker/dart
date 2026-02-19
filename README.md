@@ -630,7 +630,7 @@ $$\rho = \frac{\bar{c}_{\mathrm{term}}}{\bar{c}_{\mathrm{mid}}}$$
 
 where the terminal zone width is $e = \mathrm{clamp}(\lfloor L/10 \rfloor,\; 1,\; \lfloor L/2 \rfloor)$ residues at each end. Coverage is accumulated as the EM-weighted sum of alignment overlaps with each zone.
 
-**Important caveat:** short reads ($R$ aa) create a geometric under-coverage of the terminal zone even for real genes, because a read can only cover terminal position $p$ if it starts within $p$ residues of the end. For typical aDNA reads (15–50 aa) on a 300 aa protein, the expected $\rho$ for a real gene with uniform read distribution is roughly $0.5$–$0.7$, not 1.0. The filter threshold must be set well below this geometric baseline. The auto-calibrated default uses the 5th percentile of well-supported real genes in the dataset to account for this. Setting `--min-terminal-ratio` by hand without awareness of read length and protein length distribution will produce false rejections.
+The raw ratio is **normalised** by the theoretically expected ratio for a real gene given the observed mean read alignment length $R$. Without this, short reads (15–50 aa) systematically under-cover terminal positions — a read can only reach position $p$ if it starts within $p$ residues of the terminus — making the raw ratio $0.5$–$0.7$ even for authentic genes. After normalisation, $\rho \approx 1.0$ for real genes regardless of protein length or read length, and $\rho \ll 1$ for interior domain hits.
 
 ```
      reference protein
@@ -638,11 +638,11 @@ where the terminal zone width is $e = \mathrm{clamp}(\lfloor L/10 \rfloor,\; 1,\
 
 Spurious (interior domain):
      |..........|##############################|..........|
-     c_term ~ 0.5,  c_mid ~ 7,  rho = 0.5 / 7 = 0.07   FAIL
+     c_term ~ 0.5,  c_mid ~ 7,  rho_normalised = 0.07 / 0.68 = 0.10   FAIL
 
 Authentic (real gene):
      |##########|##############################|##########|
-     c_term ~ 14,  c_mid ~ 20,  rho = 14 / 20 = 0.68   PASS
+     c_term ~ 14,  c_mid ~ 20,  rho_normalised = 0.68 / 0.68 = 1.00   PASS
 ```
 
 The two filters are complementary: the positional score catches reads piled at any single location on the protein, while the terminal ratio catches reads that collectively avoid both ends.
