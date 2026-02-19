@@ -366,6 +366,130 @@ SequenceReader::Format SequenceReader::get_format() const {
     return impl_->format_;
 }
 
+// SequenceWriter implementation
+class SequenceWriter::Impl {
+public:
+    std::ofstream file_;
+    FILE* pipe_file_ = nullptr;
+    bool use_pigz_ = false;
+    bool is_fastq_ = false;
+    bool format_locked_ = false;
+    static constexpr size_t BUFFER_SIZE = 1024 * 1024;  // 1MB buffer
+    char buffer_[BUFFER_SIZE];
+
+    void write(const char* data, size_t len) {
+        if (use_pigz_) {
+            fwrite(data, 1, len, pipe_file_);
+        } else {
+            file_.write(data, len);
+        }
+    }
+
+    void write(const std::string& str) {
+        write(str.c_str(), str.size());
+    }
+
+    void write_fasta_wrapped(const std::string& sequence) {
+        const char* seq_data = sequence.c_str();
+        const size_t seq_len = sequence.length();
+        for (size_t i = 0; i < seq_len; i += 80) {
+            const size_t line_len = std::min(size_t(80), seq_len - i);
+            write(seq_data + i, line_len);
+            write("\n", 1);
+        }
+    }
+};
+
+SequenceWriter::SequenceWriter(const std::string& filename, bool compress)
+    : impl_(std::make_unique<Impl>()) {
+
+    const bool want_gzip = compress ||
+        (filename.size() > 3 && filename.substr(filename.size() - 3) == ".gz");
+
+    if (want_gzip && command_exists("pigz")) {
+        std::string cmd = "pigz -c > " + shell_escape(filename);
+        impl_->pipe_file_ = popen(cmd.c_str(), "w");
+        if (impl_->pipe_file_) {
+            impl_->use_pigz_ = true;
+            setvbuf(impl_->pipe_file_, nullptr, _IOFBF, GZBUF_SIZE);
+            return;
+        }
+    }
+
+    std::string out_filename = filename;
+    if (want_gzip && !command_exists("pigz") &&
+        filename.size() > 3 && filename.substr(filename.size() - 3) == ".gz") {
+        out_filename = filename.substr(0, filename.size() - 3);
+        std::cerr << "Warning: pigz not found, writing uncompressed to " << out_filename << "\n";
+    }
+
+    impl_->file_.open(out_filename);
+    if (!impl_->file_) {
+        throw std::runtime_error("Failed to open sequence output file: " + out_filename);
+    }
+    impl_->file_.rdbuf()->pubsetbuf(impl_->buffer_, SequenceWriter::Impl::BUFFER_SIZE);
+}
+
+SequenceWriter::~SequenceWriter() {
+    if (impl_) {
+        close();
+    }
+}
+
+void SequenceWriter::write(const SequenceRecord& record) {
+    const bool record_is_fastq = !record.quality.empty();
+
+    if (!impl_->format_locked_) {
+        impl_->format_locked_ = true;
+        impl_->is_fastq_ = record_is_fastq;
+    } else if (impl_->is_fastq_ != record_is_fastq) {
+        throw std::runtime_error("SequenceWriter cannot mix FASTA and FASTQ records");
+    }
+
+    if (impl_->is_fastq_) {
+        if (record.quality.size() != record.sequence.size()) {
+            throw std::runtime_error(
+                "FASTQ quality length must match sequence length for record: " + record.id);
+        }
+        impl_->write("@", 1);
+        impl_->write(record.id);
+        if (!record.description.empty()) {
+            impl_->write(" ", 1);
+            impl_->write(record.description);
+        }
+        impl_->write("\n", 1);
+        impl_->write(record.sequence);
+        impl_->write("\n+\n", 3);
+        impl_->write(record.quality);
+        impl_->write("\n", 1);
+        return;
+    }
+
+    impl_->write(">", 1);
+    impl_->write(record.id);
+    if (!record.description.empty()) {
+        impl_->write(" ", 1);
+        impl_->write(record.description);
+    }
+    impl_->write("\n", 1);
+    impl_->write_fasta_wrapped(record.sequence);
+}
+
+void SequenceWriter::write_all(const std::vector<SequenceRecord>& records) {
+    for (const auto& record : records) {
+        write(record);
+    }
+}
+
+void SequenceWriter::close() {
+    if (impl_->use_pigz_ && impl_->pipe_file_) {
+        pclose(impl_->pipe_file_);
+        impl_->pipe_file_ = nullptr;
+    } else if (impl_->file_.is_open()) {
+        impl_->file_.close();
+    }
+}
+
 // GeneWriter implementation
 class GeneWriter::Impl {
 public:

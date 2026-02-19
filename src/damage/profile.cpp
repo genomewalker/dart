@@ -100,9 +100,12 @@ DamageProfile DamageModel::create_profile(size_t seq_len) const {
 }
 
 const DamageProfile& DamageModel::create_profile_cached(size_t seq_len) const {
-    // Clamp to cache size
+    // Large reads are rare and can exceed the fixed cache domain.
+    // Build them per-thread to avoid out-of-bounds profile use.
     if (seq_len >= profile_cache_.size()) {
-        seq_len = profile_cache_.size() - 1;
+        static thread_local DamageProfile large_profile;
+        large_profile = create_profile(seq_len);
+        return large_profile;
     }
 
     // Lock before both read and write to avoid races on optional storage.

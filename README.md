@@ -82,27 +82,81 @@ make -j$(nproc)
 
 ---
 
+## Documentation scope
+
+- **README (this file):** installation, quick intro, command usage, and output schemas.
+- **Wiki:** long-form methods derivations, benchmark deep dives, and figure-heavy discussion.
+
+If you maintain both, keep CLI behavior and examples in README, and move evolving narrative analysis to the wiki: `https://github.com/genomewalker/agp/wiki`.
+
+---
+
 ## Quick start
 
-### Sample damage assessment
+### 5-minute tutorial run (recommended)
 
-Before gene prediction, check whether the sample shows authentic ancient damage:
+AGP ships a reproducible tutorial in `examples/tutorial/` with:
+- `reads.fq.gz` (KapK synthetic ancient reads)
+- `ref_proteins.faa.gz` (matched reference subset)
+- `run_tutorial.sh` (end-to-end pipeline)
+- `data/benchmark_summary.tsv` (benchmark-derived fixture used for docs/tests)
+
+Run it:
+
+```bash
+cd examples/tutorial
+AGP=../../build/agp DB=./ref_proteins.faa.gz bash run_tutorial.sh
+```
+
+Equivalent core commands (from `run_tutorial.sh`):
+
+```bash
+# 1) predict
+agp predict -i reads.fq.gz -o out/predictions.gff \
+  --fasta-aa out/proteins.faa --damage-index out/predictions.agd --adaptive -t 8
+
+# 2) search
+mmseqs easy-search out/proteins.faa ref_proteins.faa.gz out/hits.tsv out/tmp \
+  --format-output "query,target,fident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits,qlen,tlen,qaln,taln" \
+  --threads 8
+
+# 3) build EMI
+agp hits2emi -i out/hits.tsv -o out/hits.emi --damage-index out/predictions.agd -t 8
+
+# 4) damage annotation
+agp damage-annotate --emi out/hits.emi --damage-index out/predictions.agd \
+  -o out/annotated.tsv --gene-summary out/gene_summary.tsv --auto-calibrate-spurious -t 8
+```
+
+### Sample damage assessment only
+
+If you only want a fast sample-level damage profile:
 
 ```bash
 agp sample-damage reads.fq.gz
 ```
 
-Output (JSON):
+Output (JSON, current schema):
 ```json
 {
-  "d_max": 0.25,
-  "lambda": 0.3,
-  "damage_validated": true,
-  "library_type": "double-stranded"
+  "version": "0.3.0",
+  "input": "reads.fq.gz",
+  "domain": "gtdb",
+  "sequences": 50000,
+  "damage": {
+    "level": "HIGH DAMAGE",
+    "d_max": 16.3,
+    "lambda_5prime": 0.480,
+    "lambda_3prime": 0.480,
+    "damage_validated": true,
+    "library_type": "double-stranded"
+  }
 }
 ```
 
-### Full functional profiling pipeline
+Note: `d_max` values in `sample-damage` JSON are reported as percentages (0-100), not fractions.
+
+### Full functional profiling pipeline (custom data)
 
 ```bash
 # 1. Predict genes with damage model (produces proteins and damage index)
@@ -113,7 +167,6 @@ agp predict -i reads.fq.gz -o out.gff \
 
 # 2. Search against a reference database with aDNA-optimized settings
 mmseqs easy-search search.faa kegg_genes.faa hits.tsv tmp/ \
-    --sub-mat VTML20.out \
     --format-output "query,target,fident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits,qlen,tlen,qaln,taln"
 
 # 3. Convert hits to columnar index (embeds damage probabilities)
@@ -124,6 +177,7 @@ agp damage-annotate --emi hits.emi -o annotated_hits.tsv -t 16
 ```
 
 The `--fasta-aa-masked` output replaces damage-induced stop codons with X so MMseqs2 can align across them.
+If you have a VTML20 matrix, you can add `--sub-mat <VTML20.out> --seed-sub-mat <VTML20.out>` to `mmseqs easy-search`.
 
 ---
 
@@ -149,9 +203,8 @@ Output:
 
 Parameters:
   --adaptive             Adaptive damage correction (recommended)
-  --domain NAME          Taxonomic domain: gtdb, fungi, plant, viral,
-                         vertebrate_mammalian, vertebrate_other,
-                         invertebrate, protozoa (default: gtdb)
+  --domain NAME          Taxonomic domain: gtdb, fungi, plant, protozoa,
+                         invertebrate, viral (default: gtdb)
   --orf-min-aa N         Minimum protein length (default: 10)
   -t, --threads N        Thread count (default: auto)
 ```
@@ -161,13 +214,16 @@ Parameters:
 Estimates sample-wide damage rate without gene prediction.
 
 ```
-Usage: agp sample-damage <input.fq.gz> [options]
+Usage: agp sample-damage <input.fq> [options]
 
 Output fields:
-  d_max              Maximum damage rate at read termini (0-1)
-  lambda             Exponential decay constant
-  damage_validated   True if damage confirmed by stop codon signal
-  library_type       single-stranded or double-stranded
+  damage.d_max       Maximum damage rate at read termini (percent, 0-100)
+  damage.lambda_5prime / damage.lambda_3prime
+                     Exponential decay constants
+  damage.damage_validated
+                     True if damage confirmed by stop codon signal
+  damage.library_type
+                     single-stranded or double-stranded
 ```
 
 ### `agp hits2emi`
@@ -347,14 +403,15 @@ Usage: agp validate <fastq.gz> <aa-damage.tsv.gz> <predictions.gff> [proteins.fa
 ### GFF3
 
 ```
-read_001  AGP  CDS  1  150  0.85  +  0  ID=gene_1;ancient_prob=0.72;damage_pct=15.3;conf=0.88
+read_001  AncientGenePredictor  gene  1  150  0.85  +  .  ID=gene1;frame=0;conf=0.88;damage_signal=0.41;damage_pct=15.3;p_damaged=0.72
 ```
 
 | Attribute | Description |
 |-----------|-------------|
-| ancient_prob | Probability read shows damage pattern (0-1) |
+| p_damaged | Per-read damage posterior from prediction |
 | damage_pct | Estimated damage percentage |
 | conf | Prediction confidence from length and coding score |
+| frame | Reading frame used for the prediction |
 
 ### Damage Index (.agd)
 
@@ -364,17 +421,19 @@ Binary format for O(1) per-read damage lookup. Contains sequence length, frame, 
 
 Columnar alignment index consumed by `damage-annotate`. Stores MMseqs2 alignments in a memory-efficient columnar layout optimised for streaming EM and damage annotation.
 
-**Key columns:**
+**Core stored columns (EMI schema):**
 
 | Column | Type | Description |
 |--------|------|-------------|
-| query_id | string | Read identifier |
-| target_id | string | Reference protein ID |
+| read_idx | uint32 | Read identifier index |
+| ref_idx | uint32 | Reference protein identifier index |
 | fident | float32 | Fractional sequence identity |
 | bits | float32 | Bit score |
 | qaln | string | Query alignment string (required for damage detection) |
 | taln | string | Target alignment string |
-| p_read | float32 | Pre-mapping damage probability (from AGD) |
+| damage_score | float32 | Per-read damage prior (from AGD when provided) |
+
+`query_id` / `target_id` are resolved via EMI name dictionaries; `damage-annotate` exposes them in TSV output.
 
 ### Annotated Hits TSV
 
@@ -393,6 +452,8 @@ Per-read output from `damage-annotate`:
 ---
 
 ## Benchmark
+
+Benchmark headline results are kept here for quick reference; full per-sample plots/tables and interpretation should live in the project wiki to keep README focused for new users.
 
 ### Gene prediction
 

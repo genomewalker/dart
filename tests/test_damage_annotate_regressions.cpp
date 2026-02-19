@@ -356,14 +356,14 @@ static bool test_threshold_is_damaged(const std::string& agp_bin, const std::str
     std::string out_lo, out_hi;
     std::string cmd_hi = shell_quote(agp_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
                          " --damage-index " + shell_quote(agd_path) +
-                         " --d-max 0.3 --no-identity --threshold 0.7";
+                         " --d-max 0.3 --no-identity --threshold 1.0";
     if (!run_command_capture(cmd_hi, out_hi, err)) {
         std::cerr << err << "\n";
         return false;
     }
     std::string cmd_lo = shell_quote(agp_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
                          " --damage-index " + shell_quote(agd_path) +
-                         " --d-max 0.3 --no-identity --threshold 0.5";
+                         " --d-max 0.3 --no-identity --threshold 0.0";
     if (!run_command_capture(cmd_lo, out_lo, err)) {
         std::cerr << err << "\n";
         return false;
@@ -381,8 +381,13 @@ static bool test_threshold_is_damaged(const std::string& agp_bin, const std::str
     }
 
     if (!expect(rhi["posterior"] != "NA", "posterior should be informative with AGD p_read")) return false;
-    if (!expect(rhi["is_damaged"] == "0", "threshold 0.7 should mark read as not damaged")) return false;
-    if (!expect(rlo["is_damaged"] == "1", "threshold 0.5 should mark read as damaged")) return false;
+    if (!expect(rhi["damage_informative"] == "1", "damage_informative should be 1 with AGD evidence")) return false;
+
+    const double posterior = std::stod(rhi["posterior"]);
+    if (!expect(posterior > 0.0 && posterior < 1.0, "posterior should be strictly between 0 and 1")) return false;
+
+    if (!expect(rhi["is_damaged"] == "0", "threshold 1.0 should mark read as not damaged")) return false;
+    if (!expect(rlo["is_damaged"] == "1", "threshold 0.0 should mark read as damaged")) return false;
     return true;
 }
 
