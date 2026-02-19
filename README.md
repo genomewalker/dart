@@ -1,4 +1,4 @@
-# AGP: Ancient Gene Predictor
+# AGP: Ancient Gene Predictor for damage-aware translation of ancient DNA
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
