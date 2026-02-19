@@ -1,0 +1,16 @@
+%%{init: {'theme': 'base', 'themeVariables': { 'lineColor': '#525252', 'textColor': '#1a1a1a', 'fontSize': '13px', 'fontFamily': 'Helvetica, Arial, sans-serif'}}}%%
+
+flowchart LR
+    R["Reads<br/><small>millions</small>"] --> CA["Channel A<br/><small>T/(T+C)</small>"]
+    R --> CB["Channel B<br/><small>stop conv.</small>"]
+    CA --> SP["Sample Profile<br/><small>d<sub>max</sub>, λ</small>"]
+    CB --> SP
+    SP -->|"informs"| PR["Per-Read<br/><small>Bayesian</small>"]
+    PR --> PP["Per-Protein<br/><small>p<sub>damaged</sub></small>"]
+
+    style R fill:#dbeafe,stroke:#1d4ed8,stroke-width:1px
+    style CA fill:#fef3c7,stroke:#d97706,stroke-width:1px
+    style CB fill:#dcfce7,stroke:#15803d,stroke-width:1px
+    style SP fill:#fef3c7,stroke:#d97706,stroke-width:1px
+    style PR fill:#f3e8ff,stroke:#7c3aed,stroke-width:1px
+    style PP fill:#dcfce7,stroke:#15803d,stroke-width:1px
