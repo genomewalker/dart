@@ -16,7 +16,7 @@ The pipeline runs in three stages. **Pass 1** scans all reads to measure the sam
 
 ## The problem: ancient DNA is chemically damaged
 
-DNA degrades after death. The most common change is **deamination**: cytosines (C) spontaneously convert to uracil, which reads as thymine (T) during sequencing. This happens most at the *ends* of DNA fragments — the longer ago an organism died, the more damage accumulates near the termini.
+DNA degrades after death. The most common change is **deamination**: cytosines (C) spontaneously convert to uracil, which reads as thymine (T) during sequencing [Lindahl 1993]. This happens most at the *ends* of DNA fragments — the longer ago an organism died, the more damage accumulates near the termini [Briggs et al. 2007].
 
 This causes two practical problems for bioinformatics:
 
@@ -52,7 +52,7 @@ Every read is assigned `p_read` — the probability that its terminal pattern re
 
 ### Step 3 — Search and score damage authenticity
 
-Predicted proteins are searched against a reference database (KEGG, CAZy, viral proteins, etc.) with MMseqs2 using VTML20, a substitution matrix calibrated for the conservative amino acid changes typical of ancient DNA.
+Predicted proteins are searched against a reference database (KEGG, CAZy, viral proteins, etc.) with MMseqs2 [Steinegger & Söding 2017] using VTML20 [Müller & Vingron 2000], a substitution matrix calibrated for the conservative amino acid changes typical of ancient DNA.
 
 After search, `damage-annotate` scores each protein hit for authentic ancient damage using three lines of evidence fused in log-odds space:
 
@@ -403,8 +403,8 @@ Benchmarked on 18.3 million synthetic ancient DNA reads from the KapK community 
 | Method | Recall | Precision | Avg Identity |
 |--------|--------|-----------|--------------|
 | AGP | 67.6% | **97.2%** | **96.2%** |
-| MMseqs2 blastx | **68.5%** | 96.3% | 94.8% |
-| FGS-rs | 19.1% | 95.3% | 94.2% |
+| MMseqs2 blastx [Steinegger & Söding 2017] | **68.5%** | 96.3% | 94.8% |
+| FGS-rs [Van der Jeugt et al. 2022] | 19.1% | 95.3% | 94.2% |
 
 **Timing (4.4M reads, 8 threads):**
 
@@ -458,7 +458,7 @@ Averaging over multiple reads per protein substantially improves discrimination 
 
 ### Sample-wide damage detection
 
-AGP estimates sample-wide damage without reference alignment. Validated against metaDMG on 31 real ancient metagenomes:
+AGP estimates sample-wide damage without reference alignment. Validated against metaDMG [Michelsen et al. 2022] on 31 real ancient metagenomes:
 
 | Sample | metaDMG (%) | AGP d_max (%) | Channel B LLR | Decision |
 |--------|-------------|---------------|---------------|----------|
@@ -480,7 +480,7 @@ Correlation r = 0.81 across the full 0–55% damage range. The +4.4% bias reflec
 
 ### Damage model
 
-Post-mortem deamination hydrolytically removes the amine group from cytosine, converting it to uracil (read as thymine). This reaction preferentially affects single-stranded overhangs at fragment termini, producing a characteristic gradient of C→T substitutions at 5′ ends and, in double-stranded libraries, complementary G→A substitutions at 3′ ends. The rate follows exponential decay from the terminus:
+Post-mortem deamination hydrolytically removes the amine group from cytosine, converting it to uracil (read as thymine) [Lindahl 1993]. This reaction preferentially affects single-stranded overhangs at fragment termini, producing a characteristic gradient of C→T substitutions at 5′ ends and, in double-stranded libraries, complementary G→A substitutions at 3′ ends [Briggs et al. 2007]. The rate follows exponential decay from the terminus:
 
 $$\delta(p) = d_{\max} \cdot e^{-\lambda p}$$
 
@@ -562,7 +562,7 @@ All three Bayes factors are conditionally independent given the damage status (t
 
 ### EM multi-mapping resolution
 
-In complex metagenomes, short reads often align equally well to multiple reference proteins. AGP uses Expectation-Maximisation (EM) to redistribute ambiguous reads based on reference abundance [Dempster et al. 1977; Salzberg et al. 1998].
+In complex metagenomes, short reads often align equally well to multiple reference proteins. AGP uses Expectation-Maximisation (EM) [Dempster et al. 1977] to redistribute ambiguous reads based on reference abundance.
 
 **E-step:** Compute soft assignments (responsibilities) for each read $i$ to reference $j$:
 
@@ -683,6 +683,30 @@ If you use AGP in your research, please cite:
   doi={10.1101/2023.06.10.544454}
 }
 ```
+
+## References
+
+- **Briggs et al. 2007** — Briggs AW, Stenzel U, Johnson PLF, Green RE, Kelso J, Prüfer K, Meyer M, Krause J, Ronan MT, Lachmann M, Pääbo S. Patterns of damage in genomic DNA sequences from a Neandertal. *PNAS* 104(37):14616–14621. [doi:10.1073/pnas.0704665104](https://doi.org/10.1073/pnas.0704665104)
+
+- **Dempster et al. 1977** — Dempster AP, Laird NM, Rubin DB. Maximum likelihood from incomplete data via the EM algorithm. *J Royal Statistical Society B* 39(1):1–22. [doi:10.1111/j.2517-6161.1977.tb01600.x](https://doi.org/10.1111/j.2517-6161.1977.tb01600.x)
+
+- **Jónsson et al. 2013** — Jónsson H, Ginolhac A, Schubert M, Johnson PLF, Orlando L. mapDamage2.0: fast approximate Bayesian estimates of ancient DNA damage parameters. *Bioinformatics* 29(13):1682–1684. [doi:10.1093/bioinformatics/btt193](https://doi.org/10.1093/bioinformatics/btt193)
+
+- **Lindahl 1993** — Lindahl T. Instability and decay of the primary structure of DNA. *Nature* 362(6422):709–715. [doi:10.1038/362709a0](https://doi.org/10.1038/362709a0)
+
+- **Michelsen et al. 2022** — Michelsen C, Pedersen MW, Fernandez-Guerra A, Zhao L, Petersen TC, Korneliussen TS. metaDMG: a fast and accurate ancient DNA damage toolkit for metagenomic data. *bioRxiv* preprint. [doi:10.1101/2022.12.06.519264](https://doi.org/10.1101/2022.12.06.519264)
+
+- **Müller & Vingron 2000** — Müller T, Vingron M. Modeling amino acid replacement. *J Computational Biology* 7(6):761–776. [doi:10.1089/10665270050514918](https://doi.org/10.1089/10665270050514918)
+
+- **Rho et al. 2010** — Rho M, Tang H, Ye Y. FragGeneScan: predicting genes in short and error-prone reads. *Nucleic Acids Research* 38(20):e191. [doi:10.1093/nar/gkq747](https://doi.org/10.1093/nar/gkq747)
+
+- **Steinegger & Söding 2017** — Steinegger M, Söding J. MMseqs2 enables sensitive protein sequence searching for the analysis of massive data sets. *Nature Biotechnology* 35(11):1026–1028. [doi:10.1038/nbt.3988](https://doi.org/10.1038/nbt.3988)
+
+- **Van der Jeugt et al. 2022** — Van der Jeugt F, Dawyndt P, Mesuere B. FragGeneScanRs: faster gene prediction for short reads. *BMC Bioinformatics* 23(1):198. [doi:10.1186/s12859-022-04736-5](https://doi.org/10.1186/s12859-022-04736-5)
+
+- **Varadhan & Roland 2008** — Varadhan R, Roland C. Simple and globally convergent methods for accelerating the convergence of any EM algorithm. *Scandinavian J Statistics* 35(2):335–353. [doi:10.1111/j.1467-9469.2007.00585.x](https://doi.org/10.1111/j.1467-9469.2007.00585.x)
+
+---
 
 ## License
 
