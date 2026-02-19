@@ -480,74 +480,118 @@ Correlation r = 0.81 across the full 0–55% damage range. The +4.4% bias reflec
 
 ### Damage model
 
-Post-mortem deamination causes C→T substitutions at 5′ ends and G→A at 3′ ends, following exponential decay from fragment termini:
+Post-mortem deamination hydrolytically removes the amine group from cytosine, converting it to uracil (read as thymine). This reaction preferentially affects single-stranded overhangs at fragment termini, producing a characteristic gradient of C→T substitutions at 5′ ends and, in double-stranded libraries, complementary G→A substitutions at 3′ ends. The rate follows exponential decay from the terminus:
 
 $$\delta(p) = d_{\max} \cdot e^{-\lambda p}$$
 
-Where $d_{\max}$ is maximum damage at the terminus, $\lambda$ is the decay constant (0.2–0.5), and $p$ is position from the terminus. Half-life: $t_{1/2} = \ln(2) / \lambda \approx 1.4\text{–}3.5$ positions.
+$d_{\max}$ is the substitution rate at the outermost position, reflecting both the age of the sample and preservation conditions. $\lambda$ is the decay constant (typically 0.2–0.5 nats/position), controlling how deep into the read the damage signal extends. The characteristic half-life is $t_{1/2} = \ln(2) / \lambda \approx 1.4\text{–}3.5$ positions. AGP estimates both parameters from the data in Pass 1, fitting the observed T/(T+C) profile to this model via maximum likelihood.
 
-### Two-channel validation
+Single-stranded library preparation (e.g. uracil-tolerant protocols) shows the full 5′ C→T gradient independently of the complementary strand. Double-stranded protocols show the characteristic mirror image: 5′ C→T and 3′ G→A from the complementary strand.
 
-**Channel A (nucleotide frequencies):** Terminal T/(T+C) enrichment:
+### Two-channel damage validation
+
+Reference-free damage detection faces a fundamental ambiguity: elevated terminal T/(T+C) can result from either genuine C→T deamination **or** a high baseline T content in the organism's genome (compositional confounding). AGP resolves this with two independent channels that respond differently to each cause.
+
+**Channel A — nucleotide frequency enrichment**
+
+Channel A measures the ratio of T to total pyrimidines at each terminal position $p$:
 
 $$r_A(p) = \frac{T_p}{T_p + C_p}$$
 
-Expected under damage: $\mathbb{E}[r_A(p)] = b_T + (1 - b_T) \cdot d_{\max} \cdot e^{-\lambda p}$
+Under the damage model, the expected value is:
 
-**Channel B (stop codon conversion):** Tracks CAA→TAA, CAG→TAG, CGA→TGA conversions. Stop conversion rate:
+$$\mathbb{E}[r_A(p)] = b_T + (1 - b_T) \cdot d_{\max} \cdot e^{-\lambda p}$$
+
+where $b_T$ is the organism's genomic T/(T+C) baseline measured from read interiors. Channel A fires when the terminal profile is significantly elevated above $b_T$ with exponential shape (measured by a log-likelihood ratio test, $\Delta \text{LLR}_A$).
+
+*Limitation:* An AT-rich organism will have a naturally high $b_T$, and any additional damage-driven enrichment sits on top of a noisy baseline. Channel A alone cannot distinguish the two.
+
+**Channel B — stop codon conversion**
+
+Channel B exploits the fact that only three sense codons contain a C that, when converted to T, produces a stop codon: CAA→TAA (Gln→ochre), CAG→TAG (Gln→amber), and CGA→TGA (Arg→opal). These are the **preimage** of the stop set under C→T substitution. The conversion rate at position $p$ is:
 
 $$r_B(p) = \frac{\text{stops}_p}{\text{stops}_p + \text{preimage}_p}$$
 
-Decision: Channel A fires AND Channel B confirms → validated damage. Channel A fires BUT Channel B is flat → compositional artifact (rejected, $d_{\max} = 0$).
+where $\text{stops}_p$ counts in-frame stop codons observed at codon position $p$ from the terminus and $\text{preimage}_p$ counts the surviving CAA/CAG/CGA codons at that position. If C→T damage is present, $r_B$ will be elevated at terminal positions relative to interior positions (a positive $\Delta \text{LLR}_B$). Crucially, Channel B **cannot** be elevated by compositional variation: a high-T genome simply has fewer C residues in CAA/CAG/CGA, but this equally depletes both numerator and denominator, leaving $r_B$ unchanged.
+
+**Joint decision**
+
+| Channel A | Channel B | Interpretation |
+|-----------|-----------|----------------|
+| Fires | Fires | Validated damage — $d_{\max}$ reported |
+| Fires | Flat / negative | Compositional artifact — $d_{\max} = 0$ |
+| Silent | — | No detectable damage — $d_{\max} = 0$ |
+
+This design eliminates false positives from AT-rich organisms (the most common failure mode of reference-free damage detection) while retaining sensitivity in validated samples.
 
 ### Per-read damage scoring
 
-Each read gets a damage probability from terminal nucleotide patterns. Log-likelihood ratio across terminal positions:
+Each read receives an individual damage probability $p_{\text{read}}$ that quantifies the likelihood of observing its terminal nucleotide composition given the sample-wide damage model. This is computed as a log-likelihood ratio (LLR) summed over terminal positions:
 
-$$\text{LLR} = \sum_{i \in \text{terminal}} \log \frac{P(B_i \mid \text{damage})}{P(B_i \mid \text{no damage})}$$
+$$\text{LLR} = \sum_{i \in \text{terminal}} \log \frac{P(B_i \mid \text{damage}, \delta(i))}{P(B_i \mid \text{no damage}, b_T)}$$
 
-Final score with Channel B modulation ($\gamma_B \in \{0, 0.5, 1\}$):
+where $B_i$ is the observed base at position $i$, $P(B_i \mid \text{damage}) = (1 - \delta(i)) \cdot b_T + \delta(i)$ for T observations (a T could be original or damage-converted), and $P(B_i \mid \text{no damage}) = b_T$. The LLR is converted to a posterior via a Bayesian update starting from the sample-level prior $\pi_0$:
 
-$$p_{\text{read}} = \gamma_B \cdot \sigma(\text{logit}(\pi_0) + \text{LLR})$$
+$$p_{\text{read}} = \gamma_B \cdot \sigma\!\left(\text{logit}(\pi_0) + \text{LLR}\right)$$
+
+The modulation factor $\gamma_B \in \{0, 0.5, 1\}$ suppresses per-read scores for samples where Channel B validation failed (no real damage) or is inconclusive, preventing the score from conveying false confidence when the sample-level signal is absent.
 
 ### Bayesian damage score
 
-Per-protein posterior fuses three evidence sources in log-odds space:
+After alignment, each detected protein accumulates evidence from all its covering reads. A Bayesian log-odds fusion combines three statistically independent evidence sources:
 
 $$\text{logit}(P_{\text{posterior}}) = \text{logit}(\pi) + \log BF_{\text{terminal}} + \log BF_{\text{sites}} + \log BF_{\text{identity}}$$
 
-- $BF_{\text{terminal}}$: Bayes factor from terminal patterns (p_read)
-- $BF_{\text{sites}}$: Bayes factor from damage-consistent AA substitutions (R→W, H→Y, Q→*, etc.)
-- $BF_{\text{identity}}$: Bayes factor from alignment identity: $\log BF = 20 \times (\text{fident} - 0.90)$, capped ±5
+**Terminal evidence ($BF_{\text{terminal}}$):** Derived from $p_{\text{read}}$ for all reads covering the protein. The Bayes factor converts the terminal nucleotide signal into a likelihood ratio relative to the sample-level prior:
 
-### EM reassignment
+$$\log BF_{\text{terminal}} = \text{logit}(p_{\text{read}}) - \text{logit}(\pi_0)$$
 
-**E-step:** Responsibility $\gamma_{ij}$ for each read-reference pair:
+**Site evidence ($BF_{\text{sites}}$):** Counts damage-consistent amino acid substitutions in the alignment — specifically those caused by C→T (R→W, H→Y, Q→\*, S→L) and G→A (E→K, D→N) — and compares their rate to a background mismatch rate $q_0$:
 
-$$\gamma_{ij} = \frac{\phi_j \cdot L(i,j)}{\sum_{k \in R_i} \phi_k \cdot L(i,k)}$$
+$$\log BF_{\text{sites}} = k \cdot \log\!\frac{d_{\max} \cdot 0.5 \cdot \text{AA\_scale} + q_0}{q_0}$$
 
-Where $L(i,j) = \exp(S_{ij}/\lambda) \cdot p_{\text{read},i}^{\alpha}$.
+where $k$ is the count of damage-consistent mismatches, $q_0 = 0.005$ is the baseline rate of such substitutions in modern proteins, and AA\_scale = 0.30 converts the nucleotide-level $d_{\max}$ to the amino acid level (only ~30% of C→T events in a codon are non-synonymous). This term is particularly valuable for GC-rich organisms where Channel A alone is weak.
 
-**M-step:** Update reference abundances:
+**Identity evidence ($BF_{\text{identity}}$):** Ancient proteins on average align at higher identity to reference databases than spurious modern matches, because ancient reads derive from real organisms present in the environment while false positives are often near-random k-mer matches. The Bayes factor is:
+
+$$\log BF_{\text{identity}} = 20 \times (\text{fident} - 0.90), \quad \text{capped at} \pm 5$$
+
+calibrated so that a 93.3% identity alignment (mean ancient) contributes $+\log BF \approx +0.66$ nats relative to 90.5% (mean modern/spurious), and proteins below 90% identity are penalised.
+
+All three Bayes factors are conditionally independent given the damage status (terminal patterns, alignment column composition, and overall identity are driven by different physical processes), justifying additive fusion in log-odds space.
+
+### EM multi-mapping resolution
+
+In complex metagenomes, short reads often align equally well to multiple reference proteins. AGP uses Expectation–Maximisation (EM) to redistribute ambiguous reads based on reference abundance, mirroring the approach of tools such as DIAMOND's iterative assignment.
+
+**E-step** — compute soft assignments (responsibilities) for each read $i$ to reference $j$:
+
+$$\gamma_{ij} = \frac{\phi_j \cdot L(i,j)}{\sum_{k \in \mathcal{R}_i} \phi_k \cdot L(i,k)}$$
+
+The likelihood $L(i,j) = \exp(S_{ij} / \lambda)$ is a Boltzmann weighting of the alignment bit score $S_{ij}$ by temperature $\lambda$ (default 1.0); lower $\lambda$ sharpens assignment towards the best hit. The set $\mathcal{R}_i$ contains all references that read $i$ aligns to within the score window.
+
+**M-step** — update reference abundances with a Dirichlet prior $\alpha_0$ for regularisation:
 
 $$\phi_j = \frac{\alpha_0 + \sum_i \gamma_{ij}}{J \cdot \alpha_0 + N}$$
 
-Convergence typically takes 5–15 iterations with SQUAREM acceleration. Reads are kept if $\gamma_{ij} \geq \epsilon$ (default $\epsilon = 10^{-6}$, controlled by `--em-min-prob`).
+where $J$ is the number of references and $N$ the total read count. The prior prevents zero-count collapse and smooths abundance estimates for low-coverage references.
+
+Convergence is assessed by the $\ell_1$ change in $\boldsymbol{\phi}$ between iterations; SQUAREM acceleration is applied to speed convergence. In practice, 5–15 iterations suffice. Reads with final responsibility $\gamma_{ij} < \epsilon$ (default $\epsilon = 10^{-6}$, `--em-min-prob`) are pruned, reducing memory and noise in downstream damage annotation.
 
 ### Frame scoring
 
-Frame selection combines multiple signals:
+AGP evaluates all six reading frames for each read and selects the frame with the highest composite coding score. The score is a weighted product of signals:
 
-| Signal | Weight |
-|--------|--------|
-| Codon usage bias | 0.15 |
-| Stop codon penalty | 0.28 |
-| Dicodon/hexamer patterns | 0.13 |
-| Amino acid composition | 0.10 |
-| GC3 content | 0.05 |
-| Damage-frame consistency | variable |
+| Signal | Weight | Description |
+|--------|--------|-------------|
+| Codon usage bias | 0.15 | Log-likelihood of codon frequencies vs null |
+| Stop codon penalty | 0.28 | Multiplicative: 1.0 (no stops) → 0.2 (one stop) → 0.05 (multiple) |
+| Dicodon/hexamer patterns | 0.13 | Adjacent codon pair frequencies |
+| Amino acid composition | 0.10 | Global AA frequency match |
+| GC3 content | 0.05 | GC at third codon position (coding bias indicator) |
+| Damage-frame consistency | variable | Bonus when damage sites align with predicted frame |
 
-In damage-aware mode, stop penalties are weighted by $(1 - P_{\text{damage}})$, reducing penalties for likely damage-induced stops.
+The stop codon penalty is multiplicative (not additive) to prevent a single downstream stop from completely masking an otherwise well-supported long ORF. In damage-aware mode, each in-frame stop codon is weighted by $(1 - P_{\text{damage}}(p))$ where $P_{\text{damage}}(p) = d_{\max} \cdot e^{-\lambda p}$ at codon position $p$. A stop codon near the 5′ end of a highly damaged read contributes very little penalty — the model accepts it as likely a damage artefact rather than a true stop.
 
 ### Domain-specific models
 

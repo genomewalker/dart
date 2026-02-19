@@ -1,147 +1,158 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg width="480" height="420" viewBox="0 0 480 420" xmlns="http://www.w3.org/2000/svg">
+<svg width="700" height="318" viewBox="0 0 700 318" xmlns="http://www.w3.org/2000/svg">
   <defs>
     <style>
-      .bg { fill: #ffffff; }
-      .box { fill: #ffffff; stroke: #2d2d2d; stroke-width: 1; }
-      .box-input { fill: #e3eef7; stroke: #2d2d2d; stroke-width: 1; }
-      .box-process { fill: #f5f5f5; stroke: #2d2d2d; stroke-width: 1; }
-      .box-key { fill: #fdf4dc; stroke: #2d2d2d; stroke-width: 1; }
-      .box-output { fill: #e4f2e4; stroke: #2d2d2d; stroke-width: 1; }
-      .arrow { fill: none; stroke: #2d2d2d; stroke-width: 0.9; marker-end: url(#arr); }
-      .arrow-bend { fill: none; stroke: #2d2d2d; stroke-width: 0.9; }
-      .arrow-data { fill: none; stroke: #888; stroke-width: 0.7; stroke-dasharray: 3,2; marker-end: url(#arr-g); }
-      .title { font-family: Helvetica, Arial, sans-serif; font-size: 10px; fill: #1a1a1a; text-anchor: middle; font-weight: 600; }
-      .label { font-family: Helvetica, Arial, sans-serif; font-size: 9px; fill: #2a2a2a; text-anchor: middle; }
-      .sub { font-family: Helvetica, Arial, sans-serif; font-size: 7.5px; fill: #555; text-anchor: middle; }
-      .row-label { font-family: Helvetica, Arial, sans-serif; font-size: 8px; fill: #888; font-weight: 500; }
+      text { font-family: -apple-system, Helvetica, Arial, sans-serif; }
+      .ph  { font-size: 8px; font-weight: 700; letter-spacing: 0.9px; }
+      .nt  { font-size: 8.5px; font-weight: 600; text-anchor: middle; }
+      .ns  { font-size: 6.5px; text-anchor: middle; fill: #666; }
+      .file { fill: #F7F9FA; stroke: #90A4AE; stroke-width: 0.9; }
+      .p1  { fill: #EAF4FD; stroke: #1E88E5; stroke-width: 1.1; }
+      .p2  { fill: #F4EEF9; stroke: #8E24AA; stroke-width: 1.1; }
+      .p3  { fill: #EAFAF1; stroke: #43A047; stroke-width: 1.1; }
+      .out { fill: #E0F2F1; stroke: #00897B; stroke-width: 1.2; }
+      .sub { fill: #EDE7F6; stroke: #7B1FA2; stroke-width: 0.7; }
+      .arr  { fill: none; stroke: #546E7A; stroke-width: 0.9; marker-end: url(#ah); }
+      .dash  { fill: none; stroke: #90A4AE; stroke-width: 0.85; stroke-dasharray: 4,2.5; marker-end: url(#ahg); }
+      .dline { fill: none; stroke: #90A4AE; stroke-width: 0.85; stroke-dasharray: 4,2.5; }
     </style>
-    <marker id="arr" markerWidth="5" markerHeight="4" refX="4" refY="2" orient="auto">
-      <polygon points="0 0, 5 2, 0 4" fill="#2d2d2d"/>
+    <marker id="ah"  markerWidth="5" markerHeight="4" refX="4" refY="2" orient="auto">
+      <polygon points="0 0,5 2,0 4" fill="#546E7A"/>
     </marker>
-    <marker id="arr-g" markerWidth="4" markerHeight="3" refX="3" refY="1.5" orient="auto">
-      <polygon points="0 0, 4 1.5, 0 3" fill="#888"/>
+    <marker id="ahg" markerWidth="5" markerHeight="4" refX="4" refY="2" orient="auto">
+      <polygon points="0 0,5 2,0 4" fill="#90A4AE"/>
     </marker>
   </defs>
 
-  <rect width="480" height="420" class="bg"/>
+  <rect width="700" height="318" fill="white"/>
 
-  <!-- ===== ROW 1: Input → Pass 1 (left to right) ===== -->
-  <text x="20" y="25" class="row-label">Pass 1: Sample Profiling</text>
+  <!-- Phase bands -->
+  <rect x="0" y="0"   width="700" height="86"  fill="#EAF4FD" opacity="0.45"/>
+  <rect x="0" y="88"  width="700" height="152" fill="#F4EEF9" opacity="0.45"/>
+  <rect x="0" y="242" width="700" height="76"  fill="#EAFAF1" opacity="0.45"/>
 
-  <rect x="20" y="35" width="65" height="35" rx="3" class="box-input"/>
-  <text x="52" y="50" class="title">FASTQ</text>
-  <text x="52" y="62" class="sub">aDNA reads</text>
+  <!-- ═══════════════════════════════════════════════════════
+       ROW 1  left → right   PASS 1: DAMAGE DETECTION
+       ═══════════════════════════════════════════════════════ -->
+  <text x="10" y="13" class="ph" fill="#1565C0">PASS 1  ·  DAMAGE DETECTION</text>
 
-  <path d="M 87 52 L 105 52" class="arrow"/>
+  <rect x="8"   y="18" width="76"  height="54" rx="4" class="file"/>
+  <text x="46"  y="37" class="nt" fill="#546E7A">Reads</text>
+  <text x="46"  y="49" class="ns">FASTQ / FASTA</text>
+  <text x="46"  y="60" class="ns">aDNA fragments</text>
 
-  <rect x="108" y="35" width="70" height="35" rx="3" class="box-process"/>
-  <text x="143" y="50" class="label">Channel A</text>
-  <text x="143" y="62" class="sub">T/(T+C) terminal</text>
+  <rect x="96"  y="18" width="130" height="54" rx="4" class="p1"/>
+  <text x="161" y="37" class="nt" fill="#1565C0">Measure C→T enrichment</text>
+  <text x="161" y="49" class="ns">T/(T+C) at 5′ terminus</text>
+  <text x="161" y="60" class="ns">fit exponential decay</text>
 
-  <path d="M 180 52 L 198 52" class="arrow"/>
+  <rect x="238" y="18" width="130" height="54" rx="4" class="p1"/>
+  <text x="303" y="37" class="nt" fill="#1565C0">Count stop conversions</text>
+  <text x="303" y="49" class="ns">CAA / CAG / CGA → stop</text>
+  <text x="303" y="60" class="ns">terminus vs. interior rate</text>
 
-  <rect x="201" y="35" width="70" height="35" rx="3" class="box-process"/>
-  <text x="236" y="50" class="label">Channel B</text>
-  <text x="236" y="62" class="sub">stop conversion</text>
+  <rect x="380" y="18" width="110" height="54" rx="4" class="p1"/>
+  <text x="435" y="37" class="nt" fill="#1565C0">Confirm real damage</text>
+  <text x="435" y="49" class="ns">both signals must agree</text>
+  <text x="435" y="60" class="ns">C→T vs. composition</text>
 
-  <path d="M 273 52 L 291 52" class="arrow"/>
+  <rect x="502" y="18" width="186" height="54" rx="4" class="out"/>
+  <text x="595" y="35" class="nt" fill="#00695C">Damage profile</text>
+  <text x="595" y="47" class="ns">d_max · λ · library type</text>
+  <text x="595" y="58" class="ns">damage confirmed flag</text>
 
-  <rect x="294" y="35" width="55" height="35" rx="3" class="box-process"/>
-  <text x="321" y="50" class="label">Validate</text>
-  <text x="321" y="62" class="sub">both channels</text>
+  <line x1="84"  y1="45" x2="95"  y2="45" class="arr"/>
+  <line x1="226" y1="45" x2="237" y2="45" class="arr"/>
+  <line x1="368" y1="45" x2="379" y2="45" class="arr"/>
+  <line x1="490" y1="45" x2="501" y2="45" class="arr"/>
 
-  <path d="M 351 52 L 369 52" class="arrow"/>
+  <!-- Right-margin U-turn: row 1 end → row 2 start -->
+  <path d="M 688 45 L 694 45 L 694 147 L 688 147" class="arr"/>
 
-  <rect x="372" y="35" width="70" height="35" rx="3" class="box-key"/>
-  <text x="407" y="50" class="title">Profile</text>
-  <text x="407" y="62" class="sub">d_max, λ</text>
+  <!-- ═══════════════════════════════════════════════════════
+       ROW 2  right ← left   PASS 2: GENE PREDICTION
+       ═══════════════════════════════════════════════════════ -->
+  <text x="10" y="101" class="ph" fill="#4A148C">PASS 2  ·  GENE PREDICTION</text>
 
-  <!-- ===== Bend down ===== -->
-  <path d="M 407 72 L 407 95" class="arrow-bend"/>
-  <path d="M 407 95 L 407 115" class="arrow" style="marker-end: url(#arr);"/>
+  <rect x="516" y="120" width="172" height="54" rx="4" class="file"/>
+  <text x="602" y="138" class="nt" fill="#546E7A">Reads</text>
+  <text x="602" y="150" class="ns">same aDNA reads</text>
+  <text x="602" y="161" class="ns">re-scanned in pass 2</text>
 
-  <!-- ===== ROW 2: Pass 2 (right to left) ===== -->
-  <text x="20" y="110" class="row-label">Pass 2: Gene Prediction</text>
+  <!-- Translate reads: h=54, sub-boxes inside -->
+  <rect x="260" y="120" width="218" height="54" rx="4" class="p2"/>
+  <text x="369" y="133" class="nt" fill="#4A148C">Translate reads</text>
 
-  <rect x="372" y="120" width="70" height="35" rx="3" class="box-process"/>
-  <text x="407" y="135" class="label">Damage model</text>
-  <text x="407" y="147" class="sub">position decay</text>
+  <rect x="266" y="140" width="65" height="22" rx="2" class="sub"/>
+  <text x="298" y="149" class="nt" fill="#4A148C" style="font-size:7px">Frame scoring</text>
+  <text x="298" y="158" class="ns" style="font-size:6px">select best frame</text>
 
-  <path d="M 370 137 L 352 137" class="arrow"/>
+  <rect x="337" y="140" width="66" height="22" rx="2" class="sub"/>
+  <text x="370" y="149" class="nt" fill="#4A148C" style="font-size:7px">Damage-aware</text>
+  <text x="370" y="158" class="ns" style="font-size:6px">stops × (1−p_dmg)</text>
 
-  <rect x="279" y="120" width="70" height="35" rx="3" class="box-process"/>
-  <text x="314" y="135" class="label">Frame select</text>
-  <text x="314" y="147" class="sub">damage-aware</text>
+  <rect x="409" y="140" width="63" height="22" rx="2" class="sub"/>
+  <text x="440" y="149" class="nt" fill="#4A148C" style="font-size:7px">Stop rescue</text>
+  <text x="440" y="158" class="ns" style="font-size:6px">CAA→Q, CGA→R</text>
 
-  <path d="M 277 137 L 259 137" class="arrow"/>
+  <rect x="8"   y="120" width="182" height="54" rx="4" class="file"/>
+  <text x="99"  y="138" class="nt" fill="#546E7A">Predicted proteins</text>
+  <text x="99"  y="150" class="ns">stops → X where damaged</text>
+  <text x="99"  y="161" class="ns">ready for database search</text>
 
-  <rect x="176" y="120" width="80" height="35" rx="3" class="box-key"/>
-  <text x="216" y="135" class="title">Bayesian</text>
-  <text x="216" y="147" class="sub">p_read per read</text>
+  <line x1="515" y1="147" x2="479" y2="147" class="arr"/>
+  <line x1="259" y1="147" x2="191" y2="147" class="arr"/>
 
-  <path d="M 174 137 L 156 137" class="arrow"/>
+  <!-- Translate reads → Damage index -->
+  <path d="M 369 174 L 369 182" class="arr"/>
 
-  <rect x="88" y="120" width="65" height="35" rx="3" class="box-output"/>
-  <text x="120" y="135" class="label">GFF3</text>
-  <text x="120" y="147" class="sub">predictions</text>
+  <rect x="290" y="182" width="152" height="40" rx="4" class="file"/>
+  <text x="366" y="198" class="nt" fill="#546E7A">Damage index</text>
+  <text x="366" y="210" class="ns">per-read damage probability</text>
 
-  <path d="M 86 137 L 68 137" class="arrow"/>
+  <!-- Left-margin U-turn: row 2 end → row 3 start -->
+  <path d="M 8 147 L 2 147 L 2 281 L 8 281" class="arr"/>
 
-  <rect x="20" y="112" width="45" height="50" rx="3" class="box-output"/>
-  <text x="42" y="130" class="label">FASTA</text>
-  <text x="42" y="142" class="label">.agd</text>
-  <text x="42" y="154" class="sub">index</text>
+  <!-- ═══════════════════════════════════════════════════════
+       ROW 3  left → right   FUNCTIONAL ANNOTATION
+       ═══════════════════════════════════════════════════════ -->
+  <text x="10" y="246" class="ph" fill="#1B5E20">FUNCTIONAL ANNOTATION</text>
 
-  <!-- ===== Bend down ===== -->
-  <path d="M 42 164 L 42 187" class="arrow-bend"/>
-  <path d="M 42 187 L 42 207" class="arrow"/>
+  <rect x="8"   y="254" width="110" height="54" rx="4" class="p3"/>
+  <text x="63"  y="272" class="nt" fill="#1B5E20">Database search</text>
+  <text x="63"  y="284" class="ns">MMseqs2 · VTML20</text>
+  <text x="63"  y="295" class="ns">KEGG / CAZy / viral</text>
 
-  <!-- ===== ROW 3: Search (left to right) ===== -->
-  <text x="20" y="200" class="row-label">Search</text>
+  <rect x="128" y="254" width="80"  height="54" rx="4" class="file"/>
+  <text x="168" y="272" class="nt" fill="#546E7A">Search hits</text>
+  <text x="168" y="284" class="ns">alignment strings</text>
+  <text x="168" y="295" class="ns">per-read identity</text>
 
-  <rect x="20" y="210" width="75" height="35" rx="3" class="box-process"/>
-  <text x="57" y="225" class="title">MMseqs2</text>
-  <text x="57" y="237" class="sub">VTML20</text>
+  <rect x="218" y="254" width="122" height="54" rx="4" class="p3"/>
+  <text x="279" y="271" class="nt" fill="#1B5E20">Attach damage data</text>
+  <text x="279" y="282" class="ns">embed p_damage into hits</text>
+  <text x="279" y="293" class="ns">resolve multi-mappers</text>
 
-  <rect x="20" y="255" width="75" height="30" rx="3" class="box-input"/>
-  <text x="57" y="268" class="label">Reference DB</text>
-  <text x="57" y="279" class="sub">KEGG, UniRef</text>
+  <rect x="350" y="254" width="130" height="54" rx="4" class="p3"/>
+  <text x="415" y="271" class="nt" fill="#1B5E20">Score authenticity</text>
+  <text x="415" y="282" class="ns">R→W, H→Y, Q→* subs</text>
+  <text x="415" y="293" class="ns">fuse evidence sources</text>
 
-  <path d="M 57 287 L 57 297 L 42 297 L 42 247" class="arrow"/>
+  <rect x="490" y="254" width="158" height="54" rx="4" class="out"/>
+  <text x="569" y="271" class="nt" fill="#00695C">Annotated proteins</text>
+  <text x="569" y="282" class="ns">ancient damage probability</text>
+  <text x="569" y="293" class="ns">per-protein classification</text>
 
-  <path d="M 97 227 L 115 227" class="arrow"/>
+  <line x1="118" y1="281" x2="127" y2="281" class="arr"/>
+  <line x1="208" y1="281" x2="217" y2="281" class="arr"/>
+  <line x1="340" y1="281" x2="349" y2="281" class="arr"/>
+  <line x1="480" y1="281" x2="489" y2="281" class="arr"/>
 
-  <rect x="118" y="210" width="65" height="35" rx="3" class="box-output"/>
-  <text x="150" y="225" class="label">Hits TSV</text>
-  <text x="150" y="237" class="sub">alignments</text>
-
-  <path d="M 185 227 L 203 227" class="arrow"/>
-
-  <rect x="206" y="205" width="95" height="45" rx="3" class="box-key"/>
-  <text x="253" y="222" class="title">damage-annotate</text>
-  <text x="253" y="235" class="sub">Bayesian scoring</text>
-  <text x="253" y="246" class="sub">+ .agd index</text>
-
-  <!-- .agd feeds annotation -->
-  <path d="M 67 137 L 67 180 L 230 180 L 230 203" class="arrow-data"/>
-
-  <path d="M 303 227 L 321 227" class="arrow"/>
-
-  <rect x="324" y="210" width="95" height="35" rx="3" class="box-output"/>
-  <text x="371" y="225" class="title">Annotated TSV</text>
-  <text x="371" y="237" class="sub">p_damaged / protein</text>
-
-  <!-- ===== Bend down ===== -->
-  <path d="M 371 247 L 371 270" class="arrow-bend"/>
-  <path d="M 371 270 L 371 290" class="arrow"/>
-
-  <!-- ===== ROW 4: Final output (right to left) ===== -->
-  <text x="324" y="285" class="row-label">Output</text>
-
-  <rect x="304" y="295" width="115" height="45" rx="3" class="box-output"/>
-  <text x="361" y="313" class="title">Per-protein damage</text>
-  <text x="361" y="326" class="label">p_damaged score</text>
-  <text x="361" y="338" class="sub">evidence tier classification</text>
+  <!-- Damage index → bifurcation → Attach damage data + Score authenticity -->
+  <line x1="366" y1="222" x2="366" y2="238" class="dline"/>
+  <line x1="279" y1="238" x2="415" y2="238" class="dline"/>
+  <circle cx="366" cy="238" r="2" fill="#90A4AE"/>
+  <line x1="279" y1="238" x2="279" y2="254" class="dash"/>
+  <line x1="415" y1="238" x2="415" y2="254" class="dash"/>
 
 </svg>
