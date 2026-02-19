@@ -143,7 +143,7 @@ private:
 };
 
 // ============================================================================
-// Implementation (header-only for simplicity)
+// Header-only implementation
 // ============================================================================
 
 inline float JointDamageModel::log_likelihood(
@@ -312,7 +312,7 @@ inline JointDamageResult JointDamageModel::fit(const JointDamageSuffStats& stats
 }
 
 // ============================================================================
-// TWO-COMPONENT MIXTURE MODEL FOR GC-STRATIFIED DAMAGE
+// Two-component mixture model for GC-stratified damage
 // Separates damaged/undamaged subpopulations in heterogeneous metagenomes
 // ============================================================================
 

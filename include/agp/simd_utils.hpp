@@ -153,7 +153,7 @@ inline void count_bases_avx512(const char* seq, size_t len,
 
 // AVX2 fallback implementations (32 bytes at a time)
 inline void reverse_complement_avx2(const char* src, char* dst, size_t len) {
-    // Simplified scalar implementation for now
+    // Scalar implementation
     for (size_t i = 0; i < len; i++) {
         char c = src[len - 1 - i];
         char comp;

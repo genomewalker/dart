@@ -467,7 +467,7 @@ struct SampleDamageProfile {
 };
 
 // ============================================================================
-// TRI-STATE DAMAGE VALIDATION
+// Tri-state damage validation
 // Unified semantics for Channel A + Channel B decision:
 //   VALIDATED:    Both channels agree → full damage probability
 //   CONTRADICTED: Channel A fires but Channel B negative → hard suppression

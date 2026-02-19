@@ -334,7 +334,7 @@ inline char quick_translate(char c0, char c1, char c2) {
 inline float calculate_aa_composition_score(const char* seq, size_t len, int frame) {
     if (len < 3 + static_cast<size_t>(frame)) return 0.5f;
     
-    // Count amino acids (simplified - just check for unusual patterns)
+    // Count amino acids and check unusual composition patterns
     int total = 0;
     int common = 0;  // L, A, G, V, E, S, I, T (>5% each in most proteomes)
     int rare = 0;    // W, C, M, H (typically <3% each)

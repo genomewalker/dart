@@ -62,3 +62,21 @@ notebooks/data/*.tsv.gz
 .scripts/
 *.test
 test_*[!.cpp]
+
+# GitHub wiki (managed as separate git repo)
+wiki/
+
+# OpenCode/AI planning session artifacts
+docs/figures/run_*/
+docs/figures/agp_paperbanana_input.txt
+
+# PDF exports (derivable from source diagrams)
+docs/*.pdf
+
+# Development iteration figures (not for publication)
+docs/*_fixed*.png
+docs/pi0_fix_*.png
+docs/protein_damage_fixed.png
+
+# Tutorial output (generated at runtime)
+examples/tutorial/output/

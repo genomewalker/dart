@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.18)
 project(AncientGenePredictor VERSION 0.3.0 LANGUAGES CXX)
+include(CTest)
 
 # Git-based version detection
 find_package(Git QUIET)
@@ -87,6 +88,23 @@ endif()
 # Find zlib for compressed file support
 find_package(ZLIB REQUIRED)
 
+# Find zstd for columnar compression (optional)
+find_package(PkgConfig)
+if(PkgConfig_FOUND)
+    pkg_check_modules(ZSTD libzstd)
+    if(ZSTD_FOUND)
+        add_compile_definitions(HAVE_ZSTD)
+        message(STATUS "ZSTD found: ${ZSTD_VERSION}")
+    endif()
+
+    # TBB disabled - linking issues on this system
+    # pkg_check_modules(TBB tbb)
+    # if(TBB_FOUND)
+    #     add_compile_definitions(HAVE_TBB)
+    #     message(STATUS "TBB found: ${TBB_VERSION}")
+    # endif()
+endif()
+
 # Include directories
 include_directories(
     ${PROJECT_SOURCE_DIR}/include
@@ -115,6 +133,10 @@ set(AGP_CORE_SOURCES
     src/adaptive_damage.cpp
     src/damage_index_writer.cpp
     src/damage_index_reader.cpp
+    src/reference_stats.cpp
+    src/em_reassign.cpp
+    src/em_index.cpp
+    src/columnar_index.cpp
 )
 
 # Subcommand sources
@@ -125,11 +147,21 @@ set(AGP_SUBCOMMAND_SOURCES
     src/cli/cmd_sample_damage.cpp     # cmd_sample_damage
     src/cli/cmd_damage_annotate.cpp   # cmd_damage_annotate
     src/cli/cmd_damage_profile.cpp    # cmd_damage_profile
+    src/cli/cmd_hits2emi.cpp          # hits2emi (TSV to columnar)
 )
 
 # Main executable with subcommands
 add_executable(agp ${AGP_CORE_SOURCES} ${AGP_SUBCOMMAND_SOURCES})
 target_link_libraries(agp ${ZLIB_LIBRARIES})
+if(ZSTD_FOUND)
+    target_include_directories(agp PRIVATE ${ZSTD_INCLUDE_DIRS})
+    target_link_libraries(agp ${ZSTD_LIBRARIES})
+endif()
+# TBB disabled - linking issues
+# if(TBB_FOUND)
+#     target_include_directories(agp PRIVATE /usr/include ${TBB_INCLUDE_DIRS})
+#     target_link_libraries(agp ${TBB_LIBRARIES})
+# endif()
 
 if(OpenMP_CXX_FOUND)
     target_link_libraries(agp OpenMP::OpenMP_CXX)
@@ -138,6 +170,10 @@ endif()
 # Legacy standalone validation tool (for backwards compatibility)
 add_executable(agp-validate-standalone src/validate.cpp ${AGP_CORE_SOURCES})
 target_link_libraries(agp-validate-standalone ${ZLIB_LIBRARIES})
+if(ZSTD_FOUND)
+    target_include_directories(agp-validate-standalone PRIVATE ${ZSTD_INCLUDE_DIRS})
+    target_link_libraries(agp-validate-standalone ${ZSTD_LIBRARIES})
+endif()
 target_compile_definitions(agp-validate-standalone PRIVATE AGP_STANDALONE_VALIDATE)
 
 # Error analysis tool
@@ -147,6 +183,47 @@ target_link_libraries(agp-analyze-errors ${ZLIB_LIBRARIES})
 # Damage prediction benchmark
 add_executable(agp-benchmark-damage src/cli/benchmark_damage.cpp)
 target_link_libraries(agp-benchmark-damage ${ZLIB_LIBRARIES})
+
+# Streaming EM comparison test
+add_executable(test-streaming-em tests/test_streaming_em.cpp ${AGP_CORE_SOURCES})
+target_link_libraries(test-streaming-em ${ZLIB_LIBRARIES})
+if(ZSTD_FOUND)
+    target_include_directories(test-streaming-em PRIVATE ${ZSTD_INCLUDE_DIRS})
+    target_link_libraries(test-streaming-em ${ZSTD_LIBRARIES})
+endif()
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(test-streaming-em OpenMP::OpenMP_CXX)
+endif()
+
+if(BUILD_TESTING)
+    add_executable(
+        agp-cli-args-tests
+        tests/test_cli_args.cpp
+        src/cli/args.cpp
+    )
+    add_test(
+        NAME cli_args
+        COMMAND agp-cli-args-tests
+    )
+
+    add_executable(
+        agp-benchmark-fixture-test
+        tests/test_benchmark_fixture.cpp
+    )
+    add_test(
+        NAME benchmark_fixture
+        COMMAND agp-benchmark-fixture-test ${CMAKE_SOURCE_DIR}/examples/tutorial/data/benchmark_summary.tsv
+    )
+
+    add_executable(
+        agp-damage-annotate-regressions
+        tests/test_damage_annotate_regressions.cpp
+    )
+    add_test(
+        NAME damage_annotate_regressions
+        COMMAND agp-damage-annotate-regressions $<TARGET_FILE:agp>
+    )
+endif()
 
 # Install
 install(TARGETS agp DESTINATION bin)

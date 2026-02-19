@@ -69,6 +69,52 @@ public:
     uint8_t library_type() const { return header_->library_type; }
 
     /**
+     * @brief Whether both Channel A and B agree on real damage (v3+).
+     */
+    bool damage_validated() const {
+        return header_->version >= 3 && header_->damage_validated != 0;
+    }
+
+    /**
+     * @brief Whether Channel A fired but Channel B didn't (false positive, v3+).
+     */
+    bool damage_artifact() const {
+        return header_->version >= 3 && header_->damage_artifact != 0;
+    }
+
+    /**
+     * @brief Whether sufficient data existed for Channel B (v3+).
+     */
+    bool channel_b_valid() const {
+        return header_->version >= 3 && header_->channel_b_valid != 0;
+    }
+
+    /**
+     * @brief Channel B stop-codon decay LLR (v3+, 0.0 for v2 files).
+     */
+    float stop_decay_llr() const {
+        return header_->version >= 3 ? header_->stop_decay_llr : 0.0f;
+    }
+
+    /**
+     * @brief Terminal T/(T+C) shift (v3+, 0.0 for v2 files).
+     */
+    float terminal_shift() const {
+        return header_->version >= 3 ? header_->terminal_shift : 0.0f;
+    }
+
+    /**
+     * @brief Whether this sample's damage signal is informative for scoring.
+     *
+     * v3+: requires damage_validated && !damage_artifact.
+     * v2 fallback: uses d_max > 0 as a proxy.
+     */
+    bool damage_informative() const {
+        if (header_->version < 3) return d_max() > 0.0f;
+        return damage_validated() && !damage_artifact();
+    }
+
+    /**
      * @brief Get total number of records.
      */
     size_t record_count() const { return header_->num_records; }
@@ -82,6 +128,17 @@ public:
      * @brief Get record by index (for iteration).
      */
     const AgdRecord* get_record(size_t idx) const;
+
+    /**
+     * @brief Synchronously warm up the page cache.
+     *
+     * Touches every page in the mmap'd region to force it into RAM.
+     * Critical for NFS performance where MADV_WILLNEED may not be effective.
+     * Call this before starting random lookups.
+     *
+     * @return Sum of bytes read (for preventing optimizer elimination)
+     */
+    size_t warmup_cache() const;
 
 private:
     void* data_ = nullptr;          // mmap'd file data

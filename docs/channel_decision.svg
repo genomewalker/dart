@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="560" height="175" viewBox="0 0 560 175" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <style>
+      text { font-family: -apple-system, Helvetica, Arial, sans-serif; }
+      .nt  { font-size: 8.5px; font-weight: 600; text-anchor: middle; }
+      .ns  { font-size: 7px;   text-anchor: middle; fill: #555; }
+      .el  { font-size: 7.5px; fill: #546E7A; }
+      .diamond { fill: #F5F5F5; stroke: #455A64; stroke-width: 1; }
+      .yes  { fill: #E0F2F1; stroke: #00897B; stroke-width: 1.1; }
+      .no   { fill: #FFF8E1; stroke: #F57F17; stroke-width: 1.1; }
+      .arr  { fill: none; stroke: #455A64; stroke-width: 0.9; marker-end: url(#ah); }
+      .aline { fill: none; stroke: #455A64; stroke-width: 0.9; }
+    </style>
+    <marker id="ah" markerWidth="5" markerHeight="4" refX="4" refY="2" orient="auto">
+      <polygon points="0 0,5 2,0 4" fill="#455A64"/>
+    </marker>
+  </defs>
+
+  <rect width="560" height="175" fill="white"/>
+
+  <!-- Signal 1 diamond -->
+  <polygon points="116,12 200,64 116,116 32,64" class="diamond"/>
+  <text x="116" y="58" class="nt" fill="#1565C0">Signal 1</text>
+  <text x="116" y="70" class="ns">C→T frequency</text>
+  <text x="116" y="81" class="ns">elevated at 5′ end?</text>
+
+  <!-- No → down-left to No damage box -->
+  <path d="M 32 64 L 10 64 L 10 132" class="aline"/>
+  <line x1="10" y1="132" x2="10" y2="138" class="arr"/>
+  <text x="14" y="57" class="el">No</text>
+
+  <!-- No damage box -->
+  <rect x="0" y="138" width="120" height="34" rx="3" class="no"/>
+  <text x="60" y="153" class="nt" fill="#E65100">No damage</text>
+  <text x="60" y="164" class="ns">d_max = 0</text>
+
+  <!-- Yes → Signal 2 -->
+  <line x1="200" y1="64" x2="250" y2="64" class="arr"/>
+  <text x="208" y="57" class="el">Yes</text>
+
+  <!-- Signal 2 diamond -->
+  <polygon points="320,12 404,64 320,116 236,64" class="diamond"/>
+  <text x="320" y="57" class="nt" fill="#1565C0">Signal 2</text>
+  <text x="320" y="69" class="ns">stop codon excess</text>
+  <text x="320" y="80" class="ns">at fragment ends?</text>
+
+  <!-- Yes → Authentic -->
+  <line x1="404" y1="64" x2="444" y2="64" class="arr"/>
+  <text x="411" y="57" class="el">Yes</text>
+
+  <!-- Authentic box -->
+  <rect x="444" y="44" width="106" height="40" rx="3" class="yes"/>
+  <text x="497" y="61" class="nt" fill="#00695C">Authentic</text>
+  <text x="497" y="73" class="ns">report d_max</text>
+
+  <!-- No → down to Composition artifact -->
+  <line x1="320" y1="116" x2="320" y2="138" class="arr"/>
+  <text x="325" y="132" class="el">No</text>
+
+  <!-- Composition artifact box -->
+  <rect x="200" y="138" width="240" height="34" rx="3" class="no"/>
+  <text x="320" y="153" class="nt" fill="#E65100">Composition artifact</text>
+  <text x="320" y="164" class="ns">d_max = 0</text>
+
+</svg>

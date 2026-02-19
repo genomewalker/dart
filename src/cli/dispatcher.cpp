@@ -3,7 +3,7 @@
 // Usage:
 //   agp predict <input.fq> [options]     Gene prediction (main function)
 //   agp sample-damage <input.fq>         Quick sample-level damage check
-//   agp damage-annotate <hits.tsv>       Post-mapping damage annotation
+//   agp damage-annotate --emi <hits.emi> Post-mapping damage annotation
 //   agp validate <pred.gff> <ref.gff>    Validate predictions
 
 #include "subcommand.hpp"
@@ -40,6 +40,6 @@ int main(int argc, char* argv[]) {
 
     // Unknown command
     std::cerr << "Unknown command: " << first_arg << "\n";
-    std::cerr << "Use --help for usage information.\n";
+    std::cerr << "Run 'agp --help' for usage information.\n";
     return 1;
 }

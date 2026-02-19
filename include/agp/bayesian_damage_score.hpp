@@ -1,6 +1,6 @@
 #pragma once
 // Bayesian damage scoring with log-odds fusion
-// Designed with GPT-5.3-codex for principled, calibrated ancient/modern classification
+// Calibrated ancient/modern classification
 //
 // Key features:
 // - Empirical Bayes: all parameters derived from sample data
@@ -33,13 +33,14 @@ enum class EvidenceTier : uint8_t {
     Convergent   = 3   // both terminal and site evidence
 };
 
-// Site evidence from alignment scan
+// Site evidence from alignment scan (full Bernoulli LLR model)
 struct SiteEvidence {
     uint32_t m = 0;           // susceptible opportunities (C or G in target)
     uint32_t k = 0;           // observed damage hits (C→T or G→A)
     float sum_qA = 0.0f;      // sum of position-weighted ancient hazards (all positions)
-    float sum_log_qA_hits = 0.0f;  // sum of log(q) at damage sites only
+    float sum_log_qA_hits = 0.0f;  // sum of log(q1/q0) at damage sites only (legacy)
     float q_eff = 0.0f;       // effective per-site rate = sum_qA / m
+    float sum_exp_decay = 0.0f;  // sum of exp(-λ*dist) for computing effective w
 };
 
 // Modern baseline estimate from sample (can be stratified by GC)
@@ -95,6 +96,16 @@ struct BayesianScoreParams {
     float identity_baseline = 0.90f;  // neutral point (identity = baseline -> no evidence)
     bool use_identity = false;     // enable identity evidence (requires fident input)
 
+    // Damage informativeness gating
+    // When false: terminal evidence is zeroed (sample has no detectable damage signal)
+    // Site evidence and identity evidence still apply
+    bool damage_informative = true;
+
+    // Sample-level damage rate for fixed-average site evidence formula
+    // Uses d_max * 0.5 as position-independent average damage rate
+    // This matches the original proven formula (commit 0224b4a) which achieved AUC 0.82
+    float d_max = 0.0f;
+
     // Thresholds for 3-state classification
     float ancient_threshold = 0.60f;   // posterior >= this -> Ancient
     float modern_threshold = 0.25f;    // posterior <= this -> Modern
@@ -114,6 +125,7 @@ struct BayesianScoreOutput {
     float sum_qA = 0.0f;           // position-weighted hazard sum
     EvidenceTier tier = EvidenceTier::NoEvidence;
     DamageClass damage_class = DamageClass::Uncertain;  // 3-state output
+    bool informative = true;  // false when sample damage is uninformative
 };
 
 // Precomputed exponential decay lookup table
@@ -299,8 +311,11 @@ inline BayesianScoreOutput compute_bayesian_score(
     // BF = P(data|A)/P(data|M) = [p_read/(1-p_read)] / [pi0/(1-pi0)]
     // When p_read is very low (no terminal signal detected), treat as no evidence (BF=1, logBF=0)
     // rather than strong evidence against damage (which would overwhelm site evidence)
+    //
+    // When !damage_informative: sample has no detectable damage signal (artifact or
+    // unvalidated), so terminal evidence is meaningless and zeroed out.
     double logBF_terminal = 0.0;
-    if (p_read > 0.01f) {  // Only use terminal evidence if meaningful signal
+    if (params.damage_informative && p_read > 0.01f) {
         logBF_terminal = logit(pr) - logit(pi0);
     }
 
@@ -319,22 +334,42 @@ inline BayesianScoreOutput compute_bayesian_score(
         const double k = static_cast<double>(ev.k);
         const double m = static_cast<double>(ev.m);
 
-        // Tempered Bayes factor:
-        // logBF = k*log(qA/qM) + w0*(m-k)*log((1-qA)/(1-qM))
-        // With w0 < 1, absence evidence is downweighted for robustness
+        // AA-scaled average ancient hazard — shared by both positive and negative evidence
+        // so both terms are on the same scale.
+        // Previously, negative evidence used raw sum_qA/m (nucleotide scale, ~3× too large).
+        //
+        // AA_SCALE = 0.30: P(observable AA substitution | C→T nucleotide damage)
+        // w = E[exp(-λ*dist)] over susceptible alignment positions (data-driven from sum_exp_decay)
+        // avg_q_ancient = d_max * AA_SCALE * w + q_modern
+        constexpr double AA_SCALE = 0.30;
+        const double d_max_scaled = static_cast<double>(params.d_max) * AA_SCALE;
+        const double w = (ev.sum_exp_decay > 0.0f)
+            ? static_cast<double>(ev.sum_exp_decay) / m
+            : 0.12;  // Conservative estimate for ~50bp reads
+        const double avg_q_ancient = (d_max_scaled > qm)
+            ? clamp01(d_max_scaled * w + qm, eps)
+            : qm;  // d_max=0 → no expected damage → avg_q_ancient = qm
 
         if (ev.k > 0) {
-            // Positive evidence from observed damage sites
-            // sum_log_qA_hits = sum of log((q_damage + q_baseline) / q_baseline)
-            logBF_sites = static_cast<double>(ev.sum_log_qA_hits);
+            // Fixed-average logBF_sites = k * log(avg_q_ancient / q_modern)
+            //
+            // Why fixed-average (not position-weighted):
+            // - Alignment AA positions don't correspond to original read positions
+            // - Damage at terminal nucleotides appears at various AA positions after translation
+            // - Interior alignment positions may correspond to terminal read damage
+            if (d_max_scaled > qm) {
+                logBF_sites = k * std::log(avg_q_ancient / qm);
+            } else if (ev.sum_log_qA_hits > 0.0f) {
+                // Fallback: position-weighted sum (when d_max not available)
+                logBF_sites = static_cast<double>(ev.sum_log_qA_hits);
+            }
         }
 
         // Tempered negative evidence (absence of damage where expected)
         // Only apply if Channel B validates sample-level damage (otherwise no expected damage)
-        if (params.channel_b_valid && w0 > 0.0 && ev.m > ev.k) {
-            // Average ancient rate over all susceptible positions
-            double q_ancient_avg = clamp01(ev.sum_qA / m + qm, eps);
-            double log_ratio_no_damage = std::log((1.0 - q_ancient_avg) / (1.0 - qm));
+        // Uses same avg_q_ancient as positive evidence (AA-scaled, consistent).
+        if (params.channel_b_valid && w0 > 0.0 && ev.m > ev.k && avg_q_ancient > qm) {
+            double log_ratio_no_damage = std::log((1.0 - avg_q_ancient) / (1.0 - qm));
             logBF_sites += w0 * (m - k) * log_ratio_no_damage;
         }
 
@@ -360,10 +395,13 @@ inline BayesianScoreOutput compute_bayesian_score(
     const double post = inv_logit(logit_post);
 
     // Determine evidence tier
+    // When uninformative, terminal signal is not usable evidence
     const bool has_sites = (ev.k > 0);
-    const bool has_terminal = (p_read >= params.terminal_threshold);
+    const bool has_terminal = params.damage_informative && (p_read >= params.terminal_threshold);
     EvidenceTier tier;
-    if (has_terminal && has_sites) {
+    if (!params.damage_informative) {
+        tier = has_sites ? EvidenceTier::SitesOnly : EvidenceTier::NoEvidence;
+    } else if (has_terminal && has_sites) {
         tier = EvidenceTier::Convergent;
     } else if (has_terminal) {
         tier = EvidenceTier::TerminalOnly;
@@ -395,6 +433,7 @@ inline BayesianScoreOutput compute_bayesian_score(
     out.sum_qA = ev.sum_qA;
     out.tier = tier;
     out.damage_class = damage_class;
+    out.informative = params.damage_informative;
     return out;
 }
 
@@ -451,6 +490,142 @@ inline StratifiedBaseline estimate_stratified_baseline(
     out.global.q_modern = compute_q(out.global);
 
     return out;
+}
+
+// Compute damage detectability score (0.0 = uninformative, 1.0 = highly informative)
+// Based on AGD v3 header fields: damage_validated, damage_artifact, d_max,
+// stop_decay_llr (Channel B), terminal_shift
+//
+// Use cases:
+// - Gate Bayesian scoring: if detectability == 0, posterior is meaningless
+// - Downstream filtering: weight results by sample quality
+// - Reporting: flag samples where damage signal is unreliable
+inline float compute_damage_detectability(
+    float d_max,
+    bool damage_validated,
+    bool damage_artifact,
+    bool channel_b_valid,
+    float stop_decay_llr,
+    float terminal_shift) noexcept
+{
+    // No damage detected at all
+    if (d_max <= 0.0f) return 0.0f;
+
+    // Channel A fired but Channel B says artifact
+    if (damage_artifact) return 0.0f;
+
+    // Channel B not valid (insufficient data) -- use d_max as weak proxy
+    if (!channel_b_valid) {
+        // d_max alone is unreliable, but non-zero means some signal
+        // Scale: 10% d_max -> 0.3, 30% -> 0.5 (capped, never fully confident)
+        return std::min(0.5f, d_max * 3.0f);
+    }
+
+    // Both channels validated: combine d_max strength with Channel B confidence
+    if (damage_validated) {
+        // Terminal shift strength: higher shift = clearer signal
+        float shift_score = std::min(1.0f, std::abs(terminal_shift) * 5.0f);
+        // Channel B LLR strength: higher LLR = more confident
+        float llr_score = std::min(1.0f, std::max(0.0f, stop_decay_llr / 10000.0f));
+        // d_max strength
+        float dmax_score = std::min(1.0f, d_max * 5.0f);
+        // Combine: geometric-ish mean, floor at 0.5 (validated = at least moderate)
+        return std::max(0.5f, (shift_score + llr_score + dmax_score) / 3.0f);
+    }
+
+    // Fallback: not validated, not artifact, Channel B valid but flat
+    return 0.0f;
+}
+
+// Length-binned BPA statistics for short protein z-score normalization
+// Bins: 0=15-24aa, 1=25-39aa, 2=40-59aa, 3=60+aa
+struct LengthBinStats {
+    static constexpr int N_BINS = 4;
+    struct Bin {
+        double sum_bpa = 0.0;
+        double sum_bpa_sq = 0.0;
+        size_t count = 0;
+        float mu = 0.0f;
+        float sigma = 1.0f;
+        bool valid = false;
+    };
+    std::array<Bin, N_BINS> bins{};
+
+    static int get_bin(size_t aa_len) {
+        if (aa_len < 25) return 0;
+        if (aa_len < 40) return 1;
+        if (aa_len < 60) return 2;
+        return 3;
+    }
+
+    void add(size_t aa_len, float bpa) {
+        int b = get_bin(aa_len);
+        bins[b].sum_bpa += bpa;
+        bins[b].sum_bpa_sq += bpa * bpa;
+        bins[b].count++;
+    }
+
+    void finalize() {
+        for (auto& b : bins) {
+            if (b.count < 10) continue;
+            b.mu = static_cast<float>(b.sum_bpa / b.count);
+            double var = (b.sum_bpa_sq / b.count) - (b.mu * b.mu);
+            b.sigma = static_cast<float>(std::sqrt(std::max(var, 1e-6)));
+            b.valid = true;
+        }
+    }
+
+    float z_score(size_t aa_len, float bpa) const {
+        int b = get_bin(aa_len);
+        if (!bins[b].valid) return 0.0f;
+        return (bpa - bins[b].mu) / bins[b].sigma;
+    }
+};
+
+// 4-class protein classification combining damage informativeness with scoring
+enum class AncientClassification : uint8_t {
+    AncientConfident = 0,  // damage_informative AND posterior >= threshold
+    AncientLikely    = 1,  // NOT damage_informative AND source_supported
+    Undetermined     = 2,  // NOT damage_informative AND no strong source signal
+    ModernConfident  = 3   // damage_informative AND posterior <= modern_threshold
+};
+
+inline const char* classification_name(AncientClassification c) {
+    switch (c) {
+        case AncientClassification::AncientConfident: return "ancient_confident";
+        case AncientClassification::AncientLikely: return "ancient_likely";
+        case AncientClassification::Undetermined: return "undetermined";
+        case AncientClassification::ModernConfident: return "modern_confident";
+        default: return "unknown";
+    }
+}
+
+// Classify a protein using damage informativeness + Bayesian posterior + quality metrics
+// When damage is informative, posterior drives the classification.
+// When uninformative, fall back to alignment quality heuristics.
+inline AncientClassification classify_protein(
+    bool damage_informative,
+    float posterior,
+    float fident,
+    float z_bpa,
+    float delta_bits,
+    float ancient_threshold = 0.60f,
+    float modern_threshold = 0.25f) noexcept
+{
+    if (damage_informative) {
+        if (posterior >= ancient_threshold)
+            return AncientClassification::AncientConfident;
+        if (posterior <= modern_threshold)
+            return AncientClassification::ModernConfident;
+        return AncientClassification::Undetermined;
+    }
+
+    // Uninformative: use alignment quality as proxy
+    // source_supported = high identity + good length-normalized score + clear best hit
+    bool source_supported = (fident >= 0.90f) && (z_bpa >= 0.5f) && (delta_bits >= 5.0f);
+    return source_supported
+        ? AncientClassification::AncientLikely
+        : AncientClassification::Undetermined;
 }
 
 } // namespace agp

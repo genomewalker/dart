@@ -259,8 +259,8 @@ private:
         // For each pair in bucket, check diagonal consistency
         // Diagonal = pos_j - pos_i (implied overlap offset)
 
-        // Build diagonal histogram for each read pair
-        // (simplified: just check pairs directly for small buckets)
+        // Build diagonal histogram for each read pair.
+        // For small buckets we directly evaluate read pairs.
 
         for (size_t i = start; i < end; ++i) {
             for (size_t j = i + 1; j < end; ++j) {

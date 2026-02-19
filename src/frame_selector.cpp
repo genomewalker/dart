@@ -437,7 +437,7 @@ static std::string generate_search_protein(
 // 2. MAP estimation with Beta prior from sample d_max
 // 3. 2-step Newton optimization for θ_MAP
 //
-// Designed with OpenCode GPT-5.2-codex consultation.
+// Calibrated against sample-level damage statistics.
 // Expected improvement: ρ ~0.20-0.25 (vs 0.134 baseline)
 // ============================================================================
 float FrameSelector::compute_per_read_damage_prior(

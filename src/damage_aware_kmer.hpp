@@ -363,7 +363,7 @@ public:
         // 2. Sort by canonical hash
         std::sort(seeds.begin(), seeds.end());
 
-        // 3. Initialize Union-Find (simplified)
+        // 3. Initialize Union-Find
         std::vector<uint32_t> parent(n);
         std::vector<int32_t> offset(n, 0);
         for (size_t i = 0; i < n; ++i) parent[i] = i;
