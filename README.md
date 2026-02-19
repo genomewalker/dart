@@ -297,11 +297,11 @@ Protein-level damage classification benchmarked on the same 10 KapK synthetic sa
 
 | Group | AUC-ROC |
 |-------|---------|
-| Overall | **0.873** |
-| AT-rich samples | **0.945** |
-| GC-rich samples | **0.934** |
+| Overall | **0.881** |
+| AT-rich samples | **0.957** |
+| GC-rich samples | **0.943** |
 
-At the Youden-optimal threshold τ = 0.70: **Precision 99.2%, Recall 86.2%, F1 = 0.923**.
+At the Youden-optimal threshold τ = 0.70: **Precision 99.7%, Recall 89.5%, F1 = 0.943**.
 
 <p align="center">
 <img src="docs/protein_benchmark.png" width="700" alt="Protein-level damage classification: ROC curves and precision/recall">
