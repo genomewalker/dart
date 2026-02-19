@@ -484,7 +484,7 @@ Post-mortem deamination hydrolytically removes the amine group from cytosine, co
 
 $$\delta(p) = d_{\max} \cdot e^{-\lambda p}$$
 
-$d_{\max}$ is the substitution rate at the outermost position, reflecting both the age of the sample and preservation conditions. $\lambda$ is the decay constant (typically 0.2–0.5 nats/position), controlling how deep into the read the damage signal extends. The characteristic half-life is $t_{1/2} = \ln(2) / \lambda \approx 1.4\text{–}3.5$ positions. AGP estimates both parameters from the data in Pass 1, fitting the observed T/(T+C) profile to this model via maximum likelihood.
+$d_{\max}$ is the substitution rate at the outermost position, reflecting both the age of the sample and preservation conditions. $\lambda$ is the decay constant (typically 0.2–0.5 nats/position), controlling how deep into the read the damage signal extends. The characteristic half-life is $t_{1/2} = \ln(2) / \lambda$, roughly 1.4 to 3.5 positions. AGP estimates both parameters from the data in Pass 1, fitting the observed T/(T+C) profile to this model via maximum likelihood.
 
 Single-stranded library preparation (e.g. uracil-tolerant protocols) shows the full 5′ C→T gradient independently of the complementary strand. Double-stranded protocols show the characteristic mirror image: 5′ C→T and 3′ G→A from the complementary strand.
 
@@ -492,7 +492,7 @@ Single-stranded library preparation (e.g. uracil-tolerant protocols) shows the f
 
 Reference-free damage detection faces a fundamental ambiguity: elevated terminal T/(T+C) can result from either genuine C→T deamination **or** a high baseline T content in the organism's genome (compositional confounding). AGP resolves this with two independent channels that respond differently to each cause.
 
-**Channel A — nucleotide frequency enrichment**
+**Channel A: nucleotide frequency enrichment**
 
 Channel A measures the ratio of T to total pyrimidines at each terminal position $p$:
 
@@ -506,7 +506,7 @@ where $b_T$ is the organism's genomic T/(T+C) baseline measured from read interi
 
 *Limitation:* An AT-rich organism will have a naturally high $b_T$, and any additional damage-driven enrichment sits on top of a noisy baseline. Channel A alone cannot distinguish the two.
 
-**Channel B — stop codon conversion**
+**Channel B: stop codon conversion**
 
 Channel B exploits the fact that only three sense codons contain a C that, when converted to T, produces a stop codon: CAA→TAA (Gln→ochre), CAG→TAG (Gln→amber), and CGA→TGA (Arg→opal). These are the **preimage** of the stop set under C→T substitution. The conversion rate at position $p$ is:
 
@@ -518,9 +518,9 @@ where $\text{stops}_p$ counts in-frame stop codons observed at codon position $p
 
 | Channel A | Channel B | Interpretation |
 |-----------|-----------|----------------|
-| Fires | Fires | Validated damage — $d_{\max}$ reported |
-| Fires | Flat / negative | Compositional artifact — $d_{\max} = 0$ |
-| Silent | — | No detectable damage — $d_{\max} = 0$ |
+| Fires | Fires | Validated damage ($d_{\max}$ reported) |
+| Fires | Flat or negative | Compositional artifact ($d_{\max} = 0$) |
+| Silent | n/a | No detectable damage ($d_{\max} = 0$) |
 
 This design eliminates false positives from AT-rich organisms (the most common failure mode of reference-free damage detection) while retaining sensitivity in validated samples.
 
@@ -546,7 +546,7 @@ $$\text{logit}(P_{\text{posterior}}) = \text{logit}(\pi) + \log BF_{\text{termin
 
 $$\log BF_{\text{terminal}} = \text{logit}(p_{\text{read}}) - \text{logit}(\pi_0)$$
 
-**Site evidence ($BF_{\text{sites}}$):** Counts damage-consistent amino acid substitutions in the alignment — specifically those caused by C→T (R→W, H→Y, Q→\*, S→L) and G→A (E→K, D→N) — and compares their rate to a background mismatch rate $q_0$:
+**Site evidence ($BF_{\text{sites}}$):** Counts damage-consistent amino acid substitutions in the alignment (those caused by C→T: R→W, H→Y, Q→\*, S→L; and by G→A: E→K, D→N) and compares their rate to a background mismatch rate $q_0$:
 
 $$\log BF_{\text{sites}} = k \cdot \log\!\frac{d_{\max} \cdot 0.5 \cdot \text{AA\_scale} + q_0}{q_0}$$
 
@@ -562,21 +562,21 @@ All three Bayes factors are conditionally independent given the damage status (t
 
 ### EM multi-mapping resolution
 
-In complex metagenomes, short reads often align equally well to multiple reference proteins. AGP uses Expectation–Maximisation (EM) to redistribute ambiguous reads based on reference abundance, mirroring the approach of tools such as DIAMOND's iterative assignment.
+In complex metagenomes, short reads often align equally well to multiple reference proteins. AGP uses Expectation-Maximisation (EM) to redistribute ambiguous reads based on reference abundance [Dempster et al. 1977; Salzberg et al. 1998].
 
-**E-step** — compute soft assignments (responsibilities) for each read $i$ to reference $j$:
+**E-step:** Compute soft assignments (responsibilities) for each read $i$ to reference $j$:
 
 $$\gamma_{ij} = \frac{\phi_j \cdot L(i,j)}{\sum_{k \in \mathcal{R}_i} \phi_k \cdot L(i,k)}$$
 
 The likelihood $L(i,j) = \exp(S_{ij} / \lambda)$ is a Boltzmann weighting of the alignment bit score $S_{ij}$ by temperature $\lambda$ (default 1.0); lower $\lambda$ sharpens assignment towards the best hit. The set $\mathcal{R}_i$ contains all references that read $i$ aligns to within the score window.
 
-**M-step** — update reference abundances with a Dirichlet prior $\alpha_0$ for regularisation:
+**M-step:** Update reference abundances with a Dirichlet prior $\alpha_0$ for regularisation:
 
 $$\phi_j = \frac{\alpha_0 + \sum_i \gamma_{ij}}{J \cdot \alpha_0 + N}$$
 
 where $J$ is the number of references and $N$ the total read count. The prior prevents zero-count collapse and smooths abundance estimates for low-coverage references.
 
-Convergence is assessed by the $\ell_1$ change in $\boldsymbol{\phi}$ between iterations; SQUAREM acceleration is applied to speed convergence. In practice, 5–15 iterations suffice. Reads with final responsibility $\gamma_{ij} < \epsilon$ (default $\epsilon = 10^{-6}$, `--em-min-prob`) are pruned, reducing memory and noise in downstream damage annotation.
+Convergence is assessed by the $L_1$ change in $\phi$ between iterations; SQUAREM acceleration [Varadhan and Roland 2008] is applied to speed convergence. In practice, 5–15 iterations suffice. Reads with final responsibility $\gamma_{ij} < \epsilon$ (default $\epsilon = 10^{-6}$, `--em-min-prob`) are pruned, reducing memory and noise in downstream damage annotation.
 
 ### Frame scoring
 
@@ -591,7 +591,64 @@ AGP evaluates all six reading frames for each read and selects the frame with th
 | GC3 content | 0.05 | GC at third codon position (coding bias indicator) |
 | Damage-frame consistency | variable | Bonus when damage sites align with predicted frame |
 
-The stop codon penalty is multiplicative (not additive) to prevent a single downstream stop from completely masking an otherwise well-supported long ORF. In damage-aware mode, each in-frame stop codon is weighted by $(1 - P_{\text{damage}}(p))$ where $P_{\text{damage}}(p) = d_{\max} \cdot e^{-\lambda p}$ at codon position $p$. A stop codon near the 5′ end of a highly damaged read contributes very little penalty — the model accepts it as likely a damage artefact rather than a true stop.
+The stop codon penalty is multiplicative (not additive) to prevent a single downstream stop from completely masking an otherwise well-supported long ORF. In damage-aware mode, each in-frame stop codon is weighted by $(1 - P_{\text{damage}}(p))$ where $P_{\text{damage}}(p) = d_{\max} \cdot e^{-\lambda p}$ at codon position $p$. A stop codon near the 5′ end of a highly damaged read contributes very little penalty; the model accepts it as likely a damage artefact rather than a true stop.
+
+### Coverage quality filters
+
+Two optional filters (`--min-positional-score` and `--min-terminal-ratio`) reject proteins whose read coverage pattern is inconsistent with random fragmentation of a real gene. Both default to 0 (off) and can be set automatically with `--auto-calibrate-spurious`, which uses the 5th percentile of well-supported proteins (≥10 reads, ≥3 unique starts) as the threshold.
+
+**Positional score (`--min-positional-score`)**
+
+When many reads align to a short conserved sequence motif rather than a full gene, they all pile up at the same position on the reference protein. The positional score detects this by measuring how spread out read start positions are:
+
+$$s_{\mathrm{pos}} = \sqrt{d_{\mathrm{uniq}} \cdot w_{\mathrm{span}}}$$
+
+$$d_{\mathrm{uniq}} = \frac{|\mathcal{S}|}{\min(n,\; L)} \qquad w_{\mathrm{span}} = \frac{p_{\max} - p_{\min} + 1}{L}$$
+
+$|\mathcal{S}|$ is the number of distinct alignment start positions, $n$ is the read count, $L$ is the reference protein length in amino acids, and $p_{\max}, p_{\min}$ are the outermost and innermost observed start positions. $d_{\mathrm{uniq}}$ measures how many distinct start positions are used relative to the maximum possible. $w_{\mathrm{span}}$ measures how far apart the outermost starts are relative to the protein length. The geometric mean requires both to be simultaneously high.
+
+```
+              reference protein (100 aa)
+              |------------------------------------------|
+
+Spurious      ▼▼▼▼▼▼▼▼▼▼▼
+(motif hit)   reads pile up near one position
+              w_span = 0.12,  d_uniq = 0.55
+              s_pos = sqrt(0.12 * 0.55) = 0.26   FAIL
+
+Authentic     ▼   ▼  ▼    ▼   ▼    ▼   ▼   ▼  ▼    ▼
+(real gene)   reads start at many positions across protein
+              w_span = 0.88,  d_uniq = 1.00
+              s_pos = sqrt(0.88 * 1.00) = 0.94   PASS
+```
+
+**Terminal ratio (`--min-terminal-ratio`)**
+
+A conserved internal domain attracts reads that align only to the middle of a reference, leaving the terminal regions uncovered. The terminal ratio compares mean coverage depth in the outermost 10% of the protein at each end against the interior:
+
+$$\rho = \frac{\bar{c}_{\mathrm{term}}}{\bar{c}_{\mathrm{mid}}}$$
+
+where the terminal zone width is $e = \mathrm{clamp}(\lfloor L/10 \rfloor,\; 1,\; \lfloor L/2 \rfloor)$ residues at each end. Coverage is accumulated as the EM-weighted sum of alignment overlaps with each zone. A value above 1 means the termini are better covered than the interior; below 1 means the interior dominates.
+
+```
+     reference protein
+     |-- edge --|----------- middle -----------|-- edge --|
+
+Spurious    depth:  ▁▁           ▃▅████████▅▃           ▁▁
+(interior           c_term ~ 0.5,  c_mid ~ 7
+ domain)            rho = 0.5 / 7 = 0.07   FAIL
+
+Authentic   depth:  ████        ████████████████        ████
+(real gene)         c_term ~ 8,  c_mid ~ 9
+                    rho = 8 / 9 = 0.89   PASS
+```
+
+The two filters are complementary: the positional score catches reads piled at any single location on the protein, while the terminal ratio catches reads that collectively avoid both ends.
+
+| Filter | Detects | Spurious pattern |
+|--------|---------|------------------|
+| `--min-positional-score` | Reads clustered at one spot | Short conserved motif hit |
+| `--min-terminal-ratio` | Reads avoiding both ends | Interior conserved domain |
 
 ### Domain-specific models
 
