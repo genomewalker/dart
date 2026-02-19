@@ -76,7 +76,8 @@ inline const DamageEvidenceSub* find_damage_evidence_sub(char target_aa, char qu
 inline bool query_id_is_reverse(std::string_view query_id) {
     // Expected AGP suffix: ..._<+|->_<0..9>
     if (query_id.size() < 4) return false;
-    for (size_t i = query_id.size() - 1; i >= 2; --i) {
+    // Use signed index to avoid size_t underflow past 0
+    for (ptrdiff_t i = static_cast<ptrdiff_t>(query_id.size()) - 1; i >= 2; --i) {
         if (query_id[i] == '_' &&
             query_id[i - 2] == '_' &&
             (query_id[i - 1] == '+' || query_id[i - 1] == '-')) {

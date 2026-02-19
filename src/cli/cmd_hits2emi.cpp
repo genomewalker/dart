@@ -12,12 +12,15 @@
 #include "agp/damage_index_reader.hpp"
 #include "agp/log_utils.hpp"
 
-#include <iostream>
+#include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <chrono>
 #include <cctype>
-#include <limits>
 #include <fstream>
+#include <iostream>
+#include <limits>
+#include <stdexcept>
 #include <unistd.h>
 
 #ifdef _OPENMP

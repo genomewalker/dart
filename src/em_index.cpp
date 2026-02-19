@@ -10,6 +10,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <limits>
 #include <stdexcept>
 #include <sys/mman.h>
 #include <sys/stat.h>
