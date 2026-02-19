@@ -39,6 +39,7 @@
 #include <iostream>
 #include <exception>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -995,6 +996,8 @@ public:
     struct Config {
         float d_max = 0.0f;
         float lambda = 0.3f;
+        bool d_max_set_by_user = false;
+        bool lambda_set_by_user = false;
         bool verbose = false;
         bool compress = true;  // Use ZSTD compression (if available)
         int compression_level = 3;  // ZSTD level (1-19, 3 = good balance)
@@ -1031,11 +1034,13 @@ public:
         size_t file_size = static_cast<size_t>(st.st_size);
 
         // For gzip, estimate 5x expansion
-        bool is_gz = (tsv_path.size() >= 3 && tsv_path.substr(tsv_path.size() - 3) == ".gz");
+        const bool is_gz = is_gzip(tsv_path);
         size_t estimated_size = is_gz ? file_size * 5 : file_size;
 
-        // Use mmap if file fits in memory limit, otherwise stream
-        if (!config.force_streaming && estimated_size < config.memory_limit) {
+        // Prefer streaming for gzip inputs to avoid full decompression into RAM.
+        const bool use_mmap = !config.force_streaming && !is_gz && estimated_size < config.memory_limit;
+
+        if (use_mmap) {
             if (config.verbose) {
                 std::cerr << "Using mmap mode (file " << (estimated_size / (1024*1024))
                           << " MB < limit " << (config.memory_limit / (1024*1024*1024)) << " GB)\n";
@@ -1044,11 +1049,58 @@ public:
         } else {
             if (config.verbose) {
                 std::cerr << "Using streaming mode (file " << (estimated_size / (1024*1024))
-                          << " MB, limit " << (config.memory_limit / (1024*1024*1024)) << " GB)\n";
+                          << " MB, limit " << (config.memory_limit / (1024*1024*1024)) << " GB";
+                if (is_gz && !config.force_streaming) std::cerr << ", gzip input";
+                std::cerr << ")\n";
             }
             return convert_streaming(tsv_path, output_path, config);
         }
     }
+
+private:
+    static std::unique_ptr<DamageIndexReader> init_damage_reader(
+        const Config& config,
+        float& d_max_out,
+        float& lambda_out)
+    {
+        if (config.damage_index_path.empty()) return nullptr;
+
+        auto reader = std::make_unique<DamageIndexReader>(config.damage_index_path, false);
+        if (!reader->is_valid()) {
+            throw std::runtime_error("Cannot open damage index: " + config.damage_index_path);
+        }
+
+        if (!config.d_max_set_by_user && reader->d_max() > 0.0f) {
+            d_max_out = reader->d_max();
+        }
+        if (!config.lambda_set_by_user && reader->lambda() > 0.0f) {
+            lambda_out = reader->lambda();
+        }
+        return reader;
+    }
+
+    template <typename NameVec>
+    static std::vector<uint8_t> build_read_damage_quantized(
+        const DamageIndexReader* damage_reader,
+        const NameVec& read_names)
+    {
+        std::vector<uint8_t> out;
+        if (!damage_reader || !damage_reader->is_valid()) return out;
+
+        out.resize(read_names.size(), 0);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+        for (int64_t i = 0; i < static_cast<int64_t>(read_names.size()); ++i) {
+            const auto ridx = static_cast<size_t>(i);
+            if (const AgdRecord* rec = damage_reader->find(read_names[ridx])) {
+                out[ridx] = rec->p_damaged_q;
+            }
+        }
+        return out;
+    }
+
+public:
 
     /**
      * @brief Fast mmap-based conversion (for files that fit in memory)
@@ -1059,38 +1111,21 @@ public:
         const Config& config)
     {
         auto total_start = std::chrono::high_resolution_clock::now();
-
-        // Handle gzip vs plain file
-        std::vector<char> gz_buffer;
-        const char* data = nullptr;
-        size_t size = 0;
+        float header_d_max = config.d_max;
+        float header_lambda = config.lambda;
+        auto damage_reader = init_damage_reader(config, header_d_max, header_lambda);
 
         if (is_gzip(tsv_path)) {
-            if (config.verbose) {
-                std::cerr << "Detected gzip compression, decompressing...\n";
-            }
-            GzipStreamReader gz(tsv_path);
-            if (!gz.valid()) {
-                throw std::runtime_error("Cannot open gzip TSV: " + tsv_path);
-            }
-            gz_buffer = gz.read_all();
-            data = gz_buffer.data();
-            size = gz_buffer.size();
-            if (config.verbose) {
-                std::cerr << "Decompressed: " << (size / (1024*1024)) << " MB\n";
-            }
+            throw std::runtime_error(
+                "mmap mode does not support gzip input; use streaming mode");
         }
 
-        // For plain files, use mmap
-        std::unique_ptr<MappedTSV> tsv_holder;
-        if (!is_gzip(tsv_path)) {
-            tsv_holder = std::make_unique<MappedTSV>(tsv_path.c_str());
-            if (!tsv_holder->valid()) {
-                throw std::runtime_error("Cannot open TSV: " + tsv_path);
-            }
-            data = tsv_holder->data();
-            size = tsv_holder->size();
+        const std::unique_ptr<MappedTSV> tsv_holder = std::make_unique<MappedTSV>(tsv_path.c_str());
+        if (!tsv_holder->valid()) {
+            throw std::runtime_error("Cannot open TSV: " + tsv_path);
         }
+        const char* data = tsv_holder->data();
+        const size_t size = tsv_holder->size();
 
         // Skip header if present
         size_t start_offset = 0;
@@ -1239,25 +1274,13 @@ public:
         }
         read_names.swap(read_names_ordered);
 
-        std::vector<float> read_damage_by_idx;
-        if (!config.damage_index_path.empty()) {
-            DamageIndexReader damage_reader(config.damage_index_path);
-            if (!damage_reader.is_valid()) {
-                throw std::runtime_error("Cannot open damage index: " + config.damage_index_path);
-            }
-            read_damage_by_idx.resize(read_names.size(), 0.0f);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-            for (int64_t i = 0; i < static_cast<int64_t>(read_names.size()); ++i) {
-                const auto ridx = static_cast<size_t>(i);
-                if (const AgdRecord* rec = damage_reader.find(read_names[ridx])) {
-                    read_damage_by_idx[ridx] = static_cast<float>(rec->p_damaged_q) / 255.0f;
-                }
-            }
-            if (config.verbose) {
-                std::cerr << "  Embedded per-read damage scores from " << config.damage_index_path
-                          << " into EMI DAMAGE_SCORE\n";
+        std::vector<uint8_t> read_damage_q = build_read_damage_quantized(damage_reader.get(), read_names);
+        if (config.verbose && damage_reader) {
+            std::cerr << "  Embedded per-read damage scores from " << config.damage_index_path
+                      << " into EMI DAMAGE_SCORE\n";
+            if (!config.d_max_set_by_user || !config.lambda_set_by_user) {
+                std::cerr << "  Using AGD metadata for EMI header: d_max=" << header_d_max
+                          << " lambda=" << header_lambda << "\n";
             }
         }
 
@@ -1307,8 +1330,8 @@ public:
         header.num_refs = static_cast<uint32_t>(ref_name_offsets.size());
         header.num_row_groups = static_cast<uint32_t>(num_row_groups);
         header.row_group_size = static_cast<uint32_t>(rg_size);
-        header.d_max = config.d_max;
-        header.lambda = config.lambda;
+        header.d_max = header_d_max;
+        header.lambda = header_lambda;
         header.flags = 0;
 
         out.write(reinterpret_cast<const char*>(&header), sizeof(header));
@@ -1445,9 +1468,9 @@ public:
                 uint32_t tlen_v = fast_stou({fields[13], lens[13]});
 
                 rg_bit_score[local_idx] = bits;
-                rg_damage_score[local_idx] = read_damage_by_idx.empty()
+                rg_damage_score[local_idx] = read_damage_q.empty()
                     ? 0.0f
-                    : read_damage_by_idx[rg_read_idx[local_idx]];
+                    : static_cast<float>(read_damage_q[rg_read_idx[local_idx]]) * (1.0f / 255.0f);
                 rg_evalue_log10[local_idx] = (evalue > 0) ? std::log10(evalue) : -300.0f;
                 rg_dmg_k[local_idx] = 0;
                 rg_dmg_m[local_idx] = 0;
@@ -1500,8 +1523,8 @@ public:
                         taln_sv,
                         rg_qstart[local_idx],
                         rg_qlen[local_idx],
-                        config.d_max,
-                        config.lambda);
+                        header_d_max,
+                        header_lambda);
                     rg_dmg_k[local_idx] = dmg.k_hits;
                     rg_dmg_m[local_idx] = dmg.m_sites;
                     rg_dmg_ll_a[local_idx] = dmg.ll_ancient;
@@ -1742,10 +1765,17 @@ public:
         const Config& config)
     {
         auto total_start = std::chrono::high_resolution_clock::now();
+        float header_d_max = config.d_max;
+        float header_lambda = config.lambda;
+        auto damage_reader = init_damage_reader(config, header_d_max, header_lambda);
 
         if (config.verbose) {
             std::cerr << "Streaming mode (memory cap: "
                       << (config.memory_limit / (1024*1024*1024)) << " GB)\n";
+            if (damage_reader && (!config.d_max_set_by_user || !config.lambda_set_by_user)) {
+                std::cerr << "Using AGD metadata for EMI header: d_max=" << header_d_max
+                          << " lambda=" << header_lambda << "\n";
+            }
         }
 
         // =====================================================================
@@ -1958,8 +1988,8 @@ public:
         header.num_refs = static_cast<uint32_t>(ref_name_offsets.size());
         header.num_row_groups = static_cast<uint32_t>(num_row_groups);
         header.row_group_size = static_cast<uint32_t>(rg_size);
-        header.d_max = config.d_max;
-        header.lambda = config.lambda;
+        header.d_max = header_d_max;
+        header.lambda = header_lambda;
         header.flags = 0;
 
         out.write(reinterpret_cast<const char*>(&header), sizeof(header));
@@ -1989,26 +2019,11 @@ public:
         out.write(reinterpret_cast<const char*>(&ref_names_size), sizeof(ref_names_size));
         out.write(ref_names_data.data(), ref_names_data.size());
 
-        std::vector<float> read_damage_by_idx;
-        if (!config.damage_index_path.empty()) {
-            DamageIndexReader damage_reader(config.damage_index_path);
-            if (!damage_reader.is_valid()) {
-                throw std::runtime_error("Cannot open damage index: " + config.damage_index_path);
-            }
-            read_damage_by_idx.resize(header.num_reads, 0.0f);
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-            for (int64_t i = 0; i < static_cast<int64_t>(read_names_vec_str.size()); ++i) {
-                const uint32_t ridx = static_cast<uint32_t>(i);
-                if (const AgdRecord* rec = damage_reader.find(read_names_vec_str[ridx])) {
-                    read_damage_by_idx[ridx] = static_cast<float>(rec->p_damaged_q) / 255.0f;
-                }
-            }
-            if (config.verbose) {
-                std::cerr << "Embedded per-read damage scores from " << config.damage_index_path
-                          << " into EMI DAMAGE_SCORE\n";
-            }
+        std::vector<uint8_t> read_damage_q =
+            build_read_damage_quantized(damage_reader.get(), read_names_vec_str);
+        if (config.verbose && damage_reader) {
+            std::cerr << "Embedded per-read damage scores from " << config.damage_index_path
+                      << " into EMI DAMAGE_SCORE\n";
         }
 
         // Release name vectors after writing (keep lookups for row-group processing)
@@ -2121,10 +2136,10 @@ public:
                 uint32_t tlen_v = fast_stou({fields[13], lens[13]});
 
                 res.bit_score[local_idx] = bits;
-                res.damage_score[local_idx] = read_damage_by_idx.empty()
+                res.damage_score[local_idx] = read_damage_q.empty()
                     ? 0.0f
-                    : ((res.read_idx[local_idx] < read_damage_by_idx.size())
-                        ? read_damage_by_idx[res.read_idx[local_idx]]
+                    : ((res.read_idx[local_idx] < read_damage_q.size())
+                        ? static_cast<float>(read_damage_q[res.read_idx[local_idx]]) * (1.0f / 255.0f)
                         : 0.0f);
                 res.evalue_log10[local_idx] = (evalue > 0) ? std::log10(evalue) : -300.0f;
                 res.identity_q[local_idx] = static_cast<uint16_t>(std::clamp(fident, 0.0f, 1.0f) * 65535.0f);
@@ -2149,7 +2164,7 @@ public:
                         q, qaln_sv, taln_sv,
                         res.qstart[local_idx],
                         res.qlen[local_idx],
-                        config.d_max, config.lambda);
+                        header_d_max, header_lambda);
                     res.dmg_k[local_idx] = dmg.k_hits;
                     res.dmg_m[local_idx] = dmg.m_sites;
                     res.dmg_ll_a[local_idx] = dmg.ll_ancient;

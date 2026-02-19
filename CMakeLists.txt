@@ -135,6 +135,7 @@ set(AGP_CORE_SOURCES
     src/em_reassign.cpp
     src/em_index.cpp
     src/columnar_index.cpp
+    src/coverage_em.cpp
 )
 
 # Subcommand sources

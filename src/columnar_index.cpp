@@ -1195,7 +1195,8 @@ ColumnarEMResult em_solve_columnar(
     uint32_t max_iters,
     double tol,
     bool use_damage,
-    double alpha_prior)
+    double alpha_prior,
+    const std::vector<double>& initial_weights)
 {
     const uint32_t num_refs = reader.num_refs();
     const uint64_t num_alns = reader.num_alignments();
@@ -1206,7 +1207,14 @@ ColumnarEMResult em_solve_columnar(
     data.load(reader);
 
     ColumnarEMResult result;
-    result.weights.assign(num_refs, 1.0 / static_cast<double>(num_refs));
+    if (!initial_weights.empty() && initial_weights.size() == num_refs) {
+        result.weights = initial_weights;
+        double sum = 0.0;
+        for (double w : result.weights) sum += w;
+        if (sum > 0.0) for (double& w : result.weights) w /= sum;
+    } else {
+        result.weights.assign(num_refs, 1.0 / static_cast<double>(num_refs));
+    }
     result.gamma.resize(num_alns, 0.0);
     if (use_damage) {
         result.gamma_ancient.resize(num_alns, 0.0);

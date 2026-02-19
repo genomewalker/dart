@@ -9,7 +9,6 @@
 #include "subcommand.hpp"
 #include "agp/version.h"
 #include "agp/fast_columnar_writer.hpp"
-#include "agp/damage_index_reader.hpp"
 #include "agp/log_utils.hpp"
 
 #include <cmath>
@@ -160,8 +159,8 @@ int cmd_hits2emi(int argc, char* argv[]) {
             std::cout << "Usage: agp hits2emi -i <hits.tsv[.gz]> -o <output.emi> [options]\n\n";
             std::cout << "Convert MMseqs2 hits to columnar EM index (DuckDB-style streaming).\n\n";
             std::cout << "Features:\n";
-            std::cout << "  - Hybrid mode: mmap for small files, streaming for large\n";
-            std::cout << "  - Auto-detects gzip compression (.gz files)\n";
+            std::cout << "  - Hybrid mode for plain files: mmap for small, streaming for large\n";
+            std::cout << "  - Auto-detects gzip compression (.gz files, defaults to streaming)\n";
             std::cout << "  - Row groups (64K) for parallel EM processing\n";
             std::cout << "  - Spilling dictionary for billion-row support\n";
             std::cout << "  - Lossless storage (all TSV fields + qaln/taln)\n\n";
@@ -172,7 +171,7 @@ int cmd_hits2emi(int argc, char* argv[]) {
             std::cout << "  --threads, -t <N>      Number of threads (default: all available)\n";
             std::cout << "  --memory, -m <SIZE>    Memory limit (default: 10% of available RAM)\n";
             std::cout << "                         Suffixes: K, M, G, T (optional B; e.g. 512M, 4GB)\n";
-            std::cout << "                         Files < limit use fast mmap, larger use streaming\n";
+            std::cout << "                         Plain files < limit use fast mmap, larger use streaming\n";
             std::cout << "  --streaming            Force streaming mode (bounded memory)\n";
             std::cout << "  --d-max <float>        Sample damage level (0-1), stored in index\n";
             std::cout << "  --lambda <float>       Damage decay parameter (default: 0.3)\n";
@@ -201,23 +200,6 @@ int cmd_hits2emi(int argc, char* argv[]) {
     auto t_start = std::chrono::steady_clock::now();
 
     try {
-        if (!damage_index_file.empty() && (!d_max_set_by_user || !lambda_set_by_user)) {
-            DamageIndexReader damage_reader(damage_index_file);
-            if (!damage_reader.is_valid()) {
-                throw std::runtime_error("Cannot open damage index: " + damage_index_file);
-            }
-            if (!d_max_set_by_user && damage_reader.d_max() > 0.0f) {
-                d_max = damage_reader.d_max();
-            }
-            if (!lambda_set_by_user && damage_reader.lambda() > 0.0f) {
-                lambda = damage_reader.lambda();
-            }
-            if (verbose) {
-                std::cerr << "Using AGD metadata for EMI header: d_max=" << d_max
-                          << " lambda=" << lambda << "\n";
-            }
-        }
-
         // Set thread count
 #ifdef _OPENMP
         if (threads > 0) {
@@ -228,6 +210,8 @@ int cmd_hits2emi(int argc, char* argv[]) {
         FastColumnarWriter::Config config;
         config.d_max = d_max;
         config.lambda = lambda;
+        config.d_max_set_by_user = d_max_set_by_user;
+        config.lambda_set_by_user = lambda_set_by_user;
         config.verbose = verbose;
         config.skip_alignments = false;  // Alignment strings required for downstream annotate-damage.
         config.memory_limit = memory_limit_bytes;

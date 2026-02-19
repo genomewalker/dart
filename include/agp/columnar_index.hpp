@@ -347,6 +347,7 @@ ColumnarEMResult em_solve_columnar(
     uint32_t max_iters = 100,
     double tol = 1e-4,
     bool use_damage = true,
-    double alpha_prior = 1.0);
+    double alpha_prior = 1.0,
+    const std::vector<double>& initial_weights = {});
 
 }  // namespace agp

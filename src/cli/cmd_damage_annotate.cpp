@@ -12,6 +12,7 @@
 #include "agp/damage_index_reader.hpp"
 #include "agp/bayesian_damage_score.hpp"
 #include "agp/em_reassign.hpp"
+#include "agp/coverage_em.hpp"
 #include "agp/columnar_index.hpp"
 #include "agp/log_utils.hpp"
 #include "agp/mmap_array.hpp"
@@ -141,8 +142,6 @@ static const DamageSubstitution* find_damage_sub(char target_aa, char query_aa) 
 }
 
 struct DamageSite {
-    std::string query_id;
-    std::string target_id;
     size_t query_pos;
     size_t target_pos;
     char target_aa;
@@ -342,7 +341,6 @@ static ProteinDamageSummary annotate_alignment(
                 aa_sum_log_qA_hits += std::log((p_dmg + Q_BASELINE) / Q_BASELINE);
 
                 sites.push_back({
-                    query_id, target_id,
                     q_pos, t_pos,
                     t_aa, q_aa,
                     sub->damage_class,
@@ -1101,6 +1099,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     double em_tol = 1e-4;
     double em_min_prob = 1e-6;       // absolute posterior threshold for keeping alignment
 
+    // Coverage-aware outer EM options
+    bool use_coverage_em = false;
+    uint32_t coverage_em_iters = 5;
+    float coverage_em_tau = 0.13f;
+    uint32_t coverage_em_bins = 6;
+
     // Bayesian scoring parameters
     float prior_ancient = 0.10f;     // Prior P(ancient) for Bayesian scorer
     bool  auto_prior_ancient = false; // Auto-calibrate prior from mean p_read distribution
@@ -1174,6 +1178,17 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             em_tol = std::stod(argv[++i]);
         } else if (strcmp(argv[i], "--em-min-prob") == 0 && i + 1 < argc) {
             em_min_prob = std::stod(argv[++i]);
+        } else if (strcmp(argv[i], "--coverage-em") == 0) {
+            use_coverage_em = true;
+        } else if (strcmp(argv[i], "--no-coverage-em") == 0) {
+            // Backward-compatible alias; coverage EM is now opt-in.
+            use_coverage_em = false;
+        } else if (strcmp(argv[i], "--coverage-em-iters") == 0 && i + 1 < argc) {
+            coverage_em_iters = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (strcmp(argv[i], "--coverage-em-tau") == 0 && i + 1 < argc) {
+            coverage_em_tau = std::stof(argv[++i]);
+        } else if (strcmp(argv[i], "--coverage-em-bins") == 0 && i + 1 < argc) {
+            coverage_em_bins = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (strcmp(argv[i], "--prior-ancient") == 0 && i + 1 < argc) {
             prior_ancient = std::stof(argv[++i]);
         } else if (strcmp(argv[i], "--min-damage-sites") == 0 && i + 1 < argc) {
@@ -1274,6 +1289,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cout << "  --em-lambda FLOAT Temperature parameter (default: 3.0)\n";
             std::cout << "  --em-tol FLOAT    Convergence tolerance (default: 1e-4)\n";
             std::cout << "  --em-min-prob FLOAT     Min EM posterior to keep (default: 1e-6)\n";
+            std::cout << "\nCoverage-aware EM (outer loop, opt-in):\n";
+            std::cout << "  --coverage-em            Enable coverage-aware outer EM loop (default: off)\n";
+            std::cout << "  --no-coverage-em         Explicitly disable coverage-aware outer EM (kept for scripts)\n";
+            std::cout << "  --coverage-em-iters INT  Max outer EM iterations (default: 5)\n";
+            std::cout << "  --coverage-em-tau FLOAT  KL penalty temperature (default: 0.13)\n";
+            std::cout << "  --coverage-em-bins INT   Coverage bins per protein (default: 6)\n";
             std::cout << "\nBayesian scoring:\n";
             std::cout << "  --prior-ancient FLOAT   Prior P(ancient) for Bayesian scorer (default: 0.10)\n";
             std::cout << "  --auto-prior-ancient    Auto-calibrate prior from mean p_read distribution\n";
@@ -1318,6 +1339,18 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
     if (em_min_prob < 0.0 || em_min_prob > 1.0) {
         std::cerr << "Error: --em-min-prob must be in [0,1]\n";
+        return 1;
+    }
+    if (coverage_em_bins < 1) {
+        std::cerr << "Error: --coverage-em-bins must be >= 1\n";
+        return 1;
+    }
+    if (coverage_em_iters < 1) {
+        std::cerr << "Error: --coverage-em-iters must be >= 1\n";
+        return 1;
+    }
+    if (coverage_em_tau < 0.0f) {
+        std::cerr << "Error: --coverage-em-tau must be >= 0\n";
         return 1;
     }
 
@@ -2135,56 +2168,71 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         std::cerr << "  Passed: " << passed << " (" << (total > 0 ? 100.0 * passed / total : 0.0) << "%)\n\n";
     }
 
-    // Process best hits into summaries
+    // Process best hits into summaries (parallel)
     const auto annotate_start = std::chrono::steady_clock::now();
-    for (uint32_t ridx = 0; ridx < n_reads; ++ridx) {
-        const auto& hit = best_hits[ridx];
-        if (!hit.has) continue;
+    std::vector<std::pair<uint32_t, ProteinDamageSummary>> all_results;
+    #pragma omp parallel
+    {
+        std::vector<std::pair<uint32_t, ProteinDamageSummary>> local_results;
+        #pragma omp for schedule(dynamic, 256) nowait
+        for (uint32_t ridx = 0; ridx < n_reads; ++ridx) {
+            const auto& hit = best_hits[ridx];
+            if (!hit.has) continue;
 
-        std::string query_id(reader.read_name(ridx));
-        std::string target_id(reader.ref_name(hit.ref_idx));
-        auto summary = annotate_alignment(
-            query_id, target_id, hit.qaln, hit.taln,
-            hit.qstart_0, hit.tstart_0, hit.qlen,
-            hit.evalue, hit.bits, hit.fident, d_max, lambda);
+            std::string query_id(reader.read_name(ridx));
+            std::string target_id(reader.ref_name(hit.ref_idx));
+            auto summary = annotate_alignment(
+                query_id, target_id, hit.qaln, hit.taln,
+                hit.qstart_0, hit.tstart_0, hit.qlen,
+                hit.evalue, hit.bits, hit.fident, d_max, lambda);
 
-        if (summary.total_mismatches > 0) {
-            summary.read_idx = ridx;
-            filter_sites_by_distance(summary, max_dist);
-            // Store alignment data for Bayesian scoring and corrected output
-            summary.qlen = hit.qlen;
-            summary.qaln = hit.qaln;
-            summary.taln = hit.taln;
-            summary.qstart_0 = hit.qstart_0;
-            summary.tstart_0 = hit.tstart_0;
-            summary.tlen = hit.tlen;
-            // Short protein filtering metrics
-            summary.delta_bits = hit.bits - hit.bits_second;
-            summary.bpa = (summary.alnlen > 0)
-                ? hit.bits / static_cast<float>(summary.alnlen) : 0.0f;
-            summary.length_bin = static_cast<uint8_t>(
-                agp::LengthBinStats::get_bin(hit.qlen));
-            // EMI always carries DAMAGE_SCORE. Use it as per-read p_read fallback so
-            // Bayesian scoring works in EMI-only workflows.
-            summary.p_read = std::clamp(hit.damage_score, 0.0f, 1.0f);
-            summary.has_p_read = true;
-            // Look up synonymous damage and per-read p_damaged from index if available
-            if (damage_index) {
-                if (const AgdRecord* rec = damage_index->find(query_id)) {
-                    auto syn_result = detect_synonymous_damage(
-                        *rec, damage_index->d_max(), damage_index->lambda());
-                    summary.syn_5prime = syn_result.synonymous_5prime;
-                    summary.syn_3prime = syn_result.synonymous_3prime;
-                    summary.has_syn_data = true;
-                    // Retrieve per-read p_damaged (dequantize from uint8)
-                    summary.p_read = static_cast<float>(rec->p_damaged_q) / 255.0f;
-                    summary.has_p_read = true;
+            if (summary.total_mismatches > 0) {
+                summary.read_idx = ridx;
+                filter_sites_by_distance(summary, max_dist);
+                summary.qlen = hit.qlen;
+                summary.qaln = hit.qaln;
+                summary.taln = hit.taln;
+                summary.qstart_0 = hit.qstart_0;
+                summary.tstart_0 = hit.tstart_0;
+                summary.tlen = hit.tlen;
+                summary.delta_bits = hit.bits - hit.bits_second;
+                summary.bpa = (summary.alnlen > 0)
+                    ? hit.bits / static_cast<float>(summary.alnlen) : 0.0f;
+                summary.length_bin = static_cast<uint8_t>(
+                    agp::LengthBinStats::get_bin(hit.qlen));
+                summary.p_read = std::clamp(hit.damage_score, 0.0f, 1.0f);
+                summary.has_p_read = true;
+                if (damage_index) {
+                    if (const AgdRecord* rec = damage_index->find(query_id)) {
+                        auto syn_result = detect_synonymous_damage(
+                            *rec, damage_index->d_max(), damage_index->lambda());
+                        summary.syn_5prime = syn_result.synonymous_5prime;
+                        summary.syn_3prime = syn_result.synonymous_3prime;
+                        summary.has_syn_data = true;
+                        summary.p_read = static_cast<float>(rec->p_damaged_q) / 255.0f;
+                        summary.has_p_read = true;
+                    }
                 }
+                local_results.emplace_back(ridx, std::move(summary));
             }
-            summary_index_by_read[ridx] = static_cast<int32_t>(summaries.size());
-            summaries.push_back(std::move(summary));
+        }
+        #pragma omp critical
+        {
+            all_results.insert(all_results.end(),
+                std::make_move_iterator(local_results.begin()),
+                std::make_move_iterator(local_results.end()));
         }
     }
+    // Sort by read index for deterministic output order
+    std::sort(all_results.begin(), all_results.end(),
+        [](const auto& a, const auto& b) { return a.first < b.first; });
+    summaries.reserve(all_results.size());
+    for (auto& [ridx, summary] : all_results) {
+        summary_index_by_read[ridx] = static_cast<int32_t>(summaries.size());
+        summaries.push_back(std::move(summary));
+    }
+    all_results.clear();
+    all_results.shrink_to_fit();
     const auto annotate_end = std::chrono::steady_clock::now();
     if (verbose) {
         std::cerr << "Annotation runtime: "
@@ -2206,6 +2254,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         float em_ref_neff = 1.0f;       // Effective number of references: 1 / sum_j gamma_j^2
     };
     std::vector<EmReadResult> em_read_results(n_reads);
+    std::unordered_map<uint32_t, agp::ProteinCoverageStats> coverage_stats_map;
 
     // Auto-switch to streaming EM if estimated memory exceeds limit
     // Memory estimate: ~48 bytes per alignment (gamma double + Alignment struct overhead)
@@ -2250,19 +2299,33 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         reader.set_all_columns();
 
         if (verbose) {
-            std::cerr << "  Starting streaming EM...\n";
+            std::cerr << "  Starting streaming EM"
+                      << (use_coverage_em ? " (with coverage outer loop)" : "")
+                      << "...\n";
             std::cerr << std::flush;
         }
 
-        auto streaming_result = agp::streaming_em(reader, em_params,
-            [verbose](const agp::EMIterationDiagnostics& d) {
-                if (verbose && (d.iteration % 10 == 0 || d.iteration < 5)) {
-                    std::cerr << "    iter " << d.iteration
-                              << " ll=" << std::fixed << std::setprecision(2) << d.log_likelihood
-                              << "\n";
-                    std::cerr << std::flush;
-                }
-            });
+        agp::StreamingEMResult streaming_result;
+
+        if (use_coverage_em) {
+            agp::CoverageEMParams cov_params;
+            cov_params.max_outer_iters = coverage_em_iters;
+            cov_params.tau = coverage_em_tau;
+            cov_params.default_bins = coverage_em_bins;
+
+            streaming_result = agp::coverage_em_outer_loop(
+                reader, em_params, cov_params, coverage_stats_map, verbose);
+        } else {
+            streaming_result = agp::streaming_em(reader, em_params,
+                [verbose](const agp::EMIterationDiagnostics& d) {
+                    if (verbose && (d.iteration % 10 == 0 || d.iteration < 5)) {
+                        std::cerr << "    iter " << d.iteration
+                                  << " ll=" << std::fixed << std::setprecision(2) << d.log_likelihood
+                                  << "\n";
+                        std::cerr << std::flush;
+                    }
+                });
+        }
 
         const auto em_end = std::chrono::steady_clock::now();
 
@@ -2276,6 +2339,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                       << reader.num_alignments() << " alignments)\n";
             std::cerr << "  Runtime: "
                       << agp::log_utils::format_elapsed(em_start, em_end) << "\n";
+            if (use_coverage_em) {
+                std::cerr << "  Coverage stats: " << coverage_stats_map.size() << " proteins\n";
+            }
         }
 
         // Copy weights to em_state for downstream use
@@ -2290,50 +2356,36 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         std::vector<float> read_top1(n_reads, 0.0f);
         std::vector<float> read_top2(n_reads, 0.0f);
         std::vector<double> read_sum_sq(n_reads, 0.0);
-        std::mutex finalize_mtx;
+        constexpr size_t kFinalizeShards = 4096;
+        std::array<std::mutex, kFinalizeShards> finalize_mutexes;
 
         agp::streaming_em_finalize(reader, streaming_result, em_params,
             [&](uint32_t /*rg_idx*/, uint32_t num_rows,
                 const uint32_t* read_idx, const uint32_t* ref_idx,
                 const float* gamma, const float* gamma_ancient)
             {
-                // Collect updates locally first, then apply with lock
-                struct ReadUpdate {
-                    uint32_t r;
-                    float g;
-                    float g_a;
-                    uint32_t ref;
-                };
-                std::vector<ReadUpdate> updates;
-                updates.reserve(num_rows);
-
                 for (uint32_t i = 0; i < num_rows; ++i) {
-                    updates.push_back({
-                        read_idx[i],
-                        gamma[i],
-                        gamma_ancient ? gamma_ancient[i] : 0.0f,
-                        ref_idx[i]
-                    });
-                }
+                    const uint32_t r = read_idx[i];
+                    if (r >= n_reads) continue;
+                    const float g = gamma[i];
+                    const float g_a = gamma_ancient ? gamma_ancient[i] : 0.0f;
+                    const uint32_t ref = ref_idx[i];
 
-                // Apply updates under lock
-                std::lock_guard<std::mutex> lock(finalize_mtx);
-                for (const auto& u : updates) {
-                    if (u.r >= n_reads) continue;  // bounds check
+                    const size_t shard = static_cast<size_t>(r) & (kFinalizeShards - 1);
+                    std::lock_guard<std::mutex> lock(finalize_mutexes[shard]);
 
-                    read_sum_sq[u.r] += static_cast<double>(u.g) * u.g;
-                    if (u.g > read_top1[u.r]) {
-                        read_top2[u.r] = read_top1[u.r];
-                        read_top1[u.r] = u.g;
-                    } else if (u.g > read_top2[u.r]) {
-                        read_top2[u.r] = u.g;
+                    read_sum_sq[r] += static_cast<double>(g) * g;
+                    if (g > read_top1[r]) {
+                        read_top2[r] = read_top1[r];
+                        read_top1[r] = g;
+                    } else if (g > read_top2[r]) {
+                        read_top2[r] = g;
                     }
 
-                    // Check if this is the best-hit ref for this read
-                    const auto& bh = best_hits[u.r];
-                    if (bh.has && u.ref == bh.ref_idx) {
-                        em_read_results[u.r].gamma = u.g;
-                        em_read_results[u.r].gamma_ancient = u.g_a;
+                    const auto& bh = best_hits[r];
+                    if (bh.has && ref == bh.ref_idx) {
+                        em_read_results[r].gamma = g;
+                        em_read_results[r].gamma_ancient = g_a;
                     }
                 }
             });
@@ -2476,8 +2528,20 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
         const auto em_start = std::chrono::steady_clock::now();
 
-        // Run EM with SQUAREM acceleration
-        em_state = agp::squarem_em(aln_data, em_params, nullptr, em_progress);
+        if (use_coverage_em) {
+            agp::CoverageEMParams cov_params;
+            cov_params.max_outer_iters = coverage_em_iters;
+            cov_params.tau = coverage_em_tau;
+            cov_params.default_bins = coverage_em_bins;
+            if (verbose) {
+                std::cerr << "  Coverage-EM outer iterations: " << cov_params.max_outer_iters << "\n";
+            }
+            em_state = agp::coverage_em_squarem(
+                aln_data, em_params, cov_params, coverage_stats_map, em_progress, verbose);
+        } else {
+            em_state = agp::squarem_em(aln_data, em_params, nullptr, em_progress);
+        }
+
         const auto em_end = std::chrono::steady_clock::now();
 
         if (verbose) {
@@ -2492,6 +2556,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             }
             std::cerr << "  Runtime: "
                       << agp::log_utils::format_elapsed(em_start, em_end) << "\n";
+            if (use_coverage_em) {
+                std::cerr << "  Coverage stats: " << coverage_stats_map.size() << " proteins\n";
+            }
         }
 
         // Extract best assignments and build per-read lookup
@@ -2787,7 +2854,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
               "dist_5prime\tdist_3prime\tp_damage\n";
         for (const auto& s : summaries) {
             for (const auto& site : s.sites) {
-                sf << site.query_id << "\t" << site.target_id << "\t"
+                sf << s.query_id << "\t" << s.target_id << "\t"
                    << site.query_pos << "\t" << site.target_pos << "\t"
                    << site.target_aa << "\t" << site.query_aa << "\t"
                    << (site.damage_class == 'C' ? "CT" : "GA") << "\t"
@@ -2947,7 +3014,16 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         *out << "\n";
     }
 
-    std::unordered_map<std::string, GeneSummaryAccumulator> gene_agg;
+    // Build name->ref_idx reverse map for coverage stats lookup in output
+    std::unordered_map<std::string, uint32_t> name_to_ref_idx;
+    if (!coverage_stats_map.empty()) {
+        name_to_ref_idx.reserve(n_refs);
+        for (uint32_t ri = 0; ri < n_refs; ++ri) {
+            name_to_ref_idx[std::string(reader.ref_name(ri))] = ri;
+        }
+    }
+
+    std::unordered_map<uint32_t, GeneSummaryAccumulator> gene_agg;
     bool have_gene_agg = false;
 
     // Build/write gene summary (supports both best-hit and EM-weighted modes)
@@ -2966,10 +3042,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     continue;
                 }
             }
-            const std::string target_id(reader.ref_name(hit.ref_idx));
-            auto& acc = gene_agg[target_id];
+            auto& acc = gene_agg[hit.ref_idx];
             if (acc.tlen == 0) {
-                acc.target_id = target_id;
+                acc.target_id = std::string(reader.ref_name(hit.ref_idx));
                 acc.tlen = static_cast<uint32_t>(hit.tlen);
                 if (acc.tlen > 0) {
                     acc.coverage.assign(acc.tlen, 0.0f);
@@ -3050,7 +3125,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                   "ancient_frac\tci_low\tci_high\tmean_posterior\tmean_identity\t"
                   "breadth\tabundance\tdepth_std\tdepth_evenness\t"
                   "n_unique_starts\tstart_diversity\tstart_span\tpositional_score\t"
-                  "terminal_middle_ratio\tavg_aln_len\tstd_aln_len\n";
+                  "terminal_middle_ratio\tavg_aln_len\tstd_aln_len\t"
+                  "coverage_deviance\tcompleteness_fhat\tcoverage_weight\tabundance_adjusted\n";
 
             for (const auto& [tid, acc] : gene_agg) {
                 if (acc.n_reads < min_reads) continue;
@@ -3094,8 +3170,27 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                    << '\t' << std::setprecision(4) << pos_score
                    << '\t' << std::setprecision(4) << term_ratio
                    << '\t' << std::setprecision(2) << acc.avg_aln_len()
-                   << '\t' << std::setprecision(2) << acc.std_aln_len()
-                   << '\n';
+                   << '\t' << std::setprecision(2) << acc.std_aln_len();
+
+                // Coverage EM columns
+                {
+                    float g_cov_deviance = 0.0f;
+                    float g_cov_fhat = 1.0f;
+                    float g_cov_weight = 1.0f;
+                    float g_abundance_adj = acc.eff_reads();
+                    auto cit = coverage_stats_map.find(tid);
+                    if (cit != coverage_stats_map.end()) {
+                        g_cov_deviance = cit->second.coverage_deviance;
+                        g_cov_fhat = cit->second.completeness_fhat;
+                        g_cov_weight = cit->second.coverage_weight;
+                        g_abundance_adj = acc.eff_reads() * g_cov_weight;
+                    }
+                    gf << '\t' << std::setprecision(4) << g_cov_deviance
+                       << '\t' << std::setprecision(4) << g_cov_fhat
+                       << '\t' << std::setprecision(4) << g_cov_weight
+                       << '\t' << std::setprecision(2) << g_abundance_adj;
+                }
+                gf << '\n';
             }
 
             if (verbose) {
@@ -3139,7 +3234,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 float gene_modern = static_cast<float>(acc.n_modern_conf);
                 float gene_undetermined = static_cast<float>(acc.n_undetermined);
 
-                auto map_it = group_map.find(tid);
+                auto map_it = group_map.find(acc.target_id);
                 if (map_it != group_map.end()) {
                     auto& fa = group_acc[map_it->second];
                     if (fa.function_id.empty()) {
@@ -3225,10 +3320,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                             || acc.terminal_middle_ratio() < min_terminal_ratio)
                             continue;
                         // Look up mapped group for this gene
-                        auto it = group_map.find(tid);
+                        auto it = group_map.find(acc.target_id);
                         if (it == group_map.end()) continue;
                         // coverage = EM-weighted abundance (sum of gamma-weighted depth)
-                        af << tid << '\t' << it->second << '\t' << annotation_source << '\t'
+                        af << acc.target_id << '\t' << it->second << '\t' << annotation_source << '\t'
                            << std::fixed << std::setprecision(4) << abundance << '\t'
                            << std::setprecision(4) << acc.breadth() << '\n';
                         ++n_written;
@@ -3239,6 +3334,15 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     }
                 }
             }
+        }
+    }
+
+    // Build reverse map for string-keyed lookups into gene_agg (uint32_t-keyed)
+    std::unordered_map<std::string, uint32_t> gene_agg_name_to_idx;
+    if (have_gene_agg) {
+        gene_agg_name_to_idx.reserve(gene_agg.size());
+        for (const auto& [ref_idx, acc] : gene_agg) {
+            gene_agg_name_to_idx[acc.target_id] = ref_idx;
         }
     }
 
@@ -3408,6 +3512,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             "assign_ancient_frac\tassign_ci_low\tassign_ci_high\t"
             "assign_mean_posterior\tassign_mean_identity\t"
             "assign_breadth\tassign_abundance\tassign_depth_std\tassign_depth_evenness\t"
+            "coverage_deviance\tcompleteness_fhat\tcoverage_weight\tabundance_adjusted\t"
             "pass_mapping_filter\tfilter_fail\n";
         if (pf.is_open()) pf << protein_header;
         if (pff.is_open()) pff << protein_header;
@@ -3440,7 +3545,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             float assign_depth_std = 0.0f;
             float assign_depth_evenness = 0.0f;
 
-            auto git = gene_agg.find(id);
+            auto gni = gene_agg_name_to_idx.find(id);
+            auto git = (gni != gene_agg_name_to_idx.end()) ? gene_agg.find(gni->second) : gene_agg.end();
             if (git != gene_agg.end()) {
                 const auto& g = git->second;
                 assign_n_reads = g.n_reads;
@@ -3558,7 +3664,29 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 << std::fixed << std::setprecision(4) << assign_breadth << "\t"
                 << std::fixed << std::setprecision(4) << assign_abundance << "\t"
                 << std::fixed << std::setprecision(4) << assign_depth_std << "\t"
-                << std::fixed << std::setprecision(4) << assign_depth_evenness << "\t"
+                << std::fixed << std::setprecision(4) << assign_depth_evenness << "\t";
+
+            // Coverage EM columns
+            float cov_deviance = 0.0f;
+            float cov_fhat = 1.0f;
+            float cov_weight = 1.0f;
+            float abundance_adj = assign_eff_reads;
+            {
+                auto nit = name_to_ref_idx.find(id);
+                if (nit != name_to_ref_idx.end()) {
+                    auto cit = coverage_stats_map.find(nit->second);
+                    if (cit != coverage_stats_map.end()) {
+                        cov_deviance = cit->second.coverage_deviance;
+                        cov_fhat = cit->second.completeness_fhat;
+                        cov_weight = cit->second.coverage_weight;
+                        abundance_adj = assign_eff_reads * cov_weight;
+                    }
+                }
+            }
+            row << std::fixed << std::setprecision(4) << cov_deviance << "\t"
+                << std::fixed << std::setprecision(4) << cov_fhat << "\t"
+                << std::fixed << std::setprecision(4) << cov_weight << "\t"
+                << std::fixed << std::setprecision(2) << abundance_adj << "\t"
                 << (pass_mapping_filter ? 1 : 0) << "\t"
                 << filter_fail << "\n";
 
@@ -3630,13 +3758,14 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         }
         if (have_gene_agg) {
             for (const auto& kv : gene_agg) {
-                if (seen_ids.insert(kv.first).second) target_ids.push_back(kv.first);
+                if (seen_ids.insert(kv.second.target_id).second) target_ids.push_back(kv.second.target_id);
             }
         }
 
         size_t combined_written = 0;
         for (const auto& tid : target_ids) {
-            const auto git = gene_agg.find(tid);
+            auto gni = gene_agg_name_to_idx.find(tid);
+            const auto git = (gni != gene_agg_name_to_idx.end()) ? gene_agg.find(gni->second) : gene_agg.end();
             const auto pit = protein_agg.find(tid);
             const bool gene_present = (git != gene_agg.end());
             const bool protein_present = (pit != protein_agg.end());

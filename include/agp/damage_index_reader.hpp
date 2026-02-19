@@ -31,7 +31,7 @@ public:
      * @param path Path to .agd file
      * @throws std::runtime_error if file cannot be opened or is invalid
      */
-    explicit DamageIndexReader(const std::string& path);
+    explicit DamageIndexReader(const std::string& path, bool prefetch = true);
 
     /**
      * @brief Destructor unmaps file.

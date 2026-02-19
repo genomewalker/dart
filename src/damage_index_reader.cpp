@@ -10,7 +10,7 @@
 
 namespace agp {
 
-DamageIndexReader::DamageIndexReader(const std::string& path) {
+DamageIndexReader::DamageIndexReader(const std::string& path, bool prefetch) {
     // Open file
     fd_ = open(path.c_str(), O_RDONLY);
     if (fd_ < 0) {
@@ -42,9 +42,10 @@ DamageIndexReader::DamageIndexReader(const std::string& path) {
         throw std::runtime_error("Failed to mmap damage index: " + path);
     }
 
-    // Prefetch entire file into page cache before random access
-    // This is critical for NFS performance - avoids per-lookup network round-trips
-    madvise(data_, file_size_, MADV_WILLNEED);
+    if (prefetch) {
+        // Optional: pull file into page cache before random access (useful on some NFS setups).
+        madvise(data_, file_size_, MADV_WILLNEED);
+    }
 
     // Then tell kernel we'll do random access (no sequential readahead needed)
     madvise(data_, file_size_, MADV_RANDOM);
