@@ -16,7 +16,7 @@ The pipeline runs in three stages. **Pass 1** scans all reads to measure the sam
 
 ## The problem: ancient DNA is chemically damaged
 
-DNA degrades after death. The most common change is **deamination**: cytosines (C) spontaneously convert to uracil, which reads as thymine (T) during sequencing [Lindahl 1993]. This happens most at the *ends* of DNA fragments — the longer ago an organism died, the more damage accumulates near the termini [Briggs et al. 2007].
+DNA degrades after death. The most common change is **deamination**: cytosines (C) spontaneously convert to uracil, which reads as thymine (T) during sequencing [Lindahl 1993]. This happens most at the *ends* of DNA fragments. Damage accumulates over time, but the rate is strongly modulated by preservation conditions (temperature, pH, water activity), so damage level reflects depositional environment as much as age [Briggs et al. 2007].
 
 This causes two practical problems for bioinformatics:
 
@@ -52,7 +52,7 @@ Every read is assigned `p_read` — the probability that its terminal pattern re
 
 ### Step 3 — Search and score damage authenticity
 
-Predicted proteins are searched against a reference database (KEGG, CAZy, viral proteins, etc.) with MMseqs2 [Steinegger & Söding 2017] using VTML20 [Müller & Vingron 2000], a substitution matrix calibrated for the conservative amino acid changes typical of ancient DNA.
+Predicted proteins are searched against a reference database (KEGG, CAZy, viral proteins, etc.) with MMseqs2 [Steinegger & Söding 2017] using VTML20 [Müller & Vingron 2000], a low-divergence substitution matrix that penalises conservative amino acid changes less heavily than BLOSUM62, which suits the short, identity-preserving alignments typical of ancient DNA.
 
 After search, `damage-annotate` scores each protein hit for authentic ancient damage using three lines of evidence fused in log-odds space:
 
@@ -486,7 +486,7 @@ $$\delta(p) = d_{\max} \cdot e^{-\lambda p}$$
 
 $d_{\max}$ is the substitution rate at the outermost position, reflecting both the age of the sample and preservation conditions. $\lambda$ is the decay constant (typically 0.2–0.5 nats/position), controlling how deep into the read the damage signal extends. The characteristic half-life is $t_{1/2} = \ln(2) / \lambda$, roughly 1.4 to 3.5 positions. AGP estimates both parameters from the data in Pass 1, fitting the observed T/(T+C) profile to this model via maximum likelihood.
 
-Single-stranded library preparation (e.g. uracil-tolerant protocols) shows the full 5′ C→T gradient independently of the complementary strand. Double-stranded protocols show the characteristic mirror image: 5′ C→T and 3′ G→A from the complementary strand.
+Single-stranded library preparation (e.g. uracil-tolerant protocols, without UDG treatment) typically shows the full 5′ C→T gradient independently on both strands. Double-stranded protocols show a mirror-image pattern: 5′ C→T and 3′ G→A, though the exact profile depends on UDG treatment and ligation chemistry.
 
 ### Two-channel damage validation
 
@@ -512,7 +512,7 @@ Channel B exploits the fact that only three sense codons contain a C that, when 
 
 $$r_B(p) = \frac{\text{stops}_p}{\text{stops}_p + \text{preimage}_p}$$
 
-where $\text{stops}_p$ counts in-frame stop codons observed at codon position $p$ from the terminus and $\text{preimage}_p$ counts the surviving CAA/CAG/CGA codons at that position. If C→T damage is present, $r_B$ will be elevated at terminal positions relative to interior positions (a positive $\Delta \text{LLR}_B$). Crucially, Channel B **cannot** be elevated by compositional variation: a high-T genome simply has fewer C residues in CAA/CAG/CGA, but this equally depletes both numerator and denominator, leaving $r_B$ unchanged.
+where $\text{stops}_p$ counts in-frame stop codons observed at codon position $p$ from the terminus and $\text{preimage}_p$ counts the surviving CAA/CAG/CGA codons at that position. If C→T damage is present, $r_B$ will be elevated at terminal positions relative to interior positions (a positive $\Delta \text{LLR}_B$). Crucially, Channel B is not elevated by genomic T-richness: a high-T genome has fewer C residues in CAA/CAG/CGA, but this equally depletes both numerator and denominator, leaving $r_B$ unchanged. It can, however, be affected by very low coverage of convertible codons, alternative genetic codes, or terminal sequencing artifacts, so Channel B reports a confidence flag (`channel_b_valid`) alongside the LLR.
 
 **Joint decision**
 
@@ -522,7 +522,7 @@ where $\text{stops}_p$ counts in-frame stop codons observed at codon position $p
 | Fires | Flat or negative | Compositional artifact ($d_{\max} = 0$) |
 | Silent | n/a | No detectable damage ($d_{\max} = 0$) |
 
-This design eliminates false positives from AT-rich organisms (the most common failure mode of reference-free damage detection) while retaining sensitivity in validated samples.
+This design substantially reduces false positives from AT-rich organisms (the most common failure mode of reference-free damage detection) while retaining sensitivity in validated samples.
 
 ### Per-read damage scoring
 
@@ -552,13 +552,13 @@ $$\log BF_{\text{sites}} = k \cdot \log\!\frac{d_{\max} \cdot 0.5 \cdot \text{AA
 
 where $k$ is the count of damage-consistent mismatches, $q_0 = 0.005$ is the baseline rate of such substitutions in modern proteins, and AA\_scale = 0.30 converts the nucleotide-level $d_{\max}$ to the amino acid level (only ~30% of C→T events in a codon are non-synonymous). This term is particularly valuable for GC-rich organisms where Channel A alone is weak.
 
-**Identity evidence ($BF_{\text{identity}}$):** Ancient proteins on average align at higher identity to reference databases than spurious modern matches, because ancient reads derive from real organisms present in the environment while false positives are often near-random k-mer matches. The Bayes factor is:
+**Identity evidence ($BF_{\text{identity}}$):** In the KapK benchmark, ancient proteins aligned at higher identity to reference databases than spurious matches (mean 93.3% vs 90.5%), likely because genuine ancient reads come from organisms closely related to sequenced reference genomes. The Bayes factor is:
 
 $$\log BF_{\text{identity}} = 20 \times (\text{fident} - 0.90), \quad \text{capped at} \pm 5$$
 
 calibrated so that a 93.3% identity alignment (mean ancient) contributes $+\log BF \approx +0.66$ nats relative to 90.5% (mean modern/spurious), and proteins below 90% identity are penalised.
 
-All three Bayes factors are conditionally independent given the damage status (terminal patterns, alignment column composition, and overall identity are driven by different physical processes), justifying additive fusion in log-odds space.
+Additive fusion in log-odds space assumes the three Bayes factors are conditionally independent given damage status. Terminal patterns, alignment column composition, and overall identity are driven by different physical processes, making this a reasonable working assumption, though residual correlations (e.g. from reference database biases) are possible.
 
 ### EM multi-mapping resolution
 
@@ -568,7 +568,7 @@ In complex metagenomes, short reads often align equally well to multiple referen
 
 $$\gamma_{ij} = \frac{\phi_j \cdot L(i,j)}{\sum_{k \in \mathcal{R}_i} \phi_k \cdot L(i,k)}$$
 
-The likelihood $L(i,j) = \exp(S_{ij} / \lambda)$ is a Boltzmann weighting of the alignment bit score $S_{ij}$ by temperature $\lambda$ (default 1.0); lower $\lambda$ sharpens assignment towards the best hit. The set $\mathcal{R}_i$ contains all references that read $i$ aligns to within the score window.
+The likelihood $L(i,j) = \exp(\beta \cdot S_{ij})$ is an exponential weighting of the alignment bit score $S_{ij}$ by inverse-temperature $\beta$ (default 1.0); larger $\beta$ sharpens assignment towards the best hit, smaller $\beta$ spreads weight more uniformly. The set $\mathcal{R}_i$ contains all references that read $i$ aligns to within the score window.
 
 **M-step:** Update reference abundances with a Dirichlet prior $\alpha_0$ for regularisation:
 
@@ -576,7 +576,7 @@ $$\phi_j = \frac{\alpha_0 + \sum_i \gamma_{ij}}{J \cdot \alpha_0 + N}$$
 
 where $J$ is the number of references and $N$ the total read count. The prior prevents zero-count collapse and smooths abundance estimates for low-coverage references.
 
-Convergence is assessed by the $L_1$ change in $\phi$ between iterations; SQUAREM acceleration [Varadhan and Roland 2008] is applied to speed convergence. In practice, 5–15 iterations suffice. Reads with final responsibility $\gamma_{ij} < \epsilon$ (default $\epsilon = 10^{-6}$, `--em-min-prob`) are pruned, reducing memory and noise in downstream damage annotation.
+Convergence is assessed by the relative change in log-likelihood between iterations; SQUAREM acceleration [Varadhan & Roland 2008] is applied to speed convergence. In practice, 5–15 iterations suffice. Reads with final responsibility $\gamma_{ij} < \epsilon$ (default $\epsilon = 10^{-6}$, `--em-min-prob`) are pruned, reducing memory and noise in downstream damage annotation.
 
 ### Frame scoring
 
