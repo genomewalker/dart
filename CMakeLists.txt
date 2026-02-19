@@ -88,14 +88,12 @@ endif()
 # Find zlib for compressed file support
 find_package(ZLIB REQUIRED)
 
-# Find zstd for columnar compression (optional)
-find_package(PkgConfig)
-if(PkgConfig_FOUND)
-    pkg_check_modules(ZSTD libzstd)
-    if(ZSTD_FOUND)
-        add_compile_definitions(HAVE_ZSTD)
-        message(STATUS "ZSTD found: ${ZSTD_VERSION}")
-    endif()
+# Find zstd for columnar compression (required)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(ZSTD REQUIRED libzstd)
+add_compile_definitions(HAVE_ZSTD)
+message(STATUS "ZSTD found: ${ZSTD_VERSION}")
+if(FALSE)
 
     # TBB disabled - linking issues on this system
     # pkg_check_modules(TBB tbb)
