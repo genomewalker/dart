@@ -10,11 +10,13 @@
 #include "agp/sequence_io.hpp"
 #include "agp/frame_selector.hpp"
 #include "agp/hexamer_tables.hpp"
+#include "agp/log_utils.hpp"
 #include "agp/version.h"
 #include <iostream>
 #include <fstream>
 #include <cstring>
 #include <iomanip>
+#include <chrono>
 #include <vector>
 
 #ifdef _OPENMP
@@ -25,6 +27,7 @@ namespace agp {
 namespace cli {
 
 int cmd_sample_damage(int argc, char* argv[]) {
+    auto run_start = std::chrono::steady_clock::now();
     std::string input_file;
     std::string output_file;
     std::string domain_str = "gtdb";
@@ -44,26 +47,27 @@ int cmd_sample_damage(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             verbose = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            std::cerr << "Usage: agp sample-damage <input.fq> [options]\n\n";
-            std::cerr << "Quick sample-level damage profiling (Pass 1 only).\n\n";
-            std::cerr << "Options:\n";
-            std::cerr << "  -o, --output FILE       Output JSON file (default: stdout)\n";
-            std::cerr << "  -d, --domain DOMAIN     Domain for hexamer scoring (default: gtdb)\n";
-            std::cerr << "  --library-type TYPE     Library type: ds, ss, or auto (default: auto)\n";
-            std::cerr << "  -t, --threads N         Number of threads (default: auto)\n";
-            std::cerr << "  -v, --verbose           Verbose output\n";
+            std::cout << "Usage: agp sample-damage <input.fq> [options]\n\n";
+            std::cout << "Quick sample-level damage profiling (Pass 1 only).\n\n";
+            std::cout << "Options:\n";
+            std::cout << "  -o, --output FILE       Output JSON file (default: stdout)\n";
+            std::cout << "  -d, --domain DOMAIN     Domain for hexamer scoring (default: gtdb)\n";
+            std::cout << "  --library-type TYPE     Library type: ds, ss, or auto (default: auto)\n";
+            std::cout << "  -t, --threads N         Number of threads (default: auto)\n";
+            std::cout << "  -v, --verbose           Verbose output\n";
             return 0;
         } else if (argv[i][0] != '-') {
             input_file = argv[i];
         } else {
             std::cerr << "Unknown option: " << argv[i] << "\n";
+            std::cerr << "Run 'agp sample-damage --help' for usage.\n";
             return 1;
         }
     }
 
     if (input_file.empty()) {
         std::cerr << "Error: No input file specified.\n";
-        std::cerr << "Usage: agp sample-damage <input.fq> [options]\n";
+        std::cerr << "Run 'agp sample-damage --help' for usage.\n";
         return 1;
     }
 
@@ -99,6 +103,7 @@ int cmd_sample_damage(int argc, char* argv[]) {
     }
 
     // Run Pass 1: damage detection
+    auto pass1_start = std::chrono::steady_clock::now();
     SampleDamageProfile profile;
     profile.forced_library_type = forced_library;
     size_t total_reads = 0;
@@ -152,6 +157,11 @@ int cmd_sample_damage(int argc, char* argv[]) {
 
         // Finalize profile (compute decay rates, d_max, etc.)
         FrameSelector::finalize_sample_profile(profile);
+        if (verbose) {
+            auto pass1_end = std::chrono::steady_clock::now();
+            std::cerr << "Pass 1 runtime: "
+                      << agp::log_utils::format_elapsed(pass1_start, pass1_end) << "\n";
+        }
 
     } catch (const std::exception& e) {
         std::cerr << "Error reading input: " << e.what() << "\n";
@@ -198,6 +208,7 @@ int cmd_sample_damage(int argc, char* argv[]) {
     }
 
     if (needs_pass2) {
+        auto pass2_start = std::chrono::steady_clock::now();
         if (verbose) {
             std::cerr << "\nPass 2: Computing damage-weighted profile...\n";
             if (profile.inverted_pattern_5prime || profile.inverted_pattern_3prime) {
@@ -277,6 +288,9 @@ int cmd_sample_damage(int argc, char* argv[]) {
                           << (100.0f * n_high_damage_reads / pass2_reads) << "%)\n";
                 std::cerr << "Weighted d_max: " << std::fixed << std::setprecision(1)
                           << (d_metamatch_filtered * 100.0f) << "%\n";
+                auto pass2_end = std::chrono::steady_clock::now();
+                std::cerr << "Pass 2 runtime: "
+                          << agp::log_utils::format_elapsed(pass2_start, pass2_end) << "\n";
             }
 
         } catch (const std::exception& e) {
@@ -355,6 +369,8 @@ int cmd_sample_damage(int argc, char* argv[]) {
         std::cerr << "  D_max: " << std::fixed << std::setprecision(1) << (d_max * 100.0f) << "%\n";
         std::cerr << "  Channel B LLR: " << std::fixed << std::setprecision(1) << profile.stop_decay_llr_5prime << "\n";
         std::cerr << "  Validated: " << (profile.damage_validated ? "yes" : "no") << "\n";
+        auto run_end = std::chrono::steady_clock::now();
+        std::cerr << "  Runtime: " << agp::log_utils::format_elapsed(run_start, run_end) << "\n";
     }
 
     return 0;

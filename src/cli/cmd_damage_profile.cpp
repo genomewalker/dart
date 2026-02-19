@@ -5,6 +5,7 @@
 
 #include "subcommand.hpp"
 #include "agp/version.h"
+#include "agp/log_utils.hpp"
 #include "agp/sequence_io.hpp"
 #include <iostream>
 #include <fstream>
@@ -17,6 +18,7 @@
 #include <array>
 #include <algorithm>
 #include <iomanip>
+#include <chrono>
 #include <zlib.h>
 
 namespace agp {
@@ -59,7 +61,7 @@ static std::string extract_read_name(const std::string& query_id) {
 }
 
 static void print_usage(const char* prog) {
-    std::cerr << "Usage: " << prog << " [options]\n\n"
+    std::cout << "Usage: " << prog << " [options]\n\n"
               << "Compute terminal nucleotide damage profiles for protein-mapped reads.\n\n"
               << "Required:\n"
               << "  -i, --input FILE       Input FASTQ file (gzipped supported)\n"
@@ -77,6 +79,7 @@ static void print_usage(const char* prog) {
 }
 
 int cmd_damage_profile(int argc, char* argv[]) {
+    auto run_start = std::chrono::steady_clock::now();
     std::string input_file;
     std::string hits_file;
     std::string output_file;
@@ -101,17 +104,27 @@ int cmd_damage_profile(int argc, char* argv[]) {
             min_reads = std::stoi(argv[++i]);
         } else if (strcmp(argv[i], "--max-pos") == 0 && i + 1 < argc) {
             max_pos = std::stoi(argv[++i]);
+        } else if (argv[i][0] == '-') {
+            std::cerr << "Unknown option: " << argv[i] << "\n";
+            std::cerr << "Run 'agp damage-profile --help' for usage.\n";
+            return 1;
+        } else {
+            std::cerr << "Unexpected positional argument: " << argv[i] << "\n";
+            std::cerr << "Run 'agp damage-profile --help' for usage.\n";
+            return 1;
         }
     }
 
     if (input_file.empty() || hits_file.empty() || output_file.empty()) {
-        print_usage(argv[0]);
+        std::cerr << "Error: --input, --hits, and --output are required.\n";
+        std::cerr << "Run 'agp damage-profile --help' for usage.\n";
         return 1;
     }
 
     if (max_pos > MAX_POSITIONS) max_pos = MAX_POSITIONS;
 
     // Step 1: Parse hits file to get read->target mapping
+    auto step1_start = std::chrono::steady_clock::now();
     std::cerr << "Reading hits file..." << std::endl;
     std::unordered_map<std::string, std::string> read_to_target;
 
@@ -141,10 +154,13 @@ int cmd_damage_profile(int argc, char* argv[]) {
         }
     }
     hits.close();
+    auto step1_end = std::chrono::steady_clock::now();
 
     std::cerr << "  Found " << read_to_target.size() << " read-protein mappings" << std::endl;
+    std::cerr << "  Step 1 runtime: " << agp::log_utils::format_elapsed(step1_start, step1_end) << std::endl;
 
     // Step 2: Read FASTQ and compute profiles
+    auto step2_start = std::chrono::steady_clock::now();
     std::cerr << "Processing reads..." << std::endl;
 
     std::unordered_map<std::string, NucleotideCounts> target_counts;
@@ -213,11 +229,14 @@ int cmd_damage_profile(int argc, char* argv[]) {
     }
 
     gzclose(gz);
+    auto step2_end = std::chrono::steady_clock::now();
 
     std::cerr << "  Total: " << reads_processed << " reads, "
               << reads_matched << " matched to " << target_counts.size() << " proteins" << std::endl;
+    std::cerr << "  Step 2 runtime: " << agp::log_utils::format_elapsed(step2_start, step2_end) << std::endl;
 
     // Step 3: Write output
+    auto step3_start = std::chrono::steady_clock::now();
     std::cerr << "Writing output..." << std::endl;
 
     gzFile out = gzopen(output_file.c_str(), "wb");
@@ -290,8 +309,12 @@ int cmd_damage_profile(int argc, char* argv[]) {
     std::string output_str = oss.str();
     gzwrite(out, output_str.c_str(), output_str.size());
     gzclose(out);
+    auto step3_end = std::chrono::steady_clock::now();
+    auto run_end = std::chrono::steady_clock::now();
 
     std::cerr << "Done. Output: " << output_file << std::endl;
+    std::cerr << "  Step 3 runtime: " << agp::log_utils::format_elapsed(step3_start, step3_end) << std::endl;
+    std::cerr << "  Total runtime: " << agp::log_utils::format_elapsed(run_start, run_end) << std::endl;
 
     return 0;
 }

@@ -2,6 +2,7 @@
 #include "agp/version.h"
 #include <iostream>
 #include <algorithm>
+#include <string>
 
 namespace agp {
 namespace cli {
@@ -49,34 +50,77 @@ Options parse_args(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
 
+        auto require_value = [&](const std::string& flag) -> std::string {
+            if (i + 1 >= argc) {
+                throw ParseArgsExit(1, "Error: Missing value for " + flag);
+            }
+            return argv[++i];
+        };
+
+        auto parse_size = [&](const std::string& flag, const std::string& value) -> size_t {
+            try {
+                size_t idx = 0;
+                size_t parsed = std::stoull(value, &idx);
+                if (idx != value.size()) {
+                    throw ParseArgsExit(1, "Error: Invalid integer for " + flag + ": " + value);
+                }
+                return parsed;
+            } catch (const ParseArgsExit&) {
+                throw;
+            } catch (...) {
+                throw ParseArgsExit(1, "Error: Invalid integer for " + flag + ": " + value);
+            }
+        };
+
+        auto parse_int = [&](const std::string& flag, const std::string& value) -> int {
+            try {
+                size_t idx = 0;
+                int parsed = std::stoi(value, &idx);
+                if (idx != value.size()) {
+                    throw ParseArgsExit(1, "Error: Invalid integer for " + flag + ": " + value);
+                }
+                return parsed;
+            } catch (const ParseArgsExit&) {
+                throw;
+            } catch (...) {
+                throw ParseArgsExit(1, "Error: Invalid integer for " + flag + ": " + value);
+            }
+        };
+
         if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
-            exit(0);
+            throw ParseArgsExit(0);
         } else if (arg == "-V" || arg == "--version") {
             print_version();
-            exit(0);
+            throw ParseArgsExit(0);
         } else if (arg == "-i" || arg == "--input") {
-            if (i + 1 < argc) opts.input_file = argv[++i];
+            opts.input_file = require_value(arg);
         } else if (arg == "-o" || arg == "--output") {
-            if (i + 1 < argc) opts.output_file = argv[++i];
+            opts.output_file = require_value(arg);
         } else if (arg == "--fasta-nt") {
-            if (i + 1 < argc) opts.fasta_nt = argv[++i];
+            opts.fasta_nt = require_value(arg);
         } else if (arg == "--fasta-nt-corrected") {
-            if (i + 1 < argc) opts.fasta_nt_corrected = argv[++i];
+            opts.fasta_nt_corrected = require_value(arg);
         } else if (arg == "--fasta-aa") {
-            if (i + 1 < argc) opts.fasta_aa = argv[++i];
+            opts.fasta_aa = require_value(arg);
         } else if (arg == "--fasta-aa-masked") {
-            if (i + 1 < argc) opts.fasta_aa_masked = argv[++i];
+            opts.fasta_aa_masked = require_value(arg);
         } else if (arg == "--summary") {
-            if (i + 1 < argc) opts.summary_file = argv[++i];
+            opts.summary_file = require_value(arg);
         } else if (arg == "--damage-index") {
-            if (i + 1 < argc) opts.damage_index = argv[++i];
+            opts.damage_index = require_value(arg);
         } else if (arg == "--no-damage") {
             opts.use_damage = false;
         } else if (arg == "--min-length") {
-            if (i + 1 < argc) opts.min_length = std::stoul(argv[++i]);
+            opts.min_length = parse_size(arg, require_value(arg));
+            if (opts.min_length < 1) {
+                throw ParseArgsExit(1, "Error: --min-length must be >= 1");
+            }
         } else if (arg == "-t" || arg == "--threads") {
-            if (i + 1 < argc) opts.num_threads = std::stoi(argv[++i]);
+            opts.num_threads = parse_int(arg, require_value(arg));
+            if (opts.num_threads < 1) {
+                throw ParseArgsExit(1, "Error: --threads must be >= 1");
+            }
         } else if (arg == "-v" || arg == "--verbose") {
             opts.verbose = true;
         } else if (arg == "--no-aggregate") {
@@ -84,41 +128,32 @@ Options parse_args(int argc, char* argv[]) {
         } else if (arg == "--damage-only") {
             opts.damage_only = true;
         } else if (arg == "--library-type") {
-            if (i + 1 < argc) {
-                std::string lib_type = argv[++i];
-                if (lib_type == "ds" || lib_type == "double-stranded") {
-                    opts.forced_library_type = LibraryType::DOUBLE_STRANDED;
-                } else if (lib_type == "ss" || lib_type == "single-stranded") {
-                    opts.forced_library_type = LibraryType::SINGLE_STRANDED;
-                } else if (lib_type == "auto") {
-                    opts.forced_library_type = LibraryType::UNKNOWN;
-                } else {
-                    std::cerr << "Error: Unknown library type '" << lib_type << "'\n";
-                    exit(1);
-                }
+            std::string lib_type = require_value(arg);
+            if (lib_type == "ds" || lib_type == "double-stranded") {
+                opts.forced_library_type = LibraryType::DOUBLE_STRANDED;
+            } else if (lib_type == "ss" || lib_type == "single-stranded") {
+                opts.forced_library_type = LibraryType::SINGLE_STRANDED;
+            } else if (lib_type == "auto") {
+                opts.forced_library_type = LibraryType::UNKNOWN;
+            } else {
+                throw ParseArgsExit(1, "Error: Unknown library type '" + lib_type + "'");
             }
         } else if (arg == "--domain") {
-            if (i + 1 < argc) opts.domain_name = argv[++i];
+            opts.domain_name = require_value(arg);
         } else if (arg == "--orf-min-aa") {
-            if (i + 1 < argc) {
-                opts.orf_min_aa = std::stoul(argv[++i]);
-                if (opts.orf_min_aa < 1) {
-                    std::cerr << "Error: --orf-min-aa must be >= 1\n";
-                    exit(1);
-                }
+            opts.orf_min_aa = parse_size(arg, require_value(arg));
+            if (opts.orf_min_aa < 1) {
+                throw ParseArgsExit(1, "Error: --orf-min-aa must be >= 1");
             }
         } else if (arg == "--adaptive") {
             opts.adaptive_orf = true;
         } else {
-            std::cerr << "Unknown option: " << arg << "\n";
-            exit(1);
+            throw ParseArgsExit(1, "Error: Unknown option: " + arg);
         }
     }
 
     if (opts.input_file.empty()) {
-        std::cerr << "Error: No input file specified\n\n";
-        print_usage(argv[0]);
-        exit(1);
+        throw ParseArgsExit(1, "Error: No input file specified");
     }
 
     return opts;

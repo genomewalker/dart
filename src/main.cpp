@@ -8,6 +8,7 @@
 #include "agp/codon_tables.hpp"
 #include "agp/unified_codon_scorer.hpp"
 #include "agp/damage_index_writer.hpp"
+#include "agp/log_utils.hpp"
 #include "agp/version.h"
 #include <iostream>
 #include <fstream>
@@ -16,6 +17,7 @@
 #include <mutex>
 #include <atomic>
 #include <vector>
+#include <cstring>
 #include <unistd.h>
 
 #ifdef _OPENMP
@@ -41,6 +43,7 @@ namespace cli {
 
 int cmd_predict(int argc, char* argv[]) {
     try {
+        auto run_start = std::chrono::steady_clock::now();
         Options opts = agp::cli::parse_args(argc, argv);
 
         // Set up threading
@@ -254,7 +257,7 @@ int cmd_predict(int argc, char* argv[]) {
                      << " | 5' damage: " << std::fixed << std::setprecision(1)
                      << sample_profile.max_damage_5prime * 100.0f << "%"
                      << " | 3' damage: " << sample_profile.max_damage_3prime * 100.0f << "%"
-                     << " | " << std::setprecision(1) << pass1_duration.count() / 1000.0 << "s\n\n";
+                     << " | " << agp::log_utils::format_duration_ms(pass1_duration.count()) << "\n\n";
 
             damage_model.update_from_sample_profile(sample_profile);
             calibrator.initialize(sample_profile);
@@ -438,7 +441,7 @@ int cmd_predict(int argc, char* argv[]) {
 
         std::cerr << "  Sequences: " << total_seqs.load()
                   << " | Genes: " << total_genes.load()
-                  << " | " << std::setprecision(1) << pass2_duration.count() / 1000.0 << "s"
+                  << " | " << agp::log_utils::format_duration_ms(pass2_duration.count())
                   << " (" << (total_seqs.load() * 1000 / std::max(1LL, (long long)pass2_duration.count())) << " seq/s)\n";
 
         // Write summary if requested
@@ -458,9 +461,19 @@ int cmd_predict(int argc, char* argv[]) {
             summary << "}\n";
         }
 
-        std::cerr << "\nDone.\n";
+        auto run_end = std::chrono::steady_clock::now();
+        std::cerr << "\nDone. Total runtime: "
+                  << agp::log_utils::format_elapsed(run_start, run_end) << "\n";
         return 0;
 
+    } catch (const agp::cli::ParseArgsExit& e) {
+        if (e.exit_code() != 0) {
+            if (std::strlen(e.what()) > 0) {
+                std::cerr << e.what() << "\n\n";
+            }
+            agp::cli::print_usage(argv[0]);
+        }
+        return e.exit_code();
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";
         return 1;

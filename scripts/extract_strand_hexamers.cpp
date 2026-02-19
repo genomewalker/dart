@@ -1,4 +1,4 @@
-// Ultra-fast strand hexamer extractor
+// Strand hexamer extractor
 // Uses DNA 6-mers (4096) instead of AA 6-mers (85M)
 // Per-thread counters, no atomics, merge at end
 // ~10 minutes for full GTDB

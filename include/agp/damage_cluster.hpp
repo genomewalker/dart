@@ -5,8 +5,6 @@
 // Round 0: Frame from coding score alone
 // Round 1: Refine using cluster support + terminal damage consistency
 //
-// Design:
-
 #include <array>
 #include <algorithm>
 #include <cstdint>

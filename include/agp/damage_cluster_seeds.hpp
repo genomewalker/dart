@@ -5,8 +5,6 @@
 // - Strict seeds (k=7): no canonicalization, high precision
 // - Tolerant seeds (k=5): damage-canonicalized, terminal regions only
 //
-// Design:
-
 #include <algorithm>
 #include <array>
 #include <cmath>

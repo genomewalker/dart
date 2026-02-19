@@ -14,10 +14,12 @@
 // Reference: Briggs et al. (2007), mapDamage2, metaDMG
 
 #include <cmath>
+#include <cstdint>
 #include <array>
 #include <vector>
 #include <algorithm>
 #include <numeric>
+#include <string>
 
 namespace agp {
 
@@ -102,6 +104,198 @@ inline double trigamma(double x) {
     return result;
 }
 
+// Regularized incomplete beta function I_x(a,b) using continued fraction
+// This is the CDF of Beta(a,b) distribution
+// Uses Lentz's algorithm for continued fraction evaluation
+inline double beta_inc(double a, double b, double x) {
+    if (x < 0.0 || x > 1.0) return 0.0;
+    if (x == 0.0) return 0.0;
+    if (x == 1.0) return 1.0;
+
+    // Use symmetry for better convergence: I_x(a,b) = 1 - I_{1-x}(b,a)
+    bool flip = x > (a + 1.0) / (a + b + 2.0);
+    if (flip) {
+        std::swap(a, b);
+        x = 1.0 - x;
+    }
+
+    // Continued fraction (Lentz's algorithm)
+    constexpr double TINY = 1e-30;
+    constexpr double EPS = 1e-10;
+    constexpr int MAX_ITER = 200;
+
+    double qab = a + b;
+    double qap = a + 1.0;
+    double qam = a - 1.0;
+
+    double c = 1.0;
+    double d = 1.0 - qab * x / qap;
+    if (std::abs(d) < TINY) d = TINY;
+    d = 1.0 / d;
+    double h = d;
+
+    for (int m = 1; m <= MAX_ITER; ++m) {
+        int m2 = 2 * m;
+
+        // Even step
+        double aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+        d = 1.0 + aa * d;
+        if (std::abs(d) < TINY) d = TINY;
+        c = 1.0 + aa / c;
+        if (std::abs(c) < TINY) c = TINY;
+        d = 1.0 / d;
+        h *= d * c;
+
+        // Odd step
+        aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+        d = 1.0 + aa * d;
+        if (std::abs(d) < TINY) d = TINY;
+        c = 1.0 + aa / c;
+        if (std::abs(c) < TINY) c = TINY;
+        d = 1.0 / d;
+        double del = d * c;
+        h *= del;
+
+        if (std::abs(del - 1.0) < EPS) break;
+    }
+
+    // Compute the front factor
+    double bt = std::exp(
+        log_gamma(a + b) - log_gamma(a) - log_gamma(b)
+        + a * std::log(x) + b * std::log(1.0 - x)
+    );
+
+    double result = bt * h / a;
+    return flip ? 1.0 - result : result;
+}
+
+// Beta CDF: P(X <= x) where X ~ Beta(a, b)
+inline double beta_cdf(double a, double b, double x) {
+    return beta_inc(a, b, x);
+}
+
+// Beta quantile (inverse CDF) using bisection
+// Returns x such that P(X <= x) = p where X ~ Beta(a, b)
+inline double beta_quantile(double a, double b, double p) {
+    if (p <= 0.0) return 0.0;
+    if (p >= 1.0) return 1.0;
+
+    constexpr double EPS = 1e-8;
+    constexpr int MAX_ITER = 50;
+
+    double lo = 0.0, hi = 1.0;
+    for (int i = 0; i < MAX_ITER; ++i) {
+        double mid = 0.5 * (lo + hi);
+        double cdf = beta_cdf(a, b, mid);
+        if (cdf < p) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+        if (hi - lo < EPS) break;
+    }
+    return 0.5 * (lo + hi);
+}
+
+// ============================================================================
+// GENE-LEVEL AGGREGATION (Beta-Bernoulli)
+// ============================================================================
+
+// Result of gene-level aggregation with EM weights
+struct GeneDamageSummary {
+    std::string protein_id;
+
+    // Effective counts (γ-weighted)
+    double n_eff = 0.0;             // Σγ_rt (effective read count)
+    double n_anc_eff = 0.0;         // Σγ_rt × p_rta (ancient evidence)
+
+    // Beta posterior: θ ~ Beta(α₀ + n_anc_eff, β₀ + n_mod_eff)
+    double theta_raw = 0.0;         // n_anc_eff / n_eff (MLE)
+    double theta_post = 0.0;        // Posterior mean with shrinkage
+    double theta_ci_low = 0.0;      // 95% credible interval lower
+    double theta_ci_high = 0.0;     // 95% credible interval upper
+
+    // Enrichment test: P(θ > θ_bg + δ)
+    double p_enriched = 0.0;        // Posterior probability of enrichment
+    bool enriched = false;          // p_enriched >= 0.95
+
+    // Coverage statistics (γ-weighted)
+    double breadth = 0.0;           // Fraction of positions covered
+    double depth = 0.0;             // Mean coverage depth
+    double mean_identity = 0.0;     // Weighted mean identity
+
+    // QC metrics
+    uint32_t n_raw = 0;             // Raw read count (before EM)
+    double multimap_entropy = 0.0;  // Assignment uncertainty (high = ambiguous)
+    bool low_count = false;         // n_eff < threshold
+    bool low_breadth = false;       // breadth < threshold
+};
+
+// Compute gene-level summary from EM results
+// Parameters:
+//   nu0: prior pseudo-count (shrinkage strength, default 10)
+//   theta_bg: background ancient rate (global sample π)
+//   delta: enrichment threshold (default 0.05)
+inline GeneDamageSummary compute_gene_summary(
+    const std::string& protein_id,
+    double n_eff,
+    double n_anc_eff,
+    double breadth,
+    double depth,
+    double mean_identity,
+    uint32_t n_raw,
+    double multimap_entropy,
+    double nu0 = 10.0,
+    double theta_bg = 0.10,
+    double delta = 0.05,
+    double min_n_eff = 3.0,
+    double min_breadth = 0.10)
+{
+    GeneDamageSummary result;
+    result.protein_id = protein_id;
+    result.n_eff = n_eff;
+    result.n_anc_eff = n_anc_eff;
+    result.breadth = breadth;
+    result.depth = depth;
+    result.mean_identity = mean_identity;
+    result.n_raw = n_raw;
+    result.multimap_entropy = multimap_entropy;
+
+    // QC flags
+    result.low_count = (n_eff < min_n_eff);
+    result.low_breadth = (breadth < min_breadth);
+
+    // Raw MLE (avoid division by zero)
+    result.theta_raw = (n_eff > 0.0) ? n_anc_eff / n_eff : 0.0;
+
+    // Beta posterior with empirical Bayes shrinkage
+    // Prior: α₀ = ν₀ × θ_bg, β₀ = ν₀ × (1 - θ_bg)
+    double alpha0 = nu0 * theta_bg;
+    double beta0 = nu0 * (1.0 - theta_bg);
+
+    double n_mod_eff = n_eff - n_anc_eff;  // Modern evidence
+    double alpha_post = alpha0 + n_anc_eff;
+    double beta_post = beta0 + n_mod_eff;
+
+    // Posterior mean
+    result.theta_post = alpha_post / (alpha_post + beta_post);
+
+    // 95% credible interval
+    result.theta_ci_low = beta_quantile(alpha_post, beta_post, 0.025);
+    result.theta_ci_high = beta_quantile(alpha_post, beta_post, 0.975);
+
+    // Enrichment probability: P(θ > θ_bg + δ)
+    double threshold = theta_bg + delta;
+    if (threshold >= 1.0) {
+        result.p_enriched = 0.0;
+    } else {
+        result.p_enriched = 1.0 - beta_cdf(alpha_post, beta_post, threshold);
+    }
+    result.enriched = (result.p_enriched >= 0.95);
+
+    return result;
+}
+
 // ============================================================================
 // BETA-BINOMIAL MODEL
 // ============================================================================
@@ -169,8 +363,9 @@ struct ReadDamageObs {
  * @param phi Concentration parameter φ = α + β (higher = less overdispersion)
  * @return Log-likelihood
  */
-inline double log_beta_binomial(size_t k, size_t n, double theta, double phi) {
-    if (n == 0) return 0.0;
+inline double log_beta_binomial(double k, double n, double theta, double phi) {
+    if (n <= 0.0) return 0.0;
+    k = std::clamp(k, 0.0, n);
 
     // Reparameterize: α = θφ, β = (1-θ)φ
     theta = std::clamp(theta, 1e-10, 1.0 - 1e-10);
@@ -183,7 +378,7 @@ inline double log_beta_binomial(size_t k, size_t n, double theta, double phi) {
     // P(k|n,α,β) = C(n,k) * B(k+α, n-k+β) / B(α, β)
     // log P = log C(n,k) + log B(k+α, n-k+β) - log B(α, β)
 
-    double log_binom = log_gamma(n + 1) - log_gamma(k + 1) - log_gamma(n - k + 1);
+    double log_binom = log_gamma(n + 1.0) - log_gamma(k + 1.0) - log_gamma(n - k + 1.0);
     double log_beta_num = log_beta(k + alpha, n - k + beta);
     double log_beta_denom = log_beta(alpha, beta);
 
@@ -218,14 +413,11 @@ inline ProteinDamageResult fit_protein_damage(
 
     // Aggregate statistics
     double sum_p = 0.0, sum_p2 = 0.0;
-    double sum_lr = 0.0, sum_info = 0.0;
     size_t n_damaged = 0, total_sites = 0;
 
     for (const auto& o : obs) {
         sum_p += o.p_damaged;
         sum_p2 += o.p_damaged * o.p_damaged;
-        sum_lr += o.log_lr;
-        sum_info += o.info;
         if (o.is_damaged) ++n_damaged;
         total_sites += o.n_sites;
     }
@@ -235,7 +427,12 @@ inline ProteinDamageResult fit_protein_damage(
     result.mean_p_damaged = sum_p / obs.size();
 
     const size_t n = obs.size();
-    const size_t k = n_damaged;
+    const double n_eff = static_cast<double>(n);
+    const double k_eff = sum_p;  // Soft count from per-read posteriors
+    const double prior_theta_clamped = std::clamp(prior_theta, 1e-6, 1.0 - 1e-6);
+    const double prior_strength_pos = std::max(prior_strength, 1e-6);
+    const double prior_alpha = prior_theta_clamped * prior_strength_pos;
+    const double prior_beta = (1.0 - prior_theta_clamped) * prior_strength_pos;
 
     // =========================================================================
     // Method of moments for initial estimates
@@ -252,14 +449,15 @@ inline ProteinDamageResult fit_protein_damage(
     // But we're using continuous posteriors, so approximate with:
     // φ ≈ θ(1-θ)/var_p - 1
 
-    double theta_init = std::clamp(mean_p, 0.01, 0.99);
+    double theta_init = (k_eff + prior_alpha) / (n_eff + prior_alpha + prior_beta);
+    theta_init = std::clamp(theta_init, 0.01, 0.99);
     double phi_init = theta_init * (1.0 - theta_init) / var_p - 1.0;
     phi_init = std::clamp(phi_init, 2.0, 1000.0);  // Reasonable range
 
     // =========================================================================
     // Null model: θ = 0 (no damage)
     // =========================================================================
-    result.log_lik_m0 = log_beta_binomial(k, n, 1e-6, phi_init);
+    result.log_lik_m0 = log_beta_binomial(k_eff, n_eff, 1e-6, phi_init);
 
     // =========================================================================
     // Damage model: θ > 0 with Newton-Raphson MLE
@@ -268,18 +466,18 @@ inline ProteinDamageResult fit_protein_damage(
     double theta = theta_init;
     double phi = phi_init;
 
-    // Newton iterations for theta (holding phi fixed for simplicity)
+    // Newton iterations for theta while holding phi fixed
     for (int iter = 0; iter < 20; ++iter) {
         double alpha = theta * phi;
         double beta = (1.0 - theta) * phi;
 
         // Score: d/dθ log L
         // = φ * (digamma(k + α) - digamma(n - k + β) - digamma(α) + digamma(β))
-        double score = phi * (digamma(k + alpha) - digamma(n - k + beta)
+        double score = phi * (digamma(k_eff + alpha) - digamma(n_eff - k_eff + beta)
                               - digamma(alpha) + digamma(beta));
 
         // Fisher information (expected)
-        double info = phi * phi * (trigamma(k + alpha) + trigamma(n - k + beta)
+        double info = phi * phi * (trigamma(k_eff + alpha) + trigamma(n_eff - k_eff + beta)
                                    - trigamma(alpha) - trigamma(beta));
         info = std::max(std::abs(info), 1e-6);
 
@@ -291,7 +489,7 @@ inline ProteinDamageResult fit_protein_damage(
 
     result.delta_max = theta;
     result.phi = phi;
-    result.log_lik_m1 = log_beta_binomial(k, n, theta, phi);
+    result.log_lik_m1 = log_beta_binomial(k_eff, n_eff, theta, phi);
 
     // =========================================================================
     // Likelihood Ratio Test
@@ -316,7 +514,7 @@ inline ProteinDamageResult fit_protein_damage(
     // With uniform prior on [0,1], this simplifies
     double alpha_hat = theta * phi;
     double beta_hat = (1.0 - theta) * phi;
-    double fisher_info = phi * phi * (trigamma(k + alpha_hat) + trigamma(n - k + beta_hat)
+    double fisher_info = phi * phi * (trigamma(k_eff + alpha_hat) + trigamma(n_eff - k_eff + beta_hat)
                                       - trigamma(alpha_hat) - trigamma(beta_hat));
     fisher_info = std::max(std::abs(fisher_info), 1e-6);
 
@@ -344,7 +542,7 @@ inline ProteinDamageResult fit_protein_damage(
     // Search for lower bound
     double lower = 0.0;
     for (double t = theta; t >= 1e-4; t -= 0.01) {
-        double ll = log_beta_binomial(k, n, t, phi);
+        double ll = log_beta_binomial(k_eff, n_eff, t, phi);
         if (ll < ll_threshold) {
             lower = t + 0.01;
             break;
@@ -355,7 +553,7 @@ inline ProteinDamageResult fit_protein_damage(
     // Search for upper bound
     double upper = 1.0;
     for (double t = theta; t <= 1.0 - 1e-4; t += 0.01) {
-        double ll = log_beta_binomial(k, n, t, phi);
+        double ll = log_beta_binomial(k_eff, n_eff, t, phi);
         if (ll < ll_threshold) {
             upper = t - 0.01;
             break;
@@ -370,7 +568,7 @@ inline ProteinDamageResult fit_protein_damage(
 }
 
 // ============================================================================
-// SAMPLE-LEVEL DAMAGE DETECTION
+// Sample-level damage detection
 // ============================================================================
 
 // Result of sample-level damage analysis
@@ -492,7 +690,7 @@ inline SampleDamageResult fit_sample_damage(
         hess_dd = std::max(hess_dd, 1e-6);
         hess_ll = std::max(hess_ll, 1e-6);
 
-        // Newton step (simplified diagonal approximation)
+        // Newton step with diagonal approximation
         double step_d = grad_d / hess_dd;
         double step_l = grad_l / hess_ll;
 

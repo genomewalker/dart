@@ -28,7 +28,7 @@ namespace agp {
 namespace codon {
 
 // ============================================================================
-// THREAD-LOCAL BUFFERS FOR ZERO-ALLOCATION HOT PATH
+// Thread-local buffers for zero-allocation hot path
 // ============================================================================
 
 // Maximum sequence length we support without allocation
@@ -284,7 +284,7 @@ inline PeriodicMarkovModel& get_learned_periodic_model() {
 }
 
 // ============================================================================
-// GC-CONDITIONAL PERIODIC MARKOV MODEL
+// GC-conditional periodic Markov model
 // ============================================================================
 
 /**
@@ -444,7 +444,7 @@ inline GCConditionalPeriodicModel& get_gc_conditional_model() {
 // - Strand-only LLR: NEW - uses all positions for strand discrimination
 // - Self-trained periodic: EM-learned from sample
 // - X code: DISABLED - hurts on metagenome (designed for single organisms)
-// - AA bigram: DISABLED - needs full bigram table, simplified version hurts
+// - AA bigram: DISABLED - partial table was not robust
 // - Stop positional: marginal benefit, keep at low weight
 // IMPORTANT: Strand discrimination is FUNDAMENTALLY LIMITED for double-stranded
 // ancient DNA libraries without reference alignment:
@@ -1119,9 +1119,7 @@ inline float compute_rny_bias_score(
     int total0 = R_count[0] + Y_count[0];
     float R_freq0 = total0 > 0 ? R_count[0] / static_cast<float>(total0) : 0.5f;
 
-    // Position 2: this is more complex - depends on GC content
-    // For now, use empirical observation that position 2 has higher GC variance
-    // Skip this for simplicity
+    // Position 2 dependence on GC is intentionally omitted in this score.
 
     // Score is just R enrichment at position 0 vs baseline 0.5
     // LLR form: log(R_freq0 / 0.5) - log((1-R_freq0) / 0.5)
@@ -1408,7 +1406,7 @@ inline CodonPosteriors compute_codon_posteriors_joint_fast(
         char t1 = tcag_to_base((c >> 2) & 3);
         char t2 = tcag_to_base(c & 3);
 
-        // Fast damage emission (simplified - no CpG for speed)
+        // Fast damage emission (without CpG context)
         float e0 = damage_emission_physical(
             forward ? t0 : COMPLEMENT_TABLE[static_cast<unsigned char>(t0)],
             forward ? o0 : COMPLEMENT_TABLE[static_cast<unsigned char>(o0)],
@@ -1788,7 +1786,6 @@ inline float score_aa_bigram_llr(
                 float freq_b = default_aa_freq(b);
 
                 // Directional bonus: certain pairs are more common in proteins
-                // (This is a simplified model - could use full bigram table)
                 float pair_bonus = 0.0f;
 
                 // Hydrophobic pairs tend to cluster
@@ -1981,7 +1978,7 @@ inline std::array<FrameStrandResult, 6> score_all_hypotheses(
             s_xcode = (s_xcode / static_cast<float>(num_codons)) - 0.31f; // X-code baseline
         }
 
-        // Stop position score (simplified: penalize interior stops)
+        // Stop position score: penalize interior stops
         s_stoppos = -0.5f * static_cast<float>(interior_stops);
 
         // Strand scores
@@ -1999,7 +1996,7 @@ inline std::array<FrameStrandResult, 6> score_all_hypotheses(
         // Fourier periodogram
         float s_fourier = score_fourier_periodicity_fast(oriented, L, frame);
 
-        // AA bigram (simplified - skip for speed, weight is 0 anyway)
+        // AA bigram term (currently disabled)
         float s_bigram = 0.0f;
 
         // Combined score
@@ -2122,7 +2119,7 @@ inline float compute_read_damage_probability(
 }
 
 // ============================================================================
-// EM TRAINING FOR PERIODIC MARKOV MODEL
+// EM training for periodic Markov model
 // ============================================================================
 
 /**

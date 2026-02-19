@@ -44,14 +44,14 @@
 #include <new>
 #include <ctime>
 
-// ============== COMPILE-TIME CONSTANTS ==============
+// Compile-time constants
 constexpr size_t CACHE_LINE_SIZE = 64;
 constexpr size_t START_REGION_SIZE = 30;   // First 30bp for START hexamers
 constexpr size_t END_REGION_SIZE = 30;     // Last 30bp for END hexamers
 constexpr size_t MIN_CDS_LENGTH = 90;      // Need distinct regions
 constexpr size_t READ_BUFFER_SIZE = 1 << 16;  // 64KB
 
-// ============== HEXAMER ENCODING ==============
+// Hexamer encoding
 alignas(CACHE_LINE_SIZE) static const int8_t BASE_MAP[256] = {
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
     -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
@@ -104,7 +104,7 @@ inline char complement(char c) {
     }
 }
 
-// ============== CDS VALIDATION ==============
+// CDS validation
 __attribute__((always_inline))
 inline bool has_valid_start(const char* seq, size_t len) {
     if (len < 3) return false;
@@ -124,7 +124,7 @@ inline bool has_valid_stop(const char* seq, size_t len) {
     return (c0 == 'T' && ((c1 == 'A' && (c2 == 'A' || c2 == 'G')) || (c1 == 'G' && c2 == 'A')));
 }
 
-// ============== ALIGNED COUNT ARRAYS ==============
+// Aligned count arrays
 struct alignas(CACHE_LINE_SIZE) AlignedCounts {
     uint64_t counts[4096];
     uint64_t total;
@@ -141,7 +141,7 @@ struct alignas(CACHE_LINE_SIZE) AlignedCounts {
     }
 };
 
-// ============== REVERSE COMPLEMENT ==============
+// Reverse complement
 inline std::string reverse_complement(const std::string& seq) {
     std::string rc(seq.length(), 'N');
     for (size_t i = 0; i < seq.length(); i++) {
@@ -150,7 +150,7 @@ inline std::string reverse_complement(const std::string& seq) {
     return rc;
 }
 
-// ============== THREAD-LOCAL STATE ==============
+// Thread-local state
 struct ThreadState {
     // Overall hexamer frequencies
     AlignedCounts overall;
@@ -182,7 +182,7 @@ struct ThreadState {
     }
 };
 
-// ============== FILE PROCESSING ==============
+// File processing
 void process_file(const std::string& filepath, ThreadState& state) {
     gzFile file = gzopen(filepath.c_str(), "rb");
     if (!file) return;
@@ -208,7 +208,7 @@ void process_file(const std::string& filepath, ThreadState& state) {
 
         state.valid_cds++;
 
-        // === 1. OVERALL HEXAMER FREQUENCIES ===
+        // 1) Overall hexamer frequencies
         // Scan all hexamers at codon boundaries (frame 0)
         for (size_t i = 0; i + 5 < len; i += 3) {
             uint32_t code = encode_hexamer(seq + i);
@@ -218,7 +218,7 @@ void process_file(const std::string& filepath, ThreadState& state) {
             }
         }
 
-        // === 2. POSITIONAL HEXAMER FREQUENCIES ===
+        // 2) Positional hexamer frequencies
         // START region: first 30bp
         const char* ptr = seq;
         const char* start_end = seq + std::min(START_REGION_SIZE, len) - 5;
@@ -262,7 +262,7 @@ void process_file(const std::string& filepath, ThreadState& state) {
             }
         }
 
-        // === 3. TERMINAL NUCLEOTIDE COUNTS FOR DAMAGE LLR ===
+        // 3) Terminal nucleotide counts for damage LLR
         // 5' end: T and C counts at first 15 positions
         for (size_t i = 0; i < 15 && i < len; i++) {
             char c = seq[i] & 0xDF;  // Uppercase
@@ -279,7 +279,7 @@ void process_file(const std::string& filepath, ThreadState& state) {
             else if (c == 'G') state.g_count_3prime[i]++;
         }
 
-        // === 4. SENSE/ANTISENSE HEXAMER FREQUENCIES ===
+        // 4) Sense/antisense hexamer frequencies
         // For strand discrimination: compare hexamers from sense vs antisense strands
         // Sense strand: the CDS as provided (coding strand)
         // Antisense strand: reverse complement of the CDS
@@ -330,7 +330,7 @@ void process_file(const std::string& filepath, ThreadState& state) {
     gzclose(file);
 }
 
-// ============== FILE DISCOVERY ==============
+// File discovery
 void find_fasta_files(const std::string& dir_path, std::vector<std::string>& files) {
     DIR* dir = opendir(dir_path.c_str());
     if (!dir) return;
@@ -363,7 +363,7 @@ void find_fasta_files(const std::string& dir_path, std::vector<std::string>& fil
     closedir(dir);
 }
 
-// ============== OUTPUT GENERATION ==============
+// Output generation
 void write_frequency_array(std::ofstream& out, const std::string& name,
                            const uint64_t* counts, uint64_t total,
                            bool add_pseudocount = false) {
@@ -460,7 +460,7 @@ void write_damage_llr_array(std::ofstream& out, const std::string& name,
     out << "};\n\n";
 }
 
-// ============== MAIN OUTPUT FUNCTIONS ==============
+// Main output functions
 void write_hexamer_table(const std::string& output_dir, const std::string& domain,
                          const uint64_t* counts, uint64_t total,
                          uint64_t files_processed, uint64_t valid_cds) {
@@ -594,7 +594,7 @@ void write_damage_likelihood_table(const std::string& output_dir, const std::str
     std::cerr << "  Wrote: " << filename << "\n";
 }
 
-// ============== STRAND HEXAMER TABLE OUTPUT ==============
+// Strand hexamer table output
 void write_strand_hexamer_table(const std::string& output_dir, const std::string& domain,
                                 const uint64_t* sense_counts, uint64_t sense_total,
                                 const uint64_t* antisense_counts, uint64_t antisense_total,
@@ -726,7 +726,7 @@ void write_strand_hexamer_table(const std::string& output_dir, const std::string
     std::cerr << "  Wrote: " << filename << "\n";
 }
 
-// ============== MANIFEST OUTPUT ==============
+// Manifest output
 void write_manifest(const std::string& output_dir, const std::string& domain,
                     uint64_t files_processed, uint64_t total_sequences,
                     uint64_t valid_cds, uint64_t overall_hexamers,
@@ -773,7 +773,7 @@ void write_manifest(const std::string& output_dir, const std::string& domain,
     std::cerr << "  Wrote: " << filename << "\n";
 }
 
-// ============== MAIN ==============
+// Main
 int main(int argc, char* argv[]) {
     if (argc < 3) {
         std::cerr << "Unified Hexamer Table Extractor for AGP\n\n";
@@ -829,7 +829,7 @@ int main(int argc, char* argv[]) {
 
     omp_set_num_threads(num_threads);
 
-    std::cerr << "=== Unified Hexamer Extractor ===\n";
+    std::cerr << "Unified hexamer extractor\n";
     std::cerr << "Domain: " << domain << "\n";
     std::cerr << "Threads: " << num_threads << "\n";
     std::cerr << "Output dir: " << output_dir << "\n";
@@ -910,7 +910,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    std::cerr << "\n\n=== RESULTS ===\n";
+    std::cerr << "\n\nResults\n";
     std::cerr << "Files processed: " << total_files.load() << "\n";
     std::cerr << "Total sequences: " << total_sequences.load() << "\n";
     std::cerr << "Valid CDS: " << total_valid_cds.load() << "\n";
@@ -927,7 +927,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Show terminal damage bias (should be ~equal for undamaged samples)
-    std::cerr << "\n=== TERMINAL NUCLEOTIDE BIAS ===\n";
+    std::cerr << "\nTerminal nucleotide bias\n";
     std::cerr << "5' end T/(T+C) by position:\n  ";
     for (int i = 0; i < 10; i++) {
         uint64_t t = global_t_5prime[i].load();
@@ -949,7 +949,7 @@ int main(int argc, char* argv[]) {
     std::cerr << "\n";
 
     // Write output files
-    std::cerr << "\n=== WRITING OUTPUT FILES ===\n";
+    std::cerr << "\nWriting output files\n";
 
     write_hexamer_table(output_dir, domain,
                         global_overall, total_overall_hex.load(),
