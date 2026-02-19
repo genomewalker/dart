@@ -3003,8 +3003,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 float calib_min_pos = calib_pos_scores[idx_5pct];
                 float calib_min_term = calib_term_ratios[idx_5pct];
 
-                // Apply floor to terminal ratio (min 0.05)
-                calib_min_term = std::max(0.05f, calib_min_term);
+                // Apply floor to terminal ratio (min 0.20 in normalised units,
+                // where 1.0 = expected for a real gene given read length)
+                calib_min_term = std::max(0.20f, calib_min_term);
 
                 // Override if auto-calibration yields stricter thresholds
                 if (calib_min_pos > min_positional_score) {
