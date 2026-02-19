@@ -548,9 +548,9 @@ $$\log BF_{\text{terminal}} = \text{logit}(p_{\text{read}}) - \text{logit}(\pi_0
 
 **Site evidence ($BF_{\text{sites}}$):** Counts damage-consistent amino acid substitutions in the alignment (those caused by C→T: R→W, H→Y, Q→\*, S→L; and by G→A: E→K, D→N) and compares their rate to a background mismatch rate $q_0$:
 
-$$\log BF_{\text{sites}} = k \cdot \log\!\frac{d_{\max} \cdot 0.5 \cdot \text{AA\_scale} + q_0}{q_0}$$
+$$\log BF_{\text{sites}} = k \cdot \log\frac{0.5 \cdot 0.30 \cdot d_{\max} + q_0}{q_0}$$
 
-where $k$ is the count of damage-consistent mismatches, $q_0 = 0.005$ is the baseline rate of such substitutions in modern proteins, and AA\_scale = 0.30 converts the nucleotide-level $d_{\max}$ to the amino acid level (only ~30% of C→T events in a codon are non-synonymous). This term is particularly valuable for GC-rich organisms where Channel A alone is weak.
+where $k$ is the count of damage-consistent mismatches, $q_0 = 0.005$ is the baseline rate of such substitutions in modern proteins, and the factor 0.30 converts the nucleotide-level $d_{\max}$ to the amino acid level (only ~30% of C→T events in a codon are non-synonymous). This term is particularly valuable for GC-rich organisms where Channel A alone is weak.
 
 **Identity evidence ($BF_{\text{identity}}$):** In the KapK benchmark, ancient proteins aligned at higher identity to reference databases than spurious matches (mean 93.3% vs 90.5%), likely because genuine ancient reads come from organisms closely related to sequenced reference genomes. The Bayes factor is:
 
