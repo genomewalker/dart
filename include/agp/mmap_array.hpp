@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -236,7 +237,12 @@ private:
 #endif
         } else {
             if (file_backed_) {
-                alloc_file_backed("", new_capacity);
+                // data_ is null but file_backed_ is true: the backing file path
+                // was not retained, so we cannot re-open it. This is an invalid
+                // state that should never arise in normal usage.
+                throw std::logic_error(
+                    "MmapArray::grow: cannot grow a file-backed array that was "
+                    "not initially allocated (data_ is null)");
             } else {
                 alloc_anonymous(new_capacity);
                 size_ = 0;  // alloc_anonymous sets size_ = count
