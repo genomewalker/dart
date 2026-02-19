@@ -55,8 +55,8 @@ scripts/run_calibration_pipeline.slurm.sh
 # Workflows (keep in separate repos)
 workflows/
 
-# Notebook data (too large for git)
-notebooks/data/*.tsv.gz
+# Notebooks (local analysis, too large/ephemeral for git)
+notebooks/
 
 # Development/analysis scripts (local only)
 .scripts/
