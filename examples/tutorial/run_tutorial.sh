@@ -9,9 +9,7 @@
 #
 # Prerequisites:
 #   - agp built: cmake --build build -j8 && cp build/agp /usr/local/bin/
-#   - mmseqs2 installed: conda install -c bioconda mmseqs2
-#   - Optional VTML20 matrix (for higher sensitivity):
-#       set VTML=/path/to/VTML20.out
+#   - mmseqs2 installed: conda install -c bioconda mmseqs2 (includes VTML20.out)
 #
 # Runtime: ~5 s (predict) + ~10 s (MMseqs2 against tutorial DB) + <1 s (annotate)
 #
@@ -28,7 +26,6 @@ set -euo pipefail
 AGP=${AGP:-agp}
 MMSEQS=${MMSEQS:-mmseqs}
 DB=${DB:?Please set DB= to a protein FASTA or mmseqs2 database (e.g. DB=./ref_proteins.faa.gz)}
-VTML=${VTML:-}
 THREADS=${THREADS:-8}
 
 TUTORIAL_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -41,16 +38,6 @@ echo "Reads:     $TUTORIAL_DIR/reads.fq.gz (50,000 reads, KapK-12-1-37)"
 echo "Reference: $DB"
 echo "Output:    $OUT_DIR"
 echo ""
-
-# Configure optional VTML20 scoring flags if matrix is available.
-MMSEQS_VTML_ARGS=()
-if [[ -n "${VTML}" ]]; then
-    if [[ -f "${VTML}" ]]; then
-        MMSEQS_VTML_ARGS=(--sub-mat "$VTML" --seed-sub-mat "$VTML")
-    else
-        echo "Warning: VTML matrix not found at '$VTML'. Falling back to MMseqs2 defaults."
-    fi
-fi
 
 # ---------------------------------------------------------------------------
 # Step 1: Predict genes and build damage index
@@ -80,7 +67,8 @@ echo "Step 2/4: MMseqs2 search against reference proteins..."
     --min-seq-id 0.86 \
     -c 0.65 \
     --cov-mode 2 \
-    "${MMSEQS_VTML_ARGS[@]}" \
+    --sub-mat VTML20.out \
+    --seed-sub-mat VTML20.out \
     -s 2 -k 6 \
     --spaced-kmer-pattern 11011101 \
     --format-output "query,target,fident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits,qlen,tlen,qaln,taln" \

@@ -56,23 +56,64 @@ The four pipeline stages:
 # 1) Predict genes + AGD damage index
 agp predict -i reads.fq.gz -o out/predictions.gff \
   --fasta-aa out/proteins.faa --damage-index out/predictions.agd --adaptive -t 8
+```
+```
+Ancient Gene Predictor v0.4.0
+Input: reads.fq.gz  |  Domain: gtdb  |  Threads: 8
 
-# 2) Search against reference proteins
+[Pass 1] Scanning for damage patterns...
+  Reads: 50000 | 5' damage: 28.6% | 3' damage: 26.3% | 4.1 s
+
+[Pass 2] Gene prediction...
+  Damage index: 192449 records
+  Sequences: 50000 | Genes: 192449 | 2.0 s (25062 seq/s)
+
+Done. Total runtime: 6.1 s
+```
+
+```bash
+# 2) Search against reference proteins (VTML20 optimised for aDNA)
 mmseqs easy-search out/proteins.faa ref_proteins.faa.gz out/hits.tsv out/tmp \
   --search-type 1 --min-length 12 -e 10.0 --min-seq-id 0.86 -c 0.65 --cov-mode 2 \
+  --sub-mat VTML20.out --seed-sub-mat VTML20.out \
   -s 2 -k 6 --spaced-kmer-pattern 11011101 \
   --format-output "query,target,fident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits,qlen,tlen,qaln,taln" \
   --threads 8
+```
+```
+[=================================================================] 185.1K  ~10 s
+Time for merging to hits.tsv: 0h 0m 0s 267ms
+```
 
+```bash
 # 3) Build EMI index
 agp hits2emi -i out/hits.tsv -o out/hits.emi --damage-index out/predictions.agd -t 8
+```
+```
+Lines: 46628 (scan: 3 ms), building dictionary...
+  Embedded per-read damage scores  |  d_max=25.1%  lambda=0.424
+  Dictionary: 133 ms (22367 reads, 13681 refs, 8 threads)
+Parsed: 46628 rows in 249 ms  |  Written: out/hits.emi  |  Total: 298 ms
+```
 
+```bash
 # 4) Damage annotation
 agp damage-annotate --emi out/hits.emi --damage-index out/predictions.agd \
   -o out/annotated.tsv --gene-summary out/gene_summary.tsv --auto-calibrate-spurious -t 8
 ```
+```
+Loaded damage index: 192449 records  |  d_max: 25.1%  |  lambda: 0.424
+EMI: 46628 alignments, 22367 reads, 13681 refs
+EM converged in 8 iterations
+  Unique mappers: 13011  |  Multi-mappers: 9356  |  Reassigned: 8.1%
+Reads with damage-consistent sites: 5962  |  Total sites: 6722
+Auto-calibration (n=397 genes): min_positional_score=0.786
+Gene summary: 591/7645 genes after filtering
+Summary: assigned_reads=21819, mismatch_reads=8624, reads_with_damage_sites=5962
+Runtime: 186 ms
+```
 
-If you have a VTML20 matrix, add `--sub-mat <VTML20.out> --seed-sub-mat <VTML20.out>` to the MMseqs2 command. The `--fasta-aa-masked` output flag replaces damage-induced stop codons with X so MMseqs2 can align across them.
+Use `--fasta-aa-masked` instead of `--fasta-aa` to replace damage-induced stop codons with X so MMseqs2 can align across them.
 
 ### Sample damage assessment only
 
