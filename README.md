@@ -1,26 +1,72 @@
-# AGP: Ancient Gene Predictor for damage-aware translation of ancient DNA
+# AGP: Ancient Gene Predictor
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-AGP translates ancient DNA (aDNA) reads into proteins for functional annotation. It predicts protein-coding genes from short, degraded metagenomic sequences while accounting for post-mortem C→T and G→A deamination that corrupts standard translation.
+AGP translates ancient DNA (aDNA) reads into proteins for functional annotation. It predicts protein-coding genes from short, degraded metagenomic sequences while accounting for post-mortem DNA damage that corrupts standard translation.
 
-## What AGP does
+## Overview
 
-Ancient DNA reads are too short and fragmented for genome assembly. AGP translates them directly into proteins that can be searched against functional databases (KEGG, CAZy, viral protein databases) to identify metabolic pathways, enzyme functions, and viral content in ancient samples.
+<p align="center">
+<img src="docs/agp_pipeline.svg" width="700" alt="AGP pipeline — three-row overview">
+</p>
 
-**Primary use cases:**
-- Functional profiling of ancient environmental metagenomes (KEGG pathway analysis)
-- Carbohydrate-active enzyme (CAZyme) discovery in permafrost and sediments
-- Viral detection in ancient environmental samples
-- Authentication of ancient proteins via damage patterns
+The pipeline runs in three stages. **Pass 1** scans all reads to measure the sample's damage level. **Pass 2** translates reads into proteins using that damage estimate to rescue genes that would otherwise be missed. **Functional annotation** searches those proteins against databases and scores each hit for authentic ancient damage.
 
-## Features
+---
 
-- **Damage-aware translation**: Adjusts for C→T/G→A deamination that creates false stop codons
-- **Per-protein damage scoring**: Identifies which proteins show authentic ancient damage patterns
-- **Reference-free damage detection**: No alignment to reference genomes required
-- **Two-channel validation**: Distinguishes real damage from natural sequence composition
-- **High throughput**: ~20,000 reads/second with SIMD optimization
+## The problem: ancient DNA is chemically damaged
+
+DNA degrades after death. The most common change is **deamination**: cytosines (C) spontaneously convert to uracil, which reads as thymine (T) during sequencing. This happens most at the *ends* of DNA fragments — the longer ago an organism died, the more damage accumulates near the termini.
+
+This causes two practical problems for bioinformatics:
+
+1. **False stop codons.** A C→T change at certain codon positions turns a coding codon into a stop codon (e.g., CAA → TAA). Standard gene predictors see the stop and truncate or discard the gene — even though the *real* sequence had no stop there. A heavily damaged ancient sample can lose 30–50% of its genes this way.
+
+2. **False positives.** Some modern samples happen to be rich in T at read termini due to biology, not damage. Naively measuring "how much T is at the ends" gives a false alarm. AGP uses a second, independent signal — stop codon conversion rates — to confirm whether the enrichment is real damage or just natural sequence composition.
+
+---
+
+## How it works
+
+### Step 1 — Measure damage without a reference genome
+
+AGP scans all reads *before* any gene prediction to estimate how damaged the sample is. It uses two independent signals:
+
+**Channel A — terminal nucleotide frequencies.** In a damaged sample, C→T events increase the fraction of T at read ends. AGP measures T/(T+C) at each position from the 5′ terminus and fits an exponential decay curve. The amplitude at position 0 is `d_max` (maximum damage rate), and the decay constant is `λ`.
+
+**Channel B — stop codon conversion.** Codons CAA, CAG, and CGA are one C→T change away from becoming stop codons. AGP counts these stop-codon conversions separately at terminal versus interior positions. Real damage produces *more* stops near the ends. Natural composition variation does not — it produces equally elevated stops everywhere.
+
+If Channel A fires but Channel B is flat, the sample is flagged as a **compositional artifact** and `d_max` is set to zero. This prevents false positives in AT-rich organisms where terminal T enrichment is biological rather than chemical.
+
+The output is a `SampleProfile` — a compact damage model with `d_max`, decay constant `λ`, library type (single- or double-stranded), and a `damage_validated` flag.
+
+### Step 2 — Translate reads with damage awareness
+
+Standard six-frame translation fails on ancient DNA because damage-induced stop codons break reading frames. AGP rescues genes in two ways:
+
+**Damage-aware frame scoring.** Each candidate reading frame is scored using codon usage, hexamer patterns, and amino acid composition. In damage-aware mode, stop codons near the 5′ end are penalised less if they sit at positions where the sample's damage model predicts a high probability of C→T conversion. A stop that is 80% likely to be a damage artifact barely hurts the frame score; a stop in the middle of a long interior region counts heavily.
+
+**Stop codon masking.** Stops with high damage probability are replaced by `X` in the output protein sequences (`--fasta-aa-masked`). This lets MMseqs2 search across the damaged position and match the true reference protein, recovering alignments that would otherwise fail.
+
+Every read is assigned `p_read` — the probability that its terminal pattern reflects authentic ancient damage — stored in a binary index (`.agd`) for use downstream.
+
+### Step 3 — Search and score damage authenticity
+
+Predicted proteins are searched against a reference database (KEGG, CAZy, viral proteins, etc.) with MMseqs2 using VTML20, a substitution matrix calibrated for the conservative amino acid changes typical of ancient DNA.
+
+After search, `damage-annotate` scores each protein hit for authentic ancient damage using three lines of evidence fused in log-odds space:
+
+**Terminal evidence (BF_terminal).** The per-read `p_read` from Pass 2.
+
+**Site evidence (BF_sites).** The alignment is inspected for amino acid substitutions that are consistent with C→T or G→A damage: R→W, H→Y, Q→*, E→K, D→N, R→K. Each such substitution at a position near the read terminus contributes positive evidence; substitutions in the interior, where damage is rare, contribute near-zero evidence.
+
+**Identity evidence (BF_identity).** Ancient proteins match their reference proteins *better* than modern spurious hits do, because they come from organisms genuinely related to the reference. Alignment identity above 0.90 provides modest positive evidence; low identity provides negative evidence.
+
+EM reassignment resolves multi-mapping reads — reads that hit multiple reference proteins — by distributing them probabilistically based on alignment scores and damage probability, converging in 5–15 iterations.
+
+The final output is a per-protein Bayesian posterior: the probability that a protein's read support reflects authentic ancient DNA rather than modern contamination or noise.
+
+---
 
 ## Installation
 
@@ -34,65 +80,13 @@ cmake -DCMAKE_BUILD_TYPE=Release ..
 make -j$(nproc)
 ```
 
+---
+
 ## Quick start
-
-### Basic gene prediction
-
-```bash
-agp predict -i reads.fq.gz -o predictions.gff --fasta-aa proteins.faa --adaptive
-```
-
-This produces:
-- `predictions.gff`: Gene coordinates with damage scores
-- `proteins.faa`: Translated proteins for database search
-
-### Functional profiling pipeline
-
-```mermaid
-flowchart LR
-    A[reads.fq.gz] --> B[agp predict]
-    B --> C[proteins.faa]
-    B --> D[index.agd]
-    C --> E[MMseqs2 search]
-    E --> F[hits.tsv]
-    F --> G[agp hits2emi]
-    G --> H[hits.emi]
-    H --> I[agp damage-annotate]
-    D --> G
-    D --> I
-    I --> J[annotated_hits.tsv]
-
-    style B fill:#bbdefb
-    style G fill:#bbdefb
-    style I fill:#bbdefb
-```
-
-Search predicted proteins against KEGG for pathway analysis:
-
-```bash
-# 1. Predict genes with damage index
-agp predict -i reads.fq.gz -o out.gff \
-    --fasta-aa-masked search.faa \
-    --damage-index out.agd \
-    --adaptive
-
-# 2. Search against KEGG (MMseqs2 with aDNA-optimized settings)
-mmseqs easy-search search.faa kegg_genes.faa hits.tsv tmp/ \
-    --sub-mat VTML20.out \
-    --format-output "query,target,fident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits,qlen,tlen,qaln,taln"
-
-# 3. Convert hits TSV to EMI (columnar)
-agp hits2emi -i hits.tsv -o hits.emi --damage-index out.agd -t 16
-
-# 4. Annotate hits with per-protein damage scores (+ integrated EM reassignment)
-agp damage-annotate --emi hits.emi --damage-index out.agd -o annotated_hits.tsv -t 16
-```
-
-The `--fasta-aa-masked` output replaces damage-induced stop codons with X for better database matching.
 
 ### Sample damage assessment
 
-Check if a sample shows authentic ancient damage:
+Before gene prediction, check whether the sample shows authentic ancient damage:
 
 ```bash
 agp sample-damage reads.fq.gz
@@ -107,6 +101,31 @@ Output (JSON):
   "library_type": "double-stranded"
 }
 ```
+
+### Full functional profiling pipeline
+
+```bash
+# 1. Predict genes with damage model — produces proteins and damage index
+agp predict -i reads.fq.gz -o out.gff \
+    --fasta-aa-masked search.faa \
+    --damage-index out.agd \
+    --adaptive
+
+# 2. Search against a reference database with aDNA-optimized settings
+mmseqs easy-search search.faa kegg_genes.faa hits.tsv tmp/ \
+    --sub-mat VTML20.out \
+    --format-output "query,target,fident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits,qlen,tlen,qaln,taln"
+
+# 3. Convert hits to columnar index (embeds damage probabilities)
+agp hits2emi -i hits.tsv -o hits.emi --damage-index out.agd -t 16
+
+# 4. Annotate hits with per-protein Bayesian damage scores
+agp damage-annotate --emi hits.emi -o annotated_hits.tsv -t 16
+```
+
+The `--fasta-aa-masked` output replaces damage-induced stop codons with X so MMseqs2 can align across them.
+
+---
 
 ## Commands
 
@@ -189,40 +208,117 @@ Optional:
   --blast8-unique FILE   BLAST8-like export with unique mappers only (no multimaps)
   --analysis-prefix STR  Output prefix: .reads.tsv, .protein.tsv, .blast8.unique.tsv,
                          and .categories.tsv (if --map is provided)
-  --analysis-proteins FILE   Proteins output file
-  --analysis-blast8 FILE     Unique BLAST8 output file
-  --analysis-categories FILE Categories output file
   --gene-summary FILE    Per-protein/gene mapping summary (coverage/diversity metrics)
   --map FILE             Gene-to-group mapping TSV (gene_id<TAB>group)
   --functional-summary FILE  Per-group stats TSV (includes category damage enrichment)
   --anvio-ko FILE        Gene-level group abundance for anvi-estimate-metabolism
   --annotation-source STR  Source label for anvi output (default: AGP)
-  --min-positional-score FLOAT  Minimum positional score (default: 0)
-  --min-terminal-ratio FLOAT    Minimum terminal/middle coverage ratio (default: 0)
+  --preset STR           Apply filter bundle: loose or strict
   --min-reads INT        Minimum supporting reads for filtered outputs (default: 3)
-  --damage-index FILE    AGP damage index from predict
-  --corrected FILE       Reference-corrected protein FASTA
-  --threshold FLOAT      Classification threshold (default: 0.7)
+  --min-breadth FLOAT    Minimum alignment breadth (default: 0.10)
+  --min-depth FLOAT      Minimum mean depth (default: 0.5; set to 0 for ancient DNA)
+  --prior-ancient FLOAT  Prior P(ancient) for Bayesian scorer (default: 0.10)
+  --auto-prior-ancient   Auto-calibrate prior from mean p_read (requires AGD index)
+  --min-damage-sites INT Min susceptible positions for site evidence (default: auto)
+  --threshold FLOAT      Classification threshold for is_damaged (default: 0.7)
+  --aln-min-identity F   Min alignment identity (default: 0, no filter)
+  --aln-min-bits F       Min alignment bit score (default: 0, no filter)
+  --aln-max-evalue F     Max alignment e-value (default: 1e10, no filter)
   --no-em                Disable EM reassignment (enabled by default)
   --em-iters INT         Max EM iterations (default: 100)
   --em-lambda FLOAT      EM score temperature (default: 3.0)
   --em-tol FLOAT         EM convergence tolerance (default: 1e-4)
-  --em-min-prob FLOAT    Min EM posterior to keep assigned read (default: 1e-6)
-  --em-prob-fraction FLOAT Keep if gamma >= fraction*max_gamma(read) (default: 0.3)
+  --em-min-prob FLOAT    Min EM responsibility to keep a read (default: 1e-6)
 ```
 
 By default, `damage-annotate` resolves multi-mapping with integrated EM (SQUAREM-accelerated) directly on EMI alignments.
-Aggregation semantics are split by design:
-- Assignment channel (abundance/mapping): all EM-kept best-hit reads.
-- Damage channel (damage evidence): reads with at least one mismatch in `qaln/taln`.
-- `--protein-summary` now includes both channels in one table; assignment-derived fields are prefixed with `assign_`.
 
 Output columns include:
 - `p_read`: Per-read damage probability from prediction
 - `ct_sites`, `ga_sites`: C→T and G→A substitution counts from alignment
 - `posterior`: Bayesian damage probability combining terminal and alignment evidence
-- `damage_class`: 3-state classification (ancient/uncertain/modern)
+- `damage_class`: 3-state classification (damaged/uncertain/non-damaged)
 - `is_damaged`: Binary classification (posterior >= threshold)
+
+### Filtering and quality control
+
+`damage-annotate` provides layered filtering. Filters apply in order: alignment → EM → coverage → scoring.
+
+#### Quick presets
+
+```bash
+agp damage-annotate --emi hits.emi -o out.tsv --preset loose   # maximize recall
+agp damage-annotate --emi hits.emi -o out.tsv --preset strict  # maximize precision
+```
+
+| Parameter | default | `--preset loose` | `--preset strict` |
+|-----------|---------|-----------------|------------------|
+| `--min-reads` | 3 | 1 | 5 |
+| `--min-breadth` | 0.10 | 0 | 0.20 |
+| `--min-depth` | 0.5 (set to 0 for aDNA) | 0 | 1.0 |
+| `--min-positional-score` | 0 | 0 | auto-calibrated |
+| `--min-terminal-ratio` | 0 | 0 | auto-calibrated |
+| `--min-damage-sites` | auto | 1 | 5 |
+
+Presets apply immediately in the argument list — individual flags placed after `--preset` override the preset value.
+
+#### Alignment pre-filters
+
+Applied before any processing. All disabled by default.
+
+```bash
+--aln-min-identity 0.90   # skip alignments below 90% identity
+--aln-min-bits 30         # skip alignments below 30 bits
+--aln-max-evalue 1e-3     # skip alignments with e-value above 1e-3
+```
+
+#### Coverage filters
+
+Control which proteins appear in `--gene-summary` and `--protein-filtered` outputs.
+
+```bash
+--min-reads INT             # min reads per protein (default: 3)
+--min-breadth FLOAT         # min alignment breadth, 0–1 (default: 0.10; gene summary only)
+--min-depth FLOAT           # min mean depth (default: 0.5; gene summary only)
+--min-positional-score FLOAT  # min read start diversity (default: 0 = off)
+--min-terminal-ratio FLOAT    # min terminal/interior coverage ratio (default: 0 = off)
+--auto-calibrate-spurious     # auto-derive pos-score and terminal-ratio from data
+                              # (uses 5th percentile of well-supported proteins)
+```
+
+#### Bayesian scoring parameters
+
+```bash
+--prior-ancient FLOAT     # prior P(ancient) for Bayesian scorer (default: 0.10)
+--auto-prior-ancient      # auto-calibrate prior from mean p_read distribution
+--min-damage-sites INT    # min susceptible AA positions to use site evidence
+                          # (default: auto = max(1, median_qlen / 10))
+```
+
+`--prior-ancient` sets P(protein is ancient) for the Bayesian scorer. The default of 0.10 is conservative; increase it for samples expected to be predominantly ancient.
+
+`--auto-prior-ancient` derives the prior empirically from the data. It computes E[p_read] across all reads in the alignment file as an empirical Bayes estimate of the fraction that is ancient. Requires a binary AGD index (from `agp predict --damage-index`); if no p_read data is available, the explicit `--prior-ancient` value is used unchanged. Useful when the ancient/modern fraction varies across samples.
+
+`--min-damage-sites` auto-derives from the median query length in the data: short-read samples (15 aa median) get a lower threshold (1–2) while longer-read samples (50+ aa) use a higher threshold (5+). Override explicitly when needed.
+
+#### EM filter
+
+```bash
+--em-min-prob FLOAT   # min EM responsibility to keep a read (default: 1e-6)
+--no-em               # disable EM entirely (use best-hit only)
+```
+
+The EM filter keeps only reads where the best-hit protein's responsibility exceeds `--em-min-prob`. The default (1e-6) is effectively off — only use this to discard reads that are completely unassigned by EM.
+
+#### Classification threshold
+
+```bash
+--threshold FLOAT   # posterior cutoff for is_damaged column (default: 0.7)
+```
+
+This controls only the `is_damaged` label in the output — it does not exclude any rows. To filter the output by damage score, post-filter on the `posterior` column.
+
+---
 
 ### `agp damage-profile`
 
@@ -244,6 +340,8 @@ Compares predictions against ground truth for benchmarking.
 Usage: agp validate <fastq.gz> <aa-damage.tsv.gz> <predictions.gff> [proteins.faa] [corrected.faa] [--csv output.csv]
 ```
 
+---
+
 ## Output formats
 
 ### GFF3
@@ -264,22 +362,13 @@ Binary format for O(1) per-read damage lookup. Contains sequence length, frame, 
 
 ### EMI (.emi)
 
-Columnar alignment index consumed by `damage-annotate`. The EMI format stores MMseqs2 alignments in a memory-efficient columnar layout optimized for streaming EM and damage annotation.
-
-**Generation:**
-```bash
-agp hits2emi -i hits.tsv -o hits.emi --damage-index out.agd
-```
-
-**Structure:**
-- **Header**: Magic bytes, version, column count, row count, metadata
-- **Columns**: Each stored as contiguous array with type-specific encoding
-- **Metadata**: Optional sample-level parameters (d_max, λ) embedded from AGD
+Columnar alignment index consumed by `damage-annotate`. Stores MMseqs2 alignments in a memory-efficient columnar layout optimised for streaming EM and damage annotation.
 
 **Key columns:**
+
 | Column | Type | Description |
 |--------|------|-------------|
-| query_id | string | Read identifier (FNV-1a hashed for fast lookup) |
+| query_id | string | Read identifier |
 | target_id | string | Reference protein ID |
 | fident | float32 | Fractional sequence identity |
 | bits | float32 | Bit score |
@@ -287,15 +376,9 @@ agp hits2emi -i hits.tsv -o hits.emi --damage-index out.agd
 | taln | string | Target alignment string |
 | p_read | float32 | Pre-mapping damage probability (from AGD) |
 
-**Design choices:**
-- Sorted by query_id for grouped iteration (all hits per read are contiguous)
-- String dictionary encoding for repeated target IDs
-- Memory-mapped I/O for large files with configurable chunking
-- Supports streaming EM when dataset exceeds RAM
-
 ### Annotated Hits TSV
 
-Per-read output from `damage-annotate` (mismatch-evidence reads only):
+Per-read output from `damage-annotate`:
 
 | Column | Description |
 |--------|-------------|
@@ -304,115 +387,16 @@ Per-read output from `damage-annotate` (mismatch-evidence reads only):
 | ga_sites | G→A substitution count at protein level |
 | posterior | Bayesian posterior probability of damage |
 | is_damaged | 1 if posterior >= threshold |
-| syn_5prime | Synonymous C→T at 5' terminus (from damage index) |
-| syn_3prime | Synonymous G→A at 3' terminus (from damage index) |
-| em_keep | 1 if read assignment passes posterior filter |
+| em_keep | 1 if read assignment passes EM posterior filter |
 | gamma | EM responsibility for the selected target |
 
-## How it works
+---
 
-### Two-pass architecture
-
-```mermaid
-flowchart TB
-    subgraph Pass1["Pass 1: Damage estimation"]
-        A[FASTQ input] --> B[Scan terminal nucleotides]
-        B --> C[Compute T/T+C at 5']
-        B --> D[Compute A/A+G at 3']
-        C --> E[Fit exponential decay]
-        D --> E
-        E --> F[Estimate d_max, λ]
-        F --> G[Channel B validation]
-        G --> H[SampleDamageProfile]
-    end
-
-    subgraph Pass2["Pass 2: Gene prediction"]
-        H --> I[Per-read frame selection]
-        A --> I
-        I --> J[Six-frame translation]
-        J --> K[Damage-aware scoring]
-        K --> L[Stop codon rescue]
-        L --> M[GFF + proteins]
-    end
-
-    style Pass1 fill:#e1f5fe
-    style Pass2 fill:#f3e5f5
-```
-
-**Pass 1** scans all reads to estimate sample-wide damage:
-- Terminal nucleotide frequencies: T/(T+C) at 5', A/(A+G) at 3'
-- Exponential decay fitting: δ(p) = δ_max · e^(-λp)
-- Stop codon conversion rates for validation
-
-**Pass 2** predicts genes using the damage model:
-- Six-frame translation with damage-aware scoring
-- Bayesian stop codon probability based on position
-- Frame selection weighted by codon usage, hexamer patterns, and damage consistency
-
-### Two-channel damage validation
-
-Reference-free damage detection has a fundamental limitation: elevated T/(T+C) at read termini could be real C→T damage OR natural sequence composition.
-
-AGP solves this with two independent signals:
-
-**Channel A (Nucleotide frequencies)**: Measures T/(T+C) ratio at each position from 5' terminus. Real damage shows exponential decay from ~30% at position 0 to baseline (~25%) by position 15.
-
-**Channel B (Stop codon conversion)**: Tracks CAA→TAA, CAG→TAG, CGA→TGA conversions. These can ONLY be elevated by real C→T damage. Interior reads provide baseline; terminal excess indicates authentic damage.
-
-<p align="center">
-<img src="docs/damage_profile_combined.png" width="750" alt="Terminal damage profile">
-</p>
-
-*Terminal damage profiles showing characteristic "smiley" pattern: elevated T/(T+C) at 5' end and A/(A+G) at 3' end, decaying exponentially toward interior.*
-
-**Decision logic:**
-
-```mermaid
-flowchart LR
-    A{Channel A<br/>T/T+C elevated?} -->|Yes| B{Channel B<br/>stop excess?}
-    A -->|No| C[No damage<br/>d_max = 0]
-    B -->|Yes| D[Real damage<br/>report d_max]
-    B -->|No| E[Artifact<br/>d_max = 0]
-
-    style D fill:#c8e6c9
-    style C fill:#ffcdd2
-    style E fill:#ffcdd2
-```
-
-### Per-protein damage scoring
-
-After database search, `damage-annotate` identifies damage-consistent amino acid substitutions by comparing query (observed) to target (reference) proteins:
-
-| Reference | Observed | Damage Type | Codon Change |
-|-----------|----------|-------------|--------------|
-| R | W | C→T (5') | CGG→TGG |
-| Q | * | C→T (5') | CAA→TAA |
-| H | Y | C→T (5') | CAC→TAC |
-| E | K | G→A (3') | GAA→AAA |
-| D | N | G→A (3') | GAC→AAC |
-| R | K | G→A (3') | AGA→AAA |
-
-Positional probability weights these substitutions: sites near termini (where damage is expected) score higher than interior sites.
-
-## Performance
-
-Benchmarked on synthetic ancient DNA from the KapK community with known damage patterns and source proteins.
-
-### Protein damage annotation
-
-The `damage-annotate` command computes a Bayesian posterior score combining terminal nucleotide patterns, alignment-derived amino acid substitutions (R→W, H→Y, Q→*, etc.), and identity evidence in log-odds space.
-
-| Metric | AT-rich | GC-rich | Overall |
-|--------|---------|---------|---------|
-| AUC-ROC | **0.844** | **0.788** | **0.851** |
-| Precision @ τ=0.19 | 93% | 93% | 93% |
-| Recall @ τ=0.19 | 93% | 93% | 93% |
-
-The optimal threshold (τ = 0.19) is where precision equals recall.
+## Benchmark
 
 ### Gene prediction
 
-Benchmarked on 18.3M synthetic ancient DNA reads (10 KapK community samples) with known source proteins. Functional matching counts a hit as correct if it has ≥90% sequence identity to any reference protein.
+Benchmarked on 18.3 million synthetic ancient DNA reads from the KapK community (10 samples, known source proteins). A prediction is counted as correct if it matches any reference protein at ≥90% sequence identity.
 
 **Functional matching (≥90% identity):**
 
@@ -426,119 +410,129 @@ Benchmarked on 18.3M synthetic ancient DNA reads (10 KapK community samples) wit
 
 | Method | Predict | Search | Total |
 |--------|---------|--------|-------|
-| AGP | 149s | 4 min | ~6.5 min |
+| AGP | 149 s | 4 min | ~6.5 min |
 | MMseqs2 blastx | N/A | 10 min | ~10 min |
-| FGS-rs | ~18s | 4 min | ~4.5 min |
+| FGS-rs | ~18 s | 4 min | ~4.5 min |
 
-**Key findings:**
-- AGP and BLASTX have equivalent functional recall (~68%), both far exceed FGS-rs (19%)
-- AGP produces +1.4% higher identity hits than BLASTX (better quality matches)
-- AGP is ~1.5x faster than BLASTX (damage-aware frame selection vs 6-frame brute force)
-- FGS-rs fails on ancient DNA because it treats damage-induced stop codons as real stops
-
-### Throughput
-
-~35,000 sequences/second for gene prediction (8 threads, SIMD optimization).
-
-## Validation
-
-AGP validation uses two complementary datasets: (1) synthetic reads from the KapK community with known per-read damage status, and (2) 31 real ancient metagenomes with metaDMG reference-based damage estimates.
-
-### Protein-level damage classification
-
-After database search, `damage-annotate` computes a Bayesian posterior combining terminal patterns (p_read), damage-consistent amino acid substitutions, and alignment identity. Validated on 4.36M proteins from 10 synthetic KapK samples:
-
-| Metric | Value |
-|--------|-------|
-| AUC-ROC (overall) | **0.851** |
-| AUC-ROC (AT-rich samples) | **0.844** |
-| AUC-ROC (GC-rich samples) | **0.788** |
-| Optimal threshold (τ) | 0.19 |
-| Precision @ τ=0.19 | 92.8% |
-| Recall @ τ=0.19 | 92.6% |
-| F1 @ τ=0.19 | 0.927 |
-
-The figure below shows score distributions by sample type (A) and damage status (B), ROC curves (C), and precision-recall-F1 trade-offs (D). The optimal threshold is where precision equals recall.
+AGP and BLASTX have equivalent functional recall (~68%), both far exceeding FGS-rs (19%). FGS-rs treats damage-induced stop codons as real stops, discarding most ancient reads. AGP produces 1.4% higher identity hits than BLASTX and runs ~1.5× faster. Throughput: ~35,000 sequences/second (8 threads, SIMD).
 
 <p align="center">
-<img src="docs/protein_damage_classification.png" width="800" alt="Read-level damage classification">
+<img src="docs/benchmark_comparison.png" width="700" alt="Method comparison — AGP, BLASTX, FGS-rs">
 </p>
 
-The Bayesian posterior combines three evidence sources:
-1. **Terminal evidence** (BF_terminal): T/(T+C) elevation at read termini from C→T deamination
-2. **Site evidence** (BF_sites): Damage-consistent amino acid substitutions in alignments (R→W, H→Y, Q→*, etc.)
-3. **Identity evidence** (BF_identity): Ancient proteins have higher alignment identity than spurious modern matches
+### Read-level damage classification
 
-### Sample-wide damage validation
+`damage-annotate` assigns a per-read Bayesian posterior using terminal damage signal, alignment site evidence, and sequence identity. Evaluated on 3.4 million reads from 10 synthetic KapK samples (8 with ≥50 non-damaged reads):
 
-AGP estimates sample-wide damage without reference alignment using two-channel validation: terminal T/(T+C) elevation (Channel A) combined with stop codon conversion rates (Channel B). We validated against metaDMG on 31 real ancient metagenomes:
+| Group | AUC-ROC | P/R/F1 @ optimal τ |
+|-------|---------|---------------------|
+| AT-rich | **0.844** | 98.3% / 71.8% / 0.830 @ τ=0.75 |
+| GC-rich | 0.788 | — (see note below) |
+| Overall | 0.851 | |
+
+<p align="center">
+<img src="docs/read_benchmark.png" width="800" alt="Read-level damage classification">
+</p>
+
+### Protein damage classification
+
+After EM reassignment, `damage-annotate` computes `assign_mean_posterior` — the EM-weighted mean posterior across all reads assigned to a protein. Evaluated on 61,945 proteins (8 samples, ≥50 non-damaged proteins each):
+
+| Group | AUC-ROC | P/R/F1 @ optimal τ |
+|-------|---------|---------------------|
+| AT-rich | **0.948** | 99.3% / 87.4% / 0.930 @ τ=0.70 |
+| GC-rich | 0.938 | — (see note below) |
+| Overall | 0.875 | |
+
+<p align="center">
+<img src="docs/protein_benchmark.png" width="800" alt="Protein damage classification — AUC 0.948 AT-rich">
+</p>
+
+Averaging over multiple reads per protein substantially improves discrimination (+10% AUC for AT-rich, +15% for GC-rich).
+
+**Note on GC-rich samples and threshold selection.** C→T deamination creates a T/(T+C) terminal enrichment proportional to `d_max × (1 − baseline_C)`. In GC-rich organisms (baseline C ~27%), this enrichment is inherently weak even at high damage rates — AGP correctly sets d_max ≈ 0, and discrimination relies on alignment identity and EM posterior evidence rather than a damage magnitude signal. Consequently, a single classification threshold appropriate for AT-rich samples (where `d_max > 0`) is not meaningful for GC-rich samples. We therefore report precision/recall/F1 for AT-rich samples only; GC-rich performance is captured by AUC-ROC (threshold-independent). In practice, AGP reports `d_max` per sample, allowing users to apply regime-specific thresholds.
+
+**Recommended thresholds for real data:**
+- AT-rich samples (d_max > 0): τ = **0.70** at protein level, τ = **0.75** at read level
+- GC-rich samples (d_max ≈ 0): rely on AUC/ROC; any threshold is sample-specific
+
+### Sample-wide damage detection
+
+AGP estimates sample-wide damage without reference alignment. Validated against metaDMG on 31 real ancient metagenomes:
 
 | Sample | metaDMG (%) | AGP d_max (%) | Channel B LLR | Decision |
 |--------|-------------|---------------|---------------|----------|
-| low_001 | 0.48 | 0.00 | -24,707 | No damage (artifact) |
-| low_002 | 0.53 | 0.00 | -365 | No damage (artifact) |
+| low_001 | 0.48 | 0.00 | −24,707 | No damage (artifact) |
 | low_005 | 8.37 | 6.27 | +808 | Validated |
 | low_009 | 31.47 | 9.06 | +39,631 | Validated |
 | 69_34 | 39.50 | 39.00 | +5,332,371 | Validated |
 | 119_48 | 44.98 | 44.00 | +3,818,288 | Validated |
-| 75_205D | 55.82 | 42.00 | +1,481,034 | Validated |
-
-The scatter plot below shows the correlation between AGP and metaDMG estimates across all 31 samples:
 
 <p align="center">
 <img src="docs/damage_validation_scatter.png" width="600" alt="AGP vs metaDMG validation">
 </p>
 
-Correlation r = 0.81 across the full 0–55% damage range. The +4.4% bias reflects different estimands: metaDMG analyzes only aligned reads, while AGP analyzes all reads. Channel B prevents false positives—samples low_001–low_004 show elevated terminal T/(T+C) but negative Channel B LLR, correctly rejected as compositional artifacts.
+Correlation r = 0.81 across the full 0–55% damage range. The +4.4% bias reflects different estimands: metaDMG analyses only aligned reads while AGP analyses all reads. Channel B prevents false positives — samples low_001–low_004 show elevated terminal T/(T+C) but negative Channel B LLR, correctly rejected as compositional artifacts.
+
+---
 
 ## Methods
 
 ### Damage model
 
-Post-mortem deamination causes C→T substitutions at 5' ends and G→A at 3' ends, following exponential decay from fragment termini:
+Post-mortem deamination causes C→T substitutions at 5′ ends and G→A at 3′ ends, following exponential decay from fragment termini:
 
 $$\delta(p) = d_{\max} \cdot e^{-\lambda p}$$
 
-Where $d_{\max}$ is maximum damage at terminus, $\lambda$ is decay constant (0.2–0.5), and $p$ is position from terminus. Half-life: $t_{1/2} = \ln(2) / \lambda \approx 1.4\text{–}3.5$ positions.
+Where $d_{\max}$ is maximum damage at the terminus, $\lambda$ is the decay constant (0.2–0.5), and $p$ is position from the terminus. Half-life: $t_{1/2} = \ln(2) / \lambda \approx 1.4\text{–}3.5$ positions.
 
 ### Two-channel validation
 
-AGP uses two independent signals to distinguish real damage from compositional artifacts:
-
-**Channel A (nucleotide frequencies):** Measures T/(T+C) enrichment at terminal positions:
+**Channel A (nucleotide frequencies):** Terminal T/(T+C) enrichment:
 
 $$r_A(p) = \frac{T_p}{T_p + C_p}$$
 
-Expected ratio under damage: $\mathbb{E}[r_A(p)] = b_T + (1 - b_T) \cdot d_{\max} \cdot e^{-\lambda p}$, where $b_T$ is baseline T/(T+C) from interior positions.
+Expected under damage: $\mathbb{E}[r_A(p)] = b_T + (1 - b_T) \cdot d_{\max} \cdot e^{-\lambda p}$
 
 **Channel B (stop codon conversion):** Tracks CAA→TAA, CAG→TAG, CGA→TGA conversions. Stop conversion rate:
 
 $$r_B(p) = \frac{\text{stops}_p}{\text{stops}_p + \text{preimage}_p}$$
 
-Decision logic: If Channel A fires AND Channel B confirms ($c > 0$, $\text{LLR}_B > 0$) → validated damage. If Channel A fires BUT Channel B is flat → compositional artifact (rejected).
+Decision: Channel A fires AND Channel B confirms → validated damage. Channel A fires BUT Channel B is flat → compositional artifact (rejected, $d_{\max} = 0$).
 
 ### Per-read damage scoring
 
-Each read gets a damage probability based on terminal nucleotide patterns. At position $i$ with observed base $B$:
-
-$$P(B=T \mid \text{damage}) = b_{TC} + (1 - b_{TC}) \cdot d_{\max} \cdot e^{-\lambda i}$$
-$$P(B=T \mid \text{no damage}) = b_{TC}$$
-
-Log-likelihood ratio across terminal positions:
+Each read gets a damage probability from terminal nucleotide patterns. Log-likelihood ratio across terminal positions:
 
 $$\text{LLR} = \sum_{i \in \text{terminal}} \log \frac{P(B_i \mid \text{damage})}{P(B_i \mid \text{no damage})}$$
 
-Final read-level score with Channel B modulation ($\gamma_B \in \{0, 0.5, 1\}$):
+Final score with Channel B modulation ($\gamma_B \in \{0, 0.5, 1\}$):
 
 $$p_{\text{read}} = \gamma_B \cdot \sigma(\text{logit}(\pi_0) + \text{LLR})$$
 
-### Stop codon rescue
+### Bayesian damage score
 
-For a stop codon at position $p$ from 5' terminus, the probability it arose from damage:
+Per-protein posterior fuses three evidence sources in log-odds space:
 
-$$P(\text{damage} \mid \text{stop}) = \frac{P(\text{stop} \mid \text{damage}) \cdot P(\text{damage})}{P(\text{stop})}$$
+$$\text{logit}(P_{\text{posterior}}) = \text{logit}(\pi) + \log BF_{\text{terminal}} + \log BF_{\text{sites}} + \log BF_{\text{identity}}$$
 
-Where P(stop | damage) depends on convertible precursors (CAA, CAG, CGA) and P(damage) = δ(p). High-probability damage stops are X-masked in search output.
+- $BF_{\text{terminal}}$: Bayes factor from terminal patterns (p_read)
+- $BF_{\text{sites}}$: Bayes factor from damage-consistent AA substitutions (R→W, H→Y, Q→*, etc.)
+- $BF_{\text{identity}}$: Bayes factor from alignment identity: $\log BF = 20 \times (\text{fident} - 0.90)$, capped ±5
+
+### EM reassignment
+
+**E-step:** Responsibility $\gamma_{ij}$ for each read-reference pair:
+
+$$\gamma_{ij} = \frac{\phi_j \cdot L(i,j)}{\sum_{k \in R_i} \phi_k \cdot L(i,k)}$$
+
+Where $L(i,j) = \exp(S_{ij}/\lambda) \cdot p_{\text{read},i}^{\alpha}$.
+
+**M-step:** Update reference abundances:
+
+$$\phi_j = \frac{\alpha_0 + \sum_i \gamma_{ij}}{J \cdot \alpha_0 + N}$$
+
+Convergence typically takes 5–15 iterations with SQUAREM acceleration. Reads are kept if $\gamma_{ij} \geq \epsilon$ (default $\epsilon = 10^{-6}$, controlled by `--em-min-prob`).
 
 ### Frame scoring
 
@@ -555,62 +549,20 @@ Frame selection combines multiple signals:
 
 In damage-aware mode, stop penalties are weighted by $(1 - P_{\text{damage}})$, reducing penalties for likely damage-induced stops.
 
-### Bayesian damage score
-
-The per-protein damage score combines evidence in log-odds space:
-
-$$\text{logit}(P_{\text{posterior}}) = \text{logit}(\pi) + \log BF_{\text{terminal}} + \log BF_{\text{sites}} + \log BF_{\text{identity}}$$
-
-Where:
-- $BF_{\text{terminal}}$: Bayes factor from terminal patterns (p_read)
-- $BF_{\text{sites}}$: Bayes factor from damage-consistent AA substitutions (R→W, H→Y, Q→*, etc.)
-- $BF_{\text{identity}}$: Bayes factor from alignment identity: $\log BF = 20 \times (\text{fident} - 0.90)$
-
-### EM reassignment
-
-EM resolves multi-mapping by distributing reads probabilistically across candidate references.
-
-**E-step:** Compute responsibility $\gamma_{ij}$ for each read-reference pair:
-
-$$\gamma_{ij} = \frac{\phi_j \cdot L(i,j)}{\sum_{k \in R_i} \phi_k \cdot L(i,k)}$$
-
-Where likelihood $L(i,j) = \exp(S_{ij}/\lambda) \cdot p_{\text{read},i}^{\alpha}$ combines alignment score and damage probability.
-
-**M-step:** Update reference abundances:
-
-$$\phi_j = \frac{\alpha_0 + \sum_i \gamma_{ij}}{J \cdot \alpha_0 + N}$$
-
-Convergence typically takes 5-15 iterations with SQUAREM acceleration. Reads are kept if $\gamma_{ij} \geq 10^{-6}$ and $\gamma_{ij} \geq 0.3 \cdot \max_k(\gamma_{ik})$.
-
-### Protein-level aggregation
-
-After EM, the protein-level damage probability combines evidence across reads:
-
-$$P(\text{protein damaged}) = 1 - \prod_{i \in \text{reads}_j} (1 - p_{\text{posterior},i})^{\gamma_{ij}}$$
-
-This is the probability that at least one read shows authentic damage, weighted by assignment confidence.
-
 ### Domain-specific models
-
-AGP includes pre-trained hexamer frequency tables for different taxonomic groups, enabling accurate frame selection across diverse organisms:
 
 | Domain | Source | CDS sequences | Description |
 |--------|--------|---------------|-------------|
-| gtdb | GTDB r220 | 405M | Bacteria and archaea (default) |
-| fungi | RefSeq | 6.8M | Fungal eukaryotes |
-| plant | RefSeq | 9.2M | Land plants |
-| protozoa | RefSeq | 1.2M | Single-celled eukaryotes |
-| invertebrate | RefSeq | 12.9M | Invertebrate animals |
-| vertebrate_mammalian | RefSeq | 12.9M | Mammals |
-| vertebrate_other | RefSeq | 21.3M | Non-mammalian vertebrates |
-| viral | RefSeq | 0.7M | Viruses |
+| gtdb | GTDB r220 | 405 M | Bacteria and archaea (default) |
+| fungi | RefSeq | 6.8 M | Fungal eukaryotes |
+| plant | RefSeq | 9.2 M | Land plants |
+| protozoa | RefSeq | 1.2 M | Single-celled eukaryotes |
+| invertebrate | RefSeq | 12.9 M | Invertebrate animals |
+| vertebrate_mammalian | RefSeq | 12.9 M | Mammals |
+| vertebrate_other | RefSeq | 21.3 M | Non-mammalian vertebrates |
+| viral | RefSeq | 0.7 M | Viruses |
 
-Each domain has three types of hexamer tables:
-- **Overall frequencies**: Codon-pair (dicodon) patterns for coding potential scoring
-- **Positional frequencies**: Position-specific patterns for start/internal/end regions
-- **Damage likelihood ratios**: Log-likelihood ratios for damage-consistent patterns
-
-For ancient environmental metagenomes, the default `gtdb` domain works well since bacterial sequences typically dominate. Use `--domain` to specify a different taxonomic group when analyzing samples with known composition.
+---
 
 ## Citation
 
@@ -633,4 +585,4 @@ If you use AGP in your research, please cite:
 
 ## License
 
-MIT License - see LICENSE file for details.
+MIT License — see LICENSE file for details.

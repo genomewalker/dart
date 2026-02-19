@@ -184,10 +184,7 @@ struct ProteinDamageSummary {
     uint32_t aa_k_hits = 0;
     float aa_sum_qA = 0.0f;
     float aa_sum_log_qA_hits = 0.0f;
-    // Full Bernoulli LLR (hits + non-hits, position-weighted)
-    float aa_llr_bernoulli = 0.0f;
     float aa_sum_exp_decay = 0.0f;
-    bool aa_has_bernoulli = false;
     // Stored for single-pass corrected output
     std::string qaln;
     std::string taln;
@@ -267,9 +264,6 @@ static ProteinDamageSummary annotate_alignment(
     float aa_sum_qA = 0.0f;
     float aa_sum_log_qA_hits = 0.0f;
 
-    // Fix 3 & 4: Full Bernoulli LLR including non-hits
-    // LLR = sum_j [ y_j*log(q1_j/q0_j) + (1-y_j)*log((1-q1_j)/(1-q0_j)) ]
-    float llr_bernoulli = 0.0f;
     float sum_exp_decay = 0.0f;  // Fix 2: data-driven w = sum_exp_decay / m
 
     size_t q_pos = qstart;  // 0-based
@@ -329,16 +323,6 @@ static ProteinDamageSummary annotate_alignment(
                     is_hit = true;
                 }
             }
-
-            // Position-weighted LLR contribution (hits only)
-            // Absence evidence removed: most ancient reads have only 1-2 damage events,
-            // so absence at a position doesn't mean "not ancient" - just means that
-            // particular C/G wasn't converted. Including absence evidence is too aggressive.
-            if (is_hit) {
-                // Positive evidence: log(q1/q0)
-                llr_bernoulli += std::log(q1_safe / q0_safe);
-            }
-            // Non-hits: no penalty (one-sided test)
 
             aa_sum_qA += h;  // Legacy: sum of hazards
         }
@@ -423,7 +407,7 @@ static ProteinDamageSummary annotate_alignment(
         logit_posterior = std::clamp(logit_posterior, -10.0f, 10.0f);
         p_damaged = 1.0f / (1.0f + std::exp(-logit_posterior));
     } else {
-        p_damaged = 0.0f;  // No damage-consistent sites = no AA-level evidence
+        p_damaged = PRIOR_DAMAGED;  // No AA-level evidence → return prior
     }
 
     // damage_consistent now includes ALL damage-consistent sites (not just terminal)
@@ -454,10 +438,7 @@ static ProteinDamageSummary annotate_alignment(
     out.aa_k_hits = aa_k_hits;
     out.aa_sum_qA = aa_sum_qA;
     out.aa_sum_log_qA_hits = aa_sum_log_qA_hits;
-    // Full Bernoulli LLR (Fixes 3 & 4)
-    out.aa_llr_bernoulli = llr_bernoulli;
     out.aa_sum_exp_decay = sum_exp_decay;
-    out.aa_has_bernoulli = (aa_m_opportunities > 0);
     return out;
 }
 
@@ -1054,7 +1035,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     double em_lambda_b = 3.0;
     double em_tol = 1e-4;
     double em_min_prob = 1e-6;       // absolute posterior threshold for keeping alignment
-    double em_prob_fraction = 0.3;   // keep if gamma >= fraction * read_max_gamma
+
+    // Bayesian scoring parameters
+    float prior_ancient = 0.10f;     // Prior P(ancient) for Bayesian scorer
+    bool  auto_prior_ancient = false; // Auto-calibrate prior from mean p_read distribution
+    int   min_damage_sites = -1;     // Min susceptible positions to trust site evidence (-1 = auto)
 
     // Alignment-level pre-filters (applied before any processing)
     float aln_min_identity = 0.0f;   // 0 = no filter
@@ -1124,8 +1109,22 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             em_tol = std::stod(argv[++i]);
         } else if (strcmp(argv[i], "--em-min-prob") == 0 && i + 1 < argc) {
             em_min_prob = std::stod(argv[++i]);
-        } else if (strcmp(argv[i], "--em-prob-fraction") == 0 && i + 1 < argc) {
-            em_prob_fraction = std::stod(argv[++i]);
+        } else if (strcmp(argv[i], "--prior-ancient") == 0 && i + 1 < argc) {
+            prior_ancient = std::stof(argv[++i]);
+        } else if (strcmp(argv[i], "--min-damage-sites") == 0 && i + 1 < argc) {
+            min_damage_sites = std::stoi(argv[++i]);
+        } else if (strcmp(argv[i], "--preset") == 0 && i + 1 < argc) {
+            const char* preset = argv[++i];
+            if (strcmp(preset, "loose") == 0) {
+                min_reads = 1; min_breadth = 0.0f; min_depth = 0.0f; min_damage_sites = 1;
+            } else if (strcmp(preset, "strict") == 0) {
+                min_reads = 5; min_breadth = 0.20f; min_depth = 1.0f;
+                auto_calibrate_spurious = true; min_damage_sites = 5;
+            } else {
+                std::cerr << "Error: --preset must be 'loose' or 'strict'\n"; return 1;
+            }
+        } else if (strcmp(argv[i], "--auto-prior-ancient") == 0) {
+            auto_prior_ancient = true;
         } else if (strcmp(argv[i], "--em-streaming") == 0) {
             em_streaming = true;
         } else if ((strcmp(argv[i], "--em-max-memory") == 0 || strcmp(argv[i], "-m") == 0) && i + 1 < argc) {
@@ -1210,7 +1209,17 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cout << "  --em-lambda FLOAT Temperature parameter (default: 3.0)\n";
             std::cout << "  --em-tol FLOAT    Convergence tolerance (default: 1e-4)\n";
             std::cout << "  --em-min-prob FLOAT     Min EM posterior to keep (default: 1e-6)\n";
-            std::cout << "  --em-prob-fraction FLOAT Keep if gamma >= fraction*max_gamma(read) (default: 0.3)\n";
+            std::cout << "\nBayesian scoring:\n";
+            std::cout << "  --prior-ancient FLOAT   Prior P(ancient) for Bayesian scorer (default: 0.10)\n";
+            std::cout << "  --auto-prior-ancient    Auto-calibrate prior from mean p_read distribution\n";
+            std::cout << "                          Requires AGD index (--damage-index). Uses E[p_read]\n";
+            std::cout << "                          as an empirical Bayes estimate of fraction ancient.\n";
+            std::cout << "  --min-damage-sites INT  Min susceptible AA positions to use site evidence\n";
+            std::cout << "                          (default: auto = max(1, median_qlen/10))\n";
+            std::cout << "\nPresets (applied immediately; individual flags after --preset override):\n";
+            std::cout << "  --preset loose   Maximize recall: min-reads=1, breadth=0, depth=0, min-damage-sites=1\n";
+            std::cout << "  --preset strict  Maximize precision: min-reads=5, breadth=0.2, depth=1.0,\n";
+            std::cout << "                   auto-calibrate-spurious, min-damage-sites=5\n";
             std::cout << "  --em-streaming    Use streaming EM (low memory, ~2.5x slower)\n";
             std::cout << "  --em-max-memory, -m MB  Max EM memory in MB (default: 4096)\n";
             std::cout << "                       Auto-switches to streaming if estimate exceeds limit\n";
@@ -1244,10 +1253,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
     if (em_min_prob < 0.0 || em_min_prob > 1.0) {
         std::cerr << "Error: --em-min-prob must be in [0,1]\n";
-        return 1;
-    }
-    if (em_prob_fraction < 0.0 || em_prob_fraction > 1.0) {
-        std::cerr << "Error: --em-prob-fraction must be in [0,1]\n";
         return 1;
     }
 
@@ -2270,9 +2275,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
         // Finalize per-read stats
         for (uint32_t r = 0; r < n_reads; ++r) {
-            float keep_thr = std::max(
-                static_cast<float>(em_min_prob),
-                static_cast<float>(em_prob_fraction) * read_top1[r]);
+            float keep_thr = static_cast<float>(em_min_prob);
 
             em_read_results[r].em_threshold = keep_thr;
             em_read_results[r].em_margin = std::max(0.0f, read_top1[r] - read_top2[r]);
@@ -2298,7 +2301,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cerr << "  Param tolerance: " << std::scientific << std::setprecision(3)
                       << std::sqrt(std::max(em_tol, 1e-15)) << std::defaultfloat << "\n";
             std::cerr << "  Min prob keep: " << em_min_prob << "\n";
-            std::cerr << "  Prob fraction keep: " << em_prob_fraction << "\n";
             std::cerr << "  Length normalization: on\n";
         }
 
@@ -2456,9 +2458,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
             // Check if the best-by-bitscore hit matches the EM-assigned best
             const auto& bh = best_hits[r];
-            float keep_thr = std::max(
-                static_cast<float>(em_min_prob),
-                static_cast<float>(em_prob_fraction) * top1);
+            float keep_thr = static_cast<float>(em_min_prob);
             bool em_keep = true;
             if (bh.has) {
                 const uint32_t best_hit_ref = bh.ref_idx;
@@ -2493,7 +2493,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             size_t multi = 0, unique = 0;
             size_t reassigned = 0;
             size_t kept_total = 0, kept_multi = 0;
-            size_t fail_abs = 0, fail_frac = 0;
+            size_t fail_abs = 0;
             double margin_sum = 0.0;
             double neff_sum = 0.0;
             size_t margin_n = 0;
@@ -2508,7 +2508,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     if (deg > 1) kept_multi++;
                 } else {
                     if (er.gamma < static_cast<float>(em_min_prob)) fail_abs++;
-                    else fail_frac++;
                 }
                 if (deg > 0) {
                     margin_sum += er.em_margin;
@@ -2523,8 +2522,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                       << " (" << std::fixed << std::setprecision(2)
                       << (n_reads > 0 ? 100.0 * static_cast<double>(kept_total) / static_cast<double>(n_reads) : 0.0)
                       << "%), kept multi " << kept_multi << "/" << multi << "\n";
-            std::cerr << "    failed abs(min_prob): " << fail_abs
-                      << ", failed frac(max*prob_fraction): " << fail_frac << "\n";
+            std::cerr << "    failed abs(min_prob): " << fail_abs << "\n";
             if (margin_n > 0) {
                 const double reassigned_pct =
                     100.0 * static_cast<double>(reassigned) / static_cast<double>(margin_n);
@@ -2547,6 +2545,20 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         total_ga += s.ga_sites;
         total_high += s.high_conf_sites;
         if (s.damage_consistent > 0) proteins_with_damage++;
+    }
+
+    // Auto-derive min_damage_sites from median read length if not set
+    if (min_damage_sites < 0 && !summaries.empty()) {
+        std::vector<size_t> qlens;
+        qlens.reserve(summaries.size());
+        for (const auto& s : summaries) qlens.push_back(s.qlen);
+        std::nth_element(qlens.begin(), qlens.begin() + qlens.size() / 2, qlens.end());
+        const size_t median_qlen = qlens[qlens.size() / 2];
+        min_damage_sites = std::max(1, static_cast<int>(median_qlen / 10));
+        if (verbose) std::cerr << "Auto min_damage_sites: " << min_damage_sites
+                               << " (median qlen=" << median_qlen << " aa)\n";
+    } else if (min_damage_sites < 0) {
+        min_damage_sites = 3;  // fallback if no summaries
     }
 
     if (verbose) {
@@ -2619,15 +2631,31 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     constexpr float PI0_FIXED = 0.10f;
     const float empirical_pi0 = PI0_FIXED;
 
+    // Auto-calibrate prior_ancient from mean p_read if requested
+    // E[p_read] = weighted average of P(damaged|read) ≈ fraction of ancient reads in the sample.
+    // Requires AGD index (has_p_read); falls back to default if insufficient data.
+    if (auto_prior_ancient) {
+        if (p_read_n_all >= 50) {
+            const float mean_p_read = static_cast<float>(p_read_sum_all / p_read_n_all);
+            prior_ancient = std::clamp(mean_p_read, 0.05f, 0.80f);
+            if (verbose) std::cerr << "Auto prior_ancient: " << std::fixed << std::setprecision(3)
+                                   << prior_ancient << " (mean p_read=" << mean_p_read
+                                   << " from " << p_read_n_all << " reads)\n";
+        } else if (verbose) {
+            std::cerr << "Auto prior_ancient: skipped (need >=50 reads with p_read, got "
+                      << p_read_n_all << "); using default " << prior_ancient << "\n";
+        }
+    }
+
     // Set up scoring parameters with empirical Bayes approach
     agp::BayesianScoreParams score_params;
-    score_params.pi = 0.10f;             // Prior P(ancient) - conservative
+    score_params.pi = prior_ancient;
     score_params.pi0 = empirical_pi0;    // Empirical baseline for terminal evidence transform
     score_params.q_modern = modern_est.q_modern;
     score_params.w0 = 0.3f;              // Temper absence evidence (robustness)
     score_params.terminal_threshold = 0.50f;
     score_params.site_cap = 3.0f;        // Cap site contribution (matches original)
-    score_params.min_opportunities = 3;  // Minimum m to trust site evidence
+    score_params.min_opportunities = min_damage_sites;
     score_params.channel_b_valid = (d_max > 0.0f);  // Trust site evidence if damage detected
     score_params.ancient_threshold = 0.60f;
     score_params.modern_threshold = 0.25f;
@@ -2785,10 +2813,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             ev.sum_qA = s.aa_sum_qA;
             ev.sum_log_qA_hits = s.aa_sum_log_qA_hits;
             ev.q_eff = (ev.m > 0) ? (ev.sum_qA / static_cast<float>(ev.m)) : 0.0f;
-            // Full Bernoulli LLR (Fixes 3 & 4)
-            ev.llr_bernoulli = s.aa_llr_bernoulli;
             ev.sum_exp_decay = s.aa_sum_exp_decay;
-            ev.has_bernoulli = s.aa_has_bernoulli;
 
             // Compute Bayesian score (with optional identity evidence)
             bayes_out = agp::compute_bayesian_score(s.p_read, ev, score_params, s.fident);
@@ -3117,14 +3142,14 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             }
 
             // Write Anvi'o-compatible gene abundance (for anvi-estimate-metabolism --enzymes-txt)
-            // Format: gene_id  enzyme_accession  source  coverage  detection
+            // Format: gene_callers_id  enzyme_accession  source  coverage  detection
             // Where coverage = EM-weighted abundance (gamma-weighted depth), detection = breadth
             if (!anvio_ko_file.empty() && !group_map.empty()) {
                 std::ofstream af(anvio_ko_file);
                 if (!af.is_open()) {
                     std::cerr << "Error: Cannot open Anvi'o KO file: " << anvio_ko_file << "\n";
                 } else {
-                    af << "gene_id\tenzyme_accession\tsource\tcoverage\tdetection\n";
+                    af << "gene_callers_id\tenzyme_accession\tsource\tcoverage\tdetection\n";
                     size_t n_written = 0;
                     for (const auto& [tid, acc] : gene_agg) {
                         // Skip filtered genes

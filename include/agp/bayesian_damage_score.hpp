@@ -40,12 +40,7 @@ struct SiteEvidence {
     float sum_qA = 0.0f;      // sum of position-weighted ancient hazards (all positions)
     float sum_log_qA_hits = 0.0f;  // sum of log(q1/q0) at damage sites only (legacy)
     float q_eff = 0.0f;       // effective per-site rate = sum_qA / m
-
-    // Full Bernoulli LLR: sum over ALL opportunities (hits + non-hits)
-    // LLR = sum_j [ y_j*log(q1_j/q0_j) + (1-y_j)*log((1-q1_j)/(1-q0_j)) ]
-    float llr_bernoulli = 0.0f;  // full position-weighted LLR
     float sum_exp_decay = 0.0f;  // sum of exp(-λ*dist) for computing effective w
-    bool has_bernoulli = false;  // true if llr_bernoulli was computed
 };
 
 // Modern baseline estimate from sample (can be stratified by GC)
@@ -339,33 +334,30 @@ inline BayesianScoreOutput compute_bayesian_score(
         const double k = static_cast<double>(ev.k);
         const double m = static_cast<double>(ev.m);
 
-        // Tempered Bayes factor:
-        // logBF = k*log(qA/qM) + w0*(m-k)*log((1-qA)/(1-qM))
-        // With w0 < 1, absence evidence is downweighted for robustness
+        // AA-scaled average ancient hazard — shared by both positive and negative evidence
+        // so both terms are on the same scale.
+        // Previously, negative evidence used raw sum_qA/m (nucleotide scale, ~3× too large).
+        //
+        // AA_SCALE = 0.30: P(observable AA substitution | C→T nucleotide damage)
+        // w = E[exp(-λ*dist)] over susceptible alignment positions (data-driven from sum_exp_decay)
+        // avg_q_ancient = d_max * AA_SCALE * w + q_modern
+        constexpr double AA_SCALE = 0.30;
+        const double d_max_scaled = static_cast<double>(params.d_max) * AA_SCALE;
+        const double w = (ev.sum_exp_decay > 0.0f)
+            ? static_cast<double>(ev.sum_exp_decay) / m
+            : 0.12;  // Conservative estimate for ~50bp reads
+        const double avg_q_ancient = (d_max_scaled > qm)
+            ? clamp01(d_max_scaled * w + qm, eps)
+            : qm;  // d_max=0 → no expected damage → avg_q_ancient = qm
 
         if (ev.k > 0) {
-            // Fixed-average formula for logBF_sites
+            // Fixed-average logBF_sites = k * log(avg_q_ancient / q_modern)
             //
             // Why fixed-average (not position-weighted):
             // - Alignment AA positions don't correspond to original read positions
             // - Damage at terminal nucleotides appears at various AA positions after translation
             // - Interior alignment positions may correspond to terminal read damage
-            //
-            // Fix 1: AA_SCALE = 0.30 (P(observable AA event | nucleotide damage))
-            // Fix 2: w = E[exp(-λ*dist)] corrected from 0.5 to data-driven value
-            //
-            // Data-driven w from per-read sum_exp_decay if available, else estimate:
-            // With λ=0.3 and typical read lengths: w ≈ 0.10-0.15
-            const double w = (ev.sum_exp_decay > 0.0f && ev.m > 0)
-                ? static_cast<double>(ev.sum_exp_decay) / static_cast<double>(ev.m)
-                : 0.12;  // Conservative estimate for ~50bp reads
-
-            constexpr double AA_SCALE = 0.30;  // Nucleotide → AA damage rate conversion
-            const double d_max_scaled = static_cast<double>(params.d_max) * AA_SCALE;
-
             if (d_max_scaled > qm) {
-                // logBF_sites = k * log((d_max_scaled * w + qm) / qm)
-                const double avg_q_ancient = d_max_scaled * w + qm;
                 logBF_sites = k * std::log(avg_q_ancient / qm);
             } else if (ev.sum_log_qA_hits > 0.0f) {
                 // Fallback: position-weighted sum (when d_max not available)
@@ -375,10 +367,9 @@ inline BayesianScoreOutput compute_bayesian_score(
 
         // Tempered negative evidence (absence of damage where expected)
         // Only apply if Channel B validates sample-level damage (otherwise no expected damage)
-        if (params.channel_b_valid && w0 > 0.0 && ev.m > ev.k) {
-            // Average ancient rate over all susceptible positions
-            double q_ancient_avg = clamp01(ev.sum_qA / m + qm, eps);
-            double log_ratio_no_damage = std::log((1.0 - q_ancient_avg) / (1.0 - qm));
+        // Uses same avg_q_ancient as positive evidence (AA-scaled, consistent).
+        if (params.channel_b_valid && w0 > 0.0 && ev.m > ev.k && avg_q_ancient > qm) {
+            double log_ratio_no_damage = std::log((1.0 - avg_q_ancient) / (1.0 - qm));
             logBF_sites += w0 * (m - k) * log_ratio_no_damage;
         }
 
