@@ -647,10 +647,12 @@ Authentic (real gene):
 
 The two filters are complementary: the positional score catches reads piled at any single location on the protein, while the terminal ratio catches reads that collectively avoid both ends.
 
-| Filter | Detects | Spurious pattern |
-|--------|---------|------------------|
-| `--min-positional-score` | Reads clustered at one spot | Short conserved motif hit |
-| `--min-terminal-ratio` | Reads avoiding both ends | Interior conserved domain |
+| Filter | Detects | Spurious pattern | aDNA robustness |
+|--------|---------|------------------|-----------------|
+| `--min-positional-score` | Reads clustered at one spot | Short conserved motif hit | **High** — measures read start diversity, not depth |
+| `--min-terminal-ratio` | Reads avoiding both ends | Interior conserved domain | **Moderate** — depth-based; vulnerable to differential preservation |
+
+**Note for ancient DNA:** aDNA coverage depth is inherently non-uniform due to differential preservation of genomic regions (AT-rich regions degrade faster), fragment length distribution (short fragments enriched), and fragment-end sequence biases. The terminal ratio normalisation corrects for read-length geometry but not for these preservation effects. A real protein whose terminal codons sit in a poorly-preserved genomic context can show low terminal ratio through no fault of its own. In highly degraded or AT-rich samples, prefer `--min-positional-score` as the primary spurious-hit filter; use `--min-terminal-ratio` only at conservative thresholds (< 0.3) or leave it disabled (default 0.0).
 
 ### Domain-specific models
 
