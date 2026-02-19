@@ -4,6 +4,7 @@
 #include <string>
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 namespace agp {
 namespace cli {
@@ -41,6 +42,18 @@ struct Options {
     // ORF enumeration parameters
     size_t orf_min_aa = 10;          // Minimum ORF length in amino acids
     bool adaptive_orf = false;       // Adaptive mode: output ORFs within score threshold
+};
+
+// Exception used by parse_args to signal an early/controlled CLI exit.
+class ParseArgsExit : public std::runtime_error {
+public:
+    ParseArgsExit(int exit_code, const std::string& message = "")
+        : std::runtime_error(message), exit_code_(exit_code) {}
+
+    int exit_code() const noexcept { return exit_code_; }
+
+private:
+    int exit_code_ = 1;
 };
 
 // Convert CLI LibraryType to string for display

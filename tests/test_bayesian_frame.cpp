@@ -105,15 +105,13 @@ std::vector<GroundTruth> load_ground_truth(const std::string& tsv_content, int m
 }
 
 int main(int argc, char* argv[]) {
-    std::string tsv_path = "/projects/caeg/scratch/kbd606/agp/benchmark_data/69_B2_100_L0_KapK-12-1-34_aa-damage.tsv.gz";
-    int max_reads = 100000;  // Test on subset first
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <ground_truth.tsv.gz> [max_reads]\n";
+        return 1;
+    }
 
-    if (argc > 1) {
-        tsv_path = argv[1];
-    }
-    if (argc > 2) {
-        max_reads = std::stoi(argv[2]);
-    }
+    std::string tsv_path = argv[1];
+    int max_reads = (argc > 2) ? std::stoi(argv[2]) : 100000;
 
     std::cout << "=== Bayesian Frame Selector Test ===" << std::endl;
     std::cout << "Loading ground truth from: " << tsv_path << std::endl;

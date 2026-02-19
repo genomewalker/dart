@@ -404,7 +404,8 @@ private:
     std::optional<std::vector<float>> empirical_ct_5prime_;
     std::optional<std::vector<float>> empirical_ga_3prime_;
 
-    // Profile cache for high-throughput processing (max 2048 different lengths)
+    // Profile cache for high-throughput processing of common read lengths.
+    // Reads >= profile_cache_.size() are computed on demand in thread-local storage.
     mutable std::array<std::optional<DamageProfile>, 2048> profile_cache_;
     mutable std::mutex cache_mutex_;  // For thread-safe caching
 };

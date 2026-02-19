@@ -17,6 +17,7 @@
 #include <mutex>
 #include <atomic>
 #include <vector>
+#include <cstring>
 #include <unistd.h>
 
 #ifdef _OPENMP
@@ -465,6 +466,14 @@ int cmd_predict(int argc, char* argv[]) {
                   << agp::log_utils::format_elapsed(run_start, run_end) << "\n";
         return 0;
 
+    } catch (const agp::cli::ParseArgsExit& e) {
+        if (e.exit_code() != 0) {
+            if (std::strlen(e.what()) > 0) {
+                std::cerr << e.what() << "\n\n";
+            }
+            agp::cli::print_usage(argv[0]);
+        }
+        return e.exit_code();
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";
         return 1;

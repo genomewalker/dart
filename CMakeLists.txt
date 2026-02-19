@@ -197,6 +197,25 @@ endif()
 
 if(BUILD_TESTING)
     add_executable(
+        agp-cli-args-tests
+        tests/test_cli_args.cpp
+        src/cli/args.cpp
+    )
+    add_test(
+        NAME cli_args
+        COMMAND agp-cli-args-tests
+    )
+
+    add_executable(
+        agp-benchmark-fixture-test
+        tests/test_benchmark_fixture.cpp
+    )
+    add_test(
+        NAME benchmark_fixture
+        COMMAND agp-benchmark-fixture-test ${CMAKE_SOURCE_DIR}/examples/tutorial/data/benchmark_summary.tsv
+    )
+
+    add_executable(
         agp-damage-annotate-regressions
         tests/test_damage_annotate_regressions.cpp
     )
