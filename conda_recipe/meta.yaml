@@ -1,17 +1,15 @@
-{% set version = "0.4.0" %}
+{% set version = "1.0.0" %}
 
 package:
-  name: dart
+  name: dart-adna
   version: {{ version }}
 
 source:
-  url: https://github.com/genomewalker/agp/archive/refs/tags/v{{ version }}.tar.gz
-  sha256: 0019dfc4b32d63c1392aa264aed2253c1e0c2fb09216f8e2cc269bbfb8bb49b5
+  url: https://github.com/genomewalker/dart/archive/refs/tags/v{{ version }}.tar.gz
+  sha256: 0000000000000000000000000000000000000000000000000000000000000000
 
 build:
   number: 0
-  run_exports:
-    - {{ pin_subpackage('agp', max_pin='x.x') }}
 
 requirements:
   build:
@@ -32,27 +30,19 @@ requirements:
 
 test:
   commands:
+    - dart --version
     - dart --help
-    - agp predict --help
-    - agp hits2emi --help
-    - agp damage-annotate --help
+    - dart predict --help
+    - dart hits2emi --help
+    - dart damage-annotate --help
 
 about:
-  home: https://github.com/genomewalker/agp
+  home: https://github.com/genomewalker/dart
   license: MIT
-  license_family: MIT
   license_file: LICENSE
-  summary: DART — damage-aware ORF prediction and Bayesian damage annotation for ancient DNA metagenomic reads
-  description: |
-    AGP (DART) is a C++ tool for gene prediction and
-    damage annotation in ancient DNA (aDNA) metagenomic datasets.
-    It uses a two-pass architecture: Pass 1 builds a sample-wide damage
-    profile (exponential C→T decay model), and Pass 2 performs
-    damage-aware frame selection and Bayesian posterior scoring.
-    Post-mapping damage annotation integrates MMseqs2 alignment results
-    with per-read damage signals via a principled log-odds fusion model.
-  doc_url: https://github.com/genomewalker/agp/wiki
-  dev_url: https://github.com/genomewalker/agp
+  summary: DART — Damage-Aware Read Translation for ancient DNA metagenomics
+  doc_url: https://github.com/genomewalker/dart/wiki
+  dev_url: https://github.com/genomewalker/dart
 
 extra:
   recipe-maintainers:
