@@ -827,7 +827,11 @@ void ColumnarIndexReader::parallel_scan(RowGroupCallback callback) const {
         }
     };
 
-    #pragma omp parallel for schedule(static)
+    #pragma omp parallel
+    {
+    std::array<std::vector<char>, static_cast<size_t>(ColumnID::NUM_COLUMNS)> decoded_columns;
+
+    #pragma omp for schedule(static)
     for (uint32_t rg_idx = 0; rg_idx < num_rg; ++rg_idx) {
         const RowGroupMeta& rg = impl_->row_groups[rg_idx];
         prefetch_row_group(rg_idx + kPrefetchDistance);
@@ -844,8 +848,6 @@ void ColumnarIndexReader::parallel_scan(RowGroupCallback callback) const {
             }
         }
         if (skip) continue;
-
-        std::array<std::vector<char>, static_cast<size_t>(ColumnID::NUM_COLUMNS)> decoded_columns;
 
         // Load column data (direct mmap pointers for uncompressed; decoded buffers for compressed).
         auto get_col = [&](ColumnID col) -> const void* {
@@ -886,6 +888,7 @@ void ColumnarIndexReader::parallel_scan(RowGroupCallback callback) const {
             static_cast<const uint16_t*>(get_col(ColumnID::GAPOPEN))
         );
     }
+    } // end omp parallel
 }
 
 void ColumnarIndexReader::parallel_scan_selected(

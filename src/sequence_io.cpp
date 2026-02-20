@@ -695,7 +695,7 @@ std::vector<Gene> SequenceUtils::find_orfs(const std::string& seq,
                     gene.protein = translate(gene.sequence, 0);
                     gene.score = 0.0f;
                     gene.damage_signal = 0.5f;
-                    orfs.push_back(gene);
+                    orfs.push_back(std::move(gene));
                 }
             }
         }
@@ -727,7 +727,7 @@ std::vector<Gene> SequenceUtils::find_orfs(const std::string& seq,
                     gene.protein = translate(rc.substr(start, end - start), 0);
                     gene.score = 0.0f;
                     gene.damage_signal = 0.5f;
-                    orfs.push_back(gene);
+                    orfs.push_back(std::move(gene));
                 }
             }
         }
