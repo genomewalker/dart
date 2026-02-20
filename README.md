@@ -1,8 +1,8 @@
-# AGP: Damage-aware gene prediction from ancient metagenomic reads
+# DART: Damage-aware gene prediction from ancient metagenomic reads
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-AGP translates ancient DNA (aDNA) reads into proteins for functional annotation. It predicts protein-coding genes from short, degraded metagenomic sequences while accounting for post-mortem DNA damage that corrupts standard translation.
+DART translates ancient DNA (aDNA) reads into proteins for functional annotation. It predicts protein-coding genes from short, degraded metagenomic sequences while accounting for post-mortem DNA damage that corrupts standard translation.
 
 ## Overview
 
@@ -12,7 +12,7 @@ AGP translates ancient DNA (aDNA) reads into proteins for functional annotation.
 
 The pipeline runs in three stages. **Pass 1** scans all reads to measure the sample's damage level. **Pass 2** translates reads into proteins using that damage estimate to rescue genes that would otherwise be missed. **Functional annotation** searches those proteins against databases and scores each hit for authentic ancient damage.
 
-Post-mortem deamination converts cytosines to uracil (read as T), producing C→T gradients at read termini. This breaks standard gene predictors by creating false stop codons. AGP models the damage and corrects for it during translation; a second independent signal (stop codon conversion rates) validates that the enrichment is real damage rather than genomic T-richness. For full methods and model derivations, see the [wiki](https://github.com/genomewalker/agp/wiki/Methods-and-Model).
+Post-mortem deamination converts cytosines to uracil (read as T), producing C→T gradients at read termini. This breaks standard gene predictors by creating false stop codons. DART models the damage and corrects for it during translation; a second independent signal (stop codon conversion rates) validates that the enrichment is real damage rather than genomic T-richness. For full methods and model derivations, see the [wiki](https://github.com/genomewalker/dart/wiki/Methods-and-Model).
 
 ---
 
@@ -24,14 +24,14 @@ The easiest way to get all build dependencies is via conda:
 
 ```bash
 conda env create -f environment.yml
-conda activate agp
+conda activate dart
 ```
 
 Then build:
 
 ```bash
-git clone https://github.com/genomewalker/agp.git
-cd agp
+git clone https://github.com/genomewalker/dart.git
+cd dart
 mkdir build && cd build
 cmake -DCMAKE_BUILD_TYPE=Release ..
 make -j$(nproc)
@@ -43,22 +43,22 @@ make -j$(nproc)
 
 ### 5-minute tutorial run (recommended)
 
-AGP ships a reproducible tutorial in `examples/tutorial/` with 50,000 synthetic KapK ancient reads and a matched reference protein subset:
+DART ships a reproducible tutorial in `examples/tutorial/` with 50,000 synthetic KapK ancient reads and a matched reference protein subset:
 
 ```bash
 cd examples/tutorial
-AGP=../../build/agp DB=./ref_proteins.faa.gz bash run_tutorial.sh
+DART=../../build/dart DB=./ref_proteins.faa.gz bash run_tutorial.sh
 ```
 
 The four pipeline stages:
 
 ```bash
 # 1) Predict genes + AGD damage index
-agp predict -i reads.fq.gz -o out/predictions.gff \
+dart predict -i reads.fq.gz -o out/predictions.gff \
   --fasta-aa out/proteins.faa --damage-index out/predictions.agd --adaptive -t 8
 ```
 ```
-Ancient Gene Predictor v0.4.0
+DART v0.4.0
 Input: reads.fq.gz  |  Domain: gtdb  |  Threads: 8
 
 [Pass 1] Scanning for damage patterns...
@@ -87,7 +87,7 @@ Time for merging to hits.tsv: 0h 0m 0s 267ms
 
 ```bash
 # 3) Build EMI index
-agp hits2emi -i out/hits.tsv -o out/hits.emi --damage-index out/predictions.agd -t 8
+dart hits2emi -i out/hits.tsv -o out/hits.emi --damage-index out/predictions.agd -t 8
 ```
 ```
 Lines: 46628 (scan: 3 ms), building dictionary...
@@ -98,7 +98,7 @@ Parsed: 46628 rows in 249 ms  |  Written: out/hits.emi  |  Total: 298 ms
 
 ```bash
 # 4) Damage annotation
-agp damage-annotate --emi out/hits.emi --damage-index out/predictions.agd \
+dart damage-annotate --emi out/hits.emi --damage-index out/predictions.agd \
   -o out/annotated.tsv --gene-summary out/gene_summary.tsv --auto-calibrate-spurious -t 8
 ```
 ```
@@ -118,7 +118,7 @@ Use `--fasta-aa-masked` instead of `--fasta-aa` to replace damage-induced stop c
 ### Sample damage assessment only
 
 ```bash
-agp sample-damage reads.fq.gz
+dart sample-damage reads.fq.gz
 ```
 
 Output (JSON):
@@ -145,12 +145,12 @@ Output (JSON):
 
 ## Commands
 
-### `agp predict`
+### `dart predict`
 
 Translates reads into proteins with damage-aware frame selection.
 
 ```
-Usage: agp predict -i <input> -o <output> [options]
+Usage: dart predict -i <input> -o <output> [options]
 
 Required:
   -i, --input FILE       Input FASTQ/FASTA (gzip supported)
@@ -171,12 +171,12 @@ Parameters:
   -t, --threads N        Thread count (default: auto)
 ```
 
-### `agp sample-damage`
+### `dart sample-damage`
 
 Estimates sample-wide damage rate without gene prediction.
 
 ```
-Usage: agp sample-damage <input.fq> [options]
+Usage: dart sample-damage <input.fq> [options]
 
 Output fields:
   damage.d_max               Maximum damage rate at read termini (percent, 0-100)
@@ -186,12 +186,12 @@ Output fields:
   damage.library_type        single-stranded or double-stranded
 ```
 
-### `agp hits2emi`
+### `dart hits2emi`
 
-Converts MMseqs2 hit TSV into AGP EMI (columnar) with alignment strings required by `damage-annotate`.
+Converts MMseqs2 hit TSV into DART EMI (columnar) with alignment strings required by `damage-annotate`.
 
 ```
-Usage: agp hits2emi -i <hits.tsv[.gz]> -o <hits.emi> [options]
+Usage: dart hits2emi -i <hits.tsv[.gz]> -o <hits.emi> [options]
 
 Required:
   -i, --tsv FILE         MMseqs2 16-column hits TSV (plain or gz)
@@ -206,15 +206,15 @@ Options:
   --lambda FLOAT         Store decay lambda in EMI metadata
 ```
 
-### `agp damage-annotate`
+### `dart damage-annotate`
 
 Annotates database hits with per-protein damage evidence. Compares observed proteins to reference proteins to identify damage-consistent amino acid substitutions (R→W, H→Y, Q→*, etc.).
 
 ```
-Usage: agp damage-annotate --emi <hits.emi> -o <output.tsv> [options]
+Usage: dart damage-annotate --emi <hits.emi> -o <output.tsv> [options]
 
 Required:
-  --emi FILE             EMI index from `agp hits2emi` (with qaln/taln)
+  --emi FILE             EMI index from `dart hits2emi` (with qaln/taln)
 
 Optional:
   -t, --threads INT      OpenMP threads for EMI scans
@@ -228,7 +228,7 @@ Optional:
   --map FILE             Gene-to-group mapping TSV (gene_id<TAB>group)
   --functional-summary FILE  Per-group stats TSV
   --anvio-ko FILE        Gene-level group abundance for anvi-estimate-metabolism
-  --annotation-source STR  Source label for anvi output (default: AGP)
+  --annotation-source STR  Source label for anvi output (default: DART)
   --preset STR           Apply filter bundle: loose or strict
   --min-reads INT        Minimum supporting reads (default: 3)
   --min-breadth FLOAT    Minimum alignment breadth (default: 0.10)
@@ -247,13 +247,13 @@ Optional:
   --em-min-prob FLOAT    Min EM responsibility to keep a read (default: 1e-6)
 ```
 
-Output columns: `p_read`, `ct_sites`, `ga_sites`, `posterior`, `damage_class`, `is_damaged`, `gamma`, `em_keep`. See [Output Formats](https://github.com/genomewalker/agp/wiki/Output-Formats) for full schema.
+Output columns: `p_read`, `ct_sites`, `ga_sites`, `posterior`, `damage_class`, `is_damaged`, `gamma`, `em_keep`. See [Output Formats](https://github.com/genomewalker/dart/wiki/Output-Formats) for full schema.
 
 #### Filtering presets
 
 ```bash
-agp damage-annotate --emi hits.emi -o out.tsv --preset loose   # maximize recall
-agp damage-annotate --emi hits.emi -o out.tsv --preset strict  # maximize precision
+dart damage-annotate --emi hits.emi -o out.tsv --preset loose   # maximize recall
+dart damage-annotate --emi hits.emi -o out.tsv --preset strict  # maximize precision
 ```
 
 | Parameter | default | `--preset loose` | `--preset strict` |
@@ -265,26 +265,26 @@ agp damage-annotate --emi hits.emi -o out.tsv --preset strict  # maximize precis
 | `--min-terminal-ratio` | 0 | 0 | auto-calibrated |
 | `--min-damage-sites` | auto | 1 | 5 |
 
-Coverage filters (`--min-positional-score`, `--min-terminal-ratio`) and Bayesian scoring parameters are documented in the [wiki](https://github.com/genomewalker/agp/wiki/Methods-and-Model#coverage-quality-filters).
+Coverage filters (`--min-positional-score`, `--min-terminal-ratio`) and Bayesian scoring parameters are documented in the [wiki](https://github.com/genomewalker/dart/wiki/Methods-and-Model#coverage-quality-filters).
 
-### `agp damage-profile`
+### `dart damage-profile`
 
 Computes position-wise damage profiles for proteins with sufficient coverage.
 
 ```
-Usage: agp damage-profile -i <reads.fq> --hits <hits.tsv> -o <profile.tsv.gz>
+Usage: dart damage-profile -i <reads.fq> --hits <hits.tsv> -o <profile.tsv.gz>
 
 Options:
   --aggregate        Position-wise summary across all proteins
   --min-reads N      Minimum reads per protein (default: 10)
 ```
 
-### `agp validate`
+### `dart validate`
 
 Compares predictions against ground truth for benchmarking.
 
 ```
-Usage: agp validate <fastq.gz> <aa-damage.tsv.gz> <predictions.gff> [proteins.faa] [--csv output.csv]
+Usage: dart validate <fastq.gz> <aa-damage.tsv.gz> <predictions.gff> [proteins.faa] [--csv output.csv]
 ```
 
 ---
@@ -310,7 +310,7 @@ Binary format for O(1) per-read damage lookup. Contains sequence length, frame, 
 
 ### EMI (.emi) and Annotated TSV
 
-See [Output Formats](https://github.com/genomewalker/agp/wiki/Output-Formats) on the wiki for full column schemas.
+See [Output Formats](https://github.com/genomewalker/dart/wiki/Output-Formats) on the wiki for full column schemas.
 
 ---
 
@@ -322,14 +322,14 @@ Benchmarked on 18.3 million synthetic ancient DNA reads from the KapK community 
 
 | Method | Recall | Precision | Avg Identity |
 |--------|--------|-----------|--------------|
-| AGP | 67.6% | **97.2%** | **96.2%** |
+| DART | 67.6% | **97.2%** | **96.2%** |
 | MMseqs2 blastx [Steinegger & Söding 2017] | **68.5%** | 96.3% | 94.8% |
 | FGS-rs [Van der Jeugt et al. 2022] | 19.1% | 95.3% | 94.2% |
 
-AGP and BLASTX have equivalent functional recall (~68%), both far exceeding FGS-rs (19%), which treats damage-induced stop codons as real stops. AGP produces 1.4% higher identity hits than BLASTX and runs ~1.5× faster (~35,000 reads/s, 8 threads).
+DART and BLASTX have equivalent functional recall (~68%), both far exceeding FGS-rs (19%), which treats damage-induced stop codons as real stops. DART produces 1.4% higher identity hits than BLASTX and runs ~1.5× faster (~35,000 reads/s, 8 threads).
 
 <p align="center">
-<img src="docs/benchmark_comparison.png" width="700" alt="Method comparison: AGP, BLASTX, FGS-rs">
+<img src="docs/benchmark_comparison.png" width="700" alt="Method comparison: DART, BLASTX, FGS-rs">
 </p>
 
 ### Damage classification
@@ -354,13 +354,13 @@ Read-level damage classification (per-read `posterior` score):
 <img src="docs/read_benchmark.png" width="700" alt="Read-level damage classification benchmark">
 </p>
 
-Full benchmark details: [wiki/Benchmarks](https://github.com/genomewalker/agp/wiki/Benchmarks).
+Full benchmark details: [wiki/Benchmarks](https://github.com/genomewalker/dart/wiki/Benchmarks).
 
 ---
 
 ## Citation
 
-If you use AGP in your research, please cite:
+If you use DART in your research, please cite:
 
 > **Two-million-year-old microbial communities from the Kap København Formation in North Greenland**
 > Fernandez-Guerra A, Wörmer L, Borrel G, et al.

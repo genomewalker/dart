@@ -2,16 +2,16 @@
  * Frame scoring functions
  */
 
-#include "agp/frame_selector.hpp"
-#include "agp/codon_tables.hpp"
-#include "agp/hexamer_tables.hpp"
-#include "agp/damage_likelihood.hpp"
+#include "dart/frame_selector.hpp"
+#include "dart/codon_tables.hpp"
+#include "dart/hexamer_tables.hpp"
+#include "dart/damage_likelihood.hpp"
 #include <cmath>
 #include <algorithm>
 #include <array>
 #include <cctype>
 
-namespace agp {
+namespace dart {
 
 // Translate sequence to protein (no intermediate string allocations)
 std::string translate_sequence(const std::string& seq, int frame) {
@@ -378,4 +378,4 @@ float calculate_hexamer_llr_score(const std::string& seq, int frame) {
     return log_prob_sum / hexamer_count;
 }
 
-} // namespace agp
+} // namespace dart

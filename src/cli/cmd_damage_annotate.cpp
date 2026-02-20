@@ -1,4 +1,4 @@
-// agp damage-annotate: Post-mapping damage annotation
+// dart damage-annotate: Post-mapping damage annotation
 //
 // Given EMI alignments (with qaln/taln), identifies amino acid positions
 // where the query (observed protein) differs from the target (reference)
@@ -7,15 +7,15 @@
 // with ~90% precision when a reference protein is available.
 
 #include "subcommand.hpp"
-#include "agp/version.h"
-#include "agp/damage_stats.hpp"
-#include "agp/damage_index_reader.hpp"
-#include "agp/bayesian_damage_score.hpp"
-#include "agp/em_reassign.hpp"
-#include "agp/coverage_em.hpp"
-#include "agp/columnar_index.hpp"
-#include "agp/log_utils.hpp"
-#include "agp/mmap_array.hpp"
+#include "dart/version.h"
+#include "dart/damage_stats.hpp"
+#include "dart/damage_index_reader.hpp"
+#include "dart/bayesian_damage_score.hpp"
+#include "dart/em_reassign.hpp"
+#include "dart/coverage_em.hpp"
+#include "dart/columnar_index.hpp"
+#include "dart/log_utils.hpp"
+#include "dart/mmap_array.hpp"
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -40,7 +40,7 @@
 #include <omp.h>
 #endif
 
-namespace agp {
+namespace dart {
 namespace cli {
 
 // Damage-consistent amino acid substitutions
@@ -89,8 +89,8 @@ static constexpr DamageSubstitution DAMAGE_SUBS[] = {
     {'W', '*', 'G', false},   // TGG->TAG/TGA
 
     // X-masked positions (from search_protein): X was originally damaged AA
-    // AGP X-masks: (1) damage-convertible stops, (2) W/C likely from R at 5' terminus
-    // High-confidence because AGP only X-masks when damage probability is high
+    // DART X-masks: (1) damage-convertible stops, (2) W/C likely from R at 5' terminus
+    // High-confidence because DART only X-masks when damage probability is high
     {'Q', 'X', 'C', true},    // CAA/CAG->TAA/TAG (stop X-masked)
     {'R', 'X', 'C', true},    // CGA->TGA (stop) OR CGG->TGG (W) OR CGC/CGT->TGC/TGT (C)
     {'W', 'X', 'G', true},    // TGG->TGA/TAG (stop X-masked)
@@ -175,7 +175,7 @@ struct ProteinDamageSummary {
     size_t syn_5prime = 0;      // Synonymous C→T at 5' terminus
     size_t syn_3prime = 0;      // Synonymous G→A at 3' terminus
     bool has_syn_data = false;  // True if damage index was used
-    // Per-read p_damaged from AGP predict (stored in AGD index)
+    // Per-read p_damaged from DART predict (stored in AGD index)
     float p_read = 0.0f;        // Per-read damage probability from predict
     bool has_p_read = false;    // True if p_read was retrieved from index
     // AA-level Bayesian evidence terms (derived from alignment + site calls)
@@ -198,7 +198,7 @@ struct ProteinDamageSummary {
     float z_bpa = 0.0f;         // Length-normalized BPA z-score
 };
 
-// Parse strand and frame from AGP header suffix (e.g., readname_+_1 -> '+', 1)
+// Parse strand and frame from DART header suffix (e.g., readname_+_1 -> '+', 1)
 // Returns {strand, frame} where frame is 0, 1, or 2
 static std::pair<char, int> parse_strand_and_frame(const std::string& query_id) {
     char strand = '+';
@@ -1120,7 +1120,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     std::string map_file;            // gene_id -> group mapping
     std::string functional_summary_file;  // Output: per-function stats
     std::string anvio_ko_file;       // Output: Anvi'o-compatible grouped abundance
-    std::string annotation_source = "AGP";
+    std::string annotation_source = "DART";
 
     for (int i = 1; i < argc; ++i) {
         if ((strcmp(argv[i], "--emi") == 0 || strcmp(argv[i], "-i") == 0) && i + 1 < argc) {
@@ -1244,7 +1244,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--annotation-source") == 0 && i + 1 < argc) {
             annotation_source = argv[++i];
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            std::cout << "Usage: agp damage-annotate --emi <hits.emi> [options]\n\n";
+            std::cout << "Usage: dart damage-annotate --emi <hits.emi> [options]\n\n";
             std::cout << "Post-mapping damage annotation using EMI alignments.\n";
             std::cout << "Compares observed proteins against reference proteins to identify\n";
             std::cout << "damage-consistent amino acid substitutions with ~90% precision.\n\n";
@@ -1282,7 +1282,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cout << "  --map FILE           Gene-to-group mapping TSV (gene_id<TAB>group)\n";
             std::cout << "  --functional-summary FILE  Per-function stats TSV\n";
             std::cout << "  --anvio-ko FILE      Gene-level group abundance for anvi-estimate-metabolism\n";
-            std::cout << "  --annotation-source STR  Source label for anvi output (default: AGP)\n\n";
+            std::cout << "  --annotation-source STR  Source label for anvi output (default: DART)\n\n";
             std::cout << "EM reassignment (multi-mapping resolution, enabled by default):\n";
             std::cout << "  --no-em           Disable EM (use best-hit only)\n";
             std::cout << "  --em-iters INT    Max EM iterations (default: 100)\n";
@@ -1327,14 +1327,14 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             return 0;
         } else {
             std::cerr << "Unknown option: " << argv[i] << "\n";
-            std::cerr << "Run 'agp damage-annotate --help' for usage.\n";
+            std::cerr << "Run 'dart damage-annotate --help' for usage.\n";
             return 1;
         }
     }
 
     if (emi_file.empty()) {
         std::cerr << "Error: No EMI index specified (--emi).\n";
-        std::cerr << "Run 'agp damage-annotate --help' for usage.\n";
+        std::cerr << "Run 'dart damage-annotate --help' for usage.\n";
         return 1;
     }
     if (em_min_prob < 0.0 || em_min_prob > 1.0) {
@@ -1391,7 +1391,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 #endif
 
     if (verbose) {
-        std::cerr << "Damage annotation v" << AGP_VERSION << "\n";
+        std::cerr << "Damage annotation v" << DART_VERSION << "\n";
         std::cerr << "EMI: " << emi_file << "\n";
         if (d_max >= 0.0f) {
             std::cerr << "d_max: " << d_max << "\n";
@@ -1455,7 +1455,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
 
     // Open EMI index
-    agp::ColumnarIndexReader reader(emi_file);
+    dart::ColumnarIndexReader reader(emi_file);
     if (!reader.is_valid()) {
         std::cerr << "Error: Cannot open EMI index: " << emi_file << "\n";
         return 1;
@@ -1510,7 +1510,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     if (need_unique_degree) {
         read_degree.assign(n_reads, 0);
     }
-    std::vector<agp::CompactAlignment> em_alignments;
+    std::vector<dart::CompactAlignment> em_alignments;
     if (use_em) {
         em_alignments.reserve(static_cast<size_t>(reader.num_alignments()));
     }
@@ -1554,7 +1554,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         em_shard_count = static_cast<size_t>(std::max(1, omp_get_max_threads()));
     }
 #endif
-    std::vector<std::vector<agp::CompactAlignment>> em_alignments_by_thread;
+    std::vector<std::vector<dart::CompactAlignment>> em_alignments_by_thread;
     if (use_em) {
         em_alignments_by_thread.resize(em_shard_count);
         const size_t reserve_per_shard =
@@ -1567,21 +1567,21 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // Pass 1: numeric-only scan for filtering, best-hit selection, and EM payload.
     const auto pass1_start = std::chrono::steady_clock::now();
     reader.set_columns({
-        agp::ColumnID::READ_IDX,
-        agp::ColumnID::REF_IDX,
-        agp::ColumnID::BIT_SCORE,
-        agp::ColumnID::DAMAGE_SCORE,
-        agp::ColumnID::EVALUE_LOG10,
-        agp::ColumnID::DMG_K,
-        agp::ColumnID::DMG_M,
-        agp::ColumnID::DMG_LL_A,
-        agp::ColumnID::DMG_LL_M,
-        agp::ColumnID::IDENTITY_Q,
-        agp::ColumnID::ALN_LEN,
-        agp::ColumnID::QSTART,
-        agp::ColumnID::TSTART,
-        agp::ColumnID::TLEN,
-        agp::ColumnID::QLEN
+        dart::ColumnID::READ_IDX,
+        dart::ColumnID::REF_IDX,
+        dart::ColumnID::BIT_SCORE,
+        dart::ColumnID::DAMAGE_SCORE,
+        dart::ColumnID::EVALUE_LOG10,
+        dart::ColumnID::DMG_K,
+        dart::ColumnID::DMG_M,
+        dart::ColumnID::DMG_LL_A,
+        dart::ColumnID::DMG_LL_M,
+        dart::ColumnID::IDENTITY_Q,
+        dart::ColumnID::ALN_LEN,
+        dart::ColumnID::QSTART,
+        dart::ColumnID::TSTART,
+        dart::ColumnID::TLEN,
+        dart::ColumnID::QLEN
     });
     reader.parallel_scan([&](
         uint32_t rg_idx, uint32_t num_rows,
@@ -1622,7 +1622,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         size_t local_filtered_bits = 0;
         size_t local_filtered_evalue = 0;
 
-        std::vector<agp::CompactAlignment> local_em;
+        std::vector<dart::CompactAlignment> local_em;
         if (use_em) {
             local_em.reserve(num_rows);
         }
@@ -1737,7 +1737,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             }
 
             if (use_em) {
-                agp::CompactAlignment ca{};
+                dart::CompactAlignment ca{};
                 ca.read_idx = ridx;
                 ca.ref_idx = tidx;
                 ca.bit_score = bits;
@@ -1948,7 +1948,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     const auto pass1_end = std::chrono::steady_clock::now();
     if (verbose) {
         std::cerr << "Pass 1 runtime: "
-                  << agp::log_utils::format_elapsed(pass1_start, pass1_end) << "\n";
+                  << dart::log_utils::format_elapsed(pass1_start, pass1_end) << "\n";
     }
 
     // Pass 2: fetch alignment strings only for selected best hits.
@@ -1972,7 +1972,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     std::sort(selected_row_groups.begin(), selected_row_groups.end());
 
     if (selected_best_hits > 0) {
-        reader.set_columns({agp::ColumnID::QALN, agp::ColumnID::TALN});
+        reader.set_columns({dart::ColumnID::QALN, dart::ColumnID::TALN});
         std::atomic<size_t> loaded_best_hit_strings{0};
         reader.parallel_scan_selected(selected_row_groups, [&]( 
             uint32_t rg_idx, uint32_t num_rows,
@@ -2019,7 +2019,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     const auto pass2_end = std::chrono::steady_clock::now();
     if (verbose) {
         std::cerr << "Pass 2 runtime: "
-                  << agp::log_utils::format_elapsed(pass2_start, pass2_end)
+                  << dart::log_utils::format_elapsed(pass2_start, pass2_end)
                   << " (" << selected_best_hits << " best-hit alignments)\n";
     }
 
@@ -2199,7 +2199,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 summary.bpa = (summary.alnlen > 0)
                     ? hit.bits / static_cast<float>(summary.alnlen) : 0.0f;
                 summary.length_bin = static_cast<uint8_t>(
-                    agp::LengthBinStats::get_bin(hit.qlen));
+                    dart::LengthBinStats::get_bin(hit.qlen));
                 summary.p_read = std::clamp(hit.damage_score, 0.0f, 1.0f);
                 summary.has_p_read = true;
                 if (damage_index) {
@@ -2236,14 +2236,14 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     const auto annotate_end = std::chrono::steady_clock::now();
     if (verbose) {
         std::cerr << "Annotation runtime: "
-                  << agp::log_utils::format_elapsed(annotate_start, annotate_end)
+                  << dart::log_utils::format_elapsed(annotate_start, annotate_end)
                   << " (" << summaries.size() << " reads with mismatches)\n";
     }
 
     const size_t em_aln_count = em_alignments.size();
 
     // EM reassignment
-    agp::EMState em_state;
+    dart::EMState em_state;
     struct EmReadResult {
         float gamma = 0.0f;             // Responsibility for the best-hit target in summaries
         float gamma_ancient = 0.0f;     // Ancient responsibility for the same target
@@ -2254,7 +2254,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         float em_ref_neff = 1.0f;       // Effective number of references: 1 / sum_j gamma_j^2
     };
     std::vector<EmReadResult> em_read_results(n_reads);
-    std::unordered_map<uint32_t, agp::ProteinCoverageStats> coverage_stats_map;
+    std::unordered_map<uint32_t, dart::ProteinCoverageStats> coverage_stats_map;
 
     // Auto-switch to streaming EM if estimated memory exceeds limit
     // Memory estimate: ~48 bytes per alignment (gamma double + Alignment struct overhead)
@@ -2285,7 +2285,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cerr << "  Note: Streaming mode uses all EMI alignments (ignores pre-filters)\n";
         }
 
-        agp::EMParams em_params;
+        dart::EMParams em_params;
         em_params.lambda_b = em_lambda_b;
         em_params.max_iters = em_max_iters;
         em_params.tol = em_tol;
@@ -2305,19 +2305,19 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cerr << std::flush;
         }
 
-        agp::StreamingEMResult streaming_result;
+        dart::StreamingEMResult streaming_result;
 
         if (use_coverage_em) {
-            agp::CoverageEMParams cov_params;
+            dart::CoverageEMParams cov_params;
             cov_params.max_outer_iters = coverage_em_iters;
             cov_params.tau = coverage_em_tau;
             cov_params.default_bins = coverage_em_bins;
 
-            streaming_result = agp::coverage_em_outer_loop(
+            streaming_result = dart::coverage_em_outer_loop(
                 reader, em_params, cov_params, coverage_stats_map, verbose);
         } else {
-            streaming_result = agp::streaming_em(reader, em_params,
-                [verbose](const agp::EMIterationDiagnostics& d) {
+            streaming_result = dart::streaming_em(reader, em_params,
+                [verbose](const dart::EMIterationDiagnostics& d) {
                     if (verbose && (d.iteration % 10 == 0 || d.iteration < 5)) {
                         std::cerr << "    iter " << d.iteration
                                   << " ll=" << std::fixed << std::setprecision(2) << d.log_likelihood
@@ -2338,7 +2338,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cerr << "  Memory: O(" << n_refs << " refs) vs O("
                       << reader.num_alignments() << " alignments)\n";
             std::cerr << "  Runtime: "
-                      << agp::log_utils::format_elapsed(em_start, em_end) << "\n";
+                      << dart::log_utils::format_elapsed(em_start, em_end) << "\n";
             if (use_coverage_em) {
                 std::cerr << "  Coverage stats: " << coverage_stats_map.size() << " proteins\n";
             }
@@ -2359,7 +2359,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         constexpr size_t kFinalizeShards = 4096;
         std::array<std::mutex, kFinalizeShards> finalize_mutexes;
 
-        agp::streaming_em_finalize(reader, streaming_result, em_params,
+        dart::streaming_em_finalize(reader, streaming_result, em_params,
             [&](uint32_t /*rg_idx*/, uint32_t num_rows,
                 const uint32_t* read_idx, const uint32_t* ref_idx,
                 const float* gamma, const float* gamma_ancient)
@@ -2422,11 +2422,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         }
 
         // Build CSR-format alignment data
-        auto aln_data = agp::build_alignment_data(
+        auto aln_data = dart::build_alignment_data(
             em_alignments.data(), em_aln_count, n_reads, n_refs);
 
         // Set up EM parameters
-        agp::EMParams em_params;
+        dart::EMParams em_params;
         em_params.lambda_b = em_lambda_b;
         em_params.max_iters = em_max_iters;
         em_params.tol = em_tol;
@@ -2501,9 +2501,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cerr << "  EM iteration diagnostics:\n";
         }
 
-        agp::EMProgressCallback em_progress;
+        dart::EMProgressCallback em_progress;
         if (verbose) {
-            em_progress = [&](const agp::EMIterationDiagnostics& d) {
+            em_progress = [&](const dart::EMIterationDiagnostics& d) {
                 const bool rel_valid = std::isfinite(d.rel_change) && d.iteration > 1;
                 std::cerr << "    iter " << d.iteration
                           << " ll=" << std::fixed << std::setprecision(2) << d.log_likelihood
@@ -2529,17 +2529,17 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         const auto em_start = std::chrono::steady_clock::now();
 
         if (use_coverage_em) {
-            agp::CoverageEMParams cov_params;
+            dart::CoverageEMParams cov_params;
             cov_params.max_outer_iters = coverage_em_iters;
             cov_params.tau = coverage_em_tau;
             cov_params.default_bins = coverage_em_bins;
             if (verbose) {
                 std::cerr << "  Coverage-EM outer iterations: " << cov_params.max_outer_iters << "\n";
             }
-            em_state = agp::coverage_em_squarem(
+            em_state = dart::coverage_em_squarem(
                 aln_data, em_params, cov_params, coverage_stats_map, em_progress, verbose);
         } else {
-            em_state = agp::squarem_em(aln_data, em_params, nullptr, em_progress);
+            em_state = dart::squarem_em(aln_data, em_params, nullptr, em_progress);
         }
 
         const auto em_end = std::chrono::steady_clock::now();
@@ -2555,14 +2555,14 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 std::cerr << "  Estimated pi (ancient fraction): n/a (per-read priors used)\n";
             }
             std::cerr << "  Runtime: "
-                      << agp::log_utils::format_elapsed(em_start, em_end) << "\n";
+                      << dart::log_utils::format_elapsed(em_start, em_end) << "\n";
             if (use_coverage_em) {
                 std::cerr << "  Coverage stats: " << coverage_stats_map.size() << " proteins\n";
             }
         }
 
         // Extract best assignments and build per-read lookup
-        auto best = agp::reassign_reads(aln_data, em_state, 0.0);
+        auto best = dart::reassign_reads(aln_data, em_state, 0.0);
 
         // Build per-read lookup: extract gamma for the best-hit target used in summaries,
         // while tracking whether EM would have reassigned this read elsewhere.
@@ -2756,7 +2756,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         }
     }
 
-    agp::ModernBaseline modern_est = agp::estimate_modern_baseline(modern_proxy);
+    dart::ModernBaseline modern_est = dart::estimate_modern_baseline(modern_proxy);
     // Use fixed pi0 = 0.10 as baseline for terminal evidence transform
     // Empirical estimation fails for heavily damaged samples where all reads have high p_read
     // (no low-tail to establish baseline), causing terminal evidence to collapse
@@ -2780,7 +2780,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
 
     // Set up scoring parameters with empirical Bayes approach
-    agp::BayesianScoreParams score_params;
+    dart::BayesianScoreParams score_params;
     score_params.pi = prior_ancient;
     score_params.pi0 = empirical_pi0;    // Empirical baseline for terminal evidence transform
     score_params.q_modern = modern_est.q_modern;
@@ -2802,7 +2802,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     if (damage_index) {
         score_params.damage_informative = damage_index->damage_informative();
         score_params.channel_b_valid = damage_index->channel_b_valid();
-        damage_detectability = agp::compute_damage_detectability(
+        damage_detectability = dart::compute_damage_detectability(
             damage_index->d_max(), damage_index->damage_validated(),
             damage_index->damage_artifact(), damage_index->channel_b_valid(),
             damage_index->stop_decay_llr(), damage_index->terminal_shift());
@@ -2830,7 +2830,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
     // Compute length-binned BPA z-scores (two-pass: accumulate then normalize)
     {
-        agp::LengthBinStats bpa_stats;
+        dart::LengthBinStats bpa_stats;
         for (const auto& s : summaries) {
             if (s.has_p_read && s.p_read < 0.20f) {
                 bpa_stats.add(s.qlen, s.bpa);
@@ -2928,18 +2928,18 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
     // Store per-read posteriors and classifications for gene summary aggregation
     std::vector<float> read_posteriors(summaries.size());
-    std::vector<agp::AncientClassification> read_classifications(summaries.size());
+    std::vector<dart::AncientClassification> read_classifications(summaries.size());
 
     for (size_t si = 0; si < summaries.size(); ++si) {
         const auto& s = summaries[si];
         // Compute Bayesian score with decomposition
         float posterior = s.p_damaged;  // fallback when AGD p_read is unavailable
-        agp::BayesianScoreOutput bayes_out{};
+        dart::BayesianScoreOutput bayes_out{};
         bayes_out.informative = score_params.damage_informative;
 
         if (s.has_p_read) {
             // AA-level evidence from alignment opportunities and damage-consistent hits.
-            agp::SiteEvidence ev{};
+            dart::SiteEvidence ev{};
             ev.k = s.aa_k_hits;
             ev.m = s.aa_m_opportunities;
             ev.sum_qA = s.aa_sum_qA;
@@ -2948,7 +2948,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             ev.sum_exp_decay = s.aa_sum_exp_decay;
 
             // Compute Bayesian score (with optional identity evidence)
-            bayes_out = agp::compute_bayesian_score(s.p_read, ev, score_params, s.fident);
+            bayes_out = dart::compute_bayesian_score(s.p_read, ev, score_params, s.fident);
             posterior = bayes_out.posterior;
         }
 
@@ -2965,7 +2965,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
              << std::fixed << std::setprecision(4) << s.p_damaged << "\t"
              << std::fixed << std::setprecision(4) << (s.has_p_read ? s.p_read : 0.0f) << "\t";
         // Classify using damage informativeness + posterior + quality metrics
-        auto classification = agp::classify_protein(
+        auto classification = dart::classify_protein(
             bayes_out.informative, posterior, s.fident, s.z_bpa, s.delta_bits,
             score_params.ancient_threshold, score_params.modern_threshold);
 
@@ -2980,15 +2980,15 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             is_damaged = (posterior >= threshold) ? "1" : "0";
         }
         *out << is_damaged << "\t"
-             << agp::classification_name(classification) << "\t";
+             << dart::classification_name(classification) << "\t";
         *out
              << std::fixed << std::setprecision(3) << bayes_out.logBF_terminal << "\t"
              << std::fixed << std::setprecision(3) << bayes_out.logBF_sites << "\t"
              << std::fixed << std::setprecision(3) << bayes_out.logBF_identity << "\t"
              << bayes_out.m << "\t" << bayes_out.k << "\t"
              << std::fixed << std::setprecision(5) << bayes_out.q_eff << "\t"
-             << agp::tier_name(bayes_out.tier) << "\t"
-             << agp::damage_class_name(bayes_out.damage_class) << "\t"
+             << dart::tier_name(bayes_out.tier) << "\t"
+             << dart::damage_class_name(bayes_out.damage_class) << "\t"
              << (s.has_syn_data ? std::to_string(s.syn_5prime) : ".") << "\t"
              << (s.has_syn_data ? std::to_string(s.syn_3prime) : ".") << "\t"
              << std::fixed << std::setprecision(1) << s.delta_bits << "\t"
@@ -3378,7 +3378,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 ? (hit.bits / static_cast<float>(hit.aln_len_on_target))
                 : 0.0f;
             agg.sum_bpa += gamma * bpa;
-            const uint8_t length_bin = static_cast<uint8_t>(agp::LengthBinStats::get_bin(hit.qlen));
+            const uint8_t length_bin = static_cast<uint8_t>(dart::LengthBinStats::get_bin(hit.qlen));
             agg.length_bin_counts[length_bin]++;
             agg.unique_starts.insert(static_cast<uint32_t>(hit.tstart_0));
             if (hit.tstart_0 < agg.min_start) agg.min_start = static_cast<uint32_t>(hit.tstart_0);
@@ -3983,7 +3983,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                   << ", reads_with_damage_sites=" << proteins_with_damage << "\n";
         const auto run_end = std::chrono::steady_clock::now();
         std::cerr << "Runtime: "
-                  << agp::log_utils::format_elapsed(run_start, run_end) << "\n";
+                  << dart::log_utils::format_elapsed(run_start, run_end) << "\n";
     }
 
     return 0;
@@ -4002,4 +4002,4 @@ namespace {
 }
 
 }  // namespace cli
-}  // namespace agp
+}  // namespace dart

@@ -1,12 +1,12 @@
 // DamageAnalyzer and CodonDamageAnalyzer implementations
 
-#include "agp/damage_model.hpp"
-#include "agp/codon_tables.hpp"
+#include "dart/damage_model.hpp"
+#include "dart/codon_tables.hpp"
 #include <cmath>
 #include <algorithm>
 #include <numeric>
 
-namespace agp {
+namespace dart {
 
 // DamageAnalyzer implementation
 DamageModel DamageAnalyzer::analyze(const std::vector<std::string>& sequences) {
@@ -266,4 +266,4 @@ std::vector<std::pair<std::string, float>> CodonDamageAnalyzer::most_vulnerable_
     return vulnerable;
 }
 
-}  // namespace agp
+}  // namespace dart

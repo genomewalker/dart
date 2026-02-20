@@ -741,14 +741,14 @@ int main(int argc, char* argv[]) {
     std::cout << " */\n\n";
     std::cout << "#pragma once\n\n";
     std::cout << "#include <cstddef>\n\n";
-    std::cout << "namespace agp {\n\n";
+    std::cout << "namespace dart {\n\n";
 
     print_nterminal_bias();
     print_distance_binned_ratios();
     print_codon_bigram_context();
     print_forbidden_w_tripeptides();
 
-    std::cout << "\n} // namespace agp\n";
+    std::cout << "\n} // namespace dart\n";
 
     return 0;
 }

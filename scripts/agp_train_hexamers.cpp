@@ -16,12 +16,12 @@
  *   ./extract_unified_hexamers --domain meta <all_cds_dirs...> [options]
  *
  * Outputs:
- *   include/agp/{domain}_hexamer_table.hpp         - Overall frequencies
- *   include/agp/{domain}_positional_hexamer.hpp    - Position-specific (START/INTERNAL/END)
- *   include/agp/{domain}_damage_likelihood.hpp     - Damage LLR tables
+ *   include/dart/{domain}_hexamer_table.hpp         - Overall frequencies
+ *   include/dart/{domain}_positional_hexamer.hpp    - Position-specific (START/INTERNAL/END)
+ *   include/dart/{domain}_damage_likelihood.hpp     - Damage LLR tables
  *
  * Or in meta mode:
- *   include/agp/meta_hexamer_tables.hpp            - Combined weighted tables
+ *   include/dart/meta_hexamer_tables.hpp            - Combined weighted tables
  */
 
 #include <iostream>
@@ -476,12 +476,12 @@ void write_hexamer_table(const std::string& output_dir, const std::string& domai
     out << "// Valid CDS: " << valid_cds << "\n";
     out << "// Total hexamers: " << total << "\n\n";
     out << "#include <cstdint>\n\n";
-    out << "namespace agp {\n\n";
+    out << "namespace dart {\n\n";
     out << "// Note: Use encode_hexamer() from hexamer_tables.hpp\n\n";
 
     write_frequency_array(out, upper_domain + "_HEXAMER_FREQ", counts, total, true);
 
-    out << "} // namespace agp\n";
+    out << "} // namespace dart\n";
 
     std::cerr << "  Wrote: " << filename << "\n";
 }
@@ -504,7 +504,7 @@ void write_positional_table(const std::string& output_dir, const std::string& do
     out << "// INTERNAL hexamers: " << internal_total << "\n";
     out << "// END hexamers: " << end_total << "\n\n";
     out << "#include <cstdint>\n\n";
-    out << "namespace agp {\n\n";
+    out << "namespace dart {\n\n";
 
     write_frequency_array(out, upper_domain + "_START_HEXAMER_FREQ", start_counts, start_total);
     write_frequency_array(out, upper_domain + "_INTERNAL_HEXAMER_FREQ", internal_counts, internal_total);
@@ -529,7 +529,7 @@ void write_positional_table(const std::string& output_dir, const std::string& do
     }
     out << "};\n\n";
 
-    out << "} // namespace agp\n";
+    out << "} // namespace dart\n";
 
     std::cerr << "  Wrote: " << filename << "\n";
 }
@@ -552,7 +552,7 @@ void write_damage_likelihood_table(const std::string& output_dir, const std::str
     out << "//\n";
     out << "// Positive values indicate damage-consistent patterns\n\n";
     out << "#include <cstdint>\n\n";
-    out << "namespace agp {\n\n";
+    out << "namespace dart {\n\n";
 
     write_damage_llr_array(out, upper_domain + "_DAMAGE_LLR_5PRIME", counts, total, true);
     write_damage_llr_array(out, upper_domain + "_DAMAGE_LLR_3PRIME", counts, total, false);
@@ -589,7 +589,7 @@ void write_damage_likelihood_table(const std::string& output_dir, const std::str
     out << "    return score_5prime + score_3prime;\n";
     out << "}\n\n";
 
-    out << "} // namespace agp\n";
+    out << "} // namespace dart\n";
 
     std::cerr << "  Wrote: " << filename << "\n";
 }
@@ -617,7 +617,7 @@ void write_strand_hexamer_table(const std::string& output_dir, const std::string
     out << "//   LLR < 0: more likely antisense (reverse) strand\n\n";
     out << "#include <cstdint>\n";
     out << "#include <cmath>\n\n";
-    out << "namespace agp {\n";
+    out << "namespace dart {\n";
     out << "namespace strand {\n\n";
 
     // Write sense hexamer frequencies
@@ -721,7 +721,7 @@ void write_strand_hexamer_table(const std::string& output_dir, const std::string
     out << "}\n\n";
 
     out << "} // namespace strand\n";
-    out << "} // namespace agp\n";
+    out << "} // namespace dart\n";
 
     std::cerr << "  Wrote: " << filename << "\n";
 }

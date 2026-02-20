@@ -19,7 +19,7 @@
 #include <unordered_map>
 #include <cmath>
 
-namespace agp {
+namespace dart {
 
 // VTML20 substitution matrix (20x20 for standard amino acids)
 // Indexed by AA code: A=0, C=1, D=2, E=3, F=4, G=5, H=6, I=7, K=8, L=9,
@@ -352,4 +352,4 @@ private:
     }
 };
 
-} // namespace agp
+} // namespace dart

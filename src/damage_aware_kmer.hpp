@@ -17,7 +17,7 @@
 #include <algorithm>
 #include <unordered_map>
 
-namespace agp {
+namespace dart {
 
 // Canonical AA: maps damaged variants back to undamaged form
 // For example: W→R (because R→W is damage), Y→H (because H→Y is damage)
@@ -459,4 +459,4 @@ private:
     }
 };
 
-} // namespace agp
+} // namespace dart

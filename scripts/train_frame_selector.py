@@ -285,7 +285,7 @@ def export_mlp_to_cpp(model, scaler, output_path):
         f.write("#include <array>\n")
         f.write("#include <cmath>\n")
         f.write("#include <algorithm>\n\n")
-        f.write("namespace agp {\n")
+        f.write("namespace dart {\n")
         f.write("namespace frame_nn {\n\n")
         
         f.write(f"constexpr int INPUT_SIZE = {input_size};\n")
@@ -338,7 +338,7 @@ def export_mlp_to_cpp(model, scaler, output_path):
         f.write("}\n\n")
         
         f.write("} // namespace frame_nn\n")
-        f.write("} // namespace agp\n")
+        f.write("} // namespace dart\n")
 
 
 def export_logistic_to_cpp(model, scaler, output_path):
@@ -354,7 +354,7 @@ def export_logistic_to_cpp(model, scaler, output_path):
         f.write(" */\n\n")
         f.write("#include <array>\n")
         f.write("#include <cmath>\n\n")
-        f.write("namespace agp {\n")
+        f.write("namespace dart {\n")
         f.write("namespace frame_nn {\n\n")
         
         f.write(f"constexpr int INPUT_SIZE = {len(coef)};\n\n")
@@ -383,7 +383,7 @@ def export_logistic_to_cpp(model, scaler, output_path):
         f.write("}\n\n")
         
         f.write("} // namespace frame_nn\n")
-        f.write("} // namespace agp\n")
+        f.write("} // namespace dart\n")
 
 
 def main():

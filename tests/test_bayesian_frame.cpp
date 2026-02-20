@@ -7,7 +7,7 @@
 #include <chrono>
 #include <zlib.h>
 
-#include "agp/bayesian_frame.hpp"
+#include "dart/bayesian_frame.hpp"
 
 // Simple gzip reader
 std::string read_gzip_file(const std::string& path) {
@@ -127,8 +127,8 @@ int main(int argc, char* argv[]) {
     std::cout << "Loaded " << ground_truth.size() << " reads with ground truth (" << load_ms << "ms)" << std::endl;
 
     // Create Bayesian frame selector with damage parameters for high-damage sample
-    agp::DamageChannel damage(0.30f, 0.30f, 0.51f, 0.51f);  // 30% D_max, λ=0.51
-    agp::BayesianFrameSelector selector(damage);
+    dart::DamageChannel damage(0.30f, 0.30f, 0.51f, 0.51f);  // 30% D_max, λ=0.51
+    dart::BayesianFrameSelector selector(damage);
 
     // Evaluation metrics
     int total_reads = 0;

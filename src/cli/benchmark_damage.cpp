@@ -1,5 +1,5 @@
 // Fast benchmark for per-read damage prediction
-// Computes AUC-ROC comparing AGP predictions to synthetic ground truth
+// Computes AUC-ROC comparing DART predictions to synthetic ground truth
 
 #include <iostream>
 #include <fstream>
@@ -88,7 +88,7 @@ float get_attr_float(const std::string& attrs, const std::string& key, float def
     return parsed;
 }
 
-// Parse AGP GFF output
+// Parse DART GFF output
 std::unordered_map<std::string, Prediction> parse_gff(const std::string& path) {
     std::unordered_map<std::string, Prediction> predictions;
     predictions.reserve(10000000);
@@ -343,7 +343,7 @@ int main(int argc, char* argv[]) {
     std::string gff_path = argv[1];
     std::string truth_path = argv[2];
 
-    std::cerr << "Loading AGP predictions from: " << gff_path << "\n";
+    std::cerr << "Loading DART predictions from: " << gff_path << "\n";
     auto predictions = parse_gff(gff_path);
     std::cerr << "  Loaded " << predictions.size() << " predictions\n";
 

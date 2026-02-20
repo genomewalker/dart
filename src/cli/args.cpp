@@ -1,18 +1,18 @@
 #include "args.hpp"
-#include "agp/version.h"
+#include "dart/version.h"
 #include <iostream>
 #include <algorithm>
 #include <string>
 
-namespace agp {
+namespace dart {
 namespace cli {
 
 void print_version() {
-    std::cout << "agp " << AGP_VERSION << "\n";
+    std::cout << "dart " << DART_VERSION << "\n";
 }
 
 void print_usage(const char* program_name) {
-    std::cout << "Ancient Gene Predictor v" << AGP_VERSION << "\n\n";
+    std::cout << "DART v" << DART_VERSION << "\n\n";
     std::cout << "Usage: " << program_name << " -i <input> -o <output> [options]\n\n";
     std::cout << "Options:\n";
     std::cout << "  -i, --input <file>       Input FASTA/FASTQ file (or .gz)\n";
@@ -160,4 +160,4 @@ Options parse_args(int argc, char* argv[]) {
 }
 
 }  // namespace cli
-}  // namespace agp
+}  // namespace dart

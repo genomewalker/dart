@@ -301,7 +301,7 @@ void write_dicodon_phase_header(const std::string& output_dir, const std::string
     
     out << "#include <cstdint>\n";
     out << "#include <cmath>\n\n";
-    out << "namespace agp {\n\n";
+    out << "namespace dart {\n\n";
     
     // Helper to write frequency array
     auto write_freq_array = [&](const std::string& name, const std::array<uint64_t, 4096>& counts, uint64_t total) {
@@ -423,7 +423,7 @@ void write_dicodon_phase_header(const std::string& output_dir, const std::string
     out << "    return {best, scores[best] - second_best};\n";
     out << "}\n\n";
     
-    out << "} // namespace agp\n";
+    out << "} // namespace dart\n";
     
     std::cerr << "  Wrote: " << filename << "\n";
 }

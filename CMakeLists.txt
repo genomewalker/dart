@@ -22,21 +22,21 @@ if(GIT_FOUND)
     )
     if(GIT_RESULT EQUAL 0 AND GIT_VERSION)
         # Extract version from tag (e.g., v0.3.0 -> 0.3.0)
-        string(REGEX REPLACE "^v" "" AGP_VERSION "${GIT_VERSION}")
+        string(REGEX REPLACE "^v" "" DART_VERSION "${GIT_VERSION}")
     else()
-        set(AGP_VERSION "${PROJECT_VERSION}-${GIT_COMMIT}")
+        set(DART_VERSION "${PROJECT_VERSION}-${GIT_COMMIT}")
     endif()
 else()
-    set(AGP_VERSION "${PROJECT_VERSION}")
+    set(DART_VERSION "${PROJECT_VERSION}")
     set(GIT_COMMIT "unknown")
 endif()
 
-message(STATUS "AGP Version: ${AGP_VERSION}")
+message(STATUS "DART Version: ${DART_VERSION}")
 
 # Generate version header
 configure_file(
     ${CMAKE_SOURCE_DIR}/cmake/version.h.in
-    ${CMAKE_BINARY_DIR}/include/agp/version.h
+    ${CMAKE_BINARY_DIR}/include/dart/version.h
     @ONLY
 )
 include_directories(${CMAKE_BINARY_DIR}/include)
@@ -111,10 +111,10 @@ include_directories(
 )
 
 # Source files
-# Hexamer data is header-only (constexpr arrays in include/agp/*_hexamer_table.hpp)
+# Hexamer data is header-only (constexpr arrays in include/dart/*_hexamer_table.hpp)
 
 # Core library sources (shared between subcommands)
-set(AGP_CORE_SOURCES
+set(DART_CORE_SOURCES
     src/cli/args.cpp
     src/cli/subcommand.cpp
     src/damage/profile.cpp
@@ -139,7 +139,7 @@ set(AGP_CORE_SOURCES
 )
 
 # Subcommand sources
-set(AGP_SUBCOMMAND_SOURCES
+set(DART_SUBCOMMAND_SOURCES
     src/cli/dispatcher.cpp
     src/main.cpp                      # cmd_predict
     src/validate.cpp                  # cmd_validate
@@ -150,41 +150,41 @@ set(AGP_SUBCOMMAND_SOURCES
 )
 
 # Main executable with subcommands
-add_executable(agp ${AGP_CORE_SOURCES} ${AGP_SUBCOMMAND_SOURCES})
-target_link_libraries(agp ${ZLIB_LIBRARIES})
+add_executable(dart ${DART_CORE_SOURCES} ${DART_SUBCOMMAND_SOURCES})
+target_link_libraries(dart ${ZLIB_LIBRARIES})
 if(ZSTD_FOUND)
-    target_include_directories(agp PRIVATE ${ZSTD_INCLUDE_DIRS})
-    target_link_libraries(agp ${ZSTD_LIBRARIES})
+    target_include_directories(dart PRIVATE ${ZSTD_INCLUDE_DIRS})
+    target_link_libraries(dart ${ZSTD_LIBRARIES})
 endif()
 # TBB disabled - linking issues
 # if(TBB_FOUND)
-#     target_include_directories(agp PRIVATE /usr/include ${TBB_INCLUDE_DIRS})
-#     target_link_libraries(agp ${TBB_LIBRARIES})
+#     target_include_directories(dart PRIVATE /usr/include ${TBB_INCLUDE_DIRS})
+#     target_link_libraries(dart ${TBB_LIBRARIES})
 # endif()
 
 if(OpenMP_CXX_FOUND)
-    target_link_libraries(agp OpenMP::OpenMP_CXX)
+    target_link_libraries(dart OpenMP::OpenMP_CXX)
 endif()
 
 # Legacy standalone validation tool (for backwards compatibility)
-add_executable(agp-validate-standalone src/validate.cpp ${AGP_CORE_SOURCES})
-target_link_libraries(agp-validate-standalone ${ZLIB_LIBRARIES})
+add_executable(dart-validate-standalone src/validate.cpp ${DART_CORE_SOURCES})
+target_link_libraries(dart-validate-standalone ${ZLIB_LIBRARIES})
 if(ZSTD_FOUND)
-    target_include_directories(agp-validate-standalone PRIVATE ${ZSTD_INCLUDE_DIRS})
-    target_link_libraries(agp-validate-standalone ${ZSTD_LIBRARIES})
+    target_include_directories(dart-validate-standalone PRIVATE ${ZSTD_INCLUDE_DIRS})
+    target_link_libraries(dart-validate-standalone ${ZSTD_LIBRARIES})
 endif()
-target_compile_definitions(agp-validate-standalone PRIVATE AGP_STANDALONE_VALIDATE)
+target_compile_definitions(dart-validate-standalone PRIVATE DART_STANDALONE_VALIDATE)
 
 # Error analysis tool
-add_executable(agp-analyze-errors src/cli/analyze_errors.cpp)
-target_link_libraries(agp-analyze-errors ${ZLIB_LIBRARIES})
+add_executable(dart-analyze-errors src/cli/analyze_errors.cpp)
+target_link_libraries(dart-analyze-errors ${ZLIB_LIBRARIES})
 
 # Damage prediction benchmark
-add_executable(agp-benchmark-damage src/cli/benchmark_damage.cpp)
-target_link_libraries(agp-benchmark-damage ${ZLIB_LIBRARIES})
+add_executable(dart-benchmark-damage src/cli/benchmark_damage.cpp)
+target_link_libraries(dart-benchmark-damage ${ZLIB_LIBRARIES})
 
 # Streaming EM comparison test
-add_executable(test-streaming-em tests/test_streaming_em.cpp ${AGP_CORE_SOURCES})
+add_executable(test-streaming-em tests/test_streaming_em.cpp ${DART_CORE_SOURCES})
 target_link_libraries(test-streaming-em ${ZLIB_LIBRARIES})
 if(ZSTD_FOUND)
     target_include_directories(test-streaming-em PRIVATE ${ZSTD_INCLUDE_DIRS})
@@ -196,33 +196,33 @@ endif()
 
 if(BUILD_TESTING)
     add_executable(
-        agp-cli-args-tests
+        dart-cli-args-tests
         tests/test_cli_args.cpp
         src/cli/args.cpp
     )
     add_test(
         NAME cli_args
-        COMMAND agp-cli-args-tests
+        COMMAND dart-cli-args-tests
     )
 
     add_executable(
-        agp-benchmark-fixture-test
+        dart-benchmark-fixture-test
         tests/test_benchmark_fixture.cpp
     )
     add_test(
         NAME benchmark_fixture
-        COMMAND agp-benchmark-fixture-test ${CMAKE_SOURCE_DIR}/examples/tutorial/data/benchmark_summary.tsv
+        COMMAND dart-benchmark-fixture-test ${CMAKE_SOURCE_DIR}/examples/tutorial/data/benchmark_summary.tsv
     )
 
     add_executable(
-        agp-damage-annotate-regressions
+        dart-damage-annotate-regressions
         tests/test_damage_annotate_regressions.cpp
     )
     add_test(
         NAME damage_annotate_regressions
-        COMMAND agp-damage-annotate-regressions $<TARGET_FILE:agp>
+        COMMAND dart-damage-annotate-regressions $<TARGET_FILE:dart>
     )
 endif()
 
 # Install
-install(TARGETS agp DESTINATION bin)
+install(TARGETS dart DESTINATION bin)

@@ -6,15 +6,15 @@
 // - Combines hexamer LLR with base composition, stop codon, and AA signals
 // - Prior from sample d_max and expected damage events
 
-#include "agp/frame_selector.hpp"
-#include "agp/codon_tables.hpp"
-#include "agp/damage_hexamer.hpp"
-#include "agp/types.hpp"
+#include "dart/frame_selector.hpp"
+#include "dart/codon_tables.hpp"
+#include "dart/damage_hexamer.hpp"
+#include "dart/types.hpp"
 #include <algorithm>
 #include <cmath>
 #include <vector>
 
-namespace agp {
+namespace dart {
 
 namespace {
 
@@ -245,4 +245,4 @@ float FrameSelector::compute_damage_percentage(
     return damage_pct;
 }
 
-} // namespace agp
+} // namespace dart

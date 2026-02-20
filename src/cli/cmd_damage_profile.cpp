@@ -1,12 +1,12 @@
-// agp damage-profile: Terminal nucleotide damage profile
+// dart damage-profile: Terminal nucleotide damage profile
 //
 // Computes T/(T+C) at 5' and A/(A+G) at 3' positions for reads
 // that mapped to proteins. Outputs per-protein or aggregate profiles.
 
 #include "subcommand.hpp"
-#include "agp/version.h"
-#include "agp/log_utils.hpp"
-#include "agp/sequence_io.hpp"
+#include "dart/version.h"
+#include "dart/log_utils.hpp"
+#include "dart/sequence_io.hpp"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -21,7 +21,7 @@
 #include <chrono>
 #include <zlib.h>
 
-namespace agp {
+namespace dart {
 namespace cli {
 
 static constexpr int MAX_POSITIONS = 25;
@@ -106,18 +106,18 @@ int cmd_damage_profile(int argc, char* argv[]) {
             max_pos = std::stoi(argv[++i]);
         } else if (argv[i][0] == '-') {
             std::cerr << "Unknown option: " << argv[i] << "\n";
-            std::cerr << "Run 'agp damage-profile --help' for usage.\n";
+            std::cerr << "Run 'dart damage-profile --help' for usage.\n";
             return 1;
         } else {
             std::cerr << "Unexpected positional argument: " << argv[i] << "\n";
-            std::cerr << "Run 'agp damage-profile --help' for usage.\n";
+            std::cerr << "Run 'dart damage-profile --help' for usage.\n";
             return 1;
         }
     }
 
     if (input_file.empty() || hits_file.empty() || output_file.empty()) {
         std::cerr << "Error: --input, --hits, and --output are required.\n";
-        std::cerr << "Run 'agp damage-profile --help' for usage.\n";
+        std::cerr << "Run 'dart damage-profile --help' for usage.\n";
         return 1;
     }
 
@@ -157,7 +157,7 @@ int cmd_damage_profile(int argc, char* argv[]) {
     auto step1_end = std::chrono::steady_clock::now();
 
     std::cerr << "  Found " << read_to_target.size() << " read-protein mappings" << std::endl;
-    std::cerr << "  Step 1 runtime: " << agp::log_utils::format_elapsed(step1_start, step1_end) << std::endl;
+    std::cerr << "  Step 1 runtime: " << dart::log_utils::format_elapsed(step1_start, step1_end) << std::endl;
 
     // Step 2: Read FASTQ and compute profiles
     auto step2_start = std::chrono::steady_clock::now();
@@ -233,7 +233,7 @@ int cmd_damage_profile(int argc, char* argv[]) {
 
     std::cerr << "  Total: " << reads_processed << " reads, "
               << reads_matched << " matched to " << target_counts.size() << " proteins" << std::endl;
-    std::cerr << "  Step 2 runtime: " << agp::log_utils::format_elapsed(step2_start, step2_end) << std::endl;
+    std::cerr << "  Step 2 runtime: " << dart::log_utils::format_elapsed(step2_start, step2_end) << std::endl;
 
     // Step 3: Write output
     auto step3_start = std::chrono::steady_clock::now();
@@ -313,8 +313,8 @@ int cmd_damage_profile(int argc, char* argv[]) {
     auto run_end = std::chrono::steady_clock::now();
 
     std::cerr << "Done. Output: " << output_file << std::endl;
-    std::cerr << "  Step 3 runtime: " << agp::log_utils::format_elapsed(step3_start, step3_end) << std::endl;
-    std::cerr << "  Total runtime: " << agp::log_utils::format_elapsed(run_start, run_end) << std::endl;
+    std::cerr << "  Step 3 runtime: " << dart::log_utils::format_elapsed(step3_start, step3_end) << std::endl;
+    std::cerr << "  Total runtime: " << dart::log_utils::format_elapsed(run_start, run_end) << std::endl;
 
     return 0;
 }
@@ -332,4 +332,4 @@ static struct DamageProfileRegistrar {
 } damage_profile_registrar;
 
 }  // namespace cli
-}  // namespace agp
+}  // namespace dart

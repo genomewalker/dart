@@ -10,7 +10,7 @@
 //
 // This allows:
 // 1. MMseqs2 to align through damaged positions (X is permissive)
-// 2. agp damage-annotate to see original AAs and detect damage
+// 2. dart damage-annotate to see original AAs and detect damage
 //
 // Strategy:
 // 1. Cluster reads by genomic coordinates (same gene region)
@@ -24,7 +24,7 @@
 #include <algorithm>
 #include <cmath>
 
-namespace agp {
+namespace dart {
 
 // Damage-consistent substitution patterns at protein level
 struct DamagePattern {
@@ -328,4 +328,4 @@ private:
     }
 };
 
-} // namespace agp
+} // namespace dart

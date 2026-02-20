@@ -14,7 +14,7 @@
 #include <unordered_map>
 #include <cmath>
 
-namespace agp {
+namespace dart {
 
 // Damage substitution patterns (reference → observed)
 // CT damage (5' C→T in DNA)
@@ -304,4 +304,4 @@ inline float rescore_with_consensus(
     return std::clamp(rescored, 0.0f, 1.0f);
 }
 
-} // namespace agp
+} // namespace dart

@@ -7,10 +7,10 @@
 // OpenMP parallelizes the E-step across reads; M-step uses thread-local
 // accumulators merged via SIMD reduction.
 
-#include "agp/em_reassign.hpp"
-#include "agp/mmap_array.hpp"
-#include "agp/reference_stats.hpp"
-#include "agp/damage_index_reader.hpp"
+#include "dart/em_reassign.hpp"
+#include "dart/mmap_array.hpp"
+#include "dart/reference_stats.hpp"
+#include "dart/damage_index_reader.hpp"
 
 #include <algorithm>
 #include <array>
@@ -23,7 +23,7 @@
 #include <omp.h>
 #endif
 
-namespace agp {
+namespace dart {
 
 // ---------------------------------------------------------------------------
 // Build CSR-format AlignmentData from CompactAlignment array
@@ -618,7 +618,7 @@ std::vector<std::pair<uint32_t, float>> reassign_reads(
     return result;
 }
 
-} // namespace agp
+} // namespace dart
 
 // ---------------------------------------------------------------------------
 // Streaming/Chunked EM: Memory-efficient implementation
@@ -633,7 +633,7 @@ std::vector<std::pair<uint32_t, float>> reassign_reads(
 // Memory: O(num_refs) + O(row_group_size) instead of O(num_alignments)
 // For 584M alignments with 10M refs: ~80MB instead of ~18GB
 
-#include "agp/columnar_index.hpp"
+#include "dart/columnar_index.hpp"
 #include <atomic>
 
 namespace {
@@ -664,7 +664,7 @@ double streaming_e_step_rowgroup(
     const uint16_t* tlen,     // Reference length per alignment (for normalize_by_length)
     const double* log_weights,
     uint32_t num_refs,
-    const agp::EMParams& params,
+    const dart::EMParams& params,
     double pi_ancient,
     std::vector<double>& ref_sums,        // Accumulated gamma per ref (output)
     std::vector<double>& ref_sums_ancient // Accumulated gamma_ancient per ref (output)
@@ -723,7 +723,7 @@ double streaming_e_step_rowgroup(
                 }
             }
 
-            double lse = agp::log_sum_exp(log_scores.data(), 2 * deg);
+            double lse = dart::log_sum_exp(log_scores.data(), 2 * deg);
             ll += lse;
 
             // Accumulate to ref_sums
@@ -751,7 +751,7 @@ double streaming_e_step_rowgroup(
                 log_scores[j] = log_w + params.lambda_b * static_cast<double>(bit_score[idx]);
             }
 
-            double lse = agp::log_sum_exp(log_scores.data(), deg);
+            double lse = dart::log_sum_exp(log_scores.data(), deg);
             ll += lse;
 
             for (uint32_t j = 0; j < deg; ++j) {
@@ -770,7 +770,7 @@ double streaming_e_step_rowgroup(
 void streaming_m_step(
     const std::vector<double>& ref_sums,
     std::vector<double>& weights,
-    const agp::EMParams& params
+    const dart::EMParams& params
 ) {
     const uint32_t T = static_cast<uint32_t>(weights.size());
     const double prior_offset = params.alpha_prior - 1.0;
@@ -789,7 +789,7 @@ void streaming_m_step(
 
 } // anonymous namespace
 
-namespace agp {
+namespace dart {
 
 StreamingEMResult streaming_em(
     ColumnarIndexReader& reader,
@@ -1094,4 +1094,4 @@ void streaming_em_finalize(
     });
 }
 
-} // namespace agp
+} // namespace dart

@@ -1,12 +1,12 @@
-#ifndef AGP_CLI_ARGS_HPP
-#define AGP_CLI_ARGS_HPP
+#ifndef DART_CLI_ARGS_HPP
+#define DART_CLI_ARGS_HPP
 
 #include <string>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 
-namespace agp {
+namespace dart {
 namespace cli {
 
 // Library type for ancient DNA analysis
@@ -75,6 +75,6 @@ void print_usage(const char* program_name);
 Options parse_args(int argc, char* argv[]);
 
 }  // namespace cli
-}  // namespace agp
+}  // namespace dart
 
-#endif  // AGP_CLI_ARGS_HPP
+#endif // DART_CLI_ARGS_HPP

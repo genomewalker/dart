@@ -316,7 +316,7 @@ int main(int argc, char* argv[]) {
     hdr << "// Stop region (near stop): " << g_total_stop_fwd << " hexamers\n";
     hdr << "// Interior region: " << g_total_interior_fwd << " hexamers\n";
     hdr << "#pragma once\n\n";
-    hdr << "namespace agp {\n\n";
+    hdr << "namespace dart {\n\n";
 
     // Write all frequency tables
     auto write_table = [&](const char* name, double* freq) {
@@ -370,7 +370,7 @@ int main(int argc, char* argv[]) {
     }
     hdr << "};\n\n";
 
-    hdr << "} // namespace agp\n";
+    hdr << "} // namespace dart\n";
     hdr.close();
 
     // Print top discriminative hexamers for each region
