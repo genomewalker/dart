@@ -89,7 +89,7 @@ find_package(ZLIB REQUIRED)
 
 # Find zstd for columnar compression (required)
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(ZSTD REQUIRED libzstd)
+pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
 add_compile_definitions(HAVE_ZSTD)
 message(STATUS "ZSTD found: ${ZSTD_VERSION}")
 if(FALSE)
@@ -150,28 +150,14 @@ set(DART_SUBCOMMAND_SOURCES
 
 # Main executable with subcommands
 add_executable(dart ${DART_CORE_SOURCES} ${DART_SUBCOMMAND_SOURCES})
-target_link_libraries(dart ${ZLIB_LIBRARIES})
-if(ZSTD_FOUND)
-    target_include_directories(dart PRIVATE ${ZSTD_INCLUDE_DIRS})
-    target_link_libraries(dart ${ZSTD_LIBRARIES})
-endif()
-# TBB disabled - linking issues
-# if(TBB_FOUND)
-#     target_include_directories(dart PRIVATE /usr/include ${TBB_INCLUDE_DIRS})
-#     target_link_libraries(dart ${TBB_LIBRARIES})
-# endif()
-
+target_link_libraries(dart ${ZLIB_LIBRARIES} PkgConfig::ZSTD)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(dart OpenMP::OpenMP_CXX)
 endif()
 
 # Legacy standalone validation tool (for backwards compatibility)
 add_executable(dart-validate-standalone src/validate.cpp ${DART_CORE_SOURCES})
-target_link_libraries(dart-validate-standalone ${ZLIB_LIBRARIES})
-if(ZSTD_FOUND)
-    target_include_directories(dart-validate-standalone PRIVATE ${ZSTD_INCLUDE_DIRS})
-    target_link_libraries(dart-validate-standalone ${ZSTD_LIBRARIES})
-endif()
+target_link_libraries(dart-validate-standalone ${ZLIB_LIBRARIES} PkgConfig::ZSTD)
 target_compile_definitions(dart-validate-standalone PRIVATE DART_STANDALONE_VALIDATE)
 
 # Error analysis tool
@@ -184,11 +170,7 @@ target_link_libraries(dart-benchmark-damage ${ZLIB_LIBRARIES})
 
 # Streaming EM comparison test
 add_executable(test-streaming-em tests/test_streaming_em.cpp ${DART_CORE_SOURCES})
-target_link_libraries(test-streaming-em ${ZLIB_LIBRARIES})
-if(ZSTD_FOUND)
-    target_include_directories(test-streaming-em PRIVATE ${ZSTD_INCLUDE_DIRS})
-    target_link_libraries(test-streaming-em ${ZSTD_LIBRARIES})
-endif()
+target_link_libraries(test-streaming-em ${ZLIB_LIBRARIES} PkgConfig::ZSTD)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(test-streaming-em OpenMP::OpenMP_CXX)
 endif()
