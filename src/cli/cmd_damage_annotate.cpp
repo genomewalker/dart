@@ -1496,11 +1496,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         uint32_t ref_idx = 0;  // For EM: ref_idx corresponding to target_id
         float fident = 0.0f;
         float evalue = 0.0f;
-        size_t qstart_0 = 0;
-        size_t tstart_0 = 0;
-        size_t qlen = 0;
-        size_t tlen = 0;
-        size_t aln_len_on_target = 0;
+        uint32_t qstart_0 = 0;
+        uint32_t tstart_0 = 0;
+        uint32_t qlen = 0;
+        uint32_t tlen = 0;
+        uint32_t aln_len_on_target = 0;
         uint32_t best_rg = UINT32_MAX;
         uint32_t best_row = UINT32_MAX;
         std::string qaln;
@@ -1513,7 +1513,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         read_degree.assign(n_reads, 0);
     }
     std::vector<dart::CompactAlignment> em_alignments;
-    if (use_em) {
+    if (use_em && !em_streaming) {
         em_alignments.reserve(static_cast<size_t>(reader.num_alignments()));
     }
     std::mutex em_damage_stats_mutex;
@@ -1552,12 +1552,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
     size_t em_shard_count = 1;
 #ifdef _OPENMP
-    if (use_em) {
+    if (use_em && !em_streaming) {
         em_shard_count = static_cast<size_t>(std::max(1, omp_get_max_threads()));
     }
 #endif
     std::vector<std::vector<dart::CompactAlignment>> em_alignments_by_thread;
-    if (use_em) {
+    if (use_em && !em_streaming) {
         em_alignments_by_thread.resize(em_shard_count);
         const size_t reserve_per_shard =
             static_cast<size_t>(reader.num_alignments() / std::max<size_t>(1, em_shard_count) + 1);
@@ -1610,11 +1610,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             uint32_t ref_idx = 0;
             float fident = 0.0f;
             float evalue = 0.0f;
-            size_t qstart_0 = 0;
-            size_t tstart_0 = 0;
-            size_t qlen = 0;
-            size_t tlen = 0;
-            size_t aln_len_on_target = 0;
+            uint32_t qstart_0 = 0;
+            uint32_t tstart_0 = 0;
+            uint32_t qlen = 0;
+            uint32_t tlen = 0;
+            uint32_t aln_len_on_target = 0;
             uint32_t best_rg = UINT32_MAX;
             uint32_t best_row = UINT32_MAX;
         };
@@ -1625,7 +1625,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         size_t local_filtered_evalue = 0;
 
         std::vector<dart::CompactAlignment> local_em;
-        if (use_em) {
+        if (use_em && !em_streaming) {
             local_em.reserve(num_rows);
         }
         uint64_t local_em_n = 0;
@@ -1647,7 +1647,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         std::unordered_map<uint32_t, float> local_em_read_damage;
         if (use_em) {
             local_em_read_damage.reserve(std::max<uint32_t>(1, num_rows / 8));
-        }
+        }  // Note: local_em_read_damage always needed for damage-variation detection
 
         bool local_sorted_hits = true;
         for (uint32_t i = 1; i < num_rows; ++i) {
@@ -1677,11 +1677,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                                     uint32_t tidx,
                                     float fident,
                                     float evalue,
-                                    size_t qstart_0,
-                                    size_t tstart_0,
-                                    size_t qlen_v,
-                                    size_t tlen_v,
-                                    size_t aln_len_on_target_v,
+                                    uint32_t qstart_0,
+                                    uint32_t tstart_0,
+                                    uint32_t qlen_v,
+                                    uint32_t tlen_v,
+                                    uint32_t aln_len_on_target_v,
                                     uint32_t row_in_group) {
             if (bits > cand.bits) {
                 cand.bits_second = cand.bits;
@@ -1723,10 +1723,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
             const uint32_t ridx = read_idx[i];
             const uint32_t tidx = ref_idx[i];
-            const size_t qstart_0 = (qstart[i] > 0) ? static_cast<size_t>(qstart[i] - 1) : 0;
-            const size_t tstart_0 = (tstart[i] > 0) ? static_cast<size_t>(tstart[i] - 1) : 0;
-            const size_t tlen_v = static_cast<size_t>(tlen[i]);
-            const size_t qlen_v = static_cast<size_t>(qlen[i]);
+            const uint32_t qstart_0 = (qstart[i] > 0) ? static_cast<uint32_t>(qstart[i] - 1) : 0u;
+            const uint32_t tstart_0 = (tstart[i] > 0) ? static_cast<uint32_t>(tstart[i] - 1) : 0u;
+            const uint32_t tlen_v = static_cast<uint32_t>(tlen[i]);
+            const uint32_t qlen_v = static_cast<uint32_t>(qlen[i]);
             const uint16_t aln_len_v = aln_len[i];
 
             if (need_unique_degree) {
@@ -1760,12 +1760,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 if (!inserted_ds && std::fabs(it_ds->second - ds) > 1e-6f) {
                     local_em_intra_read_variation = true;
                 }
-                ca.aln_start = static_cast<uint16_t>(std::min(tstart_0, size_t(65535)));
+                ca.aln_start = static_cast<uint16_t>(std::min(tstart_0, 65535u));
                 ca.aln_end = static_cast<uint16_t>(
-                    std::min(tstart_0 + static_cast<size_t>(aln_len_v), size_t(65535)));
+                    std::min(tstart_0 + static_cast<uint32_t>(aln_len_v), 65535u));
                 ca.identity_q = identity_q[i];
                 ca.flags = tlen[i];  // pass true reference length hint to EM builder
-                local_em.push_back(ca);
+                if (!em_streaming) local_em.push_back(ca);
                 local_em_n++;
                 local_em_sum += ds;
                 local_em_sumsq += static_cast<double>(ds) * static_cast<double>(ds);
@@ -1793,7 +1793,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     cand.tstart_0 = tstart_0;
                     cand.qlen = qlen_v;
                     cand.tlen = tlen_v;
-                    cand.aln_len_on_target = static_cast<size_t>(aln_len_v);
+                    cand.aln_len_on_target = static_cast<uint32_t>(aln_len_v);
                     cand.best_rg = rg_idx;
                     cand.best_row = i;
                     local_best_sorted.emplace_back(ridx, cand);
@@ -1802,7 +1802,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                                      bits, std::clamp(damage_score[i], 0.0f, 1.0f),
                                      tidx, fident, evalue,
                                      qstart_0, tstart_0, qlen_v, tlen_v,
-                                     static_cast<size_t>(aln_len_v), i);
+                                     static_cast<uint32_t>(aln_len_v), i);
                 }
             } else {
                 auto [it, inserted] = local_best_unsorted.try_emplace(ridx);
@@ -1818,7 +1818,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     cand.tstart_0 = tstart_0;
                     cand.qlen = qlen_v;
                     cand.tlen = tlen_v;
-                    cand.aln_len_on_target = static_cast<size_t>(aln_len_v);
+                    cand.aln_len_on_target = static_cast<uint32_t>(aln_len_v);
                     cand.best_rg = rg_idx;
                     cand.best_row = i;
                     it->second = cand;
@@ -1827,7 +1827,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                                      bits, std::clamp(damage_score[i], 0.0f, 1.0f),
                                      tidx, fident, evalue,
                                      qstart_0, tstart_0, qlen_v, tlen_v,
-                                     static_cast<size_t>(aln_len_v), i);
+                                     static_cast<uint32_t>(aln_len_v), i);
                 }
             }
         }
@@ -1883,14 +1883,16 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             }
         }
 
-        if (use_em && !local_em.empty()) {
-            size_t em_shard = 0;
+        if (use_em && local_em_has_rows) {
+            if (!em_streaming && !local_em.empty()) {
+                size_t em_shard = 0;
 #ifdef _OPENMP
-            em_shard = static_cast<size_t>(omp_get_thread_num());
+                em_shard = static_cast<size_t>(omp_get_thread_num());
 #endif
-            if (em_shard >= em_alignments_by_thread.size()) em_shard = 0;
-            auto& dst = em_alignments_by_thread[em_shard];
-            dst.insert(dst.end(), local_em.begin(), local_em.end());
+                if (em_shard >= em_alignments_by_thread.size()) em_shard = 0;
+                auto& dst = em_alignments_by_thread[em_shard];
+                dst.insert(dst.end(), local_em.begin(), local_em.end());
+            }
 
             std::lock_guard<std::mutex> lock(em_damage_stats_mutex);
             em_damage_n += local_em_n;
@@ -1936,7 +1938,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         }
     }
 
-    if (use_em) {
+    if (use_em && !em_streaming) {
         size_t em_total = 0;
         for (const auto& shard : em_alignments_by_thread) {
             em_total += shard.size();
@@ -1946,6 +1948,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         for (auto& shard : em_alignments_by_thread) {
             em_alignments.insert(em_alignments.end(), shard.begin(), shard.end());
         }
+        // Fix 2: free shard memory immediately after merge
+        em_alignments_by_thread.clear();
+        std::vector<std::vector<dart::CompactAlignment>>{}.swap(em_alignments_by_thread);
     }
     const auto pass1_end = std::chrono::steady_clock::now();
     if (verbose) {
@@ -2426,6 +2431,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         // Build CSR-format alignment data
         auto aln_data = dart::build_alignment_data(
             em_alignments.data(), em_aln_count, n_reads, n_refs);
+        // Fix 3: release em_alignments – aln_data has its own copy
+        std::vector<dart::CompactAlignment>{}.swap(em_alignments);
 
         // Set up EM parameters
         dart::EMParams em_params;
