@@ -169,6 +169,7 @@ public:
         // Estimate prior P(incorrect) from proportion of decoys in top hits
         size_t top_n = std::min(decoy_scores.size(), target_scores.size() / 10);
         if (top_n < 10) top_n = std::min(decoy_scores.size(), size_t(100));
+        if (top_n == 0) top_n = 1;  // Defensive: avoid division by zero for pathological inputs
 
         std::vector<float> all_scores = target_scores;
         all_scores.insert(all_scores.end(), decoy_scores.begin(), decoy_scores.end());
@@ -277,16 +278,21 @@ public:
         report.n_decoys = decoy_scores.size();
 
         // Null distribution statistics
-        float sum = 0.0f;
-        for (float s : decoy_scores) sum += s;
-        report.empirical_null_mean = sum / decoy_scores.size();
+        if (decoy_scores.empty()) {
+            report.empirical_null_mean = 0.0f;
+            report.empirical_null_sd = 0.0f;
+        } else {
+            float sum = 0.0f;
+            for (float s : decoy_scores) sum += s;
+            report.empirical_null_mean = sum / decoy_scores.size();
 
-        float var = 0.0f;
-        for (float s : decoy_scores) {
-            float diff = s - report.empirical_null_mean;
-            var += diff * diff;
+            float var = 0.0f;
+            for (float s : decoy_scores) {
+                float diff = s - report.empirical_null_mean;
+                var += diff * diff;
+            }
+            report.empirical_null_sd = std::sqrt(var / decoy_scores.size());
         }
-        report.empirical_null_sd = std::sqrt(var / decoy_scores.size());
 
         // Determine actual max score for FDR curve
         float max_score = 0.0f;

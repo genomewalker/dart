@@ -2298,6 +2298,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         em_params.tol = em_tol;
         em_params.use_squarem = false;  // Streaming doesn't support SQUAREM yet
         em_params.use_damage = true;
+        em_params.normalize_by_length = true;
         // Enable alignment damage likelihoods if available (checked via NULL in E-step)
         em_params.use_alignment_damage_likelihood = true;
 

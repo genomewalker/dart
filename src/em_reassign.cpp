@@ -850,7 +850,7 @@ StreamingEMResult streaming_em(
         }
     }
 
-    double prev_ll = -std::numeric_limits<double>::infinity();
+    double prev_obj = -std::numeric_limits<double>::infinity();
 
     // Pre-allocate buffers outside iteration loop
     std::vector<double> log_weights(T, 0.0);
@@ -949,27 +949,33 @@ StreamingEMResult streaming_em(
             }
         }
 
+        if (!std::isfinite(total_ll)) {
+            break;
+        }
+
         result.log_likelihood = total_ll;
         result.iterations = iter + 1;
+
+        double total_obj = em_objective_from_ll(params, result.weights.data(), T, total_ll);
 
         // Progress callback
         if (progress_cb) {
             EMIterationDiagnostics diag;
             diag.iteration = iter;
-            diag.log_likelihood = result.log_likelihood;
-            diag.objective = result.log_likelihood;
-            diag.rel_change = std::abs(result.log_likelihood - prev_ll) / (std::abs(prev_ll) + 1e-15);
+            diag.log_likelihood = total_ll;
+            diag.objective = total_obj;
+            diag.rel_change = std::abs(total_obj - prev_obj) / (std::abs(prev_obj) + 1e-15);
             progress_cb(diag);
         }
 
         // Convergence check
         if (iter > 0) {
-            double rel_change = std::abs(result.log_likelihood - prev_ll) / (std::abs(prev_ll) + 1e-15);
+            double rel_change = std::abs(total_obj - prev_obj) / (std::abs(prev_obj) + 1e-15);
             if (rel_change < params.tol && (iter + 1) >= params.min_iters) {
                 break;
             }
         }
-        prev_ll = result.log_likelihood;
+        prev_obj = total_obj;
     }
 
     return result;
