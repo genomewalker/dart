@@ -53,7 +53,8 @@ include/agp/*_hexamer_manifest.json
 scripts/run_calibration_pipeline.slurm.sh
 
 # Workflows (keep in separate repos)
-workflows/
+/workflows/
+!/.github/
 
 # Notebooks (local analysis, too large/ephemeral for git)
 notebooks/
