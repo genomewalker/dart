@@ -12,6 +12,7 @@
 #include "dart/damage_index_reader.hpp"
 #include "dart/bayesian_damage_score.hpp"
 #include "dart/em_reassign.hpp"
+#include "dart/theta_d_coordinator.hpp"
 #include "dart/coverage_em.hpp"
 #include "dart/columnar_index.hpp"
 #include "dart/log_utils.hpp"
@@ -1075,6 +1076,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     float d_max = -1.0f;  // -1 means "estimate from data"
     float lambda = 0.3f;
     bool lambda_set_by_user = false;
+    bool refine_damage = false;
     int max_dist = -1;
     std::string lib_type = "auto";    // ss, ds, or auto-detect
     float threshold = 0.7f;           // Classification threshold for is_damaged
@@ -1167,6 +1169,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             use_identity = true;
         } else if (strcmp(argv[i], "--no-identity") == 0) {
             use_identity = false;
+        } else if (strcmp(argv[i], "--refine-damage") == 0) {
+            refine_damage = true;
         } else if (strcmp(argv[i], "--em") == 0) {
             use_em = true;
         } else if (strcmp(argv[i], "--no-em") == 0) {
@@ -1274,6 +1278,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cout << "  --threshold FLOAT Damage classification threshold (default: 0.7)\n";
             std::cout << "                       Adds is_damaged column (1 if posterior >= threshold)\n";
             std::cout << "  --no-identity     Disable identity evidence (enabled by default)\n";
+            std::cout << "  --refine-damage       Jointly update d_max from EM assignments (Phase 2)\n";
             std::cout << "  -v                Verbose output\n\n";
             std::cout << "Gene summary (per-gene aggregation, works with or without --em):\n";
             std::cout << "  --gene-summary FILE  Per-gene statistics TSV\n";
@@ -2177,6 +2182,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
     // Process best hits into summaries (parallel)
     const auto annotate_start = std::chrono::steady_clock::now();
+    // Per-read decay sums for ALL reads (including zero-mismatch).
+    // Used by the --refine-damage coordinator denominator to avoid upward bias
+    // from excluding zero-mismatch reads that still have positive decay opportunities.
+    std::vector<float> per_read_aa_decay(n_reads, 0.0f);
     std::vector<std::pair<uint32_t, ProteinDamageSummary>> all_results;
     #pragma omp parallel
     {
@@ -2192,6 +2201,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 query_id, target_id, hit.qaln, hit.taln,
                 hit.qstart_0, hit.tstart_0, hit.qlen,
                 hit.evalue, hit.bits, hit.fident, d_max, lambda);
+
+            // Capture decay for all reads before the mismatch filter.
+            // Safe: each ridx is written by exactly one thread.
+            per_read_aa_decay[ridx] = summary.aa_sum_exp_decay;
 
             if (summary.total_mismatches > 0) {
                 summary.read_idx = ridx;
@@ -2836,6 +2849,49 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         std::cerr << "  Damage detectability: " << std::fixed << std::setprecision(3)
                   << damage_detectability << "\n";
         std::cerr << "  Identity evidence: " << (use_identity ? "enabled (k=20, baseline=0.90)" : "disabled") << "\n";
+    }
+
+    // Phase 2: gamma-weighted MLE update of d_max (--refine-damage)
+    if (refine_damage && score_params.d_max > 0.0f && use_em) {
+        dart::ThetaDSuffStats theta_ss;
+
+        // Numerator: weighted damage hits from reads that had any mismatches.
+        // Use gamma_ancient when the damage EM populated it (use_damage path),
+        // otherwise fall back to gamma (total responsibility for best-hit target).
+        for (const auto& s : summaries) {
+            if (!s.has_p_read || s.aa_m_opportunities == 0) continue;
+            const auto& er = em_read_results[s.read_idx];
+            const double g = (er.gamma_ancient > 0.0f)
+                ? static_cast<double>(er.gamma_ancient)
+                : static_cast<double>(er.gamma);
+            if (g <= 0.0) continue;
+            theta_ss.sum_gamma_k += g * static_cast<double>(s.aa_k_hits);
+            ++theta_ss.n_reads;
+        }
+
+        // Denominator: weighted decay over ALL reads, including zero-mismatch
+        // reads that were excluded from summaries.  Skipping these would bias
+        // d_max_hat upward because their decay contributes to the expected
+        // denominator without any matching hits in the numerator.
+        for (uint32_t r = 0; r < n_reads; ++r) {
+            if (per_read_aa_decay[r] <= 0.0f) continue;
+            const auto& er = em_read_results[r];
+            const double g = (er.gamma_ancient > 0.0f)
+                ? static_cast<double>(er.gamma_ancient)
+                : static_cast<double>(er.gamma);
+            if (g <= 0.0) continue;
+            theta_ss.sum_gamma_decay += g * static_cast<double>(per_read_aa_decay[r]);
+        }
+
+        const float d_max_old = score_params.d_max;
+        const float d_max_new = theta_ss.refit(score_params.d_max);
+        score_params.d_max = d_max_new;
+        if (verbose) {
+            std::cerr << "  [refine-damage] d_max: " << d_max_old
+                      << " -> " << d_max_new
+                      << " (n=" << theta_ss.n_reads << " hit-reads, "
+                      << n_reads << " total)\n";
+        }
     }
 
     // Compute length-binned BPA z-scores (two-pass: accumulate then normalize)
