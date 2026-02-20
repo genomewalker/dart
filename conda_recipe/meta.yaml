@@ -6,7 +6,7 @@ package:
 
 source:
   url: https://github.com/genomewalker/dart/archive/refs/tags/v{{ version }}.tar.gz
-  sha256: 0000000000000000000000000000000000000000000000000000000000000000
+  sha256: a793d7ada138f344fafd5ab9a32fab9c3f25e8b5f857e098efb2b71365e9e928
 
 build:
   number: 0
