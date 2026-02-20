@@ -634,7 +634,7 @@ std::vector<std::pair<uint32_t, float>> reassign_reads(
 // For 584M alignments with 10M refs: ~80MB instead of ~18GB
 
 #include "dart/columnar_index.hpp"
-#include <atomic>
+#include <mutex>
 
 namespace {
 
@@ -870,7 +870,8 @@ StreamingEMResult streaming_em(
             log_weights[t] = std::log(std::max(result.weights[t], params.min_weight));
         }
 
-        std::atomic<double> total_ll{0.0};
+        std::mutex ll_mutex;
+        double total_ll = 0.0;
 
         // E-step: process row groups in parallel via parallel_scan
         // parallel_scan already creates OMP parallel region internally,
@@ -914,7 +915,7 @@ StreamingEMResult streaming_em(
                 local_ref_sums, local_ref_sums_ancient
             );
 
-            total_ll.fetch_add(local_ll, std::memory_order_relaxed);
+            { std::lock_guard<std::mutex> lock(ll_mutex); total_ll += local_ll; }
         });
 
         // Merge thread-local accumulators into pre-allocated buffers
@@ -948,7 +949,7 @@ StreamingEMResult streaming_em(
             }
         }
 
-        result.log_likelihood = total_ll.load();
+        result.log_likelihood = total_ll;
         result.iterations = iter + 1;
 
         // Progress callback

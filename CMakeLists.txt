@@ -50,15 +50,14 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -mtune=native -DNDEBUG -ffast-math -funroll-loops")
 set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -Wall -Wextra -Wpedantic")
 
-# Enable AVX2 for SIMD optimizations
-# Note: AVX512 code in simd_utils.hpp requires VBMI which many CPUs don't support
-# AVX2 is more portable and provides sufficient performance
-include(CheckCXXCompilerFlag)
-check_cxx_compiler_flag("-mavx2" COMPILER_SUPPORTS_AVX2)
-
-if(COMPILER_SUPPORTS_AVX2)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx2")
-    add_compile_definitions(USE_AVX2)
+# Enable AVX2 for SIMD optimizations (x86_64 only)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|x86")
+    include(CheckCXXCompilerFlag)
+    check_cxx_compiler_flag("-mavx2" COMPILER_SUPPORTS_AVX2)
+    if(COMPILER_SUPPORTS_AVX2)
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx2")
+        add_compile_definitions(USE_AVX2)
+    endif()
 endif()
 
 # Options
