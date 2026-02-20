@@ -10,6 +10,8 @@ source:
 
 build:
   number: 0
+  run_exports:
+    - {{ pin_subpackage('dart-adna', max_pin='x') }}
 
 requirements:
   build:
@@ -40,7 +42,7 @@ about:
   home: https://github.com/genomewalker/dart
   license: MIT
   license_file: LICENSE
-  summary: DART — Damage-Aware Read Translation for ancient DNA metagenomics
+  summary: DART - Damage-Aware Read Translation for ancient DNA metagenomics
   doc_url: https://github.com/genomewalker/dart/wiki
   dev_url: https://github.com/genomewalker/dart
 
