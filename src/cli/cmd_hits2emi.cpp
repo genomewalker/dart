@@ -1,4 +1,4 @@
-// agp hits2emi: Convert MMseqs2 hits TSV to columnar EM index (.emi)
+// dart hits2emi: Convert MMseqs2 hits TSV to columnar EM index (.emi)
 //
 // DuckDB-style streaming architecture:
 // - Hybrid mode: mmap for small files, streaming for large
@@ -7,9 +7,9 @@
 // - Lossless storage including qaln/taln
 
 #include "subcommand.hpp"
-#include "agp/version.h"
-#include "agp/fast_columnar_writer.hpp"
-#include "agp/log_utils.hpp"
+#include "dart/version.h"
+#include "dart/fast_columnar_writer.hpp"
+#include "dart/log_utils.hpp"
 
 #include <cmath>
 #include <cstdlib>
@@ -26,7 +26,7 @@
 #include <omp.h>
 #endif
 
-namespace agp {
+namespace dart {
 namespace cli {
 
 namespace {
@@ -156,7 +156,7 @@ int cmd_hits2emi(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             verbose = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            std::cout << "Usage: agp hits2emi -i <hits.tsv[.gz]> -o <output.emi> [options]\n\n";
+            std::cout << "Usage: dart hits2emi -i <hits.tsv[.gz]> -o <output.emi> [options]\n\n";
             std::cout << "Convert MMseqs2 hits to columnar EM index (DuckDB-style streaming).\n\n";
             std::cout << "Features:\n";
             std::cout << "  - Hybrid mode for plain files: mmap for small, streaming for large\n";
@@ -182,18 +182,18 @@ int cmd_hits2emi(int argc, char* argv[]) {
             return 0;
         } else if (argv[i][0] == '-') {
             std::cerr << "Unknown option: " << argv[i] << "\n";
-            std::cerr << "Run 'agp hits2emi --help' for usage.\n";
+            std::cerr << "Run 'dart hits2emi --help' for usage.\n";
             return 1;
         } else {
             std::cerr << "Unexpected positional argument: " << argv[i] << "\n";
-            std::cerr << "Run 'agp hits2emi --help' for usage.\n";
+            std::cerr << "Run 'dart hits2emi --help' for usage.\n";
             return 1;
         }
     }
 
     if (tsv_file.empty() || output_file.empty()) {
         std::cerr << "Error: --tsv and --output are required\n";
-        std::cerr << "Run 'agp hits2emi --help' for usage.\n";
+        std::cerr << "Run 'dart hits2emi --help' for usage.\n";
         return 1;
     }
 
@@ -225,7 +225,7 @@ int cmd_hits2emi(int argc, char* argv[]) {
 
         if (verbose) {
             std::cerr << "Written: " << output_file << "\n";
-            std::cerr << "Total time: " << agp::log_utils::format_duration_ms(total_ms) << "\n";
+            std::cerr << "Total time: " << dart::log_utils::format_duration_ms(total_ms) << "\n";
             std::cerr << "Throughput: " << (n_rows * 1000 / (total_ms + 1)) << " rows/sec\n";
         }
     } catch (const std::exception& e) {
@@ -249,4 +249,4 @@ namespace {
 }
 
 }  // namespace cli
-}  // namespace agp
+}  // namespace dart

@@ -1,4 +1,4 @@
-#include "agp/damage_index_reader.hpp"
+#include "dart/damage_index_reader.hpp"
 
 #include <cmath>
 #include <cstring>
@@ -8,7 +8,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-namespace agp {
+namespace dart {
 
 DamageIndexReader::DamageIndexReader(const std::string& path, bool prefetch) {
     // Open file
@@ -143,8 +143,8 @@ const AgdRecord* DamageIndexReader::find(std::string_view read_id) const {
         return nullptr;
     }
 
-    // Strip AGP suffix and compute hash
-    std::string_view base_id = strip_agp_suffix(read_id);
+    // Strip DART suffix and compute hash
+    std::string_view base_id = strip_dart_suffix(read_id);
     uint64_t hash = fnv1a_hash(base_id);
     uint64_t bucket_idx = hash % header_->num_buckets;
 
@@ -343,4 +343,4 @@ SynonymousDamageResult detect_synonymous_damage(
     return result;
 }
 
-}  // namespace agp
+}  // namespace dart

@@ -8,7 +8,7 @@ computes FDR using target-decoy, and generates calibration header.
 Usage:
     python build_calibration_table.py \
         --results-dir /projects/caeg/scratch/kbd606/agp/calibration \
-        --output-header include/agp/score_calibration_protein.hpp
+        --output-header include/dart/score_calibration_protein.hpp
 """
 
 import argparse
@@ -213,7 +213,7 @@ def generate_header(calibration: np.ndarray,
 #include <cmath>
 #include <algorithm>
 
-namespace agp {
+namespace dart {
 
 """)
 
@@ -283,7 +283,7 @@ inline float calibrate_posterior(float p_max, float length, float damage_pct) {
     return CALIB_TABLE[s_bin][l_bin][d_bin];
 }
 
-} // namespace agp
+} // namespace dart
 """)
 
     print(f"Generated header: {output_path}")

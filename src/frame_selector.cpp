@@ -13,17 +13,17 @@
  * - Damage correction (MAP codon differs from observed when damage likely)
  */
 
-#include "agp/frame_selector.hpp"
-#include "agp/unified_codon_scorer.hpp"
-#include "agp/codon_tables.hpp"
-#include "agp/hexamer_tables.hpp"
-#include "agp/damage_aa_table.hpp"
-#include "agp/damage_model.hpp"
-#include "agp/damage_context_tables.hpp"
+#include "dart/frame_selector.hpp"
+#include "dart/unified_codon_scorer.hpp"
+#include "dart/codon_tables.hpp"
+#include "dart/hexamer_tables.hpp"
+#include "dart/damage_aa_table.hpp"
+#include "dart/damage_model.hpp"
+#include "dart/damage_context_tables.hpp"
 #include <cmath>
 #include <algorithm>
 
-namespace agp {
+namespace dart {
 
 // Convert codon scorer result to FrameScore
 static FrameScore codon_to_frame_score(const codon::FrameStrandResult& cr) {
@@ -638,7 +638,7 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
     // AA-level correction (guessing Q, R, W) was disabled due to ~2% precision.
     // Instead: X-mask damage-convertible stops in search_protein (MMseqs2-safe),
     // keep '*' in protein (truthful). This prevents ORF truncation at damage stops
-    // without making false AA claims. Post-mapping annotation (agp damage-annotate)
+    // without making false AA claims. Post-mapping annotation (dart damage-annotate)
     // achieves ~90% precision using reference proteins.
     // Use d_max_combined which respects Channel A/B arbitration
     const float d_max = sample_profile.d_max_combined > 0.0f
@@ -1489,4 +1489,4 @@ FrameSelector::FrameshiftResult FrameSelector::detect_frameshifts(
     return result;
 }
 
-}  // namespace agp
+}  // namespace dart

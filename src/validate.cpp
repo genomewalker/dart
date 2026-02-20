@@ -1,7 +1,7 @@
 /**
- * Unified AGP Validator
+ * Unified DART Validator
  *
- * Evaluates AGP predictions against aMGSIM ground truth with proper handling of:
+ * Evaluates DART predictions against aMGSIM ground truth with proper handling of:
  * 1. Frame selection accuracy (using in-frame nucleotide sequence matching)
  * 2. Strand prediction accuracy (accounting for read vs gene strand)
  * 3. Sequence identity (using local alignment for partial overlaps)
@@ -15,11 +15,11 @@
  * - True protein: intersect_seq_inframe_aa (undamaged translation)
  */
 
-#ifndef AGP_STANDALONE_VALIDATE
+#ifndef DART_STANDALONE_VALIDATE
 #include "cli/subcommand.hpp"
 #endif
-#include "agp/codon_tables.hpp"
-#include "agp/log_utils.hpp"
+#include "dart/codon_tables.hpp"
+#include "dart/log_utils.hpp"
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -57,9 +57,9 @@ struct GroundTruth {
     char strand_read = '+';   // Strand the read was sequenced from
     char strand_gene = '+';   // Strand the gene is on
 
-    // Computed ground truth for AGP
+    // Computed ground truth for DART
     int true_frame = 0;       // (read_start - gene_start) % 3
-    bool true_forward = true; // Should AGP predict forward strand?
+    bool true_forward = true; // Should DART predict forward strand?
 
     // Sequences
     std::string true_protein;     // intersect_seq_inframe_aa (undamaged)
@@ -74,7 +74,7 @@ struct GroundTruth {
     bool damage_at_3prime = false;
 };
 
-// AGP prediction for a single read
+// DART prediction for a single read
 struct Prediction {
     std::string read_id;
     char strand = '+';        // Predicted strand
@@ -237,7 +237,7 @@ int determine_true_frame(const std::string& damaged_seq,
     if (damaged_seq.empty() || inframe_nt.empty()) return -1;
 
     // Get the sequence to search in (forward or reverse complement)
-    std::string seq = same_strand ? damaged_seq : agp::reverse_complement(damaged_seq);
+    std::string seq = same_strand ? damaged_seq : dart::reverse_complement(damaged_seq);
 
     // Convert to uppercase for comparison
     std::string seq_upper, inframe_upper;
@@ -363,8 +363,8 @@ std::unordered_map<std::string, GroundTruth> load_ground_truth(const std::string
             gt.damaged_seq_inframe_nt = fields[col_damaged_seq_inframe_nt];
 
         // Compute TRUE STRAND prediction
-        // If read strand matches gene strand: AGP should predict FORWARD (use sequence as-is)
-        // If read strand differs from gene strand: AGP should predict REVERSE (use RC)
+        // If read strand matches gene strand: DART should predict FORWARD (use sequence as-is)
+        // If read strand differs from gene strand: DART should predict REVERSE (use RC)
         gt.true_forward = (gt.strand_read == gt.strand_gene);
 
         // Compute TRUE FRAME using in-frame nucleotide sequence matching
@@ -394,7 +394,7 @@ std::unordered_map<std::string, GroundTruth> load_ground_truth(const std::string
 
         // Check for terminal damage using rolling window approach
         // Find maximum damage density in any 3bp window within first/last 10bp
-        // This matches AGP's detection approach
+        // This matches DART's detection approach
         constexpr int WINDOW_SIZE = 3;
         constexpr int SEARCH_DEPTH = 10;
 
@@ -449,7 +449,7 @@ std::unordered_map<std::string, GroundTruth> load_ground_truth(const std::string
     return gt_map;
 }
 
-// Parse a GFF line and return a Prediction (supports both AGP and FGS formats)
+// Parse a GFF line and return a Prediction (supports both DART and FGS formats)
 Prediction parse_gff_line(const std::string& seqid, const std::string& source,
                           const std::string& start_s, const std::string& end_s,
                           const std::string& score_s, const std::string& strand_s,
@@ -461,7 +461,7 @@ Prediction parse_gff_line(const std::string& seqid, const std::string& source,
     // Parse score from GFF column 6
     parse_float_strict(score_s, pred.score);
 
-    // Detect format: FGS uses "FGS" as source, AGP uses "AGP"
+    // Detect format: FGS uses "FGS" as source, DART uses "DART"
     bool is_fgs = (source == "FGS" || source == "FragGeneScan" || source == "FragGeneScanRs");
 
     if (is_fgs) {
@@ -475,7 +475,7 @@ Prediction parse_gff_line(const std::string& seqid, const std::string& source,
         // FGS doesn't have damage_signal
         pred.damage_signal = 0.5f;
     } else {
-        // AGP format: parse frame= attribute
+        // DART format: parse frame= attribute
         size_t pos;
         if ((pos = attrs.find("frame=")) != std::string::npos) {
             size_t end = attrs.find(';', pos + 6);
@@ -506,7 +506,7 @@ Prediction parse_gff_line(const std::string& seqid, const std::string& source,
     return pred;
 }
 
-// Load predictions from GFF file (supports both AGP and FGS formats)
+// Load predictions from GFF file (supports both DART and FGS formats)
 std::unordered_map<std::string, std::vector<Prediction>> load_predictions_gff(const std::string& path) {
     std::unordered_map<std::string, std::vector<Prediction>> pred_map;
 
@@ -598,7 +598,7 @@ std::tuple<std::string, char, int, int> parse_fgs_header(const std::string& head
     return {id, strand, start, end};
 }
 
-// Load protein sequences from FASTA (supports both AGP and FGS formats)
+// Load protein sequences from FASTA (supports both DART and FGS formats)
 std::unordered_map<std::string, std::vector<std::pair<char, std::string>>> load_proteins(const std::string& path) {
     std::unordered_map<std::string, std::vector<std::pair<char, std::string>>> prot_map;
 
@@ -624,25 +624,25 @@ std::unordered_map<std::string, std::vector<std::pair<char, std::string>>> load_
             std::string header = line.substr(1);
 
             // Detect format:
-            // - AGP new: READ_NAME_+_N or READ_NAME_-_N (strand embedded in ID)
-            // - AGP old: protein_N READ_ID_gene_N STRAND ...
+            // - DART new: READ_NAME_+_N or READ_NAME_-_N (strand embedded in ID)
+            // - DART old: protein_N READ_ID_gene_N STRAND ...
             // - FGS: READ_ID_START_END_STRAND
 
             // First extract the sequence ID (everything before space)
             size_t space_pos = header.find(' ');
             std::string seq_id = (space_pos != std::string::npos) ? header.substr(0, space_pos) : header;
 
-            // Check for AGP new format: ends with _+_N or _-_N
+            // Check for DART new format: ends with _+_N or _-_N
             size_t plus_pos = seq_id.rfind("_+_");
             size_t minus_pos = seq_id.rfind("_-_");
 
             if (plus_pos != std::string::npos || minus_pos != std::string::npos) {
-                // AGP new format: READ_NAME_+_N or READ_NAME_-_N
+                // DART new format: READ_NAME_+_N or READ_NAME_-_N
                 size_t strand_pos = (plus_pos != std::string::npos) ? plus_pos : minus_pos;
                 current_id = seq_id.substr(0, strand_pos);
                 current_strand = (plus_pos != std::string::npos) ? '+' : '-';
             } else if (header.substr(0, 8) == "protein_" || header.substr(0, 10) == "corrected_") {
-                // AGP old format: >protein_N READ_ID_gene_N STRAND ...
+                // DART old format: >protein_N READ_ID_gene_N STRAND ...
                 std::istringstream iss(header);
                 std::string protein_name, read_id_gene, strand_s;
                 iss >> protein_name >> read_id_gene >> strand_s;
@@ -729,7 +729,7 @@ double calculate_auc(std::vector<std::pair<float, bool>>& scores) {
 void print_report(const Metrics& m) {
     std::cout << "\n";
     std::cout << "╔══════════════════════════════════════════════════════════════════════╗\n";
-    std::cout << "║              AGP UNIFIED VALIDATION REPORT                           ║\n";
+    std::cout << "║              DART UNIFIED VALIDATION REPORT                           ║\n";
     std::cout << "╚══════════════════════════════════════════════════════════════════════╝\n\n";
 
     // Dataset summary
@@ -972,16 +972,16 @@ void print_report(const Metrics& m) {
 }
 
 static void validate_print_usage(const char* prog) {
-    std::cout << "AGP Unified Validator\n\n";
+    std::cout << "DART Unified Validator\n\n";
     std::cout << "Usage: " << prog << " <fastq.gz> <aa-damage.tsv.gz> <predictions.gff> [proteins.faa] [corrected.faa] [--csv output.csv]\n\n";
     std::cout << "Arguments:\n";
     std::cout << "  fastq.gz          Input FASTQ file (gzipped)\n";
     std::cout << "  aa-damage.tsv.gz  Ground truth from aMGSIM\n";
-    std::cout << "  predictions.gff   AGP/FGS GFF3 output\n";
+    std::cout << "  predictions.gff   DART/FGS GFF3 output\n";
     std::cout << "  proteins.faa      Protein FASTA (optional, for sequence identity)\n";
     std::cout << "  corrected.faa     Damage-corrected protein FASTA (optional)\n";
     std::cout << "  --csv output.csv  Output per-read details to CSV (optional)\n\n";
-    std::cout << "Supports both AGP and FragGeneScan GFF formats.\n\n";
+    std::cout << "Supports both DART and FragGeneScan GFF formats.\n\n";
     std::cout << "Example:\n";
     std::cout << "  " << prog << " reads.fq.gz ground_truth.tsv.gz agp.gff agp.faa agp_corrected.faa --csv details.csv\n";
 }
@@ -1051,7 +1051,7 @@ static int validate_main(int argc, char* argv[]) {
     }
     const auto load_end = std::chrono::steady_clock::now();
     std::cerr << "  Loading runtime: "
-              << agp::log_utils::format_elapsed(load_start, load_end) << "\n";
+              << dart::log_utils::format_elapsed(load_start, load_end) << "\n";
 
     const auto count_start = std::chrono::steady_clock::now();
     std::cerr << "Counting total reads..." << std::endl;
@@ -1059,7 +1059,7 @@ static int validate_main(int argc, char* argv[]) {
     std::cerr << "  Total reads: " << m.total_reads << "\n";
     const auto count_end = std::chrono::steady_clock::now();
     std::cerr << "  Read counting runtime: "
-              << agp::log_utils::format_elapsed(count_start, count_end) << "\n";
+              << dart::log_utils::format_elapsed(count_start, count_end) << "\n";
 
     // Evaluate predictions
     const auto eval_start = std::chrono::steady_clock::now();
@@ -1292,21 +1292,21 @@ static int validate_main(int argc, char* argv[]) {
     print_report(m);
     const auto eval_end = std::chrono::steady_clock::now();
     std::cerr << "Evaluation runtime: "
-              << agp::log_utils::format_elapsed(eval_start, eval_end) << "\n";
+              << dart::log_utils::format_elapsed(eval_start, eval_end) << "\n";
     std::cerr << "Total runtime: "
-              << agp::log_utils::format_elapsed(run_start, eval_end) << "\n";
+              << dart::log_utils::format_elapsed(run_start, eval_end) << "\n";
 
     return 0;
 }
 
-#ifdef AGP_STANDALONE_VALIDATE
+#ifdef DART_STANDALONE_VALIDATE
 // Standalone mode: provide main() directly
 int main(int argc, char* argv[]) {
     return validate_main(argc, argv);
 }
 #else
 // Subcommand mode: register with dispatcher
-namespace agp {
+namespace dart {
 namespace cli {
 
 int cmd_validate(int argc, char* argv[]) {
@@ -1326,5 +1326,5 @@ namespace {
 }
 
 }  // namespace cli
-}  // namespace agp
+}  // namespace dart
 #endif

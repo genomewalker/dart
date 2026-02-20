@@ -1,5 +1,5 @@
 #!/bin/bash
-# AGP Tutorial: Ancient Gene Prediction + Damage Annotation
+# DART Tutorial: Ancient Gene Prediction + Damage Annotation
 #
 # Dataset: 50,000 synthetic ancient DNA reads from the KapK sediment benchmark
 # (sample KapK-12-1-37, AT-rich community, ~25% 5' C→T damage, ~25% 3' G→A).
@@ -8,7 +8,7 @@
 # (13,681 of 149,276) that are actually matched by these reads.
 #
 # Prerequisites:
-#   - agp built: cmake --build build -j8 && cp build/agp /usr/local/bin/
+#   - agp built: cmake --build build -j8 && cp build/dart /usr/local/bin/
 #   - mmseqs2 installed: conda install -c bioconda mmseqs2 (includes VTML20.out)
 #
 # Runtime: ~5 s (predict) + ~10 s (MMseqs2 against tutorial DB) + <1 s (annotate)
@@ -23,7 +23,7 @@
 
 set -euo pipefail
 
-AGP=${AGP:-agp}
+DART=${DART:-dart}
 MMSEQS=${MMSEQS:-mmseqs}
 DB=${DB:?Please set DB= to a protein FASTA or mmseqs2 database (e.g. DB=./ref_proteins.faa.gz)}
 THREADS=${THREADS:-8}
@@ -33,7 +33,7 @@ OUT_DIR="${1:-$TUTORIAL_DIR/output}"
 
 mkdir -p "$OUT_DIR" "$OUT_DIR/tmp"
 
-echo "=== AGP Tutorial ==="
+echo "=== DART Tutorial ==="
 echo "Reads:     $TUTORIAL_DIR/reads.fq.gz (50,000 reads, KapK-12-1-37)"
 echo "Reference: $DB"
 echo "Output:    $OUT_DIR"
@@ -43,7 +43,7 @@ echo ""
 # Step 1: Predict genes and build damage index
 # ---------------------------------------------------------------------------
 echo "Step 1/4: Gene prediction..."
-"$AGP" predict \
+"$DART" predict \
     -i "$TUTORIAL_DIR/reads.fq.gz" \
     -o "$OUT_DIR/predictions.gff" \
     --fasta-aa "$OUT_DIR/proteins.faa" \
@@ -79,7 +79,7 @@ echo ""
 # Step 3: Build columnar EMI index (required by damage-annotate)
 # ---------------------------------------------------------------------------
 echo "Step 3/4: Building EMI index..."
-"$AGP" hits2emi \
+"$DART" hits2emi \
     -i "$OUT_DIR/hits.tsv" \
     -o "$OUT_DIR/hits.emi" \
     --damage-index "$OUT_DIR/predictions.agd" \
@@ -90,7 +90,7 @@ echo ""
 # Step 4: Damage annotation
 # ---------------------------------------------------------------------------
 echo "Step 4/4: Damage annotation..."
-"$AGP" damage-annotate \
+"$DART" damage-annotate \
     --emi "$OUT_DIR/hits.emi" \
     --damage-index "$OUT_DIR/predictions.agd" \
     -o "$OUT_DIR/annotated.tsv" \

@@ -3,7 +3,7 @@
 // Uses mmap for zero-copy access to alignment records.
 // Kept for legacy standalone EM routines; main workflow is hits2emi -> damage-annotate.
 
-#include "agp/em_index.hpp"
+#include "dart/em_index.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -20,7 +20,7 @@
 #include <omp.h>
 #endif
 
-namespace agp {
+namespace dart {
 
 // ---------------------------------------------------------------------------
 // EMIndexWriter
@@ -424,4 +424,4 @@ EMResult em_solve_indexed(
     return result;
 }
 
-} // namespace agp
+} // namespace dart

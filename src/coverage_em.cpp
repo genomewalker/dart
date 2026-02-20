@@ -4,9 +4,9 @@
 // uniformity reweighting. Proteins with patchy coverage get down-weighted,
 // driving the inner EM toward references with uniform read distribution.
 
-#include "agp/coverage_em.hpp"
-#include "agp/em_reassign.hpp"
-#include "agp/columnar_index.hpp"
+#include "dart/coverage_em.hpp"
+#include "dart/em_reassign.hpp"
+#include "dart/columnar_index.hpp"
 
 #include <algorithm>
 #include <array>
@@ -19,7 +19,7 @@
 #include <omp.h>
 #endif
 
-namespace agp {
+namespace dart {
 
 namespace {
 
@@ -586,4 +586,4 @@ EMState coverage_em_squarem(
     return em_state;
 }
 
-} // namespace agp
+} // namespace dart

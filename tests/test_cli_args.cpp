@@ -31,8 +31,8 @@ private:
 static void expect_parse_exit(int expected_code, ArgvBuilder& builder) {
     bool threw = false;
     try {
-        (void)agp::cli::parse_args(builder.argc(), builder.argv());
-    } catch (const agp::cli::ParseArgsExit& e) {
+        (void)dart::cli::parse_args(builder.argc(), builder.argv());
+    } catch (const dart::cli::ParseArgsExit& e) {
         threw = true;
         assert(e.exit_code() == expected_code);
     }
@@ -43,7 +43,7 @@ void test_basic_args() {
     std::cout << "Testing basic args... ";
     ArgvBuilder builder;
     builder.add("agp").add("-i").add("input.fa").add("-o").add("output.gff");
-    auto opts = agp::cli::parse_args(builder.argc(), builder.argv());
+    auto opts = dart::cli::parse_args(builder.argc(), builder.argv());
     assert(opts.input_file == "input.fa");
     assert(opts.output_file == "output.gff");
     std::cout << "PASSED\n";
@@ -53,7 +53,7 @@ void test_defaults() {
     std::cout << "Testing defaults... ";
     ArgvBuilder builder;
     builder.add("agp").add("-i").add("test.fa");
-    auto opts = agp::cli::parse_args(builder.argc(), builder.argv());
+    auto opts = dart::cli::parse_args(builder.argc(), builder.argv());
     assert(opts.output_file == "predictions.gff");
     assert(opts.min_length == 30);
     assert(opts.num_threads == 0);
@@ -63,7 +63,7 @@ void test_defaults() {
     assert(opts.domain_name == "gtdb");
     assert(opts.orf_min_aa == 10);
     assert(opts.adaptive_orf == false);
-    assert(opts.forced_library_type == agp::cli::LibraryType::UNKNOWN);
+    assert(opts.forced_library_type == dart::cli::LibraryType::UNKNOWN);
     std::cout << "PASSED\n";
 }
 
@@ -77,7 +77,7 @@ void test_boolean_flags() {
            .add("--damage-only")
            .add("--adaptive")
            .add("--verbose");
-    auto opts = agp::cli::parse_args(builder.argc(), builder.argv());
+    auto opts = dart::cli::parse_args(builder.argc(), builder.argv());
     assert(opts.use_damage == false);
     assert(opts.aggregate_damage == false);
     assert(opts.damage_only == true);
@@ -94,7 +94,7 @@ void test_numeric_args() {
            .add("--min-length").add("50")
            .add("--threads").add("8")
            .add("--orf-min-aa").add("20");
-    auto opts = agp::cli::parse_args(builder.argc(), builder.argv());
+    auto opts = dart::cli::parse_args(builder.argc(), builder.argv());
     assert(opts.min_length == 50);
     assert(opts.num_threads == 8);
     assert(opts.orf_min_aa == 20);
@@ -112,7 +112,7 @@ void test_output_options() {
            .add("--fasta-aa-masked").add("out_aa_masked.fa")
            .add("--summary").add("summary.json")
            .add("--damage-index").add("out.agd");
-    auto opts = agp::cli::parse_args(builder.argc(), builder.argv());
+    auto opts = dart::cli::parse_args(builder.argc(), builder.argv());
     assert(opts.fasta_nt == "out_nt.fa");
     assert(opts.fasta_nt_corrected == "out_nt_corr.fa");
     assert(opts.fasta_aa == "out_aa.fa");
@@ -127,20 +127,20 @@ void test_library_type() {
     {
         ArgvBuilder builder;
         builder.add("agp").add("-i").add("test.fa").add("--library-type").add("ds");
-        auto opts = agp::cli::parse_args(builder.argc(), builder.argv());
-        assert(opts.forced_library_type == agp::cli::LibraryType::DOUBLE_STRANDED);
+        auto opts = dart::cli::parse_args(builder.argc(), builder.argv());
+        assert(opts.forced_library_type == dart::cli::LibraryType::DOUBLE_STRANDED);
     }
     {
         ArgvBuilder builder;
         builder.add("agp").add("-i").add("test.fa").add("--library-type").add("ss");
-        auto opts = agp::cli::parse_args(builder.argc(), builder.argv());
-        assert(opts.forced_library_type == agp::cli::LibraryType::SINGLE_STRANDED);
+        auto opts = dart::cli::parse_args(builder.argc(), builder.argv());
+        assert(opts.forced_library_type == dart::cli::LibraryType::SINGLE_STRANDED);
     }
     {
         ArgvBuilder builder;
         builder.add("agp").add("-i").add("test.fa").add("--library-type").add("auto");
-        auto opts = agp::cli::parse_args(builder.argc(), builder.argv());
-        assert(opts.forced_library_type == agp::cli::LibraryType::UNKNOWN);
+        auto opts = dart::cli::parse_args(builder.argc(), builder.argv());
+        assert(opts.forced_library_type == dart::cli::LibraryType::UNKNOWN);
     }
     std::cout << "PASSED\n";
 }

@@ -7,8 +7,8 @@
 // 2. Log-likelihood (should match)
 // 3. Number of iterations (may differ slightly)
 
-#include "agp/columnar_index.hpp"
-#include "agp/em_reassign.hpp"
+#include "dart/columnar_index.hpp"
+#include "dart/em_reassign.hpp"
 
 #include <cmath>
 #include <iostream>
@@ -19,8 +19,8 @@
 #include <chrono>
 
 // Build AlignmentData from ColumnarIndexReader for original EM
-agp::AlignmentData build_from_reader(agp::ColumnarIndexReader& reader) {
-    agp::AlignmentData data;
+dart::AlignmentData build_from_reader(dart::ColumnarIndexReader& reader) {
+    dart::AlignmentData data;
     data.num_reads = reader.num_reads();
     data.num_refs = reader.num_refs();
     data.read_offsets.resize(data.num_reads + 1, 0);
@@ -52,10 +52,10 @@ agp::AlignmentData build_from_reader(agp::ColumnarIndexReader& reader) {
         const uint16_t* /*mismatch*/,
         const uint16_t* /*gapopen*/
     ) {
-        std::vector<agp::Alignment> local_alns;
+        std::vector<dart::Alignment> local_alns;
         local_alns.reserve(num_rows);
         for (uint32_t i = 0; i < num_rows; ++i) {
-            agp::Alignment aln;
+            dart::Alignment aln;
             aln.read_idx = read_idx[i];
             aln.ref_idx = ref_idx[i];
             aln.bit_score = bit_score[i];
@@ -71,7 +71,7 @@ agp::AlignmentData build_from_reader(agp::ColumnarIndexReader& reader) {
 
     // Sort by read_idx for CSR format
     std::sort(data.alignments.begin(), data.alignments.end(),
-        [](const agp::Alignment& a, const agp::Alignment& b) {
+        [](const dart::Alignment& a, const dart::Alignment& b) {
             return a.read_idx < b.read_idx;
         });
 
@@ -95,7 +95,7 @@ int main(int argc, char* argv[]) {
     const char* emi_path = argv[1];
     std::cerr << "Loading EMI: " << emi_path << "\n";
 
-    agp::ColumnarIndexReader reader(emi_path);
+    dart::ColumnarIndexReader reader(emi_path);
     if (!reader.is_valid()) {
         std::cerr << "Error: Cannot open EMI file\n";
         return 1;
@@ -107,7 +107,7 @@ int main(int argc, char* argv[]) {
     std::cerr << "  Row groups: " << reader.num_row_groups() << "\n";
 
     // EM parameters
-    agp::EMParams params;
+    dart::EMParams params;
     params.max_iters = 50;
     params.use_damage = true;
     params.use_squarem = false;  // Disable SQUAREM for fair comparison
@@ -118,7 +118,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "Warning: File too large for original EM comparison (>50M alignments)\n";
         std::cerr << "Running streaming EM only...\n";
 
-        auto result = agp::streaming_em(reader, params, [](const agp::EMIterationDiagnostics& d) {
+        auto result = dart::streaming_em(reader, params, [](const dart::EMIterationDiagnostics& d) {
             std::cerr << "  Iter " << d.iteration << ": LL=" << d.log_likelihood << "\n";
         });
 
@@ -133,7 +133,7 @@ int main(int argc, char* argv[]) {
     // Run streaming EM
     std::cerr << "\n--- Running Streaming EM ---\n";
     auto t0 = std::chrono::high_resolution_clock::now();
-    auto streaming_result = agp::streaming_em(reader, params, [](const agp::EMIterationDiagnostics& d) {
+    auto streaming_result = dart::streaming_em(reader, params, [](const dart::EMIterationDiagnostics& d) {
         if (d.iteration % 10 == 0 || d.iteration < 5) {
             std::cerr << "  Iter " << d.iteration << ": LL=" << d.log_likelihood << "\n";
         }
@@ -149,7 +149,7 @@ int main(int argc, char* argv[]) {
     // Run original EM
     std::cerr << "\n--- Running Original EM ---\n";
     auto t2 = std::chrono::high_resolution_clock::now();
-    auto original_result = agp::em_solve(data, params);
+    auto original_result = dart::em_solve(data, params);
     auto t3 = std::chrono::high_resolution_clock::now();
     double original_ms = std::chrono::duration<double, std::milli>(t3 - t2).count();
 

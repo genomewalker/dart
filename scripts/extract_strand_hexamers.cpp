@@ -305,7 +305,7 @@ int main(int argc, char* argv[]) {
     hdr << "// Forward coding: " << g_total_fwd << " hexamers\n";
     hdr << "// Reverse (RC): " << g_total_rev << " hexamers\n";
     hdr << "#pragma once\n\n";
-    hdr << "namespace agp {\n\n";
+    hdr << "namespace dart {\n\n";
 
     // Forward frequencies
     hdr << "inline constexpr float STRAND_FWD_FREQ[4096] = {\n";
@@ -338,7 +338,7 @@ int main(int argc, char* argv[]) {
     }
     hdr << "};\n\n";
 
-    hdr << "} // namespace agp\n";
+    hdr << "} // namespace dart\n";
     hdr.close();
 
     // Print top discriminative hexamers

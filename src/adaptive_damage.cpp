@@ -3,12 +3,12 @@
  * @brief Implementation of adaptive damage calibration
  */
 
-#include "agp/adaptive_damage.hpp"
-#include "agp/hexamer_tables.hpp"
+#include "dart/adaptive_damage.hpp"
+#include "dart/hexamer_tables.hpp"
 #include <cmath>
 #include <algorithm>
 
-namespace agp {
+namespace dart {
 
 // Check if a codon is a stop codon
 static inline bool is_stop_codon(const char* codon) {
@@ -146,4 +146,4 @@ AdaptiveDamageCalibrator::validate_correction(
     return result;
 }
 
-} // namespace agp
+} // namespace dart

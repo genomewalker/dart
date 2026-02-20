@@ -274,7 +274,7 @@ def extract_strand_features(seq):
 
     # Add some additional comparative features
 
-    # Hexamer log-likelihood difference (similar to current AGP approach)
+    # Hexamer log-likelihood difference (similar to current DART approach)
     best_fwd_hex = max(compute_hexamer_score(seq, f) for f in range(3))
     best_rc_hex = max(compute_hexamer_score(rc, f) for f in range(3))
     features.append(best_fwd_hex - best_rc_hex)
@@ -405,7 +405,7 @@ def export_mlp_to_cpp(model, scaler, output_path, n_features):
         f.write("#include <cmath>\n")
         f.write("#include <algorithm>\n")
         f.write("#include <string>\n\n")
-        f.write("namespace agp {\n")
+        f.write("namespace dart {\n")
         f.write("namespace strand_nn {\n\n")
 
         f.write(f"constexpr int INPUT_SIZE = {input_size};\n")
@@ -743,7 +743,7 @@ def export_mlp_to_cpp(model, scaler, output_path, n_features):
         f.write("}\n\n")
 
         f.write("} // namespace strand_nn\n")
-        f.write("} // namespace agp\n")
+        f.write("} // namespace dart\n")
 
     print(f"Exported to {output_path}", file=sys.stderr)
 

@@ -1,0 +1,25 @@
+{
+  "domain": "gtdb",
+  "generated": "2025-12-10",
+  "source_directories": [
+    "/projects/caeg/scratch/kbd606/agp/databases/protein_fna_reps/bacteria",
+    "/projects/caeg/scratch/kbd606/agp/databases/protein_fna_reps/archaea"
+  ],
+  "files_processed": 143614,
+  "total_sequences": 436045632,
+  "valid_cds": 405428303,
+  "hexamer_counts": {
+    "overall": 130166826684,
+    "start": 3648506280,
+    "internal": 121654064890,
+    "end": 3648127631,
+    "sense": 130166826684,
+    "antisense": 130166826684
+  },
+  "output_files": [
+    "gtdb_hexamer_table.hpp",
+    "gtdb_positional_hexamer.hpp",
+    "gtdb_damage_likelihood.hpp",
+    "gtdb_strand_hexamer.hpp"
+  ]
+}

@@ -1,4 +1,4 @@
-#include "agp/damage_index.hpp"
+#include "dart/damage_index.hpp"
 
 #include <algorithm>
 #include <array>
@@ -74,12 +74,12 @@ static bool run_command_capture(const std::string& cmd, std::string& out, std::s
     return true;
 }
 
-static bool convert_hits_to_emi(const std::string& agp_bin,
+static bool convert_hits_to_emi(const std::string& dart_bin,
                                 const std::string& hits_path,
                                 const std::string& emi_path,
                                 std::string& err) {
     std::string out;
-    std::string cmd = shell_quote(agp_bin) + " hits2emi -i " + shell_quote(hits_path) +
+    std::string cmd = shell_quote(dart_bin) + " hits2emi -i " + shell_quote(hits_path) +
                       " -o " + shell_quote(emi_path) + " --threads 2";
     return run_command_capture(cmd, out, err);
 }
@@ -149,9 +149,9 @@ static bool write_single_record_agd(
     const std::string& read_id_with_suffix,
     float p_read,
     std::string& err) {
-    agp::AgdHeader header{};
-    header.magic = agp::AGD_MAGIC;
-    header.version = agp::AGD_VERSION;
+    dart::AgdHeader header{};
+    header.magic = dart::AGD_MAGIC;
+    header.version = dart::AGD_VERSION;
     header.num_records = 1;
     header.num_buckets = 8;
     header.d_max = 0.30f;
@@ -163,15 +163,15 @@ static bool write_single_record_agd(
     header.stop_decay_llr = 1000.0f;
     header.terminal_shift = 0.05f;
 
-    std::vector<agp::AgdBucket> buckets(header.num_buckets);
+    std::vector<dart::AgdBucket> buckets(header.num_buckets);
     for (auto& b : buckets) b.record_offset = 0xFFFFFFFFu;
 
-    agp::AgdRecord rec{};
-    rec.id_hash = agp::fnv1a_hash(agp::strip_agp_suffix(read_id_with_suffix));
+    dart::AgdRecord rec{};
+    rec.id_hash = dart::fnv1a_hash(dart::strip_dart_suffix(read_id_with_suffix));
     rec.seq_len = 120;
-    rec.frame_strand = agp::encode_frame_strand(0, false);
-    rec.damage_pct_q = agp::quantize_damage_pct(10.0f);
-    rec.p_damaged_q = agp::quantize_probability(p_read);
+    rec.frame_strand = dart::encode_frame_strand(0, false);
+    rec.damage_pct_q = dart::quantize_damage_pct(10.0f);
+    rec.p_damaged_q = dart::quantize_probability(p_read);
     rec.n_5prime = 0;
     rec.n_3prime = 0;
     std::memset(rec.codons_5prime, 255, sizeof(rec.codons_5prime));
@@ -189,7 +189,7 @@ static bool write_single_record_agd(
     }
     out.write(reinterpret_cast<const char*>(&header), sizeof(header));
     out.write(reinterpret_cast<const char*>(buckets.data()),
-              static_cast<std::streamsize>(buckets.size() * sizeof(agp::AgdBucket)));
+              static_cast<std::streamsize>(buckets.size() * sizeof(dart::AgdBucket)));
     out.write(reinterpret_cast<const char*>(&rec), sizeof(rec));
     out.write(reinterpret_cast<const char*>(&chain), sizeof(chain));
     if (!out) {
@@ -226,7 +226,7 @@ static bool expect(bool cond, const std::string& msg) {
     return true;
 }
 
-static bool test_em_target_gamma_consistency(const std::string& agp_bin, const std::string& tmpdir) {
+static bool test_em_target_gamma_consistency(const std::string& dart_bin, const std::string& tmpdir) {
     std::cout << "Running EM target/gamma consistency regression...\n";
     std::ostringstream hits;
     hits << "readX_+_0\ttargetA\t0.90\t4\t1\t0\t1\t4\t1\t4\t1e-20\t100\t4\t100\tWCDE\tRCDE\n";
@@ -241,13 +241,13 @@ static bool test_em_target_gamma_consistency(const std::string& agp_bin, const s
         return false;
     }
     const std::string emi_path = tmpdir + "/em_hits.emi2";
-    if (!convert_hits_to_emi(agp_bin, hits_path, emi_path, err)) {
+    if (!convert_hits_to_emi(dart_bin, hits_path, emi_path, err)) {
         std::cerr << err << "\n";
         return false;
     }
 
     std::string out;
-    std::string cmd = shell_quote(agp_bin) + " damage-annotate --emi " + shell_quote(emi_path) + " --em";
+    std::string cmd = shell_quote(dart_bin) + " damage-annotate --emi " + shell_quote(emi_path) + " --em";
     if (!run_command_capture(cmd, out, err)) {
         std::cerr << err << "\n";
         return false;
@@ -274,7 +274,7 @@ static bool test_em_target_gamma_consistency(const std::string& agp_bin, const s
     return true;
 }
 
-static bool test_max_dist_recomputes_metrics(const std::string& agp_bin, const std::string& tmpdir) {
+static bool test_max_dist_recomputes_metrics(const std::string& dart_bin, const std::string& tmpdir) {
     std::cout << "Running --max-dist metric recompute regression...\n";
     const std::string hits_path = tmpdir + "/maxdist_hits.tsv";
     const std::string taln = "AAAAAAAAAARAAAAAAAAA";
@@ -288,19 +288,19 @@ static bool test_max_dist_recomputes_metrics(const std::string& agp_bin, const s
         return false;
     }
     const std::string emi_path = tmpdir + "/maxdist_hits.emi2";
-    if (!convert_hits_to_emi(agp_bin, hits_path, emi_path, err)) {
+    if (!convert_hits_to_emi(dart_bin, hits_path, emi_path, err)) {
         std::cerr << err << "\n";
         return false;
     }
 
     std::string out1, out2;
-    std::string cmd1 = shell_quote(agp_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
+    std::string cmd1 = shell_quote(dart_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
                        " --d-max 0.3 --lambda 0.3";
     if (!run_command_capture(cmd1, out1, err)) {
         std::cerr << err << "\n";
         return false;
     }
-    std::string cmd2 = shell_quote(agp_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
+    std::string cmd2 = shell_quote(dart_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
                        " --d-max 0.3 --lambda 0.3 --max-dist 0";
     if (!run_command_capture(cmd2, out2, err)) {
         std::cerr << err << "\n";
@@ -330,7 +330,7 @@ static bool test_max_dist_recomputes_metrics(const std::string& agp_bin, const s
     return true;
 }
 
-static bool test_threshold_is_damaged(const std::string& agp_bin, const std::string& tmpdir) {
+static bool test_threshold_is_damaged(const std::string& dart_bin, const std::string& tmpdir) {
     std::cout << "Running threshold/is_damaged regression...\n";
     const std::string hits_path = tmpdir + "/threshold_hits.tsv";
     std::ostringstream hits;
@@ -342,7 +342,7 @@ static bool test_threshold_is_damaged(const std::string& agp_bin, const std::str
         return false;
     }
     const std::string emi_path = tmpdir + "/threshold_hits.emi2";
-    if (!convert_hits_to_emi(agp_bin, hits_path, emi_path, err)) {
+    if (!convert_hits_to_emi(dart_bin, hits_path, emi_path, err)) {
         std::cerr << err << "\n";
         return false;
     }
@@ -354,14 +354,14 @@ static bool test_threshold_is_damaged(const std::string& agp_bin, const std::str
     }
 
     std::string out_lo, out_hi;
-    std::string cmd_hi = shell_quote(agp_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
+    std::string cmd_hi = shell_quote(dart_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
                          " --damage-index " + shell_quote(agd_path) +
                          " --d-max 0.3 --no-identity --threshold 1.0";
     if (!run_command_capture(cmd_hi, out_hi, err)) {
         std::cerr << err << "\n";
         return false;
     }
-    std::string cmd_lo = shell_quote(agp_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
+    std::string cmd_lo = shell_quote(dart_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
                          " --damage-index " + shell_quote(agd_path) +
                          " --d-max 0.3 --no-identity --threshold 0.0";
     if (!run_command_capture(cmd_lo, out_lo, err)) {
@@ -391,7 +391,7 @@ static bool test_threshold_is_damaged(const std::string& agp_bin, const std::str
     return true;
 }
 
-static bool test_protein_mapping_filters(const std::string& agp_bin, const std::string& tmpdir) {
+static bool test_protein_mapping_filters(const std::string& dart_bin, const std::string& tmpdir) {
     std::cout << "Running protein mapping filter regression...\n";
     const std::string hits_path = tmpdir + "/mapping_hits.tsv";
     const std::string qaln = "AAAAAAAAAAAAAAAAAAAF";
@@ -413,7 +413,7 @@ static bool test_protein_mapping_filters(const std::string& agp_bin, const std::
         return false;
     }
     const std::string emi_path = tmpdir + "/mapping_hits.emi2";
-    if (!convert_hits_to_emi(agp_bin, hits_path, emi_path, err)) {
+    if (!convert_hits_to_emi(dart_bin, hits_path, emi_path, err)) {
         std::cerr << err << "\n";
         return false;
     }
@@ -423,7 +423,7 @@ static bool test_protein_mapping_filters(const std::string& agp_bin, const std::
     const std::string protein_filtered = tmpdir + "/protein_filtered.tsv";
     const std::string combined_output = tmpdir + "/combined_output.tsv";
     std::string out;
-    std::string cmd = shell_quote(agp_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
+    std::string cmd = shell_quote(dart_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
                       " --gene-summary " + shell_quote(gene_summary) +
                       " --protein-summary " + shell_quote(protein_summary) +
                       " --protein-filtered " + shell_quote(protein_filtered) +
@@ -484,7 +484,7 @@ static bool test_protein_mapping_filters(const std::string& agp_bin, const std::
     return true;
 }
 
-static bool test_blast8_unique_export(const std::string& agp_bin, const std::string& tmpdir) {
+static bool test_blast8_unique_export(const std::string& dart_bin, const std::string& tmpdir) {
     std::cout << "Running BLAST8 unique export regression...\n";
     const std::string hits_path = tmpdir + "/blast8_unique_hits.tsv";
     std::ostringstream hits;
@@ -498,14 +498,14 @@ static bool test_blast8_unique_export(const std::string& agp_bin, const std::str
         return false;
     }
     const std::string emi_path = tmpdir + "/blast8_unique_hits.emi2";
-    if (!convert_hits_to_emi(agp_bin, hits_path, emi_path, err)) {
+    if (!convert_hits_to_emi(dart_bin, hits_path, emi_path, err)) {
         std::cerr << err << "\n";
         return false;
     }
 
     const std::string blast8_unique = tmpdir + "/blast8_unique.tsv";
     std::string out;
-    std::string cmd = shell_quote(agp_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
+    std::string cmd = shell_quote(dart_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
                       " --blast8-unique " + shell_quote(blast8_unique);
     if (!run_command_capture(cmd, out, err)) {
         std::cerr << err << "\n";
@@ -531,7 +531,7 @@ static bool test_blast8_unique_export(const std::string& agp_bin, const std::str
     return true;
 }
 
-static bool test_analysis_prefix_bundle(const std::string& agp_bin, const std::string& tmpdir) {
+static bool test_analysis_prefix_bundle(const std::string& dart_bin, const std::string& tmpdir) {
     std::cout << "Running analysis-prefix bundle regression...\n";
     const std::string hits_path = tmpdir + "/bundle_hits.tsv";
     std::ostringstream hits;
@@ -543,7 +543,7 @@ static bool test_analysis_prefix_bundle(const std::string& agp_bin, const std::s
         return false;
     }
     const std::string emi_path = tmpdir + "/bundle_hits.emi2";
-    if (!convert_hits_to_emi(agp_bin, hits_path, emi_path, err)) {
+    if (!convert_hits_to_emi(dart_bin, hits_path, emi_path, err)) {
         std::cerr << err << "\n";
         return false;
     }
@@ -556,7 +556,7 @@ static bool test_analysis_prefix_bundle(const std::string& agp_bin, const std::s
 
     const std::string prefix = tmpdir + "/bundle";
     std::string out;
-    std::string cmd = shell_quote(agp_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
+    std::string cmd = shell_quote(dart_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
                       " --map " + shell_quote(map_path) +
                       " --analysis-prefix " + shell_quote(prefix) +
                       " --min-reads 1 --min-breadth 0 --min-depth 0";
@@ -583,7 +583,7 @@ static bool test_analysis_prefix_bundle(const std::string& agp_bin, const std::s
     return true;
 }
 
-static bool test_analysis_explicit_named_outputs(const std::string& agp_bin, const std::string& tmpdir) {
+static bool test_analysis_explicit_named_outputs(const std::string& dart_bin, const std::string& tmpdir) {
     std::cout << "Running explicit named analysis outputs regression...\n";
     const std::string hits_path = tmpdir + "/named_hits.tsv";
     std::ostringstream hits;
@@ -594,7 +594,7 @@ static bool test_analysis_explicit_named_outputs(const std::string& agp_bin, con
         return false;
     }
     const std::string emi_path = tmpdir + "/named_hits.emi2";
-    if (!convert_hits_to_emi(agp_bin, hits_path, emi_path, err)) {
+    if (!convert_hits_to_emi(dart_bin, hits_path, emi_path, err)) {
         std::cerr << err << "\n";
         return false;
     }
@@ -609,7 +609,7 @@ static bool test_analysis_explicit_named_outputs(const std::string& agp_bin, con
     const std::string blast8_out = tmpdir + "/my.unique.custom.blast8";
     const std::string categories_out = tmpdir + "/my.categories.custom.tsv";
     std::string out;
-    std::string cmd = shell_quote(agp_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
+    std::string cmd = shell_quote(dart_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
                       " --map " + shell_quote(map_path) +
                       " --analysis-proteins " + shell_quote(proteins_out) +
                       " --analysis-blast8 " + shell_quote(blast8_out) +
@@ -637,12 +637,12 @@ static bool test_analysis_explicit_named_outputs(const std::string& agp_bin, con
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <path-to-agp>\n";
+        std::cerr << "Usage: " << argv[0] << " <path-to-dart>\n";
         return 2;
     }
-    const std::string agp_bin = argv[1];
+    const std::string dart_bin = argv[1];
 
-    char tmp_template[] = "/tmp/agp_regress_XXXXXX";
+    char tmp_template[] = "/tmp/dart_regress_XXXXXX";
     char* tmp = mkdtemp(tmp_template);
     if (!tmp) {
         std::cerr << "Failed to create temp dir\n";
@@ -651,13 +651,13 @@ int main(int argc, char* argv[]) {
     const std::string tmpdir = tmp;
 
     bool ok = true;
-    ok = test_em_target_gamma_consistency(agp_bin, tmpdir) && ok;
-    ok = test_max_dist_recomputes_metrics(agp_bin, tmpdir) && ok;
-    ok = test_threshold_is_damaged(agp_bin, tmpdir) && ok;
-    ok = test_protein_mapping_filters(agp_bin, tmpdir) && ok;
-    ok = test_blast8_unique_export(agp_bin, tmpdir) && ok;
-    ok = test_analysis_prefix_bundle(agp_bin, tmpdir) && ok;
-    ok = test_analysis_explicit_named_outputs(agp_bin, tmpdir) && ok;
+    ok = test_em_target_gamma_consistency(dart_bin, tmpdir) && ok;
+    ok = test_max_dist_recomputes_metrics(dart_bin, tmpdir) && ok;
+    ok = test_threshold_is_damaged(dart_bin, tmpdir) && ok;
+    ok = test_protein_mapping_filters(dart_bin, tmpdir) && ok;
+    ok = test_blast8_unique_export(dart_bin, tmpdir) && ok;
+    ok = test_analysis_prefix_bundle(dart_bin, tmpdir) && ok;
+    ok = test_analysis_explicit_named_outputs(dart_bin, tmpdir) && ok;
 
     if (!ok) return 1;
     std::cout << "All damage-annotate regressions passed.\n";

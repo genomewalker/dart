@@ -1,0 +1,24 @@
+{
+  "domain": "vertebrate_other",
+  "generated": "2025-12-10",
+  "source_directories": [
+    "/projects/caeg/scratch/kbd606/agp/databases/refseq_cds/vertebrate_other/cds"
+  ],
+  "files_processed": 504,
+  "total_sequences": 21598304,
+  "valid_cds": 21256832,
+  "hexamer_counts": {
+    "overall": 15100009539,
+    "start": 191303263,
+    "internal": 14653636231,
+    "end": 191302127,
+    "sense": 15100009539,
+    "antisense": 15100009539
+  },
+  "output_files": [
+    "vertebrate_other_hexamer_table.hpp",
+    "vertebrate_other_positional_hexamer.hpp",
+    "vertebrate_other_damage_likelihood.hpp",
+    "vertebrate_other_strand_hexamer.hpp"
+  ]
+}

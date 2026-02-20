@@ -1,4 +1,4 @@
-name: agp
+name: dart
 channels:
   - conda-forge
   - bioconda

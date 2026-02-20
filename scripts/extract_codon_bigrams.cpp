@@ -306,7 +306,7 @@ void output_codon_bigram_table(const std::string& prefix, const std::string& dom
     out << "// Auto-generated codon bigram LLR for domain: " << domain << "\n";
     out << "// Total codons: " << g_total_codons << ", bigrams: " << g_total_bigrams << "\n\n";
     out << "#include <array>\n\n";
-    out << "namespace agp {\n";
+    out << "namespace dart {\n";
     out << "namespace codon_bigram {\n\n";
 
     out << "inline constexpr std::array<std::array<float, 64>, 64> " << domain_upper << "_BIGRAM_LLR = {{\n";
@@ -343,7 +343,7 @@ void output_codon_bigram_table(const std::string& prefix, const std::string& dom
 
     out << "}};\n\n";
     out << "} // namespace codon_bigram\n";
-    out << "} // namespace agp\n";
+    out << "} // namespace dart\n";
 
     std::cerr << "Wrote " << filename << "\n";
 }
@@ -359,7 +359,7 @@ void output_dipeptide_table(const std::string& prefix, const std::string& domain
     out << "// Auto-generated dipeptide LLR for domain: " << domain << "\n";
     out << "// Total AA: " << g_total_aa << ", dipeptides: " << g_total_dipeptides << "\n\n";
     out << "#include <array>\n\n";
-    out << "namespace agp {\n";
+    out << "namespace dart {\n";
     out << "namespace dipeptide {\n\n";
 
     // AA order reference
@@ -406,7 +406,7 @@ void output_dipeptide_table(const std::string& prefix, const std::string& domain
 
     out << "}};\n\n";
     out << "} // namespace dipeptide\n";
-    out << "} // namespace agp\n";
+    out << "} // namespace dart\n";
 
     std::cerr << "Wrote " << filename << "\n";
 }

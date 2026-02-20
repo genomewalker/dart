@@ -1,15 +1,15 @@
 #include "cli/args.hpp"
 #include "cli/subcommand.hpp"
-#include "agp/damage_model.hpp"
-#include "agp/adaptive_damage.hpp"
-#include "agp/sequence_io.hpp"
-#include "agp/frame_selector.hpp"
-#include "agp/hexamer_tables.hpp"
-#include "agp/codon_tables.hpp"
-#include "agp/unified_codon_scorer.hpp"
-#include "agp/damage_index_writer.hpp"
-#include "agp/log_utils.hpp"
-#include "agp/version.h"
+#include "dart/damage_model.hpp"
+#include "dart/adaptive_damage.hpp"
+#include "dart/sequence_io.hpp"
+#include "dart/frame_selector.hpp"
+#include "dart/hexamer_tables.hpp"
+#include "dart/codon_tables.hpp"
+#include "dart/unified_codon_scorer.hpp"
+#include "dart/damage_index_writer.hpp"
+#include "dart/log_utils.hpp"
+#include "dart/version.h"
 #include <iostream>
 #include <fstream>
 #include <chrono>
@@ -24,27 +24,27 @@
 #include <omp.h>
 #endif
 
-using Options = agp::cli::Options;
+using Options = dart::cli::Options;
 
 // Convert CLI library type to SampleDamageProfile library type
-inline agp::SampleDamageProfile::LibraryType to_sample_library_type(agp::cli::LibraryType lt) {
+inline dart::SampleDamageProfile::LibraryType to_sample_library_type(dart::cli::LibraryType lt) {
     switch (lt) {
-        case agp::cli::LibraryType::DOUBLE_STRANDED:
-            return agp::SampleDamageProfile::LibraryType::DOUBLE_STRANDED;
-        case agp::cli::LibraryType::SINGLE_STRANDED:
-            return agp::SampleDamageProfile::LibraryType::SINGLE_STRANDED;
+        case dart::cli::LibraryType::DOUBLE_STRANDED:
+            return dart::SampleDamageProfile::LibraryType::DOUBLE_STRANDED;
+        case dart::cli::LibraryType::SINGLE_STRANDED:
+            return dart::SampleDamageProfile::LibraryType::SINGLE_STRANDED;
         default:
-            return agp::SampleDamageProfile::LibraryType::UNKNOWN;
+            return dart::SampleDamageProfile::LibraryType::UNKNOWN;
     }
 }
 
-namespace agp {
+namespace dart {
 namespace cli {
 
 int cmd_predict(int argc, char* argv[]) {
     try {
         auto run_start = std::chrono::steady_clock::now();
-        Options opts = agp::cli::parse_args(argc, argv);
+        Options opts = dart::cli::parse_args(argc, argv);
 
         // Set up threading
         int num_threads = opts.num_threads;
@@ -60,14 +60,14 @@ int cmd_predict(int argc, char* argv[]) {
         bool is_tty = isatty(fileno(stderr));
 
         // Set active domain for hexamer scoring
-        agp::Domain active_domain = agp::parse_domain(opts.domain_name);
-        agp::set_active_domain(active_domain);
+        dart::Domain active_domain = dart::parse_domain(opts.domain_name);
+        dart::set_active_domain(active_domain);
 
         // Header
-        std::cerr << "Ancient Gene Predictor v" << AGP_VERSION << "\n";
+        std::cerr << "DART v" << DART_VERSION << "\n";
         std::cerr << "Input: " << opts.input_file << "\n";
         std::cerr << "Output: " << opts.output_file << "\n";
-        std::cerr << "Domain: " << agp::domain_name(active_domain) << "\n";
+        std::cerr << "Domain: " << dart::domain_name(active_domain) << "\n";
         std::cerr << "Threads: " << num_threads << "\n";
 
         if (opts.verbose) {
@@ -79,48 +79,48 @@ int cmd_predict(int argc, char* argv[]) {
         std::cerr << "\n";
 
         // Initialize damage model
-        agp::DamageModel damage_model;
+        dart::DamageModel damage_model;
 
         // Open output files
-        agp::GeneWriter writer(opts.output_file);
-        std::unique_ptr<agp::FastaWriter> fasta_nt_writer;
-        std::unique_ptr<agp::FastaWriter> fasta_nt_corr_writer;
-        std::unique_ptr<agp::FastaWriter> fasta_aa_writer;
-        std::unique_ptr<agp::FastaWriter> fasta_aa_masked_writer;
+        dart::GeneWriter writer(opts.output_file);
+        std::unique_ptr<dart::FastaWriter> fasta_nt_writer;
+        std::unique_ptr<dart::FastaWriter> fasta_nt_corr_writer;
+        std::unique_ptr<dart::FastaWriter> fasta_aa_writer;
+        std::unique_ptr<dart::FastaWriter> fasta_aa_masked_writer;
 
         if (!opts.fasta_nt.empty()) {
-            fasta_nt_writer = std::make_unique<agp::FastaWriter>(opts.fasta_nt);
+            fasta_nt_writer = std::make_unique<dart::FastaWriter>(opts.fasta_nt);
         }
         if (!opts.fasta_nt_corrected.empty()) {
-            fasta_nt_corr_writer = std::make_unique<agp::FastaWriter>(opts.fasta_nt_corrected);
+            fasta_nt_corr_writer = std::make_unique<dart::FastaWriter>(opts.fasta_nt_corrected);
         }
         if (!opts.fasta_aa.empty()) {
-            fasta_aa_writer = std::make_unique<agp::FastaWriter>(opts.fasta_aa);
+            fasta_aa_writer = std::make_unique<dart::FastaWriter>(opts.fasta_aa);
         }
         if (!opts.fasta_aa_masked.empty()) {
-            fasta_aa_masked_writer = std::make_unique<agp::FastaWriter>(opts.fasta_aa_masked);
+            fasta_aa_masked_writer = std::make_unique<dart::FastaWriter>(opts.fasta_aa_masked);
         }
 
         // Sample-level damage profile
-        agp::SampleDamageProfile sample_profile;
+        dart::SampleDamageProfile sample_profile;
         sample_profile.forced_library_type = to_sample_library_type(opts.forced_library_type);
 
         // Adaptive damage calibrator
-        agp::AdaptiveDamageCalibrator calibrator;
+        dart::AdaptiveDamageCalibrator calibrator;
 
         // Pass 1: Damage detection
         if (opts.aggregate_damage && opts.use_damage) {
             auto pass1_start = std::chrono::high_resolution_clock::now();
             std::cerr << "[Pass 1] Scanning for damage patterns...\n";
 
-            agp::SequenceReader first_pass(opts.input_file);
+            dart::SequenceReader first_pass(opts.input_file);
             const size_t BATCH_SIZE = 50000;
-            std::vector<agp::SequenceRecord> batch;
+            std::vector<dart::SequenceRecord> batch;
             batch.reserve(BATCH_SIZE);
             size_t count = 0;
 
             // Thread-local profiles
-            std::vector<agp::SampleDamageProfile> thread_profiles(num_threads);
+            std::vector<dart::SampleDamageProfile> thread_profiles(num_threads);
             for (auto& tp : thread_profiles) {
                 tp.forced_library_type = to_sample_library_type(opts.forced_library_type);
             }
@@ -132,7 +132,7 @@ int cmd_predict(int argc, char* argv[]) {
 
             while (true) {
                 batch.clear();
-                agp::SequenceRecord record;
+                dart::SequenceRecord record;
                 while (batch.size() < BATCH_SIZE && first_pass.read_next(record)) {
                     batch.push_back(std::move(record));
                 }
@@ -144,9 +144,9 @@ int cmd_predict(int argc, char* argv[]) {
                     #ifdef _OPENMP
                     tid = omp_get_thread_num();
                     #endif
-                    std::string seq = agp::SequenceUtils::clean(batch[i].sequence);
+                    std::string seq = dart::SequenceUtils::clean(batch[i].sequence);
                     if (seq.length() >= opts.min_length) {
-                        agp::FrameSelector::update_sample_profile(thread_profiles[tid], seq);
+                        dart::FrameSelector::update_sample_profile(thread_profiles[tid], seq);
 
                         if (seq.length() >= 60 && seq.length() <= 200) {
                             size_t slot = em_training_count.fetch_add(1, std::memory_order_relaxed);
@@ -165,13 +165,13 @@ int cmd_predict(int argc, char* argv[]) {
 
             // Merge thread profiles
             for (int t = 0; t < num_threads; ++t) {
-                agp::FrameSelector::merge_sample_profiles(sample_profile, thread_profiles[t]);
+                dart::FrameSelector::merge_sample_profiles(sample_profile, thread_profiles[t]);
             }
 
             size_t kept_training = std::min(em_training_count.load(std::memory_order_relaxed), EM_MAX_SEQS);
             em_training_seqs.resize(kept_training);
 
-            agp::FrameSelector::finalize_sample_profile(sample_profile);
+            dart::FrameSelector::finalize_sample_profile(sample_profile);
 
             // =========================================================================
             // Pass 1.5: Compute d_metamatch for high-damage samples
@@ -194,14 +194,14 @@ int cmd_predict(int argc, char* argv[]) {
                 if (needs_metamatch) {
                     std::cerr << "  Computing d_metamatch (weighted profile)...\n";
 
-                    agp::SequenceReader reader2(opts.input_file);
-                    std::vector<agp::SampleDamageProfile> thread_profiles2(num_threads);
-                    std::vector<agp::SequenceRecord> batch2;
+                    dart::SequenceReader reader2(opts.input_file);
+                    std::vector<dart::SampleDamageProfile> thread_profiles2(num_threads);
+                    std::vector<dart::SequenceRecord> batch2;
                     batch2.reserve(50000);
 
                     while (true) {
                         batch2.clear();
-                        agp::SequenceRecord rec;
+                        dart::SequenceRecord rec;
                         while (batch2.size() < 50000 && reader2.read_next(rec)) {
                             batch2.push_back(std::move(rec));
                         }
@@ -213,22 +213,22 @@ int cmd_predict(int argc, char* argv[]) {
                             #ifdef _OPENMP
                             tid = omp_get_thread_num();
                             #endif
-                            std::string seq = agp::SequenceUtils::clean(batch2[i].sequence);
+                            std::string seq = dart::SequenceUtils::clean(batch2[i].sequence);
                             if (seq.length() >= 30) {
-                                float p_damaged = agp::FrameSelector::compute_per_read_damage_prior(seq, sample_profile);
+                                float p_damaged = dart::FrameSelector::compute_per_read_damage_prior(seq, sample_profile);
                                 if (p_damaged > 0.01f) {
-                                    agp::FrameSelector::update_sample_profile_weighted(
+                                    dart::FrameSelector::update_sample_profile_weighted(
                                         thread_profiles2[tid], seq, p_damaged);
                                 }
                             }
                         }
                     }
 
-                    agp::SampleDamageProfile weighted_profile;
+                    dart::SampleDamageProfile weighted_profile;
                     for (int t = 0; t < num_threads; ++t) {
-                        agp::FrameSelector::merge_sample_profiles(weighted_profile, thread_profiles2[t]);
+                        dart::FrameSelector::merge_sample_profiles(weighted_profile, thread_profiles2[t]);
                     }
-                    agp::FrameSelector::finalize_sample_profile(weighted_profile);
+                    dart::FrameSelector::finalize_sample_profile(weighted_profile);
 
                     // Update d_max_combined with d_metamatch for prediction
                     float d_metamatch = weighted_profile.d_max_combined;
@@ -242,12 +242,12 @@ int cmd_predict(int argc, char* argv[]) {
 
             // Train periodic model
             if (!em_training_seqs.empty()) {
-                agp::codon::DamageParams em_dmg;
+                dart::codon::DamageParams em_dmg;
                 em_dmg.d_max_5p = sample_profile.max_damage_5prime;
                 em_dmg.d_max_3p = sample_profile.max_damage_3prime;
                 em_dmg.lambda_5p = sample_profile.lambda_5prime;
                 em_dmg.lambda_3p = sample_profile.lambda_3prime;
-                agp::codon::train_periodic_model(em_training_seqs, em_dmg, 3);
+                dart::codon::train_periodic_model(em_training_seqs, em_dmg, 3);
             }
 
             auto pass1_end = std::chrono::high_resolution_clock::now();
@@ -257,7 +257,7 @@ int cmd_predict(int argc, char* argv[]) {
                      << " | 5' damage: " << std::fixed << std::setprecision(1)
                      << sample_profile.max_damage_5prime * 100.0f << "%"
                      << " | 3' damage: " << sample_profile.max_damage_3prime * 100.0f << "%"
-                     << " | " << agp::log_utils::format_duration_ms(pass1_duration.count()) << "\n\n";
+                     << " | " << dart::log_utils::format_duration_ms(pass1_duration.count()) << "\n\n";
 
             damage_model.update_from_sample_profile(sample_profile);
             calibrator.initialize(sample_profile);
@@ -285,9 +285,9 @@ int cmd_predict(int argc, char* argv[]) {
         std::cerr << "[Pass 2] Gene prediction...\n";
         auto pass2_start = std::chrono::high_resolution_clock::now();
 
-        agp::SequenceReader reader(opts.input_file);
+        dart::SequenceReader reader(opts.input_file);
         const size_t BATCH_SIZE = 10000;
-        std::vector<agp::SequenceRecord> batch;
+        std::vector<dart::SequenceRecord> batch;
         batch.reserve(BATCH_SIZE);
 
         std::atomic<size_t> total_seqs{0};
@@ -295,51 +295,51 @@ int cmd_predict(int argc, char* argv[]) {
         std::mutex write_mutex;
 
         // Optional damage index writer for post-mapping annotation
-        std::unique_ptr<agp::DamageIndexWriter> damage_index_writer;
+        std::unique_ptr<dart::DamageIndexWriter> damage_index_writer;
         if (!opts.damage_index.empty()) {
-            damage_index_writer = std::make_unique<agp::DamageIndexWriter>(
+            damage_index_writer = std::make_unique<dart::DamageIndexWriter>(
                 opts.damage_index, sample_profile);
         }
 
         while (true) {
             batch.clear();
-            agp::SequenceRecord record;
+            dart::SequenceRecord record;
             while (batch.size() < BATCH_SIZE && reader.read_next(record)) {
                 batch.push_back(std::move(record));
             }
             if (batch.empty()) break;
 
             // Process batch - collect results
-            std::vector<std::pair<std::string, std::vector<agp::Gene>>> results(batch.size());
+            std::vector<std::pair<std::string, std::vector<dart::Gene>>> results(batch.size());
 
             #pragma omp parallel for schedule(dynamic, 100)
             for (size_t i = 0; i < batch.size(); ++i) {
-                std::string seq = agp::SequenceUtils::clean(batch[i].sequence);
+                std::string seq = dart::SequenceUtils::clean(batch[i].sequence);
                 if (seq.length() < opts.min_length) continue;
 
                 std::string id = batch[i].id;
-                std::vector<agp::Gene> genes;
+                std::vector<dart::Gene> genes;
 
                 // Compute per-read damage prior BEFORE ORF enumeration
                 // This allows damage-aware scoring during ORF selection
                 float per_read_damage_prior = opts.use_damage
-                    ? agp::FrameSelector::compute_per_read_damage_prior(seq, sample_profile)
+                    ? dart::FrameSelector::compute_per_read_damage_prior(seq, sample_profile)
                     : 0.0f;
 
                 // ORF enumeration with damage-aware scoring
                 // Uses per_read_damage_prior to adjust stop penalties and X-mask thresholds
-                auto orfs = agp::FrameSelector::enumerate_orf_fragments(
+                auto orfs = dart::FrameSelector::enumerate_orf_fragments(
                     seq, sample_profile,
                     opts.orf_min_aa,
                     opts.adaptive_orf,
                     per_read_damage_prior);
 
                 float damage_pct = opts.use_damage
-                    ? agp::FrameSelector::compute_damage_percentage(seq, sample_profile)
+                    ? dart::FrameSelector::compute_damage_percentage(seq, sample_profile)
                     : 0.0f;
 
                 // Refine per-read damage using ORF-specific evidence (stops, pre-stops)
-                float per_read_damage = agp::FrameSelector::infer_per_read_aa_damage(seq, orfs, sample_profile);
+                float per_read_damage = dart::FrameSelector::infer_per_read_aa_damage(seq, orfs, sample_profile);
 
                 // Pre-compute reverse complement once (not per-ORF)
                 std::string rc;
@@ -350,7 +350,7 @@ int cmd_predict(int argc, char* argv[]) {
                     size_t effective_length = std::max(orf.protein.length(), orf.search_protein.length());
                     if (effective_length < opts.orf_min_aa) continue;
 
-                    agp::Gene gene;
+                    dart::Gene gene;
                     size_t L = seq.length();
 
                     if (orf.is_forward) {
@@ -360,7 +360,7 @@ int cmd_predict(int argc, char* argv[]) {
                     } else {
                         gene.start = L - orf.nt_end;
                         gene.end = L - orf.nt_start;
-                        if (rc.empty()) rc = agp::reverse_complement(seq);
+                        if (rc.empty()) rc = dart::reverse_complement(seq);
                         gene.sequence = rc.substr(orf.nt_start, orf.nt_end - orf.nt_start);
                     }
 
@@ -441,14 +441,14 @@ int cmd_predict(int argc, char* argv[]) {
 
         std::cerr << "  Sequences: " << total_seqs.load()
                   << " | Genes: " << total_genes.load()
-                  << " | " << agp::log_utils::format_duration_ms(pass2_duration.count())
+                  << " | " << dart::log_utils::format_duration_ms(pass2_duration.count())
                   << " (" << (total_seqs.load() * 1000 / std::max(1LL, (long long)pass2_duration.count())) << " seq/s)\n";
 
         // Write summary if requested
         if (!opts.summary_file.empty()) {
             std::ofstream summary(opts.summary_file);
             summary << "{\n";
-            summary << "  \"version\": \"" << AGP_VERSION << "\",\n";
+            summary << "  \"version\": \"" << DART_VERSION << "\",\n";
             summary << "  \"input\": \"" << opts.input_file << "\",\n";
             summary << "  \"sequences\": " << total_seqs.load() << ",\n";
             summary << "  \"genes\": " << total_genes.load() << ",\n";
@@ -463,15 +463,15 @@ int cmd_predict(int argc, char* argv[]) {
 
         auto run_end = std::chrono::steady_clock::now();
         std::cerr << "\nDone. Total runtime: "
-                  << agp::log_utils::format_elapsed(run_start, run_end) << "\n";
+                  << dart::log_utils::format_elapsed(run_start, run_end) << "\n";
         return 0;
 
-    } catch (const agp::cli::ParseArgsExit& e) {
+    } catch (const dart::cli::ParseArgsExit& e) {
         if (e.exit_code() != 0) {
             if (std::strlen(e.what()) > 0) {
                 std::cerr << e.what() << "\n\n";
             }
-            agp::cli::print_usage(argv[0]);
+            dart::cli::print_usage(argv[0]);
         }
         return e.exit_code();
     } catch (const std::exception& e) {
@@ -481,15 +481,15 @@ int cmd_predict(int argc, char* argv[]) {
 }
 
 }  // namespace cli
-}  // namespace agp
+}  // namespace dart
 
 // Register the predict subcommand
 namespace {
     struct PredictRegistrar {
         PredictRegistrar() {
-            agp::cli::SubcommandRegistry::instance().register_command(
+            dart::cli::SubcommandRegistry::instance().register_command(
                 "predict", "Predict genes from sequencing reads",
-                agp::cli::cmd_predict, 20);
+                dart::cli::cmd_predict, 20);
         }
     } predict_registrar;
 }

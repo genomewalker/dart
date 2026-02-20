@@ -1,9 +1,9 @@
 #include "subcommand.hpp"
-#include "agp/version.h"
+#include "dart/version.h"
 #include <iostream>
 #include <algorithm>
 
-namespace agp {
+namespace dart {
 namespace cli {
 
 SubcommandRegistry& SubcommandRegistry::instance() {
@@ -27,14 +27,14 @@ int SubcommandRegistry::run_command(const std::string& name, int argc, char* arg
     auto it = handlers_.find(name);
     if (it == handlers_.end()) {
         std::cerr << "Unknown command: " << name << "\n";
-        std::cerr << "Run 'agp --help' for usage information.\n";
+        std::cerr << "Run 'dart --help' for usage information.\n";
         return 1;
     }
     return it->second(argc, argv);
 }
 
 void SubcommandRegistry::print_help(const char* program_name) const {
-    std::cout << "Ancient Gene Predictor v" << AGP_VERSION << "\n\n";
+    std::cout << "DART v" << DART_VERSION << "\n\n";
     std::cout << "Usage: " << program_name << " <command> [options]\n\n";
     std::cout << "Commands:\n";
 
@@ -62,4 +62,4 @@ void SubcommandRegistry::print_help(const char* program_name) const {
 }
 
 }  // namespace cli
-}  // namespace agp
+}  // namespace dart

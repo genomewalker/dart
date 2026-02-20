@@ -1,0 +1,24 @@
+{
+  "domain": "invertebrate",
+  "generated": "2025-12-10",
+  "source_directories": [
+    "/projects/caeg/scratch/kbd606/agp/databases/refseq_cds/invertebrate/cds"
+  ],
+  "files_processed": 486,
+  "total_sequences": 13064490,
+  "valid_cds": 12850973,
+  "hexamer_counts": {
+    "overall": 8425192359,
+    "start": 115650575,
+    "internal": 8155343302,
+    "end": 115648284,
+    "sense": 8425192359,
+    "antisense": 8425192359
+  },
+  "output_files": [
+    "invertebrate_hexamer_table.hpp",
+    "invertebrate_positional_hexamer.hpp",
+    "invertebrate_damage_likelihood.hpp",
+    "invertebrate_strand_hexamer.hpp"
+  ]
+}

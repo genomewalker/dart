@@ -18,7 +18,7 @@
 #include <unordered_map>
 #include <immintrin.h>
 
-namespace agp {
+namespace dart {
 
 // 5-bit AA encoding: 20 AAs + X/stop → fits in 5 bits
 // Pack 12 AAs into 64 bits (60 bits used)
@@ -458,4 +458,4 @@ private:
     std::vector<PositionCounts> positions;
 };
 
-} // namespace agp
+} // namespace dart

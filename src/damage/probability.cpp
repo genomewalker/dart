@@ -1,12 +1,12 @@
 // Damage probability calculations (ancient likelihood, AA distributions)
 
-#include "agp/damage_model.hpp"
-#include "agp/codon_tables.hpp"
+#include "dart/damage_model.hpp"
+#include "dart/codon_tables.hpp"
 #include <cmath>
 #include <algorithm>
 #include <cctype>
 
-namespace agp {
+namespace dart {
 
 Score DamageModel::calculate_ancient_likelihood(const Sequence& seq) const {
     if (seq.empty()) return 0.0f;
@@ -230,4 +230,4 @@ std::pair<std::string, std::vector<float>> DamageModel::translate_with_confidenc
     return {protein, confidences};
 }
 
-}  // namespace agp
+}  // namespace dart

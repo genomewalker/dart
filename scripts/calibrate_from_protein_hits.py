@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Calibrate AGP frame confidence using protein database hits as pseudo-labels.
+Calibrate DART frame confidence using protein database hits as pseudo-labels.
 
 Uses target-decoy approach to estimate FDR and generate calibration table
 mapping logit(p_max) to P(correct | covariates).
 
 Usage:
     python calibrate_from_protein_hits.py \
-        --agp-output predictions.gff \
+        --dart-output predictions.gff \
         --proteins predictions.faa \
         --target-db /path/to/uniref50.faa \
         --output-header score_calibration_protein.hpp \
@@ -321,7 +321,7 @@ def generate_header(
 #include <cmath>
 #include <algorithm>
 
-namespace agp {
+namespace dart {
 
 """)
 
@@ -396,15 +396,15 @@ inline float calibrate_from_posterior(float p_max, float length, float damage_pc
     return CALIBRATION_PROTEIN[s_bin][l_bin][d_bin];
 }
 
-} // namespace agp
+} // namespace dart
 """)
 
     print(f"Generated header: {output_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Calibrate AGP using protein hits")
-    parser.add_argument("--agp-gff", required=True, help="AGP GFF output file")
+    parser = argparse.ArgumentParser(description="Calibrate DART using protein hits")
+    parser.add_argument("--dart-gff", required=True, help="AGP GFF output file")
     parser.add_argument("--proteins", required=True, help="AGP protein FASTA output")
     parser.add_argument(
         "--target-db", required=True, help="Target protein database (FASTA)"

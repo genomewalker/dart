@@ -1,11 +1,11 @@
 // DamageProfile creation and caching
 
-#include "agp/damage_model.hpp"
-#include "agp/frame_selector.hpp"
+#include "dart/damage_model.hpp"
+#include "dart/frame_selector.hpp"
 #include <cmath>
 #include <algorithm>
 
-namespace agp {
+namespace dart {
 
 // Forward declaration from analyzer.cpp
 DamageModel DamageAnalyzer_analyze(const std::vector<std::string>& sequences);
@@ -123,4 +123,4 @@ bool DamageModel::is_ancient_compatible() const {
            lambda_5prime_ > 0.01f && lambda_5prime_ < 1.0f;
 }
 
-}  // namespace agp
+}  // namespace dart

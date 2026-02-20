@@ -1,0 +1,24 @@
+{
+  "domain": "fungi",
+  "generated": "2025-12-10",
+  "source_directories": [
+    "/projects/caeg/scratch/kbd606/agp/databases/refseq_cds/fungi/cds"
+  ],
+  "files_processed": 665,
+  "total_sequences": 6929995,
+  "valid_cds": 6758762,
+  "hexamer_counts": {
+    "overall": 3182135261,
+    "start": 60828129,
+    "internal": 3040203295,
+    "end": 60827818,
+    "sense": 3182135261,
+    "antisense": 3182135261
+  },
+  "output_files": [
+    "fungi_hexamer_table.hpp",
+    "fungi_positional_hexamer.hpp",
+    "fungi_damage_likelihood.hpp",
+    "fungi_strand_hexamer.hpp"
+  ]
+}

@@ -1,5 +1,5 @@
 /**
- * analyze_errors.cpp - Fast error characterization for AGP predictions
+ * analyze_errors.cpp - Fast error characterization for DART predictions
  *
  * Analyzes mispredicted reads to understand what makes them hard:
  * - Length distribution

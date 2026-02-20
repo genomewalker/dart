@@ -1,0 +1,24 @@
+{
+  "domain": "viral",
+  "generated": "2025-12-10",
+  "source_directories": [
+    "/projects/caeg/scratch/kbd606/agp/databases/refseq_cds/viral/cds"
+  ],
+  "files_processed": 15014,
+  "total_sequences": 677735,
+  "valid_cds": 675201,
+  "hexamer_counts": {
+    "overall": 163763554,
+    "start": 6076507,
+    "internal": 149585216,
+    "end": 6076347,
+    "sense": 163763554,
+    "antisense": 163763554
+  },
+  "output_files": [
+    "viral_hexamer_table.hpp",
+    "viral_positional_hexamer.hpp",
+    "viral_damage_likelihood.hpp",
+    "viral_strand_hexamer.hpp"
+  ]
+}

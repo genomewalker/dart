@@ -16,10 +16,10 @@
 #include <utility>
 #include <vector>
 
-#include "agp/damage_cluster.hpp"
-#include "agp/damage_cluster_seeds.hpp"
+#include "dart/damage_cluster.hpp"
+#include "dart/damage_cluster_seeds.hpp"
 
-namespace agp {
+namespace dart {
 namespace damage_cluster {
 
 // -----------------------------
@@ -820,4 +820,4 @@ DamageClusteringResult run_damage_clustering_rounds(
 }
 
 } // namespace damage_cluster
-} // namespace agp
+} // namespace dart

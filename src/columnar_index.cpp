@@ -6,7 +6,7 @@
 // - Predicate pushdown via chunk statistics
 // - Lazy loading of alignment strings
 
-#include "agp/columnar_index.hpp"
+#include "dart/columnar_index.hpp"
 
 #include <algorithm>
 #include <array>
@@ -32,7 +32,7 @@
 #include <omp.h>
 #endif
 
-namespace agp {
+namespace dart {
 
 namespace {
 
@@ -409,7 +409,7 @@ uint32_t ColumnarIndexWriter::add_read(std::string_view name) {
 }
 
 void ColumnarIndexWriter::add_alignment(const AlignmentRecord& rec) {
-    // Track global sort invariant required by AGP fast-path consumers.
+    // Track global sort invariant required by DART fast-path consumers.
     if (!impl_->has_prev_sort_key) {
         impl_->has_prev_sort_key = true;
     } else if (impl_->sorted_by_read_then_score) {
@@ -1431,4 +1431,4 @@ ColumnarEMResult em_solve_columnar(
     return result;
 }
 
-}  // namespace agp
+}  // namespace dart

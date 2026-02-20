@@ -1,0 +1,24 @@
+{
+  "domain": "plant",
+  "generated": "2025-12-10",
+  "source_directories": [
+    "/projects/caeg/scratch/kbd606/agp/databases/refseq_cds/plant/cds"
+  ],
+  "files_processed": 199,
+  "total_sequences": 9234859,
+  "valid_cds": 9158077,
+  "hexamer_counts": {
+    "overall": 4239895592,
+    "start": 82421227,
+    "internal": 4047580855,
+    "end": 82419885,
+    "sense": 4239895592,
+    "antisense": 4239895592
+  },
+  "output_files": [
+    "plant_hexamer_table.hpp",
+    "plant_positional_hexamer.hpp",
+    "plant_damage_likelihood.hpp",
+    "plant_strand_hexamer.hpp"
+  ]
+}

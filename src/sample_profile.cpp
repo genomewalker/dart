@@ -1,13 +1,13 @@
 // Sample-level damage profile management
 
-#include "agp/frame_selector.hpp"
-#include "agp/codon_tables.hpp"
-#include "agp/hexamer_tables.hpp"
+#include "dart/frame_selector.hpp"
+#include "dart/codon_tables.hpp"
+#include "dart/hexamer_tables.hpp"
 #include <algorithm>
 #include <cmath>
 #include <array>
 
-namespace agp {
+namespace dart {
 
 // Compute binomial log-likelihood for a single observation
 // k = successes (e.g., T count), n = total trials (e.g., T+C count), p = probability
@@ -1798,7 +1798,7 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
     // D_METAMATCH CALCULATION: Channel B-anchored damage estimate
     //
     // metaDMG uses aligned reads (selection bias toward well-preserved sequences).
-    // AGP's d_global uses ALL reads. The gap arises because alignable reads
+    // DART's d_global uses ALL reads. The gap arises because alignable reads
     // tend to show cleaner damage signal.
     //
     // APPROACH: Use Channel B (stop codon conversion) as the primary anchor.
@@ -2179,4 +2179,4 @@ SampleDamageProfile FrameSelector::compute_sample_profile(
     return profile;
 }
 
-} // namespace agp
+} // namespace dart

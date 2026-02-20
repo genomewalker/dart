@@ -5,10 +5,10 @@
  * Index = base1*16 + base2*4 + base3
  */
 
-#include "agp/codon_tables.hpp"
+#include "dart/codon_tables.hpp"
 #include <array>
 
-namespace agp {
+namespace dart {
 
 // Convert base to index: T=0, C=1, A=2, G=3
 static inline int base_to_idx(char c) {
@@ -229,4 +229,4 @@ float get_aa_freq_fast(char aa) {
     return AA_FREQ[aa - 'A'];
 }
 
-} // namespace agp
+} // namespace dart

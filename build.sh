@@ -1,11 +1,11 @@
 #!/bin/bash
 
-# Build script for Ancient Gene Predictor
+# Build script for DART
 
 set -e  # Exit on error
 
 echo "========================================"
-echo "  Ancient Gene Predictor Build Script"
+echo "  DART Build Script"
 echo "========================================"
 echo ""
 
@@ -140,7 +140,7 @@ echo -e "${GREEN}✓ Build successful${NC}"
 echo ""
 
 # Run tests if built
-if [ "$TESTS" = "ON" ] && [ -f "tests/agp_tests" ]; then
+if [ "$TESTS" = "ON" ] && [ -f "tests/dart_tests" ]; then
     echo "Running tests..."
     make test
     echo ""
@@ -159,11 +159,11 @@ echo "========================================"
 echo "  Build Complete!"
 echo "========================================"
 echo ""
-echo "Executable: $(pwd)/agp"
+echo "Executable: $(pwd)/dart"
 echo ""
 echo "To run:"
-echo "  ./agp --help"
-echo "  ./agp ../examples/test.fasta"
+echo "  ./dart --help"
+echo "  ./dart ../examples/test.fasta"
 echo ""
 
 if [ "$INSTALL" != true ]; then

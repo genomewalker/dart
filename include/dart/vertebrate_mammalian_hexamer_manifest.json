@@ -1,0 +1,24 @@
+{
+  "domain": "vertebrate_mammalian",
+  "generated": "2025-12-10",
+  "source_directories": [
+    "/projects/caeg/scratch/kbd606/agp/databases/refseq_cds/vertebrate_mammalian/cds"
+  ],
+  "files_processed": 250,
+  "total_sequences": 13003166,
+  "valid_cds": 12917051,
+  "hexamer_counts": {
+    "overall": 8704608861,
+    "start": 116251722,
+    "internal": 8433354987,
+    "end": 116251570,
+    "sense": 8704608861,
+    "antisense": 8704608861
+  },
+  "output_files": [
+    "vertebrate_mammalian_hexamer_table.hpp",
+    "vertebrate_mammalian_positional_hexamer.hpp",
+    "vertebrate_mammalian_damage_likelihood.hpp",
+    "vertebrate_mammalian_strand_hexamer.hpp"
+  ]
+}

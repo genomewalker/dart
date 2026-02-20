@@ -1,10 +1,10 @@
-#include "agp/damage_index_writer.hpp"
+#include "dart/damage_index_writer.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
 
-namespace agp {
+namespace dart {
 
 DamageIndexWriter::DamageIndexWriter(const std::string& path,
                                      const SampleDamageProfile& profile)
@@ -49,8 +49,8 @@ void DamageIndexWriter::add_record(std::string_view read_id, const Gene& gene,
     AgdRecord rec;
     std::memset(&rec, 0, sizeof(rec));
 
-    // Hash the read ID (strip AGP suffix first)
-    std::string_view base_id = strip_agp_suffix(read_id);
+    // Hash the read ID (strip DART suffix first)
+    std::string_view base_id = strip_dart_suffix(read_id);
     rec.id_hash = fnv1a_hash(base_id);
 
     // Basic metadata
@@ -295,4 +295,4 @@ void DamageIndexWriter::finalize() {
     }
 }
 
-}  // namespace agp
+}  // namespace dart

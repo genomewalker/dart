@@ -11,7 +11,7 @@ Combines:
 Usage:
     python train_damage_nn.py --data-dir /path/to/benchmark_data --output model.h
 
-Author: AGP Development Team
+Author: DART Development Team
 """
 
 import argparse
@@ -656,7 +656,7 @@ def export_to_cpp_header(model: nn.Module, filepath: str, input_dim: int = 62):
         f.write("#pragma once\n\n")
         f.write("#include <array>\n")
         f.write("#include <cmath>\n\n")
-        f.write("namespace agp {\n\n")
+        f.write("namespace dart {\n\n")
 
         f.write("class DamageNeuralNetwork {\n")
         f.write("public:\n")
@@ -738,7 +738,7 @@ def export_to_cpp_header(model: nn.Module, filepath: str, input_dim: int = 62):
                 linear_count += 1
 
         f.write("};\n\n")
-        f.write("} // namespace agp\n")
+        f.write("} // namespace dart\n")
 
     print(f"Exported model to {filepath}")
 

@@ -1,17 +1,17 @@
-// agp sample-damage: Quick sample-level damage profiling
+// dart sample-damage: Quick sample-level damage profiling
 //
-// Usage: agp sample-damage <input.fq> [-o output.json] [-v]
+// Usage: dart sample-damage <input.fq> [-o output.json] [-v]
 //
 // Runs Pass 1 only to compute sample-level damage profile.
 // Faster than full prediction when you only need damage metrics.
 
 #include "subcommand.hpp"
 #include "args.hpp"
-#include "agp/sequence_io.hpp"
-#include "agp/frame_selector.hpp"
-#include "agp/hexamer_tables.hpp"
-#include "agp/log_utils.hpp"
-#include "agp/version.h"
+#include "dart/sequence_io.hpp"
+#include "dart/frame_selector.hpp"
+#include "dart/hexamer_tables.hpp"
+#include "dart/log_utils.hpp"
+#include "dart/version.h"
 #include <iostream>
 #include <fstream>
 #include <cstring>
@@ -23,7 +23,7 @@
 #include <omp.h>
 #endif
 
-namespace agp {
+namespace dart {
 namespace cli {
 
 int cmd_sample_damage(int argc, char* argv[]) {
@@ -47,7 +47,7 @@ int cmd_sample_damage(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             verbose = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            std::cout << "Usage: agp sample-damage <input.fq> [options]\n\n";
+            std::cout << "Usage: dart sample-damage <input.fq> [options]\n\n";
             std::cout << "Quick sample-level damage profiling (Pass 1 only).\n\n";
             std::cout << "Options:\n";
             std::cout << "  -o, --output FILE       Output JSON file (default: stdout)\n";
@@ -60,14 +60,14 @@ int cmd_sample_damage(int argc, char* argv[]) {
             input_file = argv[i];
         } else {
             std::cerr << "Unknown option: " << argv[i] << "\n";
-            std::cerr << "Run 'agp sample-damage --help' for usage.\n";
+            std::cerr << "Run 'dart sample-damage --help' for usage.\n";
             return 1;
         }
     }
 
     if (input_file.empty()) {
         std::cerr << "Error: No input file specified.\n";
-        std::cerr << "Run 'agp sample-damage --help' for usage.\n";
+        std::cerr << "Run 'dart sample-damage --help' for usage.\n";
         return 1;
     }
 
@@ -96,7 +96,7 @@ int cmd_sample_damage(int argc, char* argv[]) {
     }
 
     if (verbose) {
-        std::cerr << "Sample damage profiling v" << AGP_VERSION << "\n";
+        std::cerr << "Sample damage profiling v" << DART_VERSION << "\n";
         std::cerr << "Input: " << input_file << "\n";
         std::cerr << "Domain: " << domain_name(active_domain) << "\n";
         std::cerr << "Threads: " << num_threads << "\n\n";
@@ -160,7 +160,7 @@ int cmd_sample_damage(int argc, char* argv[]) {
         if (verbose) {
             auto pass1_end = std::chrono::steady_clock::now();
             std::cerr << "Pass 1 runtime: "
-                      << agp::log_utils::format_elapsed(pass1_start, pass1_end) << "\n";
+                      << dart::log_utils::format_elapsed(pass1_start, pass1_end) << "\n";
         }
 
     } catch (const std::exception& e) {
@@ -290,7 +290,7 @@ int cmd_sample_damage(int argc, char* argv[]) {
                           << (d_metamatch_filtered * 100.0f) << "%\n";
                 auto pass2_end = std::chrono::steady_clock::now();
                 std::cerr << "Pass 2 runtime: "
-                          << agp::log_utils::format_elapsed(pass2_start, pass2_end) << "\n";
+                          << dart::log_utils::format_elapsed(pass2_start, pass2_end) << "\n";
             }
 
         } catch (const std::exception& e) {
@@ -333,7 +333,7 @@ int cmd_sample_damage(int argc, char* argv[]) {
     float d_max = profile.d_max_combined;
 
     *out << "{\n";
-    *out << "  \"version\": \"" << AGP_VERSION << "\",\n";
+    *out << "  \"version\": \"" << DART_VERSION << "\",\n";
     *out << "  \"input\": \"" << input_file << "\",\n";
     *out << "  \"domain\": \"" << domain_str << "\",\n";
     *out << "  \"sequences\": " << total_reads << ",\n";
@@ -370,7 +370,7 @@ int cmd_sample_damage(int argc, char* argv[]) {
         std::cerr << "  Channel B LLR: " << std::fixed << std::setprecision(1) << profile.stop_decay_llr_5prime << "\n";
         std::cerr << "  Validated: " << (profile.damage_validated ? "yes" : "no") << "\n";
         auto run_end = std::chrono::steady_clock::now();
-        std::cerr << "  Runtime: " << agp::log_utils::format_elapsed(run_start, run_end) << "\n";
+        std::cerr << "  Runtime: " << dart::log_utils::format_elapsed(run_start, run_end) << "\n";
     }
 
     return 0;
@@ -389,4 +389,4 @@ namespace {
 }
 
 }  // namespace cli
-}  // namespace agp
+}  // namespace dart

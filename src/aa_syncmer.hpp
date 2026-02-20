@@ -23,7 +23,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
-namespace agp {
+namespace dart {
 
 // Canonical AA mapping (damaged → undamaged)
 // This allows damage variants to hash to the same value
@@ -317,4 +317,4 @@ inline std::vector<std::string> back_translate_aa(char aa) {
     return {"NNN"};
 }
 
-} // namespace agp
+} // namespace dart

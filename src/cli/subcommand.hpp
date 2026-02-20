@@ -1,12 +1,12 @@
-#ifndef AGP_CLI_SUBCOMMAND_HPP
-#define AGP_CLI_SUBCOMMAND_HPP
+#ifndef DART_CLI_SUBCOMMAND_HPP
+#define DART_CLI_SUBCOMMAND_HPP
 
 #include <string>
 #include <vector>
 #include <functional>
 #include <unordered_map>
 
-namespace agp {
+namespace dart {
 namespace cli {
 
 // Subcommand handler function type
@@ -52,6 +52,6 @@ int cmd_damage_profile(int argc, char* argv[]);
 int cmd_hits2emi(int argc, char* argv[]);
 
 }  // namespace cli
-}  // namespace agp
+}  // namespace dart
 
-#endif  // AGP_CLI_SUBCOMMAND_HPP
+#endif // DART_CLI_SUBCOMMAND_HPP

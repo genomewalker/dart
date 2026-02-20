@@ -1,18 +1,18 @@
-// Main entry point for agp CLI with subcommand dispatch
+// Main entry point for dart CLI with subcommand dispatch
 //
 // Usage:
-//   agp predict <input.fq> [options]     Gene prediction (main function)
-//   agp sample-damage <input.fq>         Quick sample-level damage check
-//   agp damage-annotate --emi <hits.emi> Post-mapping damage annotation
-//   agp validate <pred.gff> <ref.gff>    Validate predictions
+//   dart predict <input.fq> [options]     Gene prediction (main function)
+//   dart sample-damage <input.fq>         Quick sample-level damage check
+//   dart damage-annotate --emi <hits.emi> Post-mapping damage annotation
+//   dart validate <pred.gff> <ref.gff>    Validate predictions
 
 #include "subcommand.hpp"
-#include "agp/version.h"
+#include "dart/version.h"
 #include <iostream>
 #include <cstring>
 
 int main(int argc, char* argv[]) {
-    auto& registry = agp::cli::SubcommandRegistry::instance();
+    auto& registry = dart::cli::SubcommandRegistry::instance();
 
     // Handle no arguments
     if (argc < 2) {
@@ -29,7 +29,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (strcmp(first_arg, "--version") == 0 || strcmp(first_arg, "-V") == 0) {
-        std::cout << "agp " << AGP_VERSION << "\n";
+        std::cout << "dart " << DART_VERSION << "\n";
         return 0;
     }
 
@@ -40,6 +40,6 @@ int main(int argc, char* argv[]) {
 
     // Unknown command
     std::cerr << "Unknown command: " << first_arg << "\n";
-    std::cerr << "Run 'agp --help' for usage information.\n";
+    std::cerr << "Run 'dart --help' for usage information.\n";
     return 1;
 }

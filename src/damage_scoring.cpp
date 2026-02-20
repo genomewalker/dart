@@ -1,14 +1,14 @@
 // Damage scoring and frame consistency for ancient DNA
 
-#include "agp/frame_selector.hpp"
-#include "agp/codon_tables.hpp"
-#include "agp/damage_likelihood.hpp"
-#include "agp/hexamer_tables.hpp"
+#include "dart/frame_selector.hpp"
+#include "dart/codon_tables.hpp"
+#include "dart/damage_likelihood.hpp"
+#include "dart/hexamer_tables.hpp"
 #include <algorithm>
 #include <cmath>
 #include <array>
 
-namespace agp {
+namespace dart {
 
 // ============================================================================
 // Adaptive calibration for terminal damage probability
@@ -393,4 +393,4 @@ float FrameSelector::estimate_damage_signal(
     return std::clamp(posterior, 0.0f, 1.0f);
 }
 
-} // namespace agp
+} // namespace dart

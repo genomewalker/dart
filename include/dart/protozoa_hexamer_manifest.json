@@ -1,0 +1,24 @@
+{
+  "domain": "protozoa",
+  "generated": "2025-12-10",
+  "source_directories": [
+    "/projects/caeg/scratch/kbd606/agp/databases/refseq_cds/protozoa/cds"
+  ],
+  "files_processed": 121,
+  "total_sequences": 1254990,
+  "valid_cds": 1158925,
+  "hexamer_counts": {
+    "overall": 599905551,
+    "start": 10429333,
+    "internal": 575573227,
+    "end": 10427011,
+    "sense": 599905551,
+    "antisense": 599905551
+  },
+  "output_files": [
+    "protozoa_hexamer_table.hpp",
+    "protozoa_positional_hexamer.hpp",
+    "protozoa_damage_likelihood.hpp",
+    "protozoa_strand_hexamer.hpp"
+  ]
+}

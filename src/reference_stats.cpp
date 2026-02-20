@@ -1,4 +1,4 @@
-#include "agp/reference_stats.hpp"
+#include "dart/reference_stats.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -8,7 +8,7 @@
 #include <sstream>
 #include <string>
 
-namespace agp {
+namespace dart {
 
 // Write per-reference stats as TSV
 void write_reference_stats_tsv(std::ostream& out,
@@ -107,4 +107,4 @@ void write_reference_stats_json(std::ostream& out,
     out << "}\n";
 }
 
-} // namespace agp
+} // namespace dart

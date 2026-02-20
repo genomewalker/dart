@@ -1,8 +1,8 @@
-#include "agp/types.hpp"
+#include "dart/types.hpp"
 #include <cmath>
 #include <algorithm>
 
-namespace agp {
+namespace dart {
 
 float DamageProfile::get_ct_damage(Position pos, Position seq_len) const {
     // Calculate distance from 5' end
@@ -34,4 +34,4 @@ float DamageProfile::get_ga_damage(Position pos, Position seq_len) const {
     return std::clamp(damage_3prime, 0.0f, 1.0f);
 }
 
-} // namespace agp
+} // namespace dart
