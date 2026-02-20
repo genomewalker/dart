@@ -184,7 +184,7 @@ size_t DamageIndexReader::warmup_cache() const {
 
     volatile size_t sum = 0;  // volatile prevents optimizer from removing the loop
     for (size_t offset = 0; offset < file_size_; offset += static_cast<size_t>(page_size)) {
-        sum += static_cast<unsigned char>(ptr[offset]);
+        sum = sum + static_cast<unsigned char>(ptr[offset]);
     }
     return sum;
 }
