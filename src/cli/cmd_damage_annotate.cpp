@@ -1088,6 +1088,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     uint32_t min_reads = 3;
     float min_positional_score = 0.0f;
     float min_terminal_ratio = 0.0f;
+    bool user_set_terminal_ratio = false;  // True when --min-terminal-ratio is explicitly provided
     bool auto_calibrate_spurious = false;  // Auto-derive thresholds from data
 
     // EM reassignment options (enabled by default for abundance estimation)
@@ -1221,6 +1222,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             min_positional_score = std::stof(argv[++i]);
         } else if (strcmp(argv[i], "--min-terminal-ratio") == 0 && i + 1 < argc) {
             min_terminal_ratio = std::stof(argv[++i]);
+            user_set_terminal_ratio = true;
         } else if (strcmp(argv[i], "--auto-calibrate-spurious") == 0) {
             auto_calibrate_spurious = true;
         } else if (strcmp(argv[i], "--aln-min-identity") == 0 && i + 1 < argc) {
@@ -3097,7 +3099,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 if (calib_min_pos > min_positional_score) {
                     min_positional_score = calib_min_pos;
                 }
-                if (calib_min_term > min_terminal_ratio) {
+                if (!user_set_terminal_ratio && calib_min_term > min_terminal_ratio) {
                     min_terminal_ratio = calib_min_term;
                 }
 
