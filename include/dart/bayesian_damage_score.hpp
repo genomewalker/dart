@@ -101,9 +101,10 @@ struct BayesianScoreParams {
     // Site evidence and identity evidence still apply
     bool damage_informative = true;
 
-    // Sample-level damage rate for fixed-average site evidence formula
-    // Uses d_max * 0.5 as position-independent average damage rate
-    // This matches the original proven formula (commit 0224b4a) which achieved AUC 0.82
+    // Sample-level damage rate used by site evidence.
+    // Effective AA ancient rate is computed as:
+    //   q_ancient ~= d_max * AA_SCALE * w + q_modern
+    // where w is estimated from observed positional decay (sum_exp_decay / m).
     float d_max = 0.0f;
 
     // Thresholds for 3-state classification

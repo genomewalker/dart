@@ -12,17 +12,19 @@
 // iterations to ~10-20 by extrapolating along the EM fixed-point map.
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <stdexcept>
 #include <vector>
 
 namespace dart {
 
 // EM algorithm parameters
 struct EMParams {
-    double lambda_b = 0.5;       // temperature for bit score: exp(lambda_b * score)
+    double lambda_b = 3.0;       // temperature for bit score: exp(lambda_b * score)
     uint32_t max_iters = 200;    // maximum EM iterations
     uint32_t min_iters = 8;      // minimum iterations before early-stop is allowed
     double tol = 1e-6;           // convergence tolerance (relative log-likelihood change)
@@ -397,6 +399,13 @@ inline EMState em_solve(
     const AlignmentData& data,
     const EMParams& params)
 {
+    if (!(params.alpha_prior > 0.0)) {
+        throw std::invalid_argument("EMParams::alpha_prior must be > 0");
+    }
+    if (!(params.min_weight > 0.0)) {
+        throw std::invalid_argument("EMParams::min_weight must be > 0");
+    }
+
     const uint32_t T = data.num_refs;
     const size_t A = data.alignments.size();
 
@@ -505,6 +514,10 @@ inline EMState em_solve(
                 std::copy(w0.begin(), w0.end(), state.weights.begin());
             }
 
+            if (!std::isfinite(ll)) {
+                break;
+            }
+
             const bool at_upper =
                 std::abs(alpha - step_max) <= (1e-12 * (1.0 + std::abs(step_max)));
             if (at_upper) {
@@ -523,7 +536,17 @@ inline EMState em_solve(
                 ll = e_step(data, params, state.weights.data(), state.gamma.data());
             }
             objective = em_objective_from_ll(params, state.weights.data(), T, ll);
+            if (!std::isfinite(ll)) {
+                break;
+            }
             m_step(data, params, state.gamma.data(), state.weights.data());
+#ifndef NDEBUG
+            {
+                double w_sum = 0.0;
+                for (uint32_t t = 0; t < T; ++t) w_sum += state.weights[t];
+                assert(std::abs(w_sum - 1.0) < 1e-6 && "M-step broke simplex invariant");
+            }
+#endif
         }
 
         // Update pi (ancient fraction) from damage responsibilities
