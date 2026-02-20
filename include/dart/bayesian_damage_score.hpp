@@ -99,7 +99,13 @@ struct BayesianScoreParams {
     // Damage informativeness gating
     // When false: terminal evidence is zeroed (sample has no detectable damage signal)
     // Site evidence and identity evidence still apply
+    // Deprecated: superseded by damage_detectability; kept for backward compat.
     bool damage_informative = true;
+
+    // Continuous detectability score [0, 1]: attenuates logBF_terminal proportionally.
+    // 0.0 = same effect as damage_informative=false (terminal evidence zeroed)
+    // 1.0 = full terminal evidence (same as damage_informative=true)
+    float damage_detectability = 1.0f;
 
     // Sample-level damage rate used by site evidence.
     // Effective AA ancient rate is computed as:
@@ -316,8 +322,9 @@ inline BayesianScoreOutput compute_bayesian_score(
     // When !damage_informative: sample has no detectable damage signal (artifact or
     // unvalidated), so terminal evidence is meaningless and zeroed out.
     double logBF_terminal = 0.0;
-    if (params.damage_informative && p_read > 0.01f) {
-        logBF_terminal = logit(pr) - logit(pi0);
+    if (params.damage_detectability > 0.0f && p_read > 0.01f) {
+        logBF_terminal = (logit(pr) - logit(pi0))
+                         * static_cast<double>(params.damage_detectability);
     }
 
     // Site evidence with tempering and gating
@@ -396,11 +403,11 @@ inline BayesianScoreOutput compute_bayesian_score(
     const double post = inv_logit(logit_post);
 
     // Determine evidence tier
-    // When uninformative, terminal signal is not usable evidence
+    // When detectability is 0, terminal signal is not usable evidence
     const bool has_sites = (ev.k > 0);
-    const bool has_terminal = params.damage_informative && (p_read >= params.terminal_threshold);
+    const bool has_terminal = params.damage_detectability > 0.0f && (p_read >= params.terminal_threshold);
     EvidenceTier tier;
-    if (!params.damage_informative) {
+    if (params.damage_detectability <= 0.0f) {
         tier = has_sites ? EvidenceTier::SitesOnly : EvidenceTier::NoEvidence;
     } else if (has_terminal && has_sites) {
         tier = EvidenceTier::Convergent;
@@ -434,7 +441,7 @@ inline BayesianScoreOutput compute_bayesian_score(
     out.sum_qA = ev.sum_qA;
     out.tier = tier;
     out.damage_class = damage_class;
-    out.informative = params.damage_informative;
+    out.informative = params.damage_detectability > 0.0f;
     return out;
 }
 

@@ -1112,6 +1112,15 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     float prior_ancient = 0.10f;     // Prior P(ancient) for Bayesian scorer
     bool  auto_prior_ancient = false; // Auto-calibrate prior from mean p_read distribution
     int   min_damage_sites = -1;     // Min susceptible positions to trust site evidence (-1 = auto)
+    float ancient_threshold  = 0.60f; // --ancient-threshold
+    float modern_threshold   = 0.25f; // --modern-threshold
+    float terminal_threshold = 0.50f; // --terminal-threshold
+    float site_cap           = 3.0f;  // --site-cap
+    float w0                 = 0.3f;  // --w0
+    // Coverage EM tuning
+    float depth_gate_lo = 8.0f;       // --depth-gate-lo
+    float depth_gate_hi = 20.0f;      // --depth-gate-hi
+    float w_min         = 0.20f;      // --w-min
 
     // Alignment-level pre-filters (applied before any processing)
     float aln_min_identity = 0.0f;   // 0 = no filter
@@ -1194,10 +1203,26 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             coverage_em_tau = std::stof(argv[++i]);
         } else if (strcmp(argv[i], "--coverage-em-bins") == 0 && i + 1 < argc) {
             coverage_em_bins = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (strcmp(argv[i], "--depth-gate-lo") == 0 && i + 1 < argc) {
+            depth_gate_lo = std::stof(argv[++i]);
+        } else if (strcmp(argv[i], "--depth-gate-hi") == 0 && i + 1 < argc) {
+            depth_gate_hi = std::stof(argv[++i]);
+        } else if (strcmp(argv[i], "--w-min") == 0 && i + 1 < argc) {
+            w_min = std::stof(argv[++i]);
         } else if (strcmp(argv[i], "--prior-ancient") == 0 && i + 1 < argc) {
             prior_ancient = std::stof(argv[++i]);
         } else if (strcmp(argv[i], "--min-damage-sites") == 0 && i + 1 < argc) {
             min_damage_sites = std::stoi(argv[++i]);
+        } else if (strcmp(argv[i], "--ancient-threshold") == 0 && i + 1 < argc) {
+            ancient_threshold = std::stof(argv[++i]);
+        } else if (strcmp(argv[i], "--modern-threshold") == 0 && i + 1 < argc) {
+            modern_threshold = std::stof(argv[++i]);
+        } else if (strcmp(argv[i], "--terminal-threshold") == 0 && i + 1 < argc) {
+            terminal_threshold = std::stof(argv[++i]);
+        } else if (strcmp(argv[i], "--site-cap") == 0 && i + 1 < argc) {
+            site_cap = std::stof(argv[++i]);
+        } else if (strcmp(argv[i], "--w0") == 0 && i + 1 < argc) {
+            w0 = std::stof(argv[++i]);
         } else if (strcmp(argv[i], "--preset") == 0 && i + 1 < argc) {
             const char* preset = argv[++i];
             if (strcmp(preset, "loose") == 0) {
@@ -1302,13 +1327,21 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cout << "  --coverage-em-iters INT  Max outer EM iterations (default: 5)\n";
             std::cout << "  --coverage-em-tau FLOAT  KL penalty temperature (default: 0.13)\n";
             std::cout << "  --coverage-em-bins INT   Coverage bins per protein (default: 6)\n";
+            std::cout << "  --depth-gate-lo FLOAT    Coverage depth gate lower bound (default: 8.0)\n";
+            std::cout << "  --depth-gate-hi FLOAT    Coverage depth gate upper bound (default: 20.0)\n";
+            std::cout << "  --w-min FLOAT            Coverage weight floor (default: 0.20)\n";
             std::cout << "\nBayesian scoring:\n";
-            std::cout << "  --prior-ancient FLOAT   Prior P(ancient) for Bayesian scorer (default: 0.10)\n";
-            std::cout << "  --auto-prior-ancient    Auto-calibrate prior from mean p_read distribution\n";
-            std::cout << "                          Requires AGD index (--damage-index). Uses E[p_read]\n";
-            std::cout << "                          as an empirical Bayes estimate of fraction ancient.\n";
-            std::cout << "  --min-damage-sites INT  Min susceptible AA positions to use site evidence\n";
-            std::cout << "                          (default: auto = max(1, median_qlen/10))\n";
+            std::cout << "  --prior-ancient FLOAT    Prior P(ancient) for Bayesian scorer (default: 0.10)\n";
+            std::cout << "  --auto-prior-ancient     Auto-calibrate prior from mean p_read distribution\n";
+            std::cout << "                           Requires AGD index (--damage-index). Uses E[p_read]\n";
+            std::cout << "                           as an empirical Bayes estimate of fraction ancient.\n";
+            std::cout << "  --min-damage-sites INT   Min susceptible AA positions to use site evidence\n";
+            std::cout << "                           (default: auto = max(1, median_qlen/10))\n";
+            std::cout << "  --ancient-threshold FLOAT  Ancient posterior cutoff (default: 0.60)\n";
+            std::cout << "  --modern-threshold FLOAT   Modern posterior cutoff (default: 0.25)\n";
+            std::cout << "  --terminal-threshold FLOAT Min p_read for terminal evidence (default: 0.50)\n";
+            std::cout << "  --site-cap FLOAT           Max |logBF| from AA site evidence (default: 3.0)\n";
+            std::cout << "  --w0 FLOAT                 Absence-evidence tempering weight 0-1 (default: 0.30)\n";
             std::cout << "\nPresets (applied immediately; individual flags after --preset override):\n";
             std::cout << "  --preset loose   Maximize recall: min-reads=1, breadth=0, depth=0, min-damage-sites=1\n";
             std::cout << "  --preset strict  Maximize precision: min-reads=5, breadth=0.2, depth=1.0,\n";
@@ -1358,6 +1391,38 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
     if (coverage_em_tau < 0.0f) {
         std::cerr << "Error: --coverage-em-tau must be >= 0\n";
+        return 1;
+    }
+    if (depth_gate_lo < 0.0f || depth_gate_hi <= depth_gate_lo) {
+        std::cerr << "Error: --depth-gate-lo must be >= 0 and < --depth-gate-hi\n";
+        return 1;
+    }
+    if (w_min < 0.0f || w_min > 1.0f) {
+        std::cerr << "Error: --w-min must be in [0, 1]\n";
+        return 1;
+    }
+    if (w0 < 0.0f || w0 > 1.0f) {
+        std::cerr << "Error: --w0 must be in [0, 1]\n";
+        return 1;
+    }
+    if (site_cap <= 0.0f) {
+        std::cerr << "Error: --site-cap must be > 0\n";
+        return 1;
+    }
+    if (terminal_threshold < 0.0f || terminal_threshold > 1.0f) {
+        std::cerr << "Error: --terminal-threshold must be in [0, 1]\n";
+        return 1;
+    }
+    if (modern_threshold < 0.0f || modern_threshold >= 1.0f) {
+        std::cerr << "Error: --modern-threshold must be in [0, 1)\n";
+        return 1;
+    }
+    if (ancient_threshold <= 0.0f || ancient_threshold > 1.0f) {
+        std::cerr << "Error: --ancient-threshold must be in (0, 1]\n";
+        return 1;
+    }
+    if (ancient_threshold <= modern_threshold) {
+        std::cerr << "Error: --ancient-threshold must be > --modern-threshold\n";
         return 1;
     }
 
@@ -2274,6 +2339,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         float em_ref_neff = 1.0f;       // Effective number of references: 1 / sum_j gamma_j^2
     };
     std::vector<EmReadResult> em_read_results(n_reads);
+    // True when damage-aware EM was active and gamma_ancient was actually populated.
+    // Used by --refine-damage to avoid falling back to total gamma for modern reads.
+    // Atomic because it may be set inside the parallel streaming_em_finalize callback.
+    std::atomic<bool> damage_em_active{false};
     std::unordered_map<uint32_t, dart::ProteinCoverageStats> coverage_stats_map;
 
     // Auto-switch to streaming EM if estimated memory exceeds limit
@@ -2333,6 +2402,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             cov_params.max_outer_iters = coverage_em_iters;
             cov_params.tau = coverage_em_tau;
             cov_params.default_bins = coverage_em_bins;
+            cov_params.depth_gate_lo = depth_gate_lo;
+            cov_params.depth_gate_hi = depth_gate_hi;
+            cov_params.w_min = w_min;
 
             streaming_result = dart::coverage_em_outer_loop(
                 reader, em_params, cov_params, coverage_stats_map, verbose);
@@ -2385,6 +2457,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 const uint32_t* read_idx, const uint32_t* ref_idx,
                 const float* gamma, const float* gamma_ancient)
             {
+                if (gamma_ancient) damage_em_active = true;
                 for (uint32_t i = 0; i < num_rows; ++i) {
                     const uint32_t r = read_idx[i];
                     if (r >= n_reads) continue;
@@ -2556,6 +2629,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             cov_params.max_outer_iters = coverage_em_iters;
             cov_params.tau = coverage_em_tau;
             cov_params.default_bins = coverage_em_bins;
+            cov_params.depth_gate_lo = depth_gate_lo;
+            cov_params.depth_gate_hi = depth_gate_hi;
+            cov_params.w_min = w_min;
             if (verbose) {
                 std::cerr << "  Coverage-EM outer iterations: " << cov_params.max_outer_iters << "\n";
             }
@@ -2623,6 +2699,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                         best_hit_gamma = static_cast<float>(em_state.gamma[j]);
                         if (em_params.use_damage && !em_state.gamma_ancient.empty()) {
                             best_hit_gamma_ancient = static_cast<float>(em_state.gamma_ancient[j]);
+                            damage_em_active = true;
                         }
                         break;
                     }
@@ -2807,13 +2884,13 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     score_params.pi = prior_ancient;
     score_params.pi0 = empirical_pi0;    // Empirical baseline for terminal evidence transform
     score_params.q_modern = modern_est.q_modern;
-    score_params.w0 = 0.3f;              // Temper absence evidence (robustness)
-    score_params.terminal_threshold = 0.50f;
-    score_params.site_cap = 3.0f;        // Cap site contribution (matches original)
+    score_params.w0 = w0;
+    score_params.terminal_threshold = terminal_threshold;
+    score_params.site_cap = site_cap;
     score_params.min_opportunities = min_damage_sites;
     score_params.channel_b_valid = (d_max > 0.0f);  // Trust site evidence if damage detected
-    score_params.ancient_threshold = 0.60f;
-    score_params.modern_threshold = 0.25f;
+    score_params.ancient_threshold = ancient_threshold;
+    score_params.modern_threshold = modern_threshold;
     score_params.use_identity = use_identity;
     score_params.k_identity = 20.0f;
     score_params.identity_baseline = 0.90f;
@@ -2829,6 +2906,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             damage_index->d_max(), damage_index->damage_validated(),
             damage_index->damage_artifact(), damage_index->channel_b_valid(),
             damage_index->stop_decay_llr(), damage_index->terminal_shift());
+        score_params.damage_detectability = damage_detectability;
     }
 
     if (verbose) {
@@ -2856,12 +2934,13 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         dart::ThetaDSuffStats theta_ss;
 
         // Numerator: weighted damage hits from reads that had any mismatches.
-        // Use gamma_ancient when the damage EM populated it (use_damage path),
-        // otherwise fall back to gamma (total responsibility for best-hit target).
+        // When damage-aware EM was active, use gamma_ancient directly (even when 0 —
+        // that means a modern read and should not contribute to the ancient refit).
+        // When damage-aware EM was not active, fall back to total gamma.
         for (const auto& s : summaries) {
             if (!s.has_p_read || s.aa_m_opportunities == 0) continue;
             const auto& er = em_read_results[s.read_idx];
-            const double g = (er.gamma_ancient > 0.0f)
+            const double g = damage_em_active
                 ? static_cast<double>(er.gamma_ancient)
                 : static_cast<double>(er.gamma);
             if (g <= 0.0) continue;
@@ -2876,7 +2955,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         for (uint32_t r = 0; r < n_reads; ++r) {
             if (per_read_aa_decay[r] <= 0.0f) continue;
             const auto& er = em_read_results[r];
-            const double g = (er.gamma_ancient > 0.0f)
+            const double g = damage_em_active
                 ? static_cast<double>(er.gamma_ancient)
                 : static_cast<double>(er.gamma);
             if (g <= 0.0) continue;

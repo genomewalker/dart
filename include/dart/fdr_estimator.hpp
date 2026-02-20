@@ -77,8 +77,6 @@ public:
             float fdr = estimate_fdr(t, target_scores, decoy_scores);
             if (fdr <= target_fdr) {
                 best_threshold = t;
-            } else {
-                break;  // FDR exceeded, stop lowering threshold
             }
         }
 
