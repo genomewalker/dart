@@ -157,8 +157,9 @@ public:
             struct stat st;
             if (fstat(fd_, &st) == 0) file_size_ = static_cast<size_t>(st.st_size);
 
-            // Advise sequential access
+#ifdef __linux__
             posix_fadvise(fd_, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
         }
 
         // Allocate double buffer for overlapped I/O

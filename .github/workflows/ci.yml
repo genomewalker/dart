@@ -30,6 +30,9 @@ jobs:
 
       - name: Configure
         run: |
+          if [ "$(uname)" = "Darwin" ]; then
+            export PKG_CONFIG_PATH="$(brew --prefix)/lib/pkgconfig:$PKG_CONFIG_PATH"
+          fi
           cmake -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_TESTING=ON
