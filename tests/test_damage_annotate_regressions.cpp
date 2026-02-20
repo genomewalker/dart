@@ -1,4 +1,5 @@
 #include "dart/damage_index.hpp"
+#include "dart/fdr_estimator.hpp"
 
 #include <algorithm>
 #include <array>
@@ -705,6 +706,112 @@ static bool test_refine_damage_zero_mismatch_denominator(const std::string& dart
     return true;
 }
 
+static bool test_ancient_threshold_cli_flag(const std::string& dart_bin, const std::string& tmpdir) {
+    std::cout << "Running --ancient-threshold CLI flag regression...\n";
+    const std::string hits_path = tmpdir + "/athresh_hits.tsv";
+    // One R->W damage-consistent substitution at the terminal position.
+    // Site-only posterior (no AGD p_read) lands ~0.38 — above modern_threshold (0.25)
+    // but below the default ancient_threshold (0.60), so classification is Undetermined.
+    // With --ancient-threshold 0.20 the same posterior triggers AncientConfident.
+    std::ostringstream hits;
+    hits << "athresh_r1_+_0\tatarget\t0.90\t6\t1\t0\t1\t6\t1\t6\t1e-10\t40\t6\t100\tWAAAAA\tRAAAAA\n";
+    std::string err;
+    if (!write_file(hits_path, hits.str(), err)) {
+        std::cerr << err << "\n";
+        return false;
+    }
+    const std::string emi_path = tmpdir + "/athresh_hits.emi2";
+    if (!convert_hits_to_emi(dart_bin, hits_path, emi_path, err)) {
+        std::cerr << err << "\n";
+        return false;
+    }
+
+    // Default threshold (0.60): site-only posterior ~0.38 -> Undetermined -> is_damaged=0
+    std::string out_default, out_low;
+    std::string cmd_default = shell_quote(dart_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
+                              " --d-max 0.3 --no-identity";
+    if (!run_command_capture(cmd_default, out_default, err)) {
+        std::cerr << err << "\n";
+        return false;
+    }
+
+    // Lower ancient-threshold to 0.20 (and modern-threshold to 0.10 to satisfy ordering constraint):
+    // same posterior should become damage_class="ancient"
+    std::string cmd_low = shell_quote(dart_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
+                          " --d-max 0.3 --no-identity --ancient-threshold 0.20 --modern-threshold 0.10";
+    if (!run_command_capture(cmd_low, out_low, err)) {
+        std::cerr << err << "\n";
+        return false;
+    }
+
+    Table t_default, t_low;
+    if (!parse_table(out_default, t_default, err) || !parse_table(out_low, t_low, err)) {
+        std::cerr << err << "\n";
+        return false;
+    }
+    std::unordered_map<std::string, std::string> r_default, r_low;
+    if (!get_row_for_query(t_default, "athresh_r1_+_0", r_default) ||
+        !get_row_for_query(t_low, "athresh_r1_+_0", r_low)) {
+        std::cerr << "athresh_r1_+_0 missing in output\n";
+        return false;
+    }
+
+    const double posterior = std::stod(r_default["posterior"]);
+    if (!expect(posterior > 0.20 && posterior < 0.60,
+                "default run: posterior should be in (0.20, 0.60)")) {
+        std::cerr << "  got posterior=" << posterior << "\n";
+        return false;
+    }
+    // With default ancient_threshold=0.60, posterior ~0.38 -> damage_class="uncertain"
+    if (!expect(r_default["damage_class"] == "uncertain",
+                "default threshold (0.60): damage_class should be 'uncertain'")) return false;
+
+    // With --ancient-threshold 0.20, same posterior (>0.20) -> damage_class="ancient"
+    if (!expect(r_low["damage_class"] == "ancient",
+                "--ancient-threshold 0.20: damage_class should be 'ancient'")) return false;
+    return true;
+}
+
+static bool test_fdr_scan_non_monotone() {
+    std::cout << "Running FDR scan non-monotone regression (unit test)...\n";
+
+    // Construct a non-monotone FDR scenario:
+    //   - 3 targets at high scores (0.9, 0.8, 0.7)
+    //   - 1 decoy with score 0.65 (spike causing FDR > target right at 0.65)
+    //   - 100 targets at score 0.01 (dilute the decoy at low thresholds)
+    //
+    // At target_fdr=0.05, step=0.01:
+    //   threshold=0.70: 3 targets, 0 decoys -> FDR=0 (best so far)
+    //   threshold=0.65: 3 targets, 1 decoy  -> FDR=0.25 (exceeds target -> old code breaks)
+    //   threshold=0.01: 103 targets, 1 decoy -> FDR~0.01 (below target -> correct best)
+    //
+    // Old code (with break) returns 0.70.
+    // Fixed code (no break) returns 0.01.
+
+    std::vector<float> target_scores = {0.9f, 0.8f, 0.7f};
+    for (int i = 0; i < 100; ++i) target_scores.push_back(0.01f);
+    std::vector<float> decoy_scores = {0.65f};
+
+    const float threshold = dart::FDREstimator::find_threshold_for_fdr(
+        0.05f, target_scores, decoy_scores, 0.0f, -1.0f, 0.01f);
+
+    // Fixed code should find a threshold <= 0.01 (the low-score targets satisfy FDR<=0.05)
+    if (!expect(threshold <= 0.02f,
+                "FDR scan should find threshold ~0.01 after decoy spike (no early break)")) {
+        std::cerr << "  got threshold=" << threshold << " (expected <=0.02)\n";
+        return false;
+    }
+    // Verify FDR is actually satisfied at the returned threshold
+    const float fdr_at_result = dart::FDREstimator::estimate_fdr(
+        threshold, target_scores, decoy_scores);
+    if (!expect(fdr_at_result <= 0.05f,
+                "returned threshold should satisfy target FDR=0.05")) {
+        std::cerr << "  fdr=" << fdr_at_result << " at threshold=" << threshold << "\n";
+        return false;
+    }
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -731,6 +838,8 @@ int main(int argc, char* argv[]) {
     ok = test_analysis_prefix_bundle(dart_bin, tmpdir) && ok;
     ok = test_analysis_explicit_named_outputs(dart_bin, tmpdir) && ok;
     ok = test_refine_damage_zero_mismatch_denominator(dart_bin, tmpdir) && ok;
+    ok = test_ancient_threshold_cli_flag(dart_bin, tmpdir) && ok;
+    ok = test_fdr_scan_non_monotone() && ok;
 
     if (!ok) return 1;
     std::cout << "All damage-annotate regressions passed.\n";
