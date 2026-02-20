@@ -208,6 +208,20 @@ if(BUILD_TESTING)
         NAME damage_annotate_regressions
         COMMAND dart-damage-annotate-regressions $<TARGET_FILE:dart>
     )
+
+    add_executable(
+        dart-formal-model-tests
+        tests/test_formal_model.cpp
+        ${DART_CORE_SOURCES}
+    )
+    target_link_libraries(dart-formal-model-tests ${ZLIB_LIBRARIES} PkgConfig::ZSTD)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(dart-formal-model-tests OpenMP::OpenMP_CXX)
+    endif()
+    add_test(
+        NAME formal_model
+        COMMAND dart-formal-model-tests
+    )
 endif()
 
 # Install
