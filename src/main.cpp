@@ -403,7 +403,7 @@ int cmd_predict(int argc, char* argv[]) {
                     genes.push_back(std::move(gene));
                 }
 
-                results[i] = {id, genes};
+                results[i] = {std::move(id), std::move(genes)};
             }
 
             // Write results
