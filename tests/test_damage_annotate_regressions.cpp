@@ -633,6 +633,78 @@ static bool test_analysis_explicit_named_outputs(const std::string& dart_bin, co
     return true;
 }
 
+static bool test_refine_damage_zero_mismatch_denominator(const std::string& dart_bin, const std::string& tmpdir) {
+    std::cout << "Running --refine-damage zero-mismatch denominator regression...\n";
+
+    // Create synthetic data:
+    //   5 reads with damage-consistent R->W at AA position 0 (5' terminus)
+    //   5 reads with no mismatches but same susceptible R in target at position 0
+    // All reads map to the same target.
+    //
+    // With d_max=1.0, lambda=0.3, decay at dist=0 is exp(-0.3*0)=1.0.
+    // Correct MLE (denominator includes all reads):
+    //   sum_gamma_k=5, sum_gamma_decay=10 -> d_max_hat = 0.5
+    // Biased estimate (denominator from mismatch reads only):
+    //   sum_gamma_k=5, sum_gamma_decay=5  -> d_max_hat = 1.0
+    //
+    // This regression catches upward bias from excluding zero-mismatch reads.
+
+    const std::string hits_path = tmpdir + "/refine_hits.tsv";
+    std::ostringstream hits;
+    for (int i = 1; i <= 5; ++i) {
+        // R->W damage-consistent substitution at position 0 (dist_5=0)
+        hits << "hitR_" << i << "_+_0\tprotR\t0.833\t6\t0\t0\t1\t6\t1\t6\t1e-10\t60\t6\t10\t"
+             << "WAAAAA\tRAAAAA\n";
+    }
+    for (int i = 1; i <= 5; ++i) {
+        // No mismatches, but R at target position 0 is a susceptible site
+        hits << "noHit_" << i << "_+_0\tprotR\t1.00\t6\t0\t0\t1\t6\t1\t6\t1e-10\t60\t6\t10\t"
+             << "RAAAAA\tRAAAAA\n";
+    }
+
+    std::string err;
+    if (!write_file(hits_path, hits.str(), err)) {
+        std::cerr << err << "\n";
+        return false;
+    }
+    const std::string emi_path = tmpdir + "/refine_hits.emi2";
+    if (!convert_hits_to_emi(dart_bin, hits_path, emi_path, err)) {
+        std::cerr << err << "\n";
+        return false;
+    }
+
+    std::string out;
+    // Use d_max=1.0 so any downward refit proves zero-mismatch reads enter the denominator.
+    std::string cmd = shell_quote(dart_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
+                      " --d-max 1.0 --lambda 0.3 --refine-damage -v";
+    if (!run_command_capture(cmd, out, err)) {
+        std::cerr << err << "\n";
+        return false;
+    }
+
+    const std::string marker = "[refine-damage]";
+    size_t pos = out.find(marker);
+    if (!expect(pos != std::string::npos, "--refine-damage should emit a [refine-damage] verbose line")) {
+        return false;
+    }
+
+    // Parse d_max_new from "d_max: <old> -> <new> ..."
+    size_t arrow = out.find("-> ", pos);
+    if (!expect(arrow != std::string::npos, "[refine-damage] line should contain '->'")) return false;
+    double d_max_new = std::stod(out.substr(arrow + 3));
+
+    // Unbiased estimate: 5 hits / 10 decays = 0.5
+    // Biased estimate (old behaviour): 5 hits / 5 decays = 1.0
+    // We allow generous headroom for EM weighting effects.
+    if (!expect(d_max_new < 0.8,
+                "refine-damage d_max should be < 0.8 (zero-mismatch reads in denominator)")) {
+        std::cerr << "  got d_max_new=" << d_max_new << " (expected ~0.5)\n";
+        return false;
+    }
+    if (!expect(d_max_new > 0.0, "refine-damage d_max should be > 0")) return false;
+    return true;
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -658,6 +730,7 @@ int main(int argc, char* argv[]) {
     ok = test_blast8_unique_export(dart_bin, tmpdir) && ok;
     ok = test_analysis_prefix_bundle(dart_bin, tmpdir) && ok;
     ok = test_analysis_explicit_named_outputs(dart_bin, tmpdir) && ok;
+    ok = test_refine_damage_zero_mismatch_denominator(dart_bin, tmpdir) && ok;
 
     if (!ok) return 1;
     std::cout << "All damage-annotate regressions passed.\n";
