@@ -19,6 +19,10 @@
 #include <omp.h>
 #endif
 
+#ifdef __linux__
+#include <malloc.h>
+#endif
+
 namespace dart {
 
 namespace {
@@ -327,6 +331,15 @@ StreamingEMResult coverage_em_outer_loop(
             (void)ri;
             compute_coverage_metrics_for_protein(cs, cov_params, cs.tlen);
         }
+        // coverage_accumulate_pass() builds ~num_threads per-thread unordered_maps, each
+        // potentially holding one node per reference (~86 GB total for 32 threads × 9.9M refs).
+        // When those maps are destroyed on return, glibc retains the freed pages as heap RSS
+        // rather than returning them to the OS. Across the 5+ outer iterations this compounds
+        // to >400 GB of retained-but-freed RSS. malloc_trim(0) calls madvise(MADV_DONTNEED)
+        // on all freed regions in every arena (glibc >= 2.17), releasing them to the OS.
+#ifdef __linux__
+        malloc_trim(0);
+#endif
     };
 
     for (uint32_t outer_iter = 0; outer_iter < cov_params.max_outer_iters; ++outer_iter) {
