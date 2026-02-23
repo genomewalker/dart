@@ -2318,6 +2318,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
     all_results.clear();
     all_results.shrink_to_fit();
+    // qaln/taln strings are no longer needed — their content was moved into summaries above.
+    // Free the heap allocations (~300 bytes × 98M reads ≈ 30 GB) before coverage-EM.
+    for (auto& hit : best_hits) {
+        std::string{}.swap(hit.qaln);
+        std::string{}.swap(hit.taln);
+    }
     const auto annotate_end = std::chrono::steady_clock::now();
     if (verbose) {
         std::cerr << "Annotation runtime: "
@@ -2909,6 +2915,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             damage_index->damage_artifact(), damage_index->channel_b_valid(),
             damage_index->stop_decay_llr(), damage_index->terminal_shift());
         score_params.damage_detectability = damage_detectability;
+        // All per-read lookups are done; release the 31 GB index before Bayesian scoring.
+        damage_index.reset();
     }
 
     if (verbose) {
