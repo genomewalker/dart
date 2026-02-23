@@ -65,8 +65,7 @@ inline void decompress_chunk_to_buffer(const ColumnChunk& chunk,
     }
 }
 
-inline void madvise_willneed_range(const char* addr, size_t len) {
-#ifdef MADV_WILLNEED
+inline void madvise_range(const char* addr, size_t len, int advice) {
     if (addr == nullptr || len == 0) return;
     long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) return;
@@ -77,7 +76,21 @@ inline void madvise_willneed_range(const char* addr, size_t len) {
     if (aligned_end <= aligned_start) return;
     madvise(reinterpret_cast<void*>(aligned_start),
             static_cast<size_t>(aligned_end - aligned_start),
-            MADV_WILLNEED);
+            advice);
+}
+
+inline void madvise_willneed_range(const char* addr, size_t len) {
+#ifdef MADV_WILLNEED
+    madvise_range(addr, len, MADV_WILLNEED);
+#else
+    (void)addr;
+    (void)len;
+#endif
+}
+
+inline void madvise_dontneed_range(const char* addr, size_t len) {
+#ifdef MADV_DONTNEED
+    madvise_range(addr, len, MADV_DONTNEED);
 #else
     (void)addr;
     (void)len;
@@ -887,6 +900,26 @@ void ColumnarIndexReader::parallel_scan(RowGroupCallback callback) const {
             static_cast<const uint16_t*>(get_col(ColumnID::MISMATCH)),
             static_cast<const uint16_t*>(get_col(ColumnID::GAPOPEN))
         );
+
+        // Release mmap pages for this row group — the callback has consumed
+        // the data (copied to heap or accumulated into O(refs) sums), so these
+        // pages are no longer needed until the next EM iteration re-reads them
+        // from disk. Without this, all pages accumulate in RSS over multiple
+        // streaming EM iterations, easily exceeding the file size.
+        {
+            size_t rg_min = std::numeric_limits<size_t>::max();
+            size_t rg_end = 0;
+            for (size_t c = 0; c < static_cast<size_t>(ColumnID::NUM_COLUMNS); ++c) {
+                const auto& chunk = rg.columns[c];
+                if (chunk.compressed_size == 0) continue;
+                const size_t off = static_cast<size_t>(chunk.offset);
+                const size_t sz  = static_cast<size_t>(chunk.compressed_size);
+                rg_min = std::min(rg_min, off);
+                rg_end = std::max(rg_end, off + sz);
+            }
+            if (rg_end > rg_min)
+                madvise_dontneed_range(base + rg_min, rg_end - rg_min);
+        }
     }
     } // end omp parallel
 }

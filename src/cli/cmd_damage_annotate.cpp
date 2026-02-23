@@ -2346,11 +2346,13 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     std::unordered_map<uint32_t, dart::ProteinCoverageStats> coverage_stats_map;
 
     // Auto-switch to streaming EM if estimated memory exceeds limit
-    // Memory estimate: ~48 bytes per alignment (gamma double + Alignment struct overhead)
+    // Memory estimate: ~72 bytes per alignment at SQUAREM peak:
+    //   Alignment struct (40B) + gamma (8B) + gamma_ancient (8B)
+    //   + gamma_scratch (8B) + gamma_ancient_scratch (8B) = 72B
     // Plus ~4 bytes per read for offsets
     if (use_em && !em_streaming && em_max_memory_mb > 0) {
         const size_t num_alignments = reader.num_alignments();
-        const size_t estimated_mb = (num_alignments * 48 + n_reads * 4) / (1024 * 1024);
+        const size_t estimated_mb = (num_alignments * 72 + n_reads * 4) / (1024 * 1024);
         if (estimated_mb > em_max_memory_mb) {
             em_streaming = true;
             if (verbose) {
