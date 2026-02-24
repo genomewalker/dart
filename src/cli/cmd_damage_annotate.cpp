@@ -32,6 +32,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <string_view>
+#include <sstream>
 #include <atomic>
 #include <mutex>
 #include <limits>
@@ -243,7 +244,7 @@ static inline float evalue_from_log10(float evalue_log10) {
 // Annotate a single alignment
 static ProteinDamageSummary annotate_alignment(
     const std::string& query_id, const std::string& target_id,
-    const std::string& qaln, const std::string& taln,
+    std::string_view qaln, std::string_view taln,
     size_t qstart, size_t tstart, size_t qlen,
     float evalue, float bits, float fident,
     float d_max, float lambda)
@@ -1019,7 +1020,7 @@ struct DamageEstimate {
 };
 
 static void count_damage_for_estimate(
-    const std::string& query_id, const std::string& qaln, const std::string& taln,
+    const std::string& query_id, std::string_view qaln, std::string_view taln,
     size_t qstart, size_t qlen, DamageEstimate& est)
 {
     char strand = parse_strand(query_id);
@@ -1573,8 +1574,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         uint32_t aln_len_on_target = 0;
         uint32_t best_rg = UINT32_MAX;
         uint32_t best_row = UINT32_MAX;
-        std::string qaln;
-        std::string taln;
     };
     std::vector<BestHitData> best_hits(n_reads);
     const bool need_unique_degree = !blast8_unique_file.empty();
@@ -2028,8 +2027,13 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                   << dart::log_utils::format_elapsed(pass1_start, pass1_end) << "\n";
     }
 
-    // Pass 2: fetch alignment strings only for selected best hits.
+    // Combined Pass 2+3: load strings per row group, annotate inline, release pages.
+    // Strings are never copied into best_hits — they are string_views from the mmap,
+    // valid only during their row group's callback. Peak string memory ≈ 8 threads ×
+    // one row group's qaln/taln data (~8 MB each) instead of ~20 GB across all reads.
     const auto pass2_start = std::chrono::steady_clock::now();
+
+    // Build the row-group index: maps rg_idx → sorted list of (row_in_group, ridx).
     std::vector<std::vector<std::pair<uint32_t, uint32_t>>> best_rows_by_rg(reader.num_row_groups());
     std::vector<uint32_t> selected_row_groups;
     selected_row_groups.reserve(reader.num_row_groups());
@@ -2048,173 +2052,45 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
     std::sort(selected_row_groups.begin(), selected_row_groups.end());
 
-    if (selected_best_hits > 0) {
-        reader.set_columns({dart::ColumnID::QALN, dart::ColumnID::TALN});
-        std::atomic<size_t> loaded_best_hit_strings{0};
-        reader.parallel_scan_selected(selected_row_groups, [&]( 
-            uint32_t rg_idx, uint32_t num_rows,
-            const uint32_t*, const uint32_t*,
-            const float*, const float*, const float*,
-            const uint16_t*, const uint16_t*,
-            const float*, const float*,
-            const uint16_t*, const uint16_t*,
-            const uint16_t*, const uint16_t*,
-            const uint16_t*, const uint16_t*,
-            const uint16_t*, const uint16_t*,
-            const uint16_t*, const uint16_t*)
-        {
-            const auto& rows = best_rows_by_rg[rg_idx];
-            if (rows.empty()) return;
-            size_t local_loaded = 0;
-
-            for (const auto& row_pair : rows) {
-                const uint32_t row_in_group = row_pair.first;
-                const uint32_t ridx = row_pair.second;
-                if (row_in_group >= num_rows) continue;
-
-                std::string_view qaln_sv = reader.get_qaln(rg_idx, row_in_group);
-                std::string_view taln_sv = reader.get_taln(rg_idx, row_in_group);
-
-                BestHitData& hit = best_hits[ridx];
-                hit.qaln.assign(qaln_sv.begin(), qaln_sv.end());
-                hit.taln.assign(taln_sv.begin(), taln_sv.end());
-                size_t aln_len_target = 0;
-                for (char c : hit.taln) {
-                    if (c != '-') ++aln_len_target;
-                }
-                hit.aln_len_on_target = aln_len_target;
-                local_loaded++;
-            }
-            loaded_best_hit_strings.fetch_add(local_loaded, std::memory_order_relaxed);
-        });
-
-        if (verbose && loaded_best_hit_strings.load(std::memory_order_relaxed) != selected_best_hits) {
-            std::cerr << "Warning: Loaded " << loaded_best_hit_strings.load(std::memory_order_relaxed)
-                      << "/" << selected_best_hits << " best-hit alignment strings from EMI.\n";
-        }
-    }
-    const auto pass2_end = std::chrono::steady_clock::now();
-    if (verbose) {
-        std::cerr << "Pass 2 runtime: "
-                  << dart::log_utils::format_elapsed(pass2_start, pass2_end)
-                  << " (" << selected_best_hits << " best-hit alignments)\n";
-    }
-
-    if (!blast8_unique_file.empty()) {
-        std::ofstream bf(blast8_unique_file);
-        if (!bf.is_open()) {
-            std::cerr << "Error: Cannot open BLAST8 unique file: " << blast8_unique_file << "\n";
-            return 1;
-        }
-
-        size_t written_unique = 0;
-        for (uint32_t ridx = 0; ridx < n_reads; ++ridx) {
-            if (need_unique_degree) {
-                if (ridx >= read_degree.size() || read_degree[ridx] != 1) continue;
-            }
-            const auto& hit = best_hits[ridx];
-            if (!hit.has) continue;
-
-            const std::string qid(reader.read_name(ridx));
-            const std::string sid(reader.ref_name(hit.ref_idx));
-
-            int aln_len = 0;
-            int mismatches = 0;
-            int gapopen = 0;
-            int q_aln_non_gap = 0;
-            int t_aln_non_gap = 0;
-            bool in_gap_q = false;
-            bool in_gap_t = false;
-
-            const size_t n = std::min(hit.qaln.size(), hit.taln.size());
-            for (size_t i = 0; i < n; ++i) {
-                const char q = hit.qaln[i];
-                const char t = hit.taln[i];
-                aln_len++;
-
-                if (q == '-') {
-                    if (!in_gap_q) {
-                        gapopen++;
-                        in_gap_q = true;
-                    }
-                } else {
-                    in_gap_q = false;
-                    q_aln_non_gap++;
-                }
-
-                if (t == '-') {
-                    if (!in_gap_t) {
-                        gapopen++;
-                        in_gap_t = true;
-                    }
-                } else {
-                    in_gap_t = false;
-                    t_aln_non_gap++;
-                }
-
-                if (q != '-' && t != '-' && q != t) mismatches++;
-            }
-
-            const int qstart1 = static_cast<int>(hit.qstart_0 + 1);
-            const int sstart1 = static_cast<int>(hit.tstart_0 + 1);
-            const int qend1 = (q_aln_non_gap > 0) ? (qstart1 + q_aln_non_gap - 1) : qstart1;
-            const int send1 = (t_aln_non_gap > 0) ? (sstart1 + t_aln_non_gap - 1) : sstart1;
-            const float pident = hit.fident * 100.0f;
-
-            // BLAST outfmt 6 style (qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore)
-            bf << qid << '\t' << sid << '\t'
-               << std::fixed << std::setprecision(3) << pident << '\t'
-               << aln_len << '\t' << mismatches << '\t' << gapopen << '\t'
-               << qstart1 << '\t' << qend1 << '\t'
-               << sstart1 << '\t' << send1 << '\t'
-               << std::scientific << std::setprecision(2) << hit.evalue << '\t'
-               << std::fixed << std::setprecision(1) << hit.bits << '\n';
-            written_unique++;
-        }
-
-        if (verbose) {
-            std::cerr << "Unique-mapper BLAST8 written to: " << blast8_unique_file
-                      << " (" << written_unique << " rows)\n";
-        }
-    }
-
+    // Determine d_max before annotation (annotate_alignment needs it as a parameter).
     if (d_max < 0.0f) {
         if (damage_index && damage_index->d_max() > 0.0f) {
             d_max = damage_index->d_max();
-            if (!lambda_set_by_user && damage_index->lambda() > 0.0f) {
+            if (!lambda_set_by_user && damage_index->lambda() > 0.0f)
                 lambda = damage_index->lambda();
-            }
             if (verbose) {
                 std::cerr << "Using d_max from damage index header: " << std::fixed
                           << std::setprecision(3) << d_max << "\n";
-                if (!lambda_set_by_user) {
+                if (!lambda_set_by_user)
                     std::cerr << "Using lambda from damage index header: " << std::fixed
                               << std::setprecision(3) << lambda << "\n";
-                }
             }
         } else if (reader.d_max() > 0.0f) {
             d_max = reader.d_max();
-            if (!lambda_set_by_user && reader.lambda() > 0.0f) {
+            if (!lambda_set_by_user && reader.lambda() > 0.0f)
                 lambda = reader.lambda();
-            }
             if (verbose) {
                 std::cerr << "Using d_max from EMI header: " << std::fixed
                           << std::setprecision(3) << d_max << "\n";
-                if (!lambda_set_by_user) {
+                if (!lambda_set_by_user)
                     std::cerr << "Using lambda from EMI header: " << std::fixed
                               << std::setprecision(3) << lambda << "\n";
-                }
             }
         } else {
-            if (verbose) {
+            // Rare fallback: estimate d_max from alignment strings.
+            // Requires a preliminary sequential pass through strings before the main annotation.
+            if (verbose)
                 std::cerr << "Estimating d_max from EMI best hits...\n";
-            }
+            reader.set_columns({dart::ColumnID::QALN, dart::ColumnID::TALN});
             DamageEstimate est;
-            for (uint32_t ridx = 0; ridx < n_reads; ++ridx) {
-                const BestHitData& hit = best_hits[ridx];
-                if (!hit.has) continue;
-                std::string query_id(reader.read_name(ridx));
-                count_damage_for_estimate(query_id, hit.qaln, hit.taln, hit.qstart_0, hit.qlen, est);
+            for (const uint32_t rg_idx : selected_row_groups) {
+                for (const auto& [row_in_group, ridx] : best_rows_by_rg[rg_idx]) {
+                    std::string_view qaln_sv = reader.get_qaln(rg_idx, row_in_group);
+                    std::string_view taln_sv = reader.get_taln(rg_idx, row_in_group);
+                    std::string query_id(reader.read_name(ridx));
+                    count_damage_for_estimate(query_id, qaln_sv, taln_sv,
+                        best_hits[ridx].qstart_0, best_hits[ridx].qlen, est);
+                }
             }
             d_max = est.estimate_d_max();
             if (verbose) {
@@ -2226,6 +2102,17 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             }
         }
         if (verbose) std::cerr << "\n";
+    }
+
+    // Open BLAST8 output file if requested.
+    std::ofstream blast8_out;
+    size_t written_unique = 0;
+    if (!blast8_unique_file.empty()) {
+        blast8_out.open(blast8_unique_file);
+        if (!blast8_out.is_open()) {
+            std::cerr << "Error: Cannot open BLAST8 unique file: " << blast8_unique_file << "\n";
+            return 1;
+        }
     }
 
     if (verbose) {
@@ -2245,70 +2132,148 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         std::cerr << "  Passed: " << passed << " (" << (total > 0 ? 100.0 * passed / total : 0.0) << "%)\n\n";
     }
 
-    // Process best hits into summaries (parallel)
+    // Per-read decay and annotation results.
     const auto annotate_start = std::chrono::steady_clock::now();
-    // Per-read decay sums for ALL reads (including zero-mismatch).
-    // Used by the --refine-damage coordinator denominator to avoid upward bias
-    // from excluding zero-mismatch reads that still have positive decay opportunities.
     std::vector<float> per_read_aa_decay(n_reads, 0.0f);
     std::vector<std::pair<uint32_t, ProteinDamageSummary>> all_results;
-    #pragma omp parallel
-    {
-        std::vector<std::pair<uint32_t, ProteinDamageSummary>> local_results;
-        #pragma omp for schedule(dynamic, 256) nowait
-        for (uint32_t ridx = 0; ridx < n_reads; ++ridx) {
-            const auto& hit = best_hits[ridx];
-            if (!hit.has) continue;
 
-            std::string query_id(reader.read_name(ridx));
-            std::string target_id(reader.ref_name(hit.ref_idx));
-            auto summary = annotate_alignment(
-                query_id, target_id, hit.qaln, hit.taln,
-                hit.qstart_0, hit.tstart_0, hit.qlen,
-                hit.evalue, hit.bits, hit.fident, d_max, lambda);
+    if (selected_best_hits > 0) {
+        reader.set_columns({dart::ColumnID::QALN, dart::ColumnID::TALN});
 
-            // Capture decay for all reads before the mismatch filter.
-            // Safe: each ridx is written by exactly one thread.
-            per_read_aa_decay[ridx] = summary.aa_sum_exp_decay;
+        reader.parallel_scan_selected(selected_row_groups, [&](
+            uint32_t rg_idx, uint32_t num_rows,
+            const uint32_t*, const uint32_t*,
+            const float*, const float*, const float*,
+            const uint16_t*, const uint16_t*,
+            const float*, const float*,
+            const uint16_t*, const uint16_t*,
+            const uint16_t*, const uint16_t*,
+            const uint16_t*, const uint16_t*,
+            const uint16_t*, const uint16_t*,
+            const uint16_t*, const uint16_t*)
+        {
+            const auto& rows = best_rows_by_rg[rg_idx];
+            if (rows.empty()) return;
 
-            if (summary.total_mismatches > 0) {
-                summary.read_idx = ridx;
-                filter_sites_by_distance(summary, max_dist);
-                summary.qlen = hit.qlen;
-                summary.qaln = hit.qaln;
-                summary.taln = hit.taln;
-                summary.qstart_0 = hit.qstart_0;
-                summary.tstart_0 = hit.tstart_0;
-                summary.tlen = hit.tlen;
-                summary.delta_bits = hit.bits - hit.bits_second;
-                summary.bpa = (summary.alnlen > 0)
-                    ? hit.bits / static_cast<float>(summary.alnlen) : 0.0f;
-                summary.length_bin = static_cast<uint8_t>(
-                    dart::LengthBinStats::get_bin(hit.qlen));
-                summary.p_read = std::clamp(hit.damage_score, 0.0f, 1.0f);
-                summary.has_p_read = true;
-                if (damage_index) {
-                    if (const AgdRecord* rec = damage_index->find(query_id)) {
-                        auto syn_result = detect_synonymous_damage(
-                            *rec, damage_index->d_max(), damage_index->lambda());
-                        summary.syn_5prime = syn_result.synonymous_5prime;
-                        summary.syn_3prime = syn_result.synonymous_3prime;
-                        summary.has_syn_data = true;
-                        summary.p_read = static_cast<float>(rec->p_damaged_q) / 255.0f;
+            // Parallel annotation within this row group.
+            // string_view references into the mmap are valid until MADV_DONTNEED fires
+            // after this callback returns (handled by parallel_scan_selected).
+            #pragma omp parallel
+            {
+                std::vector<std::pair<uint32_t, ProteinDamageSummary>> local_results;
+                std::ostringstream local_blast8;
+
+                #pragma omp for schedule(dynamic, 64) nowait
+                for (size_t i = 0; i < rows.size(); ++i) {
+                    const auto& [row_in_group, ridx] = rows[i];
+                    if (row_in_group >= num_rows) continue;
+                    BestHitData& hit = best_hits[ridx];
+                    if (!hit.has) continue;
+
+                    std::string_view qaln_sv = reader.get_qaln(rg_idx, row_in_group);
+                    std::string_view taln_sv = reader.get_taln(rg_idx, row_in_group);
+
+                    // Compute aln_len_on_target (previously done in the old Pass 2).
+                    uint32_t aln_len_target = 0;
+                    for (char c : taln_sv) if (c != '-') ++aln_len_target;
+                    hit.aln_len_on_target = aln_len_target;
+
+                    std::string query_id(reader.read_name(ridx));
+                    std::string target_id(reader.ref_name(hit.ref_idx));
+
+                    // BLAST8 unique-mapper output.
+                    if (!blast8_unique_file.empty() && need_unique_degree &&
+                        ridx < read_degree.size() && read_degree[ridx] == 1) {
+                        int aln_len = 0, mismatches = 0, gapopen = 0;
+                        int q_aln_non_gap = 0, t_aln_non_gap = 0;
+                        bool in_gap_q = false, in_gap_t = false;
+                        const size_t n = std::min(qaln_sv.size(), taln_sv.size());
+                        for (size_t j = 0; j < n; ++j) {
+                            const char q = qaln_sv[j];
+                            const char t = taln_sv[j];
+                            aln_len++;
+                            if (q == '-') { if (!in_gap_q) { gapopen++; in_gap_q = true; } }
+                            else { in_gap_q = false; q_aln_non_gap++; }
+                            if (t == '-') { if (!in_gap_t) { gapopen++; in_gap_t = true; } }
+                            else { in_gap_t = false; t_aln_non_gap++; }
+                            if (q != '-' && t != '-' && q != t) mismatches++;
+                        }
+                        const int qstart1 = static_cast<int>(hit.qstart_0 + 1);
+                        const int sstart1 = static_cast<int>(hit.tstart_0 + 1);
+                        const int qend1 = (q_aln_non_gap > 0) ? (qstart1 + q_aln_non_gap - 1) : qstart1;
+                        const int send1 = (t_aln_non_gap > 0) ? (sstart1 + t_aln_non_gap - 1) : sstart1;
+                        local_blast8 << query_id << '\t' << target_id << '\t'
+                            << std::fixed << std::setprecision(3) << (hit.fident * 100.0f) << '\t'
+                            << aln_len << '\t' << mismatches << '\t' << gapopen << '\t'
+                            << qstart1 << '\t' << qend1 << '\t'
+                            << sstart1 << '\t' << send1 << '\t'
+                            << std::scientific << std::setprecision(2) << hit.evalue << '\t'
+                            << std::fixed << std::setprecision(1) << hit.bits << '\n';
+                    }
+
+                    // Annotate.
+                    auto summary = annotate_alignment(
+                        query_id, target_id, qaln_sv, taln_sv,
+                        hit.qstart_0, hit.tstart_0, hit.qlen,
+                        hit.evalue, hit.bits, hit.fident, d_max, lambda);
+
+                    per_read_aa_decay[ridx] = summary.aa_sum_exp_decay;
+
+                    if (summary.total_mismatches > 0) {
+                        summary.read_idx = ridx;
+                        filter_sites_by_distance(summary, max_dist);
+                        summary.qlen = hit.qlen;
+                        summary.qaln = std::string(qaln_sv);
+                        summary.taln = std::string(taln_sv);
+                        summary.qstart_0 = hit.qstart_0;
+                        summary.tstart_0 = hit.tstart_0;
+                        summary.tlen = hit.tlen;
+                        summary.delta_bits = hit.bits - hit.bits_second;
+                        summary.bpa = (summary.alnlen > 0)
+                            ? hit.bits / static_cast<float>(summary.alnlen) : 0.0f;
+                        summary.length_bin = static_cast<uint8_t>(
+                            dart::LengthBinStats::get_bin(hit.qlen));
+                        summary.p_read = std::clamp(hit.damage_score, 0.0f, 1.0f);
                         summary.has_p_read = true;
+                        if (damage_index) {
+                            if (const AgdRecord* rec = damage_index->find(query_id)) {
+                                auto syn_result = detect_synonymous_damage(
+                                    *rec, damage_index->d_max(), damage_index->lambda());
+                                summary.syn_5prime = syn_result.synonymous_5prime;
+                                summary.syn_3prime = syn_result.synonymous_3prime;
+                                summary.has_syn_data = true;
+                                summary.p_read = static_cast<float>(rec->p_damaged_q) / 255.0f;
+                                summary.has_p_read = true;
+                            }
+                        }
+                        local_results.emplace_back(ridx, std::move(summary));
                     }
                 }
-                local_results.emplace_back(ridx, std::move(summary));
+
+                #pragma omp critical
+                {
+                    all_results.insert(all_results.end(),
+                        std::make_move_iterator(local_results.begin()),
+                        std::make_move_iterator(local_results.end()));
+                    if (!blast8_unique_file.empty()) {
+                        std::string s = local_blast8.str();
+                        if (!s.empty()) {
+                            blast8_out << s;
+                            written_unique += static_cast<size_t>(
+                                std::count(s.begin(), s.end(), '\n'));
+                        }
+                    }
+                }
             }
-        }
-        #pragma omp critical
-        {
-            all_results.insert(all_results.end(),
-                std::make_move_iterator(local_results.begin()),
-                std::make_move_iterator(local_results.end()));
-        }
+        });
     }
-    // Sort by read index for deterministic output order
+
+    if (!blast8_unique_file.empty() && verbose) {
+        std::cerr << "Unique-mapper BLAST8 written to: " << blast8_unique_file
+                  << " (" << written_unique << " rows)\n";
+    }
+
+    // Sort by read index for deterministic output order.
     std::sort(all_results.begin(), all_results.end(),
         [](const auto& a, const auto& b) { return a.first < b.first; });
     summaries.reserve(all_results.size());
@@ -2318,12 +2283,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
     all_results.clear();
     all_results.shrink_to_fit();
-    // qaln/taln strings are no longer needed — their content was moved into summaries above.
-    // Free the heap allocations (~300 bytes × 98M reads ≈ 30 GB) before coverage-EM.
-    for (auto& hit : best_hits) {
-        std::string{}.swap(hit.qaln);
-        std::string{}.swap(hit.taln);
-    }
+
     const auto annotate_end = std::chrono::steady_clock::now();
     if (verbose) {
         std::cerr << "Annotation runtime: "
