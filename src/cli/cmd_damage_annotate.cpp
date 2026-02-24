@@ -214,6 +214,24 @@ struct ProteinAggInput {
     std::vector<DamageSite> sites;  // moved from ProteinDamageSummary
 };
 
+// Compact per-read assignment data sorted by ref_idx for streaming gene/protein output.
+// Replaces the gene_agg and protein_agg unordered_maps with a sort-then-stream pass.
+struct ReadRefEntry {
+    uint32_t ref_idx;
+    uint32_t tstart_0;
+    float gamma;
+    float fident;
+    float bits;
+    float bits_second;
+    uint32_t aln_len_on_target;
+    uint16_t tlen;
+    uint8_t length_bin;
+    bool has_damage_obs;
+    float posterior;
+    uint8_t classification;  // dart::AncientClassification cast to uint8_t
+    uint8_t pad[2];
+};  // 40 bytes
+
 // Parse strand and frame from DART header suffix (e.g., readname_+_1 -> '+', 1)
 // Returns {strand, frame} where frame is 0, 1, or 2
 static std::pair<char, int> parse_strand_and_frame(const std::string& query_id) {
@@ -3173,979 +3191,689 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             protein_agg_inputs.push_back(std::move(c));
         }
     }
+    const size_t n_summaries = summaries.size();
     { decltype(summaries) tmp; tmp.swap(summaries); }
 #ifdef __linux__
     malloc_trim(0);  // Return freed summaries heap to OS before gene_agg/protein_agg
 #endif
 
-    // Build name->ref_idx reverse map for coverage stats lookup in output
-    std::unordered_map<std::string, uint32_t> name_to_ref_idx;
-    if (!coverage_stats_map.empty()) {
-        name_to_ref_idx.reserve(n_refs);
-        for (uint32_t ri = 0; ri < n_refs; ++ri) {
-            name_to_ref_idx[std::string(reader.ref_name(ri))] = ri;
-        }
-    }
+    // =====================================================================
+    // Streaming output: sort reads by ref_idx, process one ref at a time.
+    // Avoids materializing 9.9M-entry gene_agg / protein_agg maps (~35 GB).
+    // =====================================================================
 
-    std::unordered_map<uint32_t, GeneSummaryAccumulator> gene_agg;
-    bool have_gene_agg = false;
-
-    // Build/write gene summary (supports both best-hit and EM-weighted modes)
-    const bool need_gene_aggregation =
+    const bool need_any_aggregation =
         !gene_summary_file.empty() || !functional_summary_file.empty() ||
         !anvio_ko_file.empty() || !combined_output_file.empty() ||
         !protein_summary_file.empty() || !protein_filtered_file.empty();
-    if (need_gene_aggregation) {
-        gene_agg.clear();
 
+    // 1. Build ReadRefEntry list (only em_keep reads), sort by ref_idx.
+    std::vector<ReadRefEntry> read_ref_entries;
+    size_t assigned_kept_reads = 0;
+
+    if (need_any_aggregation) {
+        read_ref_entries.reserve(std::min<size_t>(n_reads, size_t{1} << 26));
         for (uint32_t ridx = 0; ridx < n_reads; ++ridx) {
             const auto& hit = best_hits[ridx];
             if (!hit.has) continue;
-            if (use_em) {
-                if (ridx >= em_read_results.size() || !em_read_results[ridx].em_keep) {
-                    continue;
-                }
+            if (use_em && (ridx >= em_read_results.size() || !em_read_results[ridx].em_keep))
+                continue;
+            ReadRefEntry e;
+            e.ref_idx              = hit.ref_idx;
+            e.tstart_0             = static_cast<uint32_t>(hit.tstart_0);
+            e.gamma                = use_em ? em_read_results[ridx].gamma : 1.0f;
+            e.fident               = hit.fident;
+            e.bits                 = hit.bits;
+            e.bits_second          = hit.bits_second;
+            e.aln_len_on_target    = static_cast<uint32_t>(hit.aln_len_on_target);
+            e.tlen                 = static_cast<uint16_t>(std::min<uint32_t>(static_cast<uint32_t>(hit.tlen), UINT16_MAX));
+            e.length_bin           = static_cast<uint8_t>(dart::LengthBinStats::get_bin(hit.qlen));
+            const int32_t si       = (ridx < summary_index_by_read.size())
+                                     ? summary_index_by_read[ridx] : -1;
+            e.has_damage_obs       = (si >= 0);
+            if (si >= 0 && static_cast<size_t>(si) < read_posteriors.size()) {
+                e.posterior        = read_posteriors[static_cast<size_t>(si)];
+                e.classification   = static_cast<uint8_t>(read_classifications[static_cast<size_t>(si)]);
+            } else {
+                e.posterior        = 0.0f;
+                e.classification   = 0;
             }
-            auto& acc = gene_agg[hit.ref_idx];
-            if (acc.tlen == 0) {
-                acc.target_id = std::string(reader.ref_name(hit.ref_idx));
-                acc.tlen = static_cast<uint32_t>(hit.tlen);
-                if (acc.tlen > 0) {
-                    acc.coverage.assign(acc.tlen, 0.0f);
-                }
-            }
-
-            const float gamma = use_em ? em_read_results[ridx].gamma : 1.0f;
-            acc.add_assignment(hit.fident, hit.tstart_0, hit.aln_len_on_target, gamma);
-
-            const int32_t summary_idx = (ridx < summary_index_by_read.size())
-                ? summary_index_by_read[ridx]
-                : -1;
-            if (summary_idx >= 0) {
-                const size_t si = static_cast<size_t>(summary_idx);
-                if (si < read_posteriors.size() && si < read_classifications.size()) {
-                    acc.add_damage_observation(read_classifications[si], read_posteriors[si], gamma);
-                }
-            }
+            e.pad[0] = 0; e.pad[1] = 0;
+            read_ref_entries.push_back(e);
         }
-
-        // Auto-calibrate spurious hit thresholds if requested
-        if (auto_calibrate_spurious) {
-            std::vector<float> calib_pos_scores;
-            std::vector<float> calib_term_ratios;
-            calib_pos_scores.reserve(gene_agg.size() / 10);
-            calib_term_ratios.reserve(gene_agg.size() / 10);
-
-            // Collect scores from well-supported genes (calibration set)
-            for (const auto& [tid, acc] : gene_agg) {
-                if (acc.n_reads >= 10 && acc.n_unique_starts() >= 3) {
-                    calib_pos_scores.push_back(acc.positional_score());
-                    calib_term_ratios.push_back(acc.terminal_middle_ratio());
-                }
-            }
-
-            if (calib_pos_scores.size() >= 100) {
-                // Compute 5th percentile for each metric
-                std::sort(calib_pos_scores.begin(), calib_pos_scores.end());
-                std::sort(calib_term_ratios.begin(), calib_term_ratios.end());
-
-                const size_t idx_5pct = calib_pos_scores.size() / 20;  // 5th percentile
-                float calib_min_pos = calib_pos_scores[idx_5pct];
-                float calib_min_term = calib_term_ratios[idx_5pct];
-
-                // Apply floor to terminal ratio (min 0.20 in normalised units,
-                // where 1.0 = expected for a real gene given read length)
-                calib_min_term = std::max(0.20f, calib_min_term);
-
-                // Override if auto-calibration yields stricter thresholds
-                if (calib_min_pos > min_positional_score) {
-                    min_positional_score = calib_min_pos;
-                }
-                if (!user_set_terminal_ratio && calib_min_term > min_terminal_ratio) {
-                    min_terminal_ratio = calib_min_term;
-                }
-
-                if (verbose) {
-                    std::cerr << "Auto-calibration (n=" << calib_pos_scores.size() << " genes):\n"
-                              << "  min_positional_score: " << std::fixed << std::setprecision(4) << min_positional_score << "\n"
-                              << "  min_terminal_ratio: " << std::fixed << std::setprecision(4) << min_terminal_ratio << "\n";
-                }
-            } else if (verbose) {
-                std::cerr << "Auto-calibration: insufficient calibration set ("
-                          << calib_pos_scores.size() << " genes, need >= 100)\n";
-            }
-        }
-
-        if (!gene_summary_file.empty()) {
-            std::ofstream gf(gene_summary_file);
-            if (!gf.is_open()) {
-                std::cerr << "Error: Cannot open gene summary file: " << gene_summary_file << "\n";
-                return 1;
-            }
-
-            // Full gene-level stats including coverage, damage, alignment, and diversity metrics
-            gf << "target_id\tn_reads\teff_reads\tn_damage_reads\teff_damage_reads\t"
-                  "n_ancient\tn_modern\tn_undetermined\t"
-                  "ancient_frac\tci_low\tci_high\tmean_posterior\tmean_identity\t"
-                  "breadth\tabundance\tdepth_std\tdepth_evenness\t"
-                  "n_unique_starts\tstart_diversity\tstart_span\tpositional_score\t"
-                  "terminal_middle_ratio\tavg_aln_len\tstd_aln_len\t"
-                  "coverage_deviance\tcompleteness_fhat\tcoverage_weight\tabundance_adjusted\n";
-
-            for (const auto& [tid, acc] : gene_agg) {
-                if (acc.n_reads < min_reads) continue;
-                float b = acc.breadth();
-                if (b < min_breadth) continue;
-                float abundance = acc.depth_mean();  // Gamma-weighted depth = abundance
-                if (abundance < min_depth) continue;
-                const float pos_score = acc.positional_score();
-                if (pos_score < min_positional_score) continue;
-                const float term_ratio = acc.terminal_middle_ratio();
-                if (term_ratio < min_terminal_ratio) continue;
-
-                // Gamma-weighted ancient/modern counts
-                float n_ancient = static_cast<float>(acc.n_ancient_conf + acc.n_ancient_likely);
-                float n_modern = static_cast<float>(acc.n_modern_conf);
-                float n_undet = static_cast<float>(acc.n_undetermined);
-
-                const double n_eff_class = static_cast<double>(n_ancient + n_modern);
-                auto [ci_lo, ci_hi] = wilson_ci_effective(n_ancient, n_eff_class);
-
-                gf << acc.target_id
-                   << '\t' << acc.n_reads
-                   << '\t' << std::fixed << std::setprecision(2) << acc.eff_reads()
-                   << '\t' << acc.n_damage_reads
-                   << '\t' << std::setprecision(2) << acc.n_damage_reads_eff
-                   << '\t' << std::setprecision(2) << n_ancient
-                   << '\t' << std::setprecision(2) << n_modern
-                   << '\t' << std::setprecision(2) << n_undet
-                   << '\t' << std::setprecision(4) << acc.ancient_frac()
-                   << '\t' << std::setprecision(4) << ci_lo
-                   << '\t' << std::setprecision(4) << ci_hi
-                   << '\t' << std::setprecision(4) << acc.avg_posterior()
-                   << '\t' << std::setprecision(4) << acc.avg_fident()
-                   << '\t' << std::setprecision(4) << b
-                   << '\t' << std::setprecision(4) << abundance
-                   << '\t' << std::setprecision(4) << acc.depth_std()
-                   << '\t' << std::setprecision(4) << acc.depth_evenness()
-                   << '\t' << acc.n_unique_starts()
-                   << '\t' << std::setprecision(4) << acc.start_diversity()
-                   << '\t' << std::setprecision(4) << acc.start_span()
-                   << '\t' << std::setprecision(4) << pos_score
-                   << '\t' << std::setprecision(4) << term_ratio
-                   << '\t' << std::setprecision(2) << acc.avg_aln_len()
-                   << '\t' << std::setprecision(2) << acc.std_aln_len();
-
-                // Coverage EM columns
-                {
-                    float g_cov_deviance = 0.0f;
-                    float g_cov_fhat = 1.0f;
-                    float g_cov_weight = 1.0f;
-                    float g_abundance_adj = acc.eff_reads();
-                    auto cit = coverage_stats_map.find(tid);
-                    if (cit != coverage_stats_map.end()) {
-                        g_cov_deviance = cit->second.coverage_deviance;
-                        g_cov_fhat = cit->second.completeness_fhat;
-                        g_cov_weight = cit->second.coverage_weight;
-                        g_abundance_adj = acc.eff_reads() * g_cov_weight;
-                    }
-                    gf << '\t' << std::setprecision(4) << g_cov_deviance
-                       << '\t' << std::setprecision(4) << g_cov_fhat
-                       << '\t' << std::setprecision(4) << g_cov_weight
-                       << '\t' << std::setprecision(2) << g_abundance_adj;
-                }
-                gf << '\n';
-            }
-
-            if (verbose) {
-                size_t total = gene_agg.size();
-                size_t passed = 0;
-                for (const auto& [tid, acc] : gene_agg) {
-                    if (acc.n_reads >= min_reads && acc.breadth() >= min_breadth
-                        && acc.depth_mean() >= min_depth
-                        && acc.positional_score() >= min_positional_score
-                        && acc.terminal_middle_ratio() >= min_terminal_ratio)
-                        ++passed;
-                }
-                std::cerr << "Gene summary written to: " << gene_summary_file
-                          << " (" << passed << "/" << total << " genes after filtering)\n";
-            }
-        }
-
-        have_gene_agg = true;
-
-        // Functional profiling (aggregate gene stats by mapped group)
-        bool do_functional = !map_file.empty();
-        if (do_functional) {
-            // Load mapping file: gene_id -> group
-            auto group_map = load_mapping_file(map_file, verbose);
-
-            // Accumulator by group
-            std::unordered_map<std::string, FunctionalAccumulator> group_acc;
-
-            // Aggregate gene stats by group
-            for (const auto& [tid, acc] : gene_agg) {
-                // Skip filtered genes
-                float abundance = acc.depth_mean();  // EM-weighted abundance
-                if (acc.n_reads < min_reads || acc.breadth() < min_breadth || abundance < min_depth
-                    || acc.positional_score() < min_positional_score
-                    || acc.terminal_middle_ratio() < min_terminal_ratio)
-                    continue;
-
-                // Use effective reads (gamma-weighted) for proper abundance estimation
-                uint32_t eff_reads = static_cast<uint32_t>(std::round(acc.eff_reads()));
-                float gene_ancient = static_cast<float>(acc.n_ancient_conf + acc.n_ancient_likely);
-                float gene_modern = static_cast<float>(acc.n_modern_conf);
-                float gene_undetermined = static_cast<float>(acc.n_undetermined);
-
-                auto map_it = group_map.find(acc.target_id);
-                if (map_it != group_map.end()) {
-                    auto& fa = group_acc[map_it->second];
-                    if (fa.function_id.empty()) {
-                        fa.function_id = map_it->second;
-                        fa.db_type = "MAP";
-                    }
-                    const float gene_mean_post = acc.avg_posterior();
-                    const bool gene_is_damaged = (gene_mean_post >= threshold);
-                    fa.add_gene(eff_reads, gene_ancient, gene_modern, gene_undetermined,
-                                gene_mean_post, gene_is_damaged);
-                }
-            }
-
-            // Write functional summary
-            if (!functional_summary_file.empty()) {
-                std::ofstream ff(functional_summary_file);
-                if (!ff.is_open()) {
-                    std::cerr << "Error: Cannot open functional summary file: " << functional_summary_file << "\n";
-                } else {
-                    ff << "db\tfunction_id\tlevel\tn_genes\tn_reads\tn_ancient\tn_modern\tn_undetermined\t"
-                       << "ancient_frac\tci_low\tci_high\tmean_posterior\t"
-                       << "n_damaged_genes\tdamaged_gene_frac\tdamage_enrichment\n";
-
-                    uint32_t global_genes = 0;
-                    uint32_t global_damaged_genes = 0;
-                    for (const auto& [fid, fa] : group_acc) {
-                        global_genes += fa.n_genes;
-                        global_damaged_genes += fa.n_damaged_genes;
-                    }
-                    const float global_damaged_frac = (global_genes > 0)
-                        ? static_cast<float>(global_damaged_genes) / static_cast<float>(global_genes)
-                        : 0.0f;
-
-                    auto write_acc = [&ff, global_damaged_frac](
-                        const std::unordered_map<std::string, FunctionalAccumulator>& accs,
-                        const std::string& level) {
-                        for (const auto& [fid, fa] : accs) {
-                            float frac = fa.ancient_frac();
-                            auto [ci_low, ci_high] = wilson_ci_effective(
-                                static_cast<double>(fa.n_ancient),
-                                static_cast<double>(fa.n_ancient + fa.n_modern));
-                            const float damaged_frac = fa.damaged_gene_frac();
-                            const float enrichment = (global_damaged_frac > 0.0f)
-                                ? (damaged_frac / global_damaged_frac)
-                                : 0.0f;
-                            ff << fa.db_type << '\t' << fa.function_id << '\t' << level << '\t'
-                               << fa.n_genes << '\t' << fa.n_reads << '\t'
-                               << std::fixed << std::setprecision(1) << fa.n_ancient << '\t'
-                               << fa.n_modern << '\t' << fa.n_undetermined << '\t'
-                               << std::setprecision(4) << frac << '\t' << ci_low << '\t' << ci_high << '\t'
-                               << fa.mean_posterior() << '\t'
-                               << fa.n_damaged_genes << '\t'
-                               << damaged_frac << '\t'
-                               << enrichment << '\n';
-                        }
-                    };
-
-                    write_acc(group_acc, "group");
-
-                    if (verbose) {
-                        size_t total_funcs = group_acc.size();
-                        std::cerr << "Functional summary written to: " << functional_summary_file
-                                  << " (" << total_funcs << " functions)\n";
-                    }
-                }
-            }
-
-            // Write Anvi'o-compatible gene abundance (for anvi-estimate-metabolism --enzymes-txt)
-            // Format: gene_callers_id  enzyme_accession  source  coverage  detection
-            // Where coverage = EM-weighted abundance (gamma-weighted depth), detection = breadth
-            if (!anvio_ko_file.empty() && !group_map.empty()) {
-                std::ofstream af(anvio_ko_file);
-                if (!af.is_open()) {
-                    std::cerr << "Error: Cannot open Anvi'o KO file: " << anvio_ko_file << "\n";
-                } else {
-                    af << "gene_callers_id\tenzyme_accession\tsource\tcoverage\tdetection\n";
-                    size_t n_written = 0;
-                    for (const auto& [tid, acc] : gene_agg) {
-                        // Skip filtered genes
-                        float abundance = acc.depth_mean();  // EM-weighted abundance
-                        if (acc.n_reads < min_reads || acc.breadth() < min_breadth || abundance < min_depth
-                            || acc.positional_score() < min_positional_score
-                            || acc.terminal_middle_ratio() < min_terminal_ratio)
-                            continue;
-                        // Look up mapped group for this gene
-                        auto it = group_map.find(acc.target_id);
-                        if (it == group_map.end()) continue;
-                        // coverage = EM-weighted abundance (sum of gamma-weighted depth)
-                        af << acc.target_id << '\t' << it->second << '\t' << annotation_source << '\t'
-                           << std::fixed << std::setprecision(4) << abundance << '\t'
-                           << std::setprecision(4) << acc.breadth() << '\n';
-                        ++n_written;
-                    }
-                    if (verbose) {
-                        std::cerr << "Anvi'o gene abundance written to: " << anvio_ko_file
-                                  << " (" << n_written << " genes with mapping annotations)\n";
-                    }
-                }
-            }
-        }
-    }
-
-    // Build reverse map for string-keyed lookups into gene_agg (uint32_t-keyed)
-    std::unordered_map<std::string, uint32_t> gene_agg_name_to_idx;
-    if (have_gene_agg) {
-        gene_agg_name_to_idx.reserve(gene_agg.size());
-        for (const auto& [ref_idx, acc] : gene_agg) {
-            gene_agg_name_to_idx[acc.target_id] = ref_idx;
-        }
-    }
-
-    std::unordered_map<std::string, ProteinAggregate> protein_agg;
-    bool have_protein_agg = false;
-
-    // Build/write per-protein aggregated summary (aggregates across all reads per target)
-    if (!protein_summary_file.empty() || !protein_filtered_file.empty() || !combined_output_file.empty()) {
-        protein_agg.clear();
-
-        // Assignment channel: aggregate all EM-kept best-hit reads for abundance/patterns.
-        // Damage channel: aggregate mismatch-evidence summaries for damage statistics.
-        constexpr size_t TERMINAL_CODONS = 3;  // First 3 codons = 9 nt
-
+        std::sort(read_ref_entries.begin(), read_ref_entries.end(),
+            [](const ReadRefEntry& a, const ReadRefEntry& b) { return a.ref_idx < b.ref_idx; });
+        assigned_kept_reads = read_ref_entries.size();
+    } else {
         for (uint32_t ridx = 0; ridx < n_reads; ++ridx) {
-            const auto& hit = best_hits[ridx];
-            if (!hit.has) continue;
-            if (use_em) {
-                if (ridx >= em_read_results.size() || !em_read_results[ridx].em_keep) {
-                    continue;
-                }
-            }
-
-            const std::string target_id(reader.ref_name(hit.ref_idx));
-            auto& agg = protein_agg[target_id];
-            if (agg.protein_id.empty()) agg.protein_id = target_id;
-            if (agg.tlen == 0) agg.tlen = static_cast<uint32_t>(hit.tlen);
-            const float gamma = use_em ? em_read_results[ridx].gamma : 1.0f;
-            agg.n_reads++;
-            agg.n_reads_eff += gamma;
-            agg.sum_delta_bits += gamma * (hit.bits - hit.bits_second);
-            const float bpa = (hit.aln_len_on_target > 0)
-                ? (hit.bits / static_cast<float>(hit.aln_len_on_target))
-                : 0.0f;
-            agg.sum_bpa += gamma * bpa;
-            const uint8_t length_bin = static_cast<uint8_t>(dart::LengthBinStats::get_bin(hit.qlen));
-            agg.length_bin_counts[length_bin]++;
-            agg.unique_starts.insert(static_cast<uint32_t>(hit.tstart_0));
-            if (hit.tstart_0 < agg.min_start) agg.min_start = static_cast<uint32_t>(hit.tstart_0);
-            if (hit.tstart_0 > agg.max_start) agg.max_start = static_cast<uint32_t>(hit.tstart_0);
-
-            // Mapping pattern metrics (lightweight, no per-position vector needed)
-            const size_t aln_on_target = hit.aln_len_on_target;
-            agg.sum_aln_len += static_cast<double>(gamma) * static_cast<double>(aln_on_target);
-            agg.sum_aln_len_sq += static_cast<double>(gamma) * static_cast<double>(aln_on_target) *
-                                  static_cast<double>(aln_on_target);
-            const size_t tlen = std::max<size_t>(1, static_cast<size_t>(hit.tlen));
-            const size_t window = std::min(std::max<size_t>(1, tlen / 10), tlen / 2);
-            const size_t start = std::min(static_cast<size_t>(hit.tstart_0), tlen);
-            const size_t end = std::min(start + aln_on_target, tlen);
-            if (end > start) {
-                const size_t left_end = window;
-                const size_t right_start = (tlen > window) ? (tlen - window) : 0;
-                const size_t left_overlap = (start < left_end) ? (std::min(end, left_end) - start) : 0;
-                const size_t right_overlap = (end > right_start && start < tlen)
-                    ? (end - std::max(start, right_start)) : 0;
-                size_t middle_overlap = 0;
-                if (right_start > left_end) {
-                    const size_t mid_start = std::max(start, left_end);
-                    const size_t mid_end = std::min(end, right_start);
-                    if (mid_end > mid_start) middle_overlap = mid_end - mid_start;
-                }
-                agg.left_cov += static_cast<double>(gamma) * static_cast<double>(left_overlap);
-                agg.right_cov += static_cast<double>(gamma) * static_cast<double>(right_overlap);
-                agg.middle_cov += static_cast<double>(gamma) * static_cast<double>(middle_overlap);
-            }
+            if (!best_hits[ridx].has) continue;
+            if (use_em && (ridx >= em_read_results.size() || !em_read_results[ridx].em_keep)) continue;
+            ++assigned_kept_reads;
         }
+    }
 
-        for (const auto& c : protein_agg_inputs) {
-            if (use_em) {
-                if (c.read_idx >= em_read_results.size() || !em_read_results[c.read_idx].em_keep) {
-                    continue;
-                }
-            }
-            const std::string target_id(reader.ref_name(c.ref_idx));
-            auto& agg = protein_agg[target_id];
-            if (agg.protein_id.empty()) agg.protein_id = target_id;
-            if (agg.tlen == 0) agg.tlen = static_cast<uint32_t>(c.tlen);
-            agg.n_damage_reads++;
-            if (c.p_damaged > 0.5f) agg.n_damaged++;
-            agg.total_damage_sites += c.damage_consistent;
-            if (c.p_damaged > agg.max_p_damaged) agg.max_p_damaged = c.p_damaged;
-            agg.sum_p_damaged += c.p_damaged;
+    // 2. Filter protein_agg_inputs by em_keep, then sort by ref_idx.
+    if (!protein_agg_inputs.empty() && use_em) {
+        auto it = std::remove_if(protein_agg_inputs.begin(), protein_agg_inputs.end(),
+            [&](const ProteinAggInput& c) {
+                return c.read_idx >= em_read_results.size() ||
+                       !em_read_results[c.read_idx].em_keep;
+            });
+        protein_agg_inputs.erase(it, protein_agg_inputs.end());
+    }
+    if (!protein_agg_inputs.empty()) {
+        std::sort(protein_agg_inputs.begin(), protein_agg_inputs.end(),
+            [](const ProteinAggInput& a, const ProteinAggInput& b) {
+                return a.ref_idx < b.ref_idx;
+            });
+    }
 
-            // Collect per-read observation for Beta-Binomial model
-            // info = sum of p_damage at sites (informativeness for weighting)
-            float info = 0.0f;
-            for (const auto& site : c.sites) {
-                info += site.p_damage;
-            }
-            ReadDamageObs read_obs;
-            read_obs.p_damaged = c.p_damaged;
-            read_obs.log_lr = 0.0f;  // Could compute from damage_fraction vs expected
-            read_obs.info = info;
-            read_obs.n_sites = static_cast<int>(c.damage_consistent);
-            read_obs.is_damaged = c.p_damaged > 0.5f;
-            agg.read_obs.push_back(read_obs);
+    // 3. Free large per-read vectors — no longer needed.
+    { decltype(best_hits) tmp; tmp.swap(best_hits); }
+    { decltype(em_read_results) tmp; tmp.swap(em_read_results); }
+    { decltype(summary_index_by_read) tmp; tmp.swap(summary_index_by_read); }
+    { decltype(read_posteriors) tmp; tmp.swap(read_posteriors); }
+    { decltype(read_classifications) tmp; tmp.swap(read_classifications); }
+#ifdef __linux__
+    malloc_trim(0);
+#endif
 
-            // Count terminal sites from per-read sites
-            for (const auto& site : c.sites) {
-                size_t codon_pos_5 = site.dist_5prime / 3;
-                size_t codon_pos_3 = site.dist_3prime / 3;
-                if (site.damage_class == 'C' && codon_pos_5 < TERMINAL_CODONS) {
-                    agg.terminal_5++;
-                } else if (site.damage_class == 'G' && codon_pos_3 < TERMINAL_CODONS) {
-                    agg.terminal_3++;
-                }
-            }
-        }
-        { decltype(protein_agg_inputs) tmp; tmp.swap(protein_agg_inputs); }
-
-        // Auto-detect library type from terminal site ratio
-        size_t total_5 = 0, total_3 = 0;
-        for (const auto& [id, agg] : protein_agg) {
-            total_5 += agg.terminal_5;
-            total_3 += agg.terminal_3;
-        }
-        bool use_both_ends = true;  // default: dsDNA
-        if (lib_type == "ss") {
-            use_both_ends = false;
-        } else if (lib_type == "ds") {
-            use_both_ends = true;
-        } else {
-            // auto-detect: if 3'/5' ratio < 0.3, assume ssDNA
-            float ratio = (total_5 > 0) ? static_cast<float>(total_3) / total_5 : 0.0f;
-            use_both_ends = (ratio > 0.3f);
-            if (verbose) {
-                std::cerr << "Library type auto-detected: " << (use_both_ends ? "dsDNA" : "ssDNA")
-                          << " (3'/5' ratio: " << ratio << ")\n";
-            }
-        }
-
-        std::ofstream pf;
-        if (!protein_summary_file.empty()) {
-            pf.open(protein_summary_file);
-            if (!pf.is_open()) {
-                std::cerr << "Error: Cannot open protein summary file: " << protein_summary_file << "\n";
-                return 1;
-            }
-        }
-        std::ofstream pff;
-        if (!protein_filtered_file.empty()) {
-            pff.open(protein_filtered_file);
-            if (!pff.is_open()) {
-                std::cerr << "Error: Cannot open protein filtered file: " << protein_filtered_file << "\n";
-                return 1;
-            }
-        }
-
-        // D_aa calculation constants (derived from observed AA susceptibility):
-        // P_SUSCEPTIBLE: ~25% of codons can produce visible damage substitutions
-        // P_NONSYNONYMOUS: ~70% of those produce amino acid changes
-        // These are not magic numbers - derived from codon table analysis
-        constexpr float P_SUSCEPTIBLE = 0.25f;
-        constexpr float P_NONSYNONYMOUS = 0.70f;
-
-        // Extended header with proper statistical outputs
-        const std::string protein_header =
-            "protein_id\tn_reads\teff_reads\tn_damage_reads\tn_damaged\tdamage_sites\t"
-            "terminal_5\tterminal_3\t"
-            "max_p_damaged\tmean_p_damaged\tfrac_damaged\tfrac_damaged_all\t"
-            "p_protein_damaged\tcombined_score\tdelta_mle\tci_lower\tci_upper\t"
-            "lrt_pvalue\tlog_bf\td_aa\t"
-            "avg_delta_bits\tavg_bpa\tlength_bin\t"
-            "n_unique_starts\tstart_diversity\tstart_span\tpositional_score\t"
-            "terminal_middle_ratio\tavg_aln_len\tstd_aln_len\t"
-            "assign_n_reads\tassign_eff_reads\tassign_n_damage_reads\tassign_eff_damage_reads\t"
-            "assign_n_ancient\tassign_n_modern\tassign_n_undetermined\t"
-            "assign_ancient_frac\tassign_ci_low\tassign_ci_high\t"
-            "assign_mean_posterior\tassign_mean_identity\t"
-            "assign_breadth\tassign_abundance\tassign_depth_std\tassign_depth_evenness\t"
-            "coverage_deviance\tcompleteness_fhat\tcoverage_weight\tabundance_adjusted\t"
-            "pass_mapping_filter\tfilter_fail\n";
-        if (pf.is_open()) pf << protein_header;
-        if (pff.is_open()) pff << protein_header;
-
-        size_t filtered_written = 0;
-        for (const auto& [id, agg] : protein_agg) {
-            float mean_p = agg.n_damage_reads > 0
-                ? (agg.sum_p_damaged / static_cast<float>(agg.n_damage_reads))
-                : 0.0f;
-            float frac = agg.n_damage_reads > 0
-                ? static_cast<float>(agg.n_damaged) / static_cast<float>(agg.n_damage_reads)
-                : 0.0f;
-            float frac_all = agg.n_reads > 0
-                ? static_cast<float>(agg.n_damaged) / static_cast<float>(agg.n_reads)
-                : 0.0f;
-            uint32_t assign_n_reads = 0;
-            float assign_eff_reads = 0.0f;
-            uint32_t assign_n_damage_reads = 0;
-            float assign_eff_damage_reads = 0.0f;
-            float assign_n_ancient = 0.0f;
-            float assign_n_modern = 0.0f;
-            float assign_n_undetermined = 0.0f;
-            float assign_ancient_frac = 0.0f;
-            float assign_ci_low = 0.0f;
-            float assign_ci_high = 0.0f;
-            float assign_mean_posterior = 0.0f;
-            float assign_mean_identity = 0.0f;
-            float assign_breadth = 0.0f;
-            float assign_abundance = 0.0f;
-            float assign_depth_std = 0.0f;
-            float assign_depth_evenness = 0.0f;
-
-            auto gni = gene_agg_name_to_idx.find(id);
-            auto git = (gni != gene_agg_name_to_idx.end()) ? gene_agg.find(gni->second) : gene_agg.end();
-            if (git != gene_agg.end()) {
-                const auto& g = git->second;
-                assign_n_reads = g.n_reads;
-                assign_eff_reads = g.eff_reads();
-                assign_n_damage_reads = g.n_damage_reads;
-                assign_eff_damage_reads = static_cast<float>(g.n_damage_reads_eff);
-                assign_n_ancient = static_cast<float>(g.n_ancient_conf + g.n_ancient_likely);
-                assign_n_modern = static_cast<float>(g.n_modern_conf);
-                assign_n_undetermined = static_cast<float>(g.n_undetermined);
-                assign_ancient_frac = g.ancient_frac();
-                const double n_eff_class = static_cast<double>(assign_n_ancient + assign_n_modern);
-                auto [ci_lo, ci_hi] = wilson_ci_effective(assign_n_ancient, n_eff_class);
-                assign_ci_low = ci_lo;
-                assign_ci_high = ci_hi;
-                assign_mean_posterior = g.avg_posterior();
-                assign_mean_identity = g.avg_fident();
-                assign_breadth = g.breadth();
-                assign_abundance = g.depth_mean();
-                assign_depth_std = g.depth_std();
-                assign_depth_evenness = g.depth_evenness();
-            }
-
-            // ================================================================
-            // PROPER STATISTICAL INFERENCE: Beta-Binomial model
-            // Replaces naive "any read damaged → p=1.0" with principled approach
-            // ================================================================
-            ProteinDamageResult result = fit_protein_damage(agg.read_obs);
-
-            float p_protein_damaged = static_cast<float>(result.p_damaged);
-            float delta_mle = static_cast<float>(result.delta_max);
-            float ci_lower = static_cast<float>(result.ci_lower);
-            float ci_upper = static_cast<float>(result.ci_upper);
-            float lrt_pvalue = static_cast<float>(result.p_value);
-            float log_bf = static_cast<float>(result.log_bayes_factor);
-            float combined_score = p_protein_damaged;
-
-            // D_aa: AA-level damage amplitude (0-1)
-            // D_aa = observed_terminal_sites / expected_if_fully_damaged
-            // This is an empirical estimate complementing the Bayesian model
-            float observed = use_both_ends
-                ? static_cast<float>(agg.terminal_5 + agg.terminal_3)
-                : static_cast<float>(agg.terminal_5);
-            float n_ends = use_both_ends ? 2.0f : 1.0f;
-            float expected = static_cast<float>(agg.n_reads_eff) * n_ends *
-                            TERMINAL_CODONS * P_SUSCEPTIBLE * P_NONSYNONYMOUS;
-            float d_aa = (expected > 0.0f) ? std::min(1.0f, observed / expected) : 0.0f;
-
-            const float pos_score = agg.positional_score();
-            const float start_div = agg.start_diversity();
-            const float term_ratio = agg.terminal_middle_ratio();
-            const bool pass_mapping_filter =
-                (agg.n_reads >= min_reads) &&
-                (pos_score >= min_positional_score) &&
-                (term_ratio >= min_terminal_ratio);
-            std::string filter_fail = ".";
-            if (!pass_mapping_filter) {
-                filter_fail.clear();
-                auto add_fail = [&filter_fail](const char* token) {
-                    if (!filter_fail.empty()) filter_fail.push_back(',');
-                    filter_fail += token;
-                };
-                if (agg.n_reads < min_reads) add_fail("min_reads");
-                if (pos_score < min_positional_score) add_fail("min_positional_score");
-                if (term_ratio < min_terminal_ratio) add_fail("min_terminal_ratio");
-                if (filter_fail.empty()) filter_fail = "unknown";
-            }
-
-            std::ostringstream row;
-            row << agg.protein_id << "\t"
-                << agg.n_reads << "\t"
-                << std::fixed << std::setprecision(2) << agg.n_reads_eff << "\t"
-                << agg.n_damage_reads << "\t"
-                << agg.n_damaged << "\t"
-                << agg.total_damage_sites << "\t"
-                << agg.terminal_5 << "\t"
-                << agg.terminal_3 << "\t"
-                << std::fixed << std::setprecision(4) << agg.max_p_damaged << "\t"
-                << std::fixed << std::setprecision(4) << mean_p << "\t"
-                << std::fixed << std::setprecision(4) << frac << "\t"
-                << std::fixed << std::setprecision(4) << frac_all << "\t"
-                << std::fixed << std::setprecision(4) << p_protein_damaged << "\t"
-                << std::fixed << std::setprecision(4) << combined_score << "\t"
-                << std::fixed << std::setprecision(4) << delta_mle << "\t"
-                << std::fixed << std::setprecision(4) << ci_lower << "\t"
-                << std::fixed << std::setprecision(4) << ci_upper << "\t"
-                << std::scientific << std::setprecision(3) << lrt_pvalue << "\t"
-                << std::fixed << std::setprecision(2) << log_bf << "\t"
-                << std::fixed << std::setprecision(4) << d_aa << "\t"
-                << std::fixed << std::setprecision(1)
-                << (agg.n_reads_eff > 0.0 ? agg.sum_delta_bits / static_cast<float>(agg.n_reads_eff) : 0.0f) << "\t"
-                << std::fixed << std::setprecision(3)
-                << (agg.n_reads_eff > 0.0 ? agg.sum_bpa / static_cast<float>(agg.n_reads_eff) : 0.0f) << "\t"
-                << static_cast<int>(std::max_element(
-                       agg.length_bin_counts.begin(),
-                       agg.length_bin_counts.end()) - agg.length_bin_counts.begin()) << "\t"
-                << agg.unique_starts.size() << "\t"
-                << std::fixed << std::setprecision(4) << start_div << "\t"
-                << std::fixed << std::setprecision(4) << agg.start_span() << "\t"
-                << std::fixed << std::setprecision(4) << pos_score << "\t"
-                << std::fixed << std::setprecision(4) << term_ratio << "\t"
-                << std::fixed << std::setprecision(2) << agg.avg_aln_len() << "\t"
-                << std::fixed << std::setprecision(2) << agg.std_aln_len() << "\t"
-                << assign_n_reads << "\t"
-                << std::fixed << std::setprecision(2) << assign_eff_reads << "\t"
-                << assign_n_damage_reads << "\t"
-                << std::fixed << std::setprecision(2) << assign_eff_damage_reads << "\t"
-                << std::fixed << std::setprecision(2) << assign_n_ancient << "\t"
-                << std::fixed << std::setprecision(2) << assign_n_modern << "\t"
-                << std::fixed << std::setprecision(2) << assign_n_undetermined << "\t"
-                << std::fixed << std::setprecision(4) << assign_ancient_frac << "\t"
-                << std::fixed << std::setprecision(4) << assign_ci_low << "\t"
-                << std::fixed << std::setprecision(4) << assign_ci_high << "\t"
-                << std::fixed << std::setprecision(4) << assign_mean_posterior << "\t"
-                << std::fixed << std::setprecision(4) << assign_mean_identity << "\t"
-                << std::fixed << std::setprecision(4) << assign_breadth << "\t"
-                << std::fixed << std::setprecision(4) << assign_abundance << "\t"
-                << std::fixed << std::setprecision(4) << assign_depth_std << "\t"
-                << std::fixed << std::setprecision(4) << assign_depth_evenness << "\t";
-
-            // Coverage EM columns
-            float cov_deviance = 0.0f;
-            float cov_fhat = 1.0f;
-            float cov_weight = 1.0f;
-            float abundance_adj = assign_eff_reads;
-            {
-                auto nit = name_to_ref_idx.find(id);
-                if (nit != name_to_ref_idx.end()) {
-                    auto cit = coverage_stats_map.find(nit->second);
-                    if (cit != coverage_stats_map.end()) {
-                        cov_deviance = cit->second.coverage_deviance;
-                        cov_fhat = cit->second.completeness_fhat;
-                        cov_weight = cit->second.coverage_weight;
-                        abundance_adj = assign_eff_reads * cov_weight;
-                    }
-                }
-            }
-            row << std::fixed << std::setprecision(4) << cov_deviance << "\t"
-                << std::fixed << std::setprecision(4) << cov_fhat << "\t"
-                << std::fixed << std::setprecision(4) << cov_weight << "\t"
-                << std::fixed << std::setprecision(2) << abundance_adj << "\t"
-                << (pass_mapping_filter ? 1 : 0) << "\t"
-                << filter_fail << "\n";
-
-            if (pf.is_open()) pf << row.str();
-            if (pff.is_open() && pass_mapping_filter) {
-                pff << row.str();
-                ++filtered_written;
-            }
-        }
-
+    if (!need_any_aggregation) {
         if (verbose) {
-            if (pf.is_open()) {
-                std::cerr << "Protein summary written to: " << protein_summary_file
-                          << " (" << protein_agg.size() << " proteins)\n";
-            }
-            if (pff.is_open()) {
-                std::cerr << "Filtered proteins written to: " << protein_filtered_file
-                          << " (" << filtered_written << " proteins passed mapping filters)\n";
-            }
+            std::cerr << "\nSummary: assigned_reads=" << assigned_kept_reads
+                      << ", mismatch_reads=" << n_summaries
+                      << ", reads_with_damage_sites=" << proteins_with_damage << "\n";
+            const auto run_end = std::chrono::steady_clock::now();
+            std::cerr << "Runtime: "
+                      << dart::log_utils::format_elapsed(run_start, run_end) << "\n";
         }
-
-        have_protein_agg = true;
+        return 0;
     }
 
+    // 4. Auto-calibration pre-pass (if --auto-calibrate-spurious).
+    if (auto_calibrate_spurious) {
+        std::vector<float> calib_pos_scores;
+        std::vector<float> calib_term_ratios;
+
+        auto ri = read_ref_entries.cbegin();
+        while (ri != read_ref_entries.cend()) {
+            const uint32_t cur_ref = ri->ref_idx;
+            auto ri_end = ri;
+            while (ri_end != read_ref_entries.cend() && ri_end->ref_idx == cur_ref) ++ri_end;
+
+            GeneSummaryAccumulator calib_acc;
+            calib_acc.tlen = ri->tlen;
+            if (calib_acc.tlen > 0) calib_acc.coverage.assign(calib_acc.tlen, 0.0f);
+            for (auto it = ri; it != ri_end; ++it)
+                calib_acc.add_assignment(it->fident, it->tstart_0, it->aln_len_on_target, it->gamma);
+
+            if (calib_acc.n_reads >= 10 && calib_acc.n_unique_starts() >= 3) {
+                calib_pos_scores.push_back(calib_acc.positional_score());
+                calib_term_ratios.push_back(calib_acc.terminal_middle_ratio());
+            }
+            ri = ri_end;
+        }
+
+        if (calib_pos_scores.size() >= 100) {
+            std::sort(calib_pos_scores.begin(), calib_pos_scores.end());
+            std::sort(calib_term_ratios.begin(), calib_term_ratios.end());
+            const size_t idx_5pct = calib_pos_scores.size() / 20;
+            float calib_min_pos  = calib_pos_scores[idx_5pct];
+            float calib_min_term = std::max(0.20f, calib_term_ratios[idx_5pct]);
+            if (calib_min_pos > min_positional_score)
+                min_positional_score = calib_min_pos;
+            if (!user_set_terminal_ratio && calib_min_term > min_terminal_ratio)
+                min_terminal_ratio = calib_min_term;
+            if (verbose) {
+                std::cerr << "Auto-calibration (n=" << calib_pos_scores.size() << " genes):\n"
+                          << "  min_positional_score: " << std::fixed << std::setprecision(4)
+                          << min_positional_score << "\n"
+                          << "  min_terminal_ratio: " << std::fixed << std::setprecision(4)
+                          << min_terminal_ratio << "\n";
+            }
+        } else if (verbose) {
+            std::cerr << "Auto-calibration: insufficient calibration set ("
+                      << calib_pos_scores.size() << " genes, need >= 100)\n";
+        }
+    }
+
+    // 5. Library type detection (needs terminal site counts).
+    bool use_both_ends = true;
+    if (lib_type == "ss") {
+        use_both_ends = false;
+    } else if (lib_type == "ds") {
+        use_both_ends = true;
+    } else {
+        size_t total_5 = 0, total_3 = 0;
+        for (const auto& c : protein_agg_inputs) {
+            for (const auto& site : c.sites) {
+                if (site.damage_class == 'C' && site.dist_5prime / 3 < 3) ++total_5;
+                else if (site.damage_class == 'G' && site.dist_3prime / 3 < 3) ++total_3;
+            }
+        }
+        float ratio = (total_5 > 0) ? static_cast<float>(total_3) / static_cast<float>(total_5) : 0.0f;
+        use_both_ends = (ratio > 0.3f);
+        if (verbose) {
+            std::cerr << "Library type auto-detected: " << (use_both_ends ? "dsDNA" : "ssDNA")
+                      << " (3'/5' ratio: " << ratio << ")\n";
+        }
+    }
+    const float n_ends_lib = use_both_ends ? 2.0f : 1.0f;
+
+    // 6. Load mapping file.
+    std::unordered_map<std::string, std::string> group_map;
+    if (!map_file.empty()) group_map = load_mapping_file(map_file, verbose);
+
+    // 7. Open output files.
+    std::ofstream gf, pf_os, pff_os, cof_os, af_f;
+    if (!gene_summary_file.empty()) {
+        gf.open(gene_summary_file);
+        if (!gf.is_open()) {
+            std::cerr << "Error: Cannot open gene summary file: " << gene_summary_file << "\n";
+            return 1;
+        }
+        gf << "target_id\tn_reads\teff_reads\tn_damage_reads\teff_damage_reads\t"
+              "n_ancient\tn_modern\tn_undetermined\t"
+              "ancient_frac\tci_low\tci_high\tmean_posterior\tmean_identity\t"
+              "breadth\tabundance\tdepth_std\tdepth_evenness\t"
+              "n_unique_starts\tstart_diversity\tstart_span\tpositional_score\t"
+              "terminal_middle_ratio\tavg_aln_len\tstd_aln_len\t"
+              "coverage_deviance\tcompleteness_fhat\tcoverage_weight\tabundance_adjusted\n";
+    }
+    if (!anvio_ko_file.empty()) {
+        af_f.open(anvio_ko_file);
+        if (!af_f.is_open()) {
+            std::cerr << "Error: Cannot open Anvi'o KO file: " << anvio_ko_file << "\n";
+            return 1;
+        }
+        af_f << "gene_callers_id\tenzyme_accession\tsource\tcoverage\tdetection\n";
+    }
+    constexpr float P_SUSCEPTIBLE_K = 0.25f;
+    constexpr float P_NONSYNONYMOUS_K = 0.70f;
+    const std::string protein_header =
+        "protein_id\tn_reads\teff_reads\tn_damage_reads\tn_damaged\tdamage_sites\t"
+        "terminal_5\tterminal_3\t"
+        "max_p_damaged\tmean_p_damaged\tfrac_damaged\tfrac_damaged_all\t"
+        "p_protein_damaged\tcombined_score\tdelta_mle\tci_lower\tci_upper\t"
+        "lrt_pvalue\tlog_bf\td_aa\t"
+        "avg_delta_bits\tavg_bpa\tlength_bin\t"
+        "n_unique_starts\tstart_diversity\tstart_span\tpositional_score\t"
+        "terminal_middle_ratio\tavg_aln_len\tstd_aln_len\t"
+        "assign_n_reads\tassign_eff_reads\tassign_n_damage_reads\tassign_eff_damage_reads\t"
+        "assign_n_ancient\tassign_n_modern\tassign_n_undetermined\t"
+        "assign_ancient_frac\tassign_ci_low\tassign_ci_high\t"
+        "assign_mean_posterior\tassign_mean_identity\t"
+        "assign_breadth\tassign_abundance\tassign_depth_std\tassign_depth_evenness\t"
+        "coverage_deviance\tcompleteness_fhat\tcoverage_weight\tabundance_adjusted\t"
+        "pass_mapping_filter\tfilter_fail\n";
+    if (!protein_summary_file.empty()) {
+        pf_os.open(protein_summary_file);
+        if (!pf_os.is_open()) {
+            std::cerr << "Error: Cannot open protein summary file: " << protein_summary_file << "\n";
+            return 1;
+        }
+        pf_os << protein_header;
+    }
+    if (!protein_filtered_file.empty()) {
+        pff_os.open(protein_filtered_file);
+        if (!pff_os.is_open()) {
+            std::cerr << "Error: Cannot open protein filtered file: " << protein_filtered_file << "\n";
+            return 1;
+        }
+        pff_os << protein_header;
+    }
     if (!combined_output_file.empty()) {
-        std::ofstream cof(combined_output_file);
-        if (!cof.is_open()) {
+        cof_os.open(combined_output_file);
+        if (!cof_os.is_open()) {
             std::cerr << "Error: Cannot open combined output file: " << combined_output_file << "\n";
             return 1;
         }
+        cof_os << "target_id\tgroup_id\tannotation_source\tgene_present\tprotein_present\t"
+                  "n_reads\teff_reads\tabundance\tbreadth\tmean_identity\tmean_posterior\t"
+                  "protein_n_damage_reads\tprotein_mean_p_damaged\tprotein_p_protein_damaged\tprotein_d_aa\t"
+                  "positional_score\tterminal_middle_ratio\tpass_mapping_filter\tfilter_fail\n";
+    }
 
-        std::unordered_map<std::string, std::string> combined_group_map;
-        if (!map_file.empty()) {
-            combined_group_map = load_mapping_file(map_file, false);
+    // 8. Functional accumulator (written after streaming pass).
+    std::unordered_map<std::string, FunctionalAccumulator> func_acc;
+
+    // 9. Main streaming pass: one ref at a time.
+    constexpr size_t TERMINAL_CODONS_S = 3;
+    size_t gene_written = 0, protein_written = 0, filtered_written = 0, combined_written = 0;
+
+    auto ri_cur = read_ref_entries.cbegin();
+    auto pi_cur = protein_agg_inputs.cbegin();
+
+    while (ri_cur != read_ref_entries.cend() || pi_cur != protein_agg_inputs.cend()) {
+        uint32_t cur_ref;
+        if (ri_cur != read_ref_entries.cend() && pi_cur != protein_agg_inputs.cend())
+            cur_ref = std::min(ri_cur->ref_idx, pi_cur->ref_idx);
+        else if (ri_cur != read_ref_entries.cend())
+            cur_ref = ri_cur->ref_idx;
+        else
+            cur_ref = pi_cur->ref_idx;
+
+        auto ri_end = ri_cur;
+        while (ri_end != read_ref_entries.cend() && ri_end->ref_idx == cur_ref) ++ri_end;
+        auto pi_end = pi_cur;
+        while (pi_end != protein_agg_inputs.cend() && pi_end->ref_idx == cur_ref) ++pi_end;
+
+        const std::string target_name(reader.ref_name(cur_ref));
+
+        // --- Gene accumulator ---
+        GeneSummaryAccumulator gene_acc;
+        gene_acc.target_id = target_name;
+        if (ri_cur != ri_end) {
+            gene_acc.tlen = ri_cur->tlen;
+            if (gene_acc.tlen > 0) gene_acc.coverage.assign(gene_acc.tlen, 0.0f);
+            for (auto it = ri_cur; it != ri_end; ++it) {
+                gene_acc.add_assignment(it->fident, it->tstart_0, it->aln_len_on_target, it->gamma);
+                if (it->has_damage_obs) {
+                    gene_acc.add_damage_observation(
+                        static_cast<dart::AncientClassification>(it->classification),
+                        it->posterior, it->gamma);
+                }
+            }
         }
 
-        bool use_both_ends_combined = true;
-        if (have_protein_agg) {
-            size_t total_5 = 0;
-            size_t total_3 = 0;
-            for (const auto& kv : protein_agg) {
-                total_5 += kv.second.terminal_5;
-                total_3 += kv.second.terminal_3;
+        // --- Protein aggregate ---
+        ProteinAggregate pa;
+        pa.protein_id = target_name;
+        for (auto it = ri_cur; it != ri_end; ++it) {
+            if (pa.tlen == 0 && it->tlen > 0) pa.tlen = it->tlen;
+            pa.n_reads++;
+            pa.n_reads_eff += it->gamma;
+            pa.sum_delta_bits += it->gamma * (it->bits - it->bits_second);
+            const float bpa_v = (it->aln_len_on_target > 0)
+                ? it->bits / static_cast<float>(it->aln_len_on_target) : 0.0f;
+            pa.sum_bpa += it->gamma * bpa_v;
+            pa.length_bin_counts[it->length_bin]++;
+            pa.unique_starts.insert(it->tstart_0);
+            if (it->tstart_0 < pa.min_start) pa.min_start = it->tstart_0;
+            if (it->tstart_0 > pa.max_start) pa.max_start = it->tstart_0;
+            const size_t aln = it->aln_len_on_target;
+            pa.sum_aln_len += it->gamma * static_cast<double>(aln);
+            pa.sum_aln_len_sq += it->gamma * static_cast<double>(aln) * static_cast<double>(aln);
+            const size_t tlen_sz = std::max<size_t>(1, static_cast<size_t>(it->tlen));
+            const size_t window = std::min(std::max<size_t>(1, tlen_sz / 10), tlen_sz / 2);
+            const size_t s_pos = std::min(static_cast<size_t>(it->tstart_0), tlen_sz);
+            const size_t e_pos = std::min(s_pos + aln, tlen_sz);
+            if (e_pos > s_pos) {
+                const size_t left_end    = window;
+                const size_t right_start = (tlen_sz > window) ? (tlen_sz - window) : 0;
+                const size_t lo = (s_pos < left_end) ? (std::min(e_pos, left_end) - s_pos) : 0;
+                const size_t ro = (e_pos > right_start && s_pos < tlen_sz)
+                    ? (e_pos - std::max(s_pos, right_start)) : 0;
+                size_t mo = 0;
+                if (right_start > left_end) {
+                    const size_t ms = std::max(s_pos, left_end);
+                    const size_t me = std::min(e_pos, right_start);
+                    if (me > ms) mo = me - ms;
+                }
+                pa.left_cov   += it->gamma * static_cast<double>(lo);
+                pa.right_cov  += it->gamma * static_cast<double>(ro);
+                pa.middle_cov += it->gamma * static_cast<double>(mo);
             }
-            if (lib_type == "ss") {
-                use_both_ends_combined = false;
-            } else if (lib_type == "ds") {
-                use_both_ends_combined = true;
-            } else {
-                float ratio = (total_5 > 0) ? static_cast<float>(total_3) / total_5 : 0.0f;
-                use_both_ends_combined = (ratio > 0.3f);
+        }
+        for (auto it = pi_cur; it != pi_end; ++it) {
+            if (pa.tlen == 0 && it->tlen > 0) pa.tlen = it->tlen;
+            pa.n_damage_reads++;
+            if (it->p_damaged > 0.5f) pa.n_damaged++;
+            pa.total_damage_sites += it->damage_consistent;
+            if (it->p_damaged > pa.max_p_damaged) pa.max_p_damaged = it->p_damaged;
+            pa.sum_p_damaged += it->p_damaged;
+            float info = 0.0f;
+            for (const auto& site : it->sites) info += site.p_damage;
+            ReadDamageObs obs;
+            obs.p_damaged = it->p_damaged;
+            obs.log_lr    = 0.0f;
+            obs.info      = info;
+            obs.n_sites   = static_cast<int>(it->damage_consistent);
+            obs.is_damaged = it->p_damaged > 0.5f;
+            pa.read_obs.push_back(obs);
+            for (const auto& site : it->sites) {
+                if (site.damage_class == 'C' && site.dist_5prime / 3 < TERMINAL_CODONS_S)
+                    ++pa.terminal_5;
+                else if (site.damage_class == 'G' && site.dist_3prime / 3 < TERMINAL_CODONS_S)
+                    ++pa.terminal_3;
             }
         }
 
-        cof << "target_id\tgroup_id\tannotation_source\tgene_present\tprotein_present\t"
-               "n_reads\teff_reads\tabundance\tbreadth\tmean_identity\tmean_posterior\t"
-               "protein_n_damage_reads\tprotein_mean_p_damaged\tprotein_p_protein_damaged\tprotein_d_aa\t"
-               "positional_score\tterminal_middle_ratio\tpass_mapping_filter\tfilter_fail\n";
-
-        std::vector<std::string> target_ids;
-        target_ids.reserve(gene_agg.size() + protein_agg.size());
-        std::unordered_set<std::string> seen_ids;
-        seen_ids.reserve(gene_agg.size() + protein_agg.size());
-
-        if (have_protein_agg) {
-            for (const auto& kv : protein_agg) {
-                if (seen_ids.insert(kv.first).second) target_ids.push_back(kv.first);
-            }
-        }
-        if (have_gene_agg) {
-            for (const auto& kv : gene_agg) {
-                if (seen_ids.insert(kv.second.target_id).second) target_ids.push_back(kv.second.target_id);
+        // --- Coverage EM stats for this ref ---
+        float cov_deviance = 0.0f, cov_fhat = 1.0f, cov_weight = 1.0f;
+        {
+            auto cit = coverage_stats_map.find(cur_ref);
+            if (cit != coverage_stats_map.end()) {
+                cov_deviance = cit->second.coverage_deviance;
+                cov_fhat     = cit->second.completeness_fhat;
+                cov_weight   = cit->second.coverage_weight;
             }
         }
 
-        size_t combined_written = 0;
-        for (const auto& tid : target_ids) {
-            auto gni = gene_agg_name_to_idx.find(tid);
-            const auto git = (gni != gene_agg_name_to_idx.end()) ? gene_agg.find(gni->second) : gene_agg.end();
-            const auto pit = protein_agg.find(tid);
-            const bool gene_present = (git != gene_agg.end());
-            const bool protein_present = (pit != protein_agg.end());
+        // --- Gene filter ---
+        const float gene_breadth   = gene_acc.breadth();
+        const float gene_abundance = gene_acc.depth_mean();
+        const float gene_pos_score = gene_acc.positional_score();
+        const float gene_term_ratio= gene_acc.terminal_middle_ratio();
+        const bool gene_passes =
+            gene_acc.n_reads >= min_reads &&
+            gene_breadth  >= min_breadth &&
+            gene_abundance >= min_depth &&
+            gene_pos_score >= min_positional_score &&
+            gene_term_ratio >= min_terminal_ratio;
 
-            uint32_t gene_n_reads = 0;
-            float gene_eff_reads = 0.0f;
-            float gene_n_ancient = 0.0f;
-            float gene_n_modern = 0.0f;
-            float gene_n_undetermined = 0.0f;
-            float gene_ancient_frac = 0.0f;
-            float gene_ci_low = 0.0f;
-            float gene_ci_high = 0.0f;
-            float gene_mean_posterior = 0.0f;
-            float gene_mean_identity = 0.0f;
-            float gene_breadth = 0.0f;
-            float gene_abundance = 0.0f;
-            float gene_depth_std = 0.0f;
-            float gene_depth_evenness = 0.0f;
-            uint32_t gene_n_unique_starts = 0;
-            float gene_start_diversity = 0.0f;
-            float gene_start_span = 0.0f;
-            float gene_pos_score = 0.0f;
-            float gene_term_ratio = 0.0f;
-            float gene_avg_aln_len = 0.0f;
-            float gene_std_aln_len = 0.0f;
-            bool pass_gene_filter = false;
-            std::string gene_filter_fail = "missing";
-            if (gene_present) {
-                const auto& g = git->second;
-                gene_n_reads = g.n_reads;
-                gene_eff_reads = g.eff_reads();
-                gene_n_ancient = static_cast<float>(g.n_ancient_conf + g.n_ancient_likely);
-                gene_n_modern = static_cast<float>(g.n_modern_conf);
-                gene_n_undetermined = static_cast<float>(g.n_undetermined);
-                gene_ancient_frac = g.ancient_frac();
-                const double n_eff_class = static_cast<double>(gene_n_ancient + gene_n_modern);
-                auto ci = wilson_ci_effective(gene_n_ancient, n_eff_class);
-                gene_ci_low = ci.first;
-                gene_ci_high = ci.second;
-                gene_mean_posterior = g.avg_posterior();
-                gene_mean_identity = g.avg_fident();
-                gene_breadth = g.breadth();
-                gene_abundance = g.depth_mean();
-                gene_depth_std = g.depth_std();
-                gene_depth_evenness = g.depth_evenness();
-                gene_n_unique_starts = g.n_unique_starts();
-                gene_start_diversity = g.start_diversity();
-                gene_start_span = g.start_span();
-                gene_pos_score = g.positional_score();
-                gene_term_ratio = g.terminal_middle_ratio();
-                gene_avg_aln_len = g.avg_aln_len();
-                gene_std_aln_len = g.std_aln_len();
+        // --- Gene output ---
+        if (gf.is_open() && gene_passes) {
+            const float n_ancient = static_cast<float>(gene_acc.n_ancient_conf + gene_acc.n_ancient_likely);
+            const float n_modern  = static_cast<float>(gene_acc.n_modern_conf);
+            const float n_undet   = static_cast<float>(gene_acc.n_undetermined);
+            const double n_eff_class = static_cast<double>(n_ancient + n_modern);
+            auto [ci_lo, ci_hi] = wilson_ci_effective(n_ancient, n_eff_class);
+            const float assign_eff = static_cast<float>(gene_acc.eff_reads());
+            gf << target_name
+               << '\t' << gene_acc.n_reads
+               << '\t' << std::fixed << std::setprecision(2) << assign_eff
+               << '\t' << gene_acc.n_damage_reads
+               << '\t' << std::setprecision(2) << gene_acc.n_damage_reads_eff
+               << '\t' << std::setprecision(2) << n_ancient
+               << '\t' << std::setprecision(2) << n_modern
+               << '\t' << std::setprecision(2) << n_undet
+               << '\t' << std::setprecision(4) << gene_acc.ancient_frac()
+               << '\t' << std::setprecision(4) << ci_lo
+               << '\t' << std::setprecision(4) << ci_hi
+               << '\t' << std::setprecision(4) << gene_acc.avg_posterior()
+               << '\t' << std::setprecision(4) << gene_acc.avg_fident()
+               << '\t' << std::setprecision(4) << gene_breadth
+               << '\t' << std::setprecision(4) << gene_abundance
+               << '\t' << std::setprecision(4) << gene_acc.depth_std()
+               << '\t' << std::setprecision(4) << gene_acc.depth_evenness()
+               << '\t' << gene_acc.n_unique_starts()
+               << '\t' << std::setprecision(4) << gene_acc.start_diversity()
+               << '\t' << std::setprecision(4) << gene_acc.start_span()
+               << '\t' << std::setprecision(4) << gene_pos_score
+               << '\t' << std::setprecision(4) << gene_term_ratio
+               << '\t' << std::setprecision(2) << gene_acc.avg_aln_len()
+               << '\t' << std::setprecision(2) << gene_acc.std_aln_len()
+               << '\t' << std::setprecision(4) << cov_deviance
+               << '\t' << std::setprecision(4) << cov_fhat
+               << '\t' << std::setprecision(4) << cov_weight
+               << '\t' << std::setprecision(2) << (assign_eff * cov_weight)
+               << '\n';
+            ++gene_written;
+        }
 
-                std::string fail;
-                auto add_fail = [&fail](const char* token) {
-                    if (!fail.empty()) fail.push_back(',');
-                    fail += token;
-                };
-                if (g.n_reads < min_reads) add_fail("min_reads");
-                if (gene_breadth < min_breadth) add_fail("min_breadth");
-                if (gene_abundance < min_depth) add_fail("min_depth");
-                if (gene_pos_score < min_positional_score) add_fail("min_positional_score");
-                if (gene_term_ratio < min_terminal_ratio) add_fail("min_terminal_ratio");
-
-                pass_gene_filter =
-                    fail.empty();
-                gene_filter_fail = fail.empty() ? "." : fail;
+        // Functional accumulation
+        if (!group_map.empty() && gene_passes) {
+            auto map_it = group_map.find(target_name);
+            if (map_it != group_map.end()) {
+                auto& fa = func_acc[map_it->second];
+                if (fa.function_id.empty()) { fa.function_id = map_it->second; fa.db_type = "MAP"; }
+                const float eff = static_cast<float>(gene_acc.eff_reads());
+                const float n_anc = static_cast<float>(gene_acc.n_ancient_conf + gene_acc.n_ancient_likely);
+                const float n_mod = static_cast<float>(gene_acc.n_modern_conf);
+                const float n_und = static_cast<float>(gene_acc.n_undetermined);
+                const float mean_post = gene_acc.avg_posterior();
+                const bool gene_damaged = (mean_post >= threshold);
+                fa.add_gene(static_cast<uint32_t>(std::round(eff)), n_anc, n_mod, n_und, mean_post, gene_damaged);
             }
+        }
 
-            uint32_t protein_n_reads = 0;
-            uint32_t protein_n_damage_reads = 0;
-            uint32_t protein_n_damaged = 0;
-            uint32_t protein_damage_sites = 0;
-            uint32_t protein_terminal_5 = 0;
-            uint32_t protein_terminal_3 = 0;
-            float protein_mean_p = 0.0f;
-            float protein_max_p = 0.0f;
-            float protein_frac_damaged = 0.0f;
-            float protein_p_protein_damaged = 0.0f;
-            float protein_delta_mle = 0.0f;
-            float protein_ci_lower = 0.0f;
-            float protein_ci_upper = 0.0f;
-            float protein_lrt_pvalue = 1.0f;
-            float protein_log_bf = 0.0f;
-            float protein_d_aa = 0.0f;
-            float protein_avg_delta_bits = 0.0f;
-            float protein_avg_bpa = 0.0f;
-            int protein_length_bin = 0;
-            uint32_t protein_n_unique_starts = 0;
-            float protein_start_diversity = 0.0f;
-            float protein_start_span = 0.0f;
-            float protein_pos_score = 0.0f;
-            float protein_term_ratio = 0.0f;
-            float protein_avg_aln_len = 0.0f;
-            float protein_std_aln_len = 0.0f;
-            bool pass_mapping_filter = false;
-            std::string protein_filter_fail = "missing";
-            if (protein_present) {
-                const auto& p = pit->second;
-                protein_n_reads = static_cast<uint32_t>(p.n_reads);
-                protein_n_damage_reads = static_cast<uint32_t>(p.n_damage_reads);
-                protein_n_damaged = static_cast<uint32_t>(p.n_damaged);
-                protein_damage_sites = static_cast<uint32_t>(p.total_damage_sites);
-                protein_terminal_5 = static_cast<uint32_t>(p.terminal_5);
-                protein_terminal_3 = static_cast<uint32_t>(p.terminal_3);
-                protein_mean_p = (p.n_damage_reads > 0)
-                    ? (p.sum_p_damaged / static_cast<float>(p.n_damage_reads))
-                    : 0.0f;
-                protein_max_p = p.max_p_damaged;
-                protein_frac_damaged = (p.n_damage_reads > 0)
-                    ? static_cast<float>(p.n_damaged) / static_cast<float>(p.n_damage_reads)
-                    : 0.0f;
-                ProteinDamageResult result = fit_protein_damage(p.read_obs);
-                protein_p_protein_damaged = static_cast<float>(result.p_damaged);
-                protein_delta_mle = static_cast<float>(result.delta_max);
-                protein_ci_lower = static_cast<float>(result.ci_lower);
-                protein_ci_upper = static_cast<float>(result.ci_upper);
-                protein_lrt_pvalue = static_cast<float>(result.p_value);
-                protein_log_bf = static_cast<float>(result.log_bayes_factor);
-                constexpr float TERMINAL_CODONS_COMBINED = 3.0f;
-                constexpr float P_SUSCEPTIBLE_COMBINED = 0.25f;
-                constexpr float P_NONSYNONYMOUS_COMBINED = 0.70f;
-                const float observed = use_both_ends_combined
-                    ? static_cast<float>(p.terminal_5 + p.terminal_3)
-                    : static_cast<float>(p.terminal_5);
-                const float n_ends = use_both_ends_combined ? 2.0f : 1.0f;
-                const float expected = static_cast<float>(p.n_reads_eff) * n_ends *
-                    TERMINAL_CODONS_COMBINED * P_SUSCEPTIBLE_COMBINED * P_NONSYNONYMOUS_COMBINED;
-                protein_d_aa = (expected > 0.0f) ? std::min(1.0f, observed / expected) : 0.0f;
-                protein_avg_delta_bits = (p.n_reads_eff > 0.0)
-                    ? (p.sum_delta_bits / static_cast<float>(p.n_reads_eff)) : 0.0f;
-                protein_avg_bpa = (p.n_reads_eff > 0.0)
-                    ? (p.sum_bpa / static_cast<float>(p.n_reads_eff)) : 0.0f;
-                protein_length_bin = static_cast<int>(std::max_element(
-                    p.length_bin_counts.begin(), p.length_bin_counts.end()) - p.length_bin_counts.begin());
-                protein_n_unique_starts = static_cast<uint32_t>(p.unique_starts.size());
-                protein_start_diversity = p.start_diversity();
-                protein_start_span = p.start_span();
-                protein_pos_score = p.positional_score();
-                protein_term_ratio = p.terminal_middle_ratio();
-                protein_avg_aln_len = p.avg_aln_len();
-                protein_std_aln_len = p.std_aln_len();
-
-                std::string fail;
-                auto add_fail = [&fail](const char* token) {
-                    if (!fail.empty()) fail.push_back(',');
-                    fail += token;
-                };
-                if (p.n_reads < min_reads) add_fail("min_reads");
-                if (protein_pos_score < min_positional_score) add_fail("min_positional_score");
-                if (protein_term_ratio < min_terminal_ratio) add_fail("min_terminal_ratio");
-                pass_mapping_filter = fail.empty();
-                protein_filter_fail = fail.empty() ? "." : fail;
+        // Anvio KO
+        if (af_f.is_open() && gene_passes && !group_map.empty()) {
+            auto it = group_map.find(target_name);
+            if (it != group_map.end()) {
+                af_f << target_name << '\t' << it->second << '\t' << annotation_source
+                     << '\t' << std::fixed << std::setprecision(4) << gene_abundance
+                     << '\t' << std::setprecision(4) << gene_breadth << '\n';
             }
+        }
 
-            std::string group_id = ".";
-            auto gm_it = combined_group_map.find(tid);
-            if (gm_it != combined_group_map.end()) {
-                group_id = gm_it->second;
-            }
-            std::string filter_fail;
-            auto append_fail = [&filter_fail](const std::string& token) {
-                if (token.empty()) return;
-                if (!filter_fail.empty()) filter_fail.push_back(',');
-                filter_fail += token;
+        // --- Protein output ---
+        const bool have_protein = (pa.n_reads > 0 || pa.n_damage_reads > 0);
+        const float assign_eff_reads = static_cast<float>(pa.n_reads_eff);
+        const float abundance_adj    = assign_eff_reads * cov_weight;
+        bool protein_passes = false;
+        std::string filter_fail_p;
+
+        if ((pf_os.is_open() || pff_os.is_open() || cof_os.is_open()) && have_protein) {
+            const float mean_p  = pa.n_damage_reads > 0
+                ? (pa.sum_p_damaged / static_cast<float>(pa.n_damage_reads)) : 0.0f;
+            const float frac    = pa.n_damage_reads > 0
+                ? static_cast<float>(pa.n_damaged) / static_cast<float>(pa.n_damage_reads) : 0.0f;
+            const float frac_all= pa.n_reads > 0
+                ? static_cast<float>(pa.n_damaged) / static_cast<float>(pa.n_reads) : 0.0f;
+
+            ProteinDamageResult result = fit_protein_damage(pa.read_obs);
+            const float p_prot  = static_cast<float>(result.p_damaged);
+            const float d_mle   = static_cast<float>(result.delta_max);
+            const float ci_lo2  = static_cast<float>(result.ci_lower);
+            const float ci_hi2  = static_cast<float>(result.ci_upper);
+            const float lrt_p   = static_cast<float>(result.p_value);
+            const float log_bf  = static_cast<float>(result.log_bayes_factor);
+
+            const float observed= use_both_ends
+                ? static_cast<float>(pa.terminal_5 + pa.terminal_3)
+                : static_cast<float>(pa.terminal_5);
+            const float expected= assign_eff_reads * n_ends_lib *
+                static_cast<float>(TERMINAL_CODONS_S) * P_SUSCEPTIBLE_K * P_NONSYNONYMOUS_K;
+            const float d_aa    = (expected > 0.0f) ? std::min(1.0f, observed / expected) : 0.0f;
+
+            const float pos_score  = pa.positional_score();
+            const float term_ratio = pa.terminal_middle_ratio();
+            auto add_fp = [&filter_fail_p](const char* t) {
+                if (!filter_fail_p.empty()) filter_fail_p.push_back(',');
+                filter_fail_p += t;
             };
-            if (!gene_present) append_fail("no_gene");
-            if (!protein_present) append_fail("no_protein");
-            if (gene_filter_fail != "." && gene_filter_fail != "missing") append_fail(gene_filter_fail);
-            if (protein_filter_fail != "." && protein_filter_fail != "missing") append_fail(protein_filter_fail);
-            if (filter_fail.empty()) filter_fail = ".";
-            const bool pass_mapping_filter_final =
-                gene_present && protein_present && pass_gene_filter && pass_mapping_filter;
-            const uint32_t combined_n_reads = protein_present ? protein_n_reads : gene_n_reads;
-            const float combined_pos_score = protein_present ? protein_pos_score : gene_pos_score;
-            const float combined_term_ratio = protein_present ? protein_term_ratio : gene_term_ratio;
+            if (pa.n_reads < min_reads)          add_fp("min_reads");
+            if (pos_score < min_positional_score) add_fp("min_positional_score");
+            if (term_ratio < min_terminal_ratio)  add_fp("min_terminal_ratio");
+            protein_passes = filter_fail_p.empty();
+            if (filter_fail_p.empty()) filter_fail_p = ".";
 
-            cof << tid << '\t' << group_id << '\t' << annotation_source << '\t'
-                << (gene_present ? 1 : 0) << '\t'
-                << (protein_present ? 1 : 0) << '\t'
-                << combined_n_reads << '\t'
-                << std::fixed << std::setprecision(2) << gene_eff_reads << '\t'
-                << std::setprecision(4) << gene_abundance << '\t'
-                << std::setprecision(4) << gene_breadth << '\t'
-                << std::setprecision(4) << gene_mean_identity << '\t'
-                << std::setprecision(4) << gene_mean_posterior << '\t'
-                << protein_n_damage_reads << '\t'
-                << std::setprecision(4) << protein_mean_p << '\t'
-                << std::setprecision(4) << protein_p_protein_damaged << '\t'
-                << std::setprecision(4) << protein_d_aa << '\t'
-                << std::setprecision(4) << combined_pos_score << '\t'
-                << std::setprecision(4) << combined_term_ratio << '\t'
-                << (pass_mapping_filter_final ? 1 : 0) << '\t'
-                << filter_fail << '\n';
-            combined_written++;
+            // assign_* columns come from the gene accumulator
+            const float assign_n_ancient = static_cast<float>(gene_acc.n_ancient_conf + gene_acc.n_ancient_likely);
+            const float assign_n_modern  = static_cast<float>(gene_acc.n_modern_conf);
+            const float assign_n_undet   = static_cast<float>(gene_acc.n_undetermined);
+            const float assign_anc_frac  = gene_acc.ancient_frac();
+            const double n_eff_cls = static_cast<double>(assign_n_ancient + assign_n_modern);
+            auto [a_ci_lo, a_ci_hi] = wilson_ci_effective(assign_n_ancient, n_eff_cls);
+
+            std::ostringstream row;
+            row << pa.protein_id
+                << '\t' << pa.n_reads
+                << '\t' << std::fixed << std::setprecision(2) << assign_eff_reads
+                << '\t' << pa.n_damage_reads
+                << '\t' << pa.n_damaged
+                << '\t' << pa.total_damage_sites
+                << '\t' << pa.terminal_5
+                << '\t' << pa.terminal_3
+                << '\t' << std::setprecision(4) << pa.max_p_damaged
+                << '\t' << std::setprecision(4) << mean_p
+                << '\t' << std::setprecision(4) << frac
+                << '\t' << std::setprecision(4) << frac_all
+                << '\t' << std::setprecision(4) << p_prot
+                << '\t' << std::setprecision(4) << p_prot
+                << '\t' << std::setprecision(4) << d_mle
+                << '\t' << std::setprecision(4) << ci_lo2
+                << '\t' << std::setprecision(4) << ci_hi2
+                << '\t' << std::scientific << std::setprecision(3) << lrt_p
+                << '\t' << std::fixed << std::setprecision(2) << log_bf
+                << '\t' << std::setprecision(4) << d_aa
+                << '\t' << std::setprecision(1)
+                << (assign_eff_reads > 0.0f ? pa.sum_delta_bits / assign_eff_reads : 0.0f)
+                << '\t' << std::setprecision(3)
+                << (assign_eff_reads > 0.0f ? pa.sum_bpa / assign_eff_reads : 0.0f)
+                << '\t' << static_cast<int>(std::max_element(
+                    pa.length_bin_counts.begin(), pa.length_bin_counts.end())
+                    - pa.length_bin_counts.begin())
+                << '\t' << pa.unique_starts.size()
+                << '\t' << std::setprecision(4) << pa.start_diversity()
+                << '\t' << std::setprecision(4) << pa.start_span()
+                << '\t' << std::setprecision(4) << pos_score
+                << '\t' << std::setprecision(4) << term_ratio
+                << '\t' << std::setprecision(2) << pa.avg_aln_len()
+                << '\t' << std::setprecision(2) << pa.std_aln_len()
+                << '\t' << gene_acc.n_reads
+                << '\t' << std::setprecision(2) << static_cast<float>(gene_acc.eff_reads())
+                << '\t' << gene_acc.n_damage_reads
+                << '\t' << std::setprecision(2) << static_cast<float>(gene_acc.n_damage_reads_eff)
+                << '\t' << std::setprecision(2) << assign_n_ancient
+                << '\t' << std::setprecision(2) << assign_n_modern
+                << '\t' << std::setprecision(2) << assign_n_undet
+                << '\t' << std::setprecision(4) << assign_anc_frac
+                << '\t' << std::setprecision(4) << a_ci_lo
+                << '\t' << std::setprecision(4) << a_ci_hi
+                << '\t' << std::setprecision(4) << gene_acc.avg_posterior()
+                << '\t' << std::setprecision(4) << gene_acc.avg_fident()
+                << '\t' << std::setprecision(4) << gene_breadth
+                << '\t' << std::setprecision(4) << gene_abundance
+                << '\t' << std::setprecision(4) << gene_acc.depth_std()
+                << '\t' << std::setprecision(4) << gene_acc.depth_evenness()
+                << '\t' << std::setprecision(4) << cov_deviance
+                << '\t' << std::setprecision(4) << cov_fhat
+                << '\t' << std::setprecision(4) << cov_weight
+                << '\t' << std::setprecision(2) << abundance_adj
+                << '\t' << (protein_passes ? 1 : 0)
+                << '\t' << filter_fail_p
+                << '\n';
+            if (pf_os.is_open()) { pf_os << row.str(); ++protein_written; }
+            if (pff_os.is_open() && protein_passes) { pff_os << row.str(); ++filtered_written; }
         }
 
-        if (verbose) {
-            std::cerr << "Combined output written to: " << combined_output_file
-                      << " (" << combined_written << " targets)\n";
+        // --- Combined output ---
+        if (cof_os.is_open()) {
+            const bool gene_present    = (gene_acc.n_reads > 0);
+            const bool protein_present = have_protein;
+
+            std::string gene_fail_str;
+            if (gene_present && !gene_passes) {
+                auto add_gf = [&gene_fail_str](const char* t) {
+                    if (!gene_fail_str.empty()) gene_fail_str.push_back(',');
+                    gene_fail_str += t;
+                };
+                if (gene_acc.n_reads < min_reads)          add_gf("min_reads");
+                if (gene_breadth < min_breadth)            add_gf("min_breadth");
+                if (gene_abundance < min_depth)            add_gf("min_depth");
+                if (gene_pos_score < min_positional_score) add_gf("min_positional_score");
+                if (gene_term_ratio < min_terminal_ratio)  add_gf("min_terminal_ratio");
+            }
+            const std::string gene_filter_fail = gene_present
+                ? (gene_passes ? "." : gene_fail_str)
+                : "missing";
+            const std::string prot_filter_fail = protein_present
+                ? (filter_fail_p.empty() ? "." : filter_fail_p)
+                : "missing";
+
+            std::string comb_fail;
+            auto append_cf = [&comb_fail](const std::string& t) {
+                if (t.empty() || t == ".") return;
+                if (!comb_fail.empty()) comb_fail.push_back(',');
+                comb_fail += t;
+            };
+            if (!gene_present)    append_cf("no_gene");
+            if (!protein_present) append_cf("no_protein");
+            if (gene_filter_fail != "." && gene_filter_fail != "missing") append_cf(gene_filter_fail);
+            if (prot_filter_fail != "." && prot_filter_fail != "missing") append_cf(prot_filter_fail);
+            if (comb_fail.empty()) comb_fail = ".";
+
+            const bool pass_final = gene_present && protein_present && gene_passes && protein_passes;
+            const uint32_t comb_n_reads = protein_present ? static_cast<uint32_t>(pa.n_reads) : gene_acc.n_reads;
+            const float comb_pos_score  = protein_present ? pa.positional_score() : gene_pos_score;
+            const float comb_term_ratio = protein_present ? pa.terminal_middle_ratio() : gene_term_ratio;
+            const float protein_mean_p  = pa.n_damage_reads > 0
+                ? (pa.sum_p_damaged / static_cast<float>(pa.n_damage_reads)) : 0.0f;
+            ProteinDamageResult comb_result = protein_present
+                ? fit_protein_damage(pa.read_obs)
+                : ProteinDamageResult{};
+            const float protein_d_aa_c = protein_present ? [&]() {
+                const float obs = use_both_ends
+                    ? static_cast<float>(pa.terminal_5 + pa.terminal_3)
+                    : static_cast<float>(pa.terminal_5);
+                const float exp_val = static_cast<float>(pa.n_reads_eff) * n_ends_lib *
+                    3.0f * 0.25f * 0.70f;
+                return (exp_val > 0.0f) ? std::min(1.0f, obs / exp_val) : 0.0f;
+            }() : 0.0f;
+
+            std::string grp_id = ".";
+            auto gm_it = group_map.find(target_name);
+            if (gm_it != group_map.end()) grp_id = gm_it->second;
+
+            cof_os << target_name << '\t' << grp_id << '\t' << annotation_source
+                   << '\t' << (gene_present ? 1 : 0)
+                   << '\t' << (protein_present ? 1 : 0)
+                   << '\t' << comb_n_reads
+                   << '\t' << std::fixed << std::setprecision(2) << static_cast<float>(gene_acc.eff_reads())
+                   << '\t' << std::setprecision(4) << gene_abundance
+                   << '\t' << std::setprecision(4) << gene_breadth
+                   << '\t' << std::setprecision(4) << gene_acc.avg_fident()
+                   << '\t' << std::setprecision(4) << gene_acc.avg_posterior()
+                   << '\t' << static_cast<uint32_t>(pa.n_damage_reads)
+                   << '\t' << std::setprecision(4) << protein_mean_p
+                   << '\t' << std::setprecision(4) << static_cast<float>(comb_result.p_damaged)
+                   << '\t' << std::setprecision(4) << protein_d_aa_c
+                   << '\t' << std::setprecision(4) << comb_pos_score
+                   << '\t' << std::setprecision(4) << comb_term_ratio
+                   << '\t' << (pass_final ? 1 : 0)
+                   << '\t' << comb_fail
+                   << '\n';
+            ++combined_written;
+        }
+
+        ri_cur = ri_end;
+        pi_cur = pi_end;
+    }
+
+    // 10. Write functional summary.
+    if (!func_acc.empty() && !functional_summary_file.empty()) {
+        std::ofstream ff_fs(functional_summary_file);
+        if (!ff_fs.is_open()) {
+            std::cerr << "Error: Cannot open functional summary file: " << functional_summary_file << "\n";
+        } else {
+            ff_fs << "db\tfunction_id\tlevel\tn_genes\tn_reads\tn_ancient\tn_modern\tn_undetermined\t"
+                     "ancient_frac\tci_low\tci_high\tmean_posterior\t"
+                     "n_damaged_genes\tdamaged_gene_frac\tdamage_enrichment\n";
+            uint32_t global_genes = 0, global_damaged = 0;
+            for (const auto& [fid, fa] : func_acc) {
+                global_genes   += fa.n_genes;
+                global_damaged += fa.n_damaged_genes;
+            }
+            const float global_dam_frac = (global_genes > 0)
+                ? static_cast<float>(global_damaged) / static_cast<float>(global_genes) : 0.0f;
+            for (const auto& [fid, fa] : func_acc) {
+                const float frac_f = fa.ancient_frac();
+                auto [ci_l, ci_h] = wilson_ci_effective(
+                    static_cast<double>(fa.n_ancient),
+                    static_cast<double>(fa.n_ancient + fa.n_modern));
+                const float dam_frac = fa.damaged_gene_frac();
+                const float enrich   = (global_dam_frac > 0.0f) ? (dam_frac / global_dam_frac) : 0.0f;
+                ff_fs << fa.db_type << '\t' << fa.function_id << '\t' << "group" << '\t'
+                      << fa.n_genes << '\t' << fa.n_reads << '\t'
+                      << std::fixed << std::setprecision(1) << fa.n_ancient << '\t'
+                      << fa.n_modern << '\t' << fa.n_undetermined << '\t'
+                      << std::setprecision(4) << frac_f << '\t' << ci_l << '\t' << ci_h << '\t'
+                      << fa.mean_posterior() << '\t'
+                      << fa.n_damaged_genes << '\t'
+                      << dam_frac << '\t'
+                      << enrich << '\n';
+            }
+            if (verbose) std::cerr << "Functional summary written to: " << functional_summary_file
+                                   << " (" << func_acc.size() << " functions)\n";
         }
     }
 
     if (verbose) {
-        size_t assigned_kept_reads = 0;
-        for (uint32_t ridx = 0; ridx < n_reads; ++ridx) {
-            if (!best_hits[ridx].has) continue;
-            if (use_em) {
-                if (ridx >= em_read_results.size() || !em_read_results[ridx].em_keep) continue;
-            }
-            assigned_kept_reads++;
-        }
+        if (gf.is_open())
+            std::cerr << "Gene summary written to: " << gene_summary_file << " (" << gene_written << " genes)\n";
+        if (pf_os.is_open())
+            std::cerr << "Protein summary written to: " << protein_summary_file << " (" << protein_written << " proteins)\n";
+        if (pff_os.is_open())
+            std::cerr << "Filtered proteins written to: " << protein_filtered_file << " (" << filtered_written << " proteins passed mapping filters)\n";
+        if (cof_os.is_open())
+            std::cerr << "Combined output written to: " << combined_output_file << " (" << combined_written << " targets)\n";
+        if (af_f.is_open())
+            std::cerr << "Anvi'o gene abundance written to: " << anvio_ko_file << "\n";
         std::cerr << "\nSummary: assigned_reads=" << assigned_kept_reads
-                  << ", mismatch_reads=" << summaries.size()
+                  << ", mismatch_reads=" << n_summaries
                   << ", reads_with_damage_sites=" << proteins_with_damage << "\n";
         const auto run_end = std::chrono::steady_clock::now();
         std::cerr << "Runtime: "
