@@ -544,6 +544,58 @@ StreamingEMResult coverage_em_outer_loop(
 }
 
 // ---------------------------------------------------------------------------
+// coverage_accumulate_from_sorted: O(1)-memory accumulation from sorted CovEntry
+// ---------------------------------------------------------------------------
+// Processes one ref at a time using a pre-sorted vector of per-read entries.
+// Eliminates per-thread unordered_maps (and their 400 GB heap fragmentation)
+// by iterating linearly through the sorted vector with a single accumulator.
+// Calls compute_coverage_metrics_for_protein before storing each ref so the
+// returned map is fully annotated (kl_divergence, coverage_weight, etc.).
+
+void coverage_accumulate_from_sorted(
+    const std::vector<dart::CovEntry>& sorted_entries,
+    const dart::CoverageEMParams& cov_params,
+    std::unordered_map<uint32_t, dart::ProteinCoverageStats>& out_stats)
+{
+    const uint32_t B_acc = accumulation_bin_count(cov_params);
+    out_stats.clear();
+    if (B_acc == 0 || sorted_entries.empty()) return;
+
+    const size_t n = sorted_entries.size();
+    size_t i = 0;
+    while (i < n) {
+        const uint32_t cur_ref  = sorted_entries[i].ref_idx;
+        const uint16_t cur_tlen = sorted_entries[i].tlen;
+
+        dart::ProteinCoverageStats cs;
+        cs.ref_idx = cur_ref;
+        cs.tlen    = cur_tlen;
+        cs.x_bins.assign(B_acc, 0.0f);
+        cs.q_bins.assign(B_acc, 0.0f);
+
+        while (i < n && sorted_entries[i].ref_idx == cur_ref) {
+            const auto& e = sorted_entries[i];
+            const double g = static_cast<double>(e.gamma);
+            if (g >= 1e-6) {
+                const uint32_t bin = start_to_bin(e.tstart_0, e.tlen, B_acc);
+                cs.x_bins[bin] += static_cast<float>(g);
+                compute_q_bin_contribution(cs.q_bins.data(), B_acc,
+                    e.tlen, e.aln_len_on_target, static_cast<float>(g));
+                cs.sum_gamma    += g;
+                cs.sum_gamma_sq += g * g;
+                cs.sum_aln_len  += g * static_cast<double>(e.aln_len_on_target);
+            }
+            ++i;
+        }
+
+        if (cs.sum_gamma > 0.0) {
+            compute_coverage_metrics_for_protein(cs, cov_params, cur_tlen);
+            out_stats.emplace(cur_ref, std::move(cs));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // coverage_accumulate_from_alignments: in-memory coverage accumulation
 // ---------------------------------------------------------------------------
 
