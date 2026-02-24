@@ -1017,6 +1017,24 @@ void ColumnarIndexReader::parallel_scan_selected(
             static_cast<const uint16_t*>(get_col(ColumnID::MISMATCH)),
             static_cast<const uint16_t*>(get_col(ColumnID::GAPOPEN))
         );
+
+        // Release pages for this row group after processing — mirrors the sequential scan.
+        // Pass 2 reads alignment strings for selected row groups; without DONTNEED the entire
+        // 114 GB EMI mmap stays resident, causing ~114 GB of avoidable RSS.
+        {
+            size_t rg_min_off = std::numeric_limits<size_t>::max();
+            size_t rg_max_end = 0;
+            for (size_t c = 0; c < static_cast<size_t>(ColumnID::NUM_COLUMNS); ++c) {
+                const auto& chunk = rg.columns[c];
+                if (chunk.compressed_size == 0) continue;
+                const size_t off = static_cast<size_t>(chunk.offset);
+                const size_t sz  = static_cast<size_t>(chunk.compressed_size);
+                rg_min_off = std::min(rg_min_off, off);
+                rg_max_end = std::max(rg_max_end, off + sz);
+            }
+            if (rg_max_end > rg_min_off)
+                madvise_dontneed_range(base + rg_min_off, rg_max_end - rg_min_off);
+        }
     }
 }
 
