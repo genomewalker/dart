@@ -192,6 +192,18 @@ inline float estimate_completeness(const std::vector<float>& x_bins,
     return f;
 }
 
+// Compact per-read entry for in-memory coverage accumulation.
+// Built from best_hits + em_read_results.gamma after streaming_em_finalize.
+// Sorted by ref_idx so coverage_accumulate_from_sorted can process one ref at a time.
+struct CovEntry {
+    uint32_t ref_idx;
+    float    gamma;              // Pass-2 EM responsibility for this ref
+    uint16_t tstart_0;          // 0-based alignment start on target
+    uint16_t aln_len_on_target;
+    uint16_t tlen;
+    uint8_t  pad[2];
+};  // 16 bytes
+
 // Forward declarations
 class ColumnarIndexReader;
 struct StreamingEMResult;
@@ -215,6 +227,15 @@ StreamingEMResult coverage_em_outer_loop(
     const CoverageEMParams& cov_params,
     std::unordered_map<uint32_t, ProteinCoverageStats>& out_stats,
     bool verbose = false);
+
+// In-memory coverage accumulation from pre-sorted CovEntry vector.
+// Processes one ref at a time: no per-thread unordered_maps, no heap fragmentation.
+// Also computes coverage metrics (kl_divergence, coverage_weight, completeness_fhat)
+// so out_stats is ready for downstream annotation.
+void coverage_accumulate_from_sorted(
+    const std::vector<CovEntry>& sorted_entries,
+    const CoverageEMParams& cov_params,
+    std::unordered_map<uint32_t, ProteinCoverageStats>& out_stats);
 
 // In-memory coverage accumulation from AlignmentData + converged EMState (columnar path).
 // Uses gamma directly from the EM state - no disk I/O required.

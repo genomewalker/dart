@@ -2397,30 +2397,30 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cerr << std::flush;
         }
 
-        dart::StreamingEMResult streaming_result;
-
+        // Coverage EM accumulation now happens after streaming_em_finalize (below).
+        // Always run standalone streaming_em; build coverage stats from sorted CovEntry
+        // after per-read gammas are available. Eliminates per-thread unordered_maps
+        // (source of ~400 GB heap fragmentation in coverage_em_outer_loop).
+        dart::CoverageEMParams cov_params_streaming;
         if (use_coverage_em) {
-            dart::CoverageEMParams cov_params;
-            cov_params.max_outer_iters = coverage_em_iters;
-            cov_params.tau = coverage_em_tau;
-            cov_params.default_bins = coverage_em_bins;
-            cov_params.depth_gate_lo = depth_gate_lo;
-            cov_params.depth_gate_hi = depth_gate_hi;
-            cov_params.w_min = w_min;
-
-            streaming_result = dart::coverage_em_outer_loop(
-                reader, em_params, cov_params, coverage_stats_map, verbose);
-        } else {
-            streaming_result = dart::streaming_em(reader, em_params,
-                [verbose](const dart::EMIterationDiagnostics& d) {
-                    if (verbose && (d.iteration % 10 == 0 || d.iteration < 5)) {
-                        std::cerr << "    iter " << d.iteration
-                                  << " ll=" << std::fixed << std::setprecision(2) << d.log_likelihood
-                                  << "\n";
-                        std::cerr << std::flush;
-                    }
-                });
+            cov_params_streaming.max_outer_iters = coverage_em_iters;
+            cov_params_streaming.tau = coverage_em_tau;
+            cov_params_streaming.default_bins = coverage_em_bins;
+            cov_params_streaming.depth_gate_lo = depth_gate_lo;
+            cov_params_streaming.depth_gate_hi = depth_gate_hi;
+            cov_params_streaming.w_min = w_min;
         }
+
+        dart::StreamingEMResult streaming_result;
+        streaming_result = dart::streaming_em(reader, em_params,
+            [verbose](const dart::EMIterationDiagnostics& d) {
+                if (verbose && (d.iteration % 10 == 0 || d.iteration < 5)) {
+                    std::cerr << "    iter " << d.iteration
+                              << " ll=" << std::fixed << std::setprecision(2) << d.log_likelihood
+                              << "\n";
+                    std::cerr << std::flush;
+                }
+            });
 
         const auto em_end = std::chrono::steady_clock::now();
 
@@ -2434,9 +2434,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                       << reader.num_alignments() << " alignments)\n";
             std::cerr << "  Runtime: "
                       << dart::log_utils::format_elapsed(em_start, em_end) << "\n";
-            if (use_coverage_em) {
-                std::cerr << "  Coverage stats: " << coverage_stats_map.size() << " proteins\n";
-            }
         }
 
         // Copy weights to em_state for downstream use
@@ -2500,6 +2497,63 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
         if (verbose) {
             std::cerr << "  Streaming finalize complete\n\n";
+        }
+
+        // Post-finalize coverage accumulation: build sorted CovEntry from
+        // best_hits + em_read_results.gamma, then accumulate per-ref coverage
+        // stats in a single linear scan (O(1) memory per ref, no fragmentation).
+        if (use_coverage_em) {
+            const auto cov_start = std::chrono::steady_clock::now();
+            if (verbose) {
+                std::cerr << "Coverage EM (sorted in-memory pass)...\n";
+                std::cerr << std::flush;
+            }
+
+            // Build compact CovEntry vector from best_hits + em_read_results
+            std::vector<dart::CovEntry> cov_entries;
+            cov_entries.reserve(n_reads);
+            for (uint32_t r = 0; r < n_reads; ++r) {
+                const auto& bh = best_hits[r];
+                if (!bh.has) continue;
+                const float g = em_read_results[r].gamma;
+                if (g < 1e-6f) continue;
+                dart::CovEntry e;
+                e.ref_idx           = bh.ref_idx;
+                e.gamma             = g;
+                e.tstart_0          = static_cast<uint16_t>(std::min(bh.tstart_0,          65535u));
+                e.aln_len_on_target = static_cast<uint16_t>(std::min(bh.aln_len_on_target, 65535u));
+                e.tlen              = static_cast<uint16_t>(std::min(bh.tlen,              65535u));
+                cov_entries.push_back(e);
+            }
+            std::sort(cov_entries.begin(), cov_entries.end(),
+                [](const dart::CovEntry& a, const dart::CovEntry& b) {
+                    return a.ref_idx < b.ref_idx;
+                });
+
+            dart::coverage_accumulate_from_sorted(
+                cov_entries, cov_params_streaming, coverage_stats_map);
+
+            // Apply coverage weights to em_state.weights (one reweighting step)
+            double w_sum = 0.0;
+            for (uint32_t j = 0; j < static_cast<uint32_t>(em_state.weights.size()); ++j) {
+                auto it = coverage_stats_map.find(j);
+                if (it != coverage_stats_map.end()) {
+                    const double cw = static_cast<double>(it->second.coverage_weight);
+                    em_state.weights[j] *= cw;
+                }
+                w_sum += em_state.weights[j];
+            }
+            if (w_sum > 0.0) {
+                const double inv = 1.0 / w_sum;
+                for (auto& w : em_state.weights) w *= inv;
+            }
+
+            const auto cov_end = std::chrono::steady_clock::now();
+            if (verbose) {
+                std::cerr << "  Coverage stats: " << coverage_stats_map.size() << " proteins\n";
+                std::cerr << "  Runtime: "
+                          << dart::log_utils::format_elapsed(cov_start, cov_end) << "\n\n";
+            }
         }
 
     } else if (use_em && em_aln_count > 0) {
