@@ -959,7 +959,11 @@ void ColumnarIndexReader::parallel_scan_selected(
         }
     };
 
-    #pragma omp parallel for schedule(static)
+    // Sequential (no OMP): each row group is read, strings copied into best_hits, then
+    // DONTNEED is called before the next group loads. With OMP parallel, all threads
+    // simultaneously touch different parts of the NFS-backed mmap — MADV_DONTNEED is
+    // not flushed between groups, so the entire file stays resident (~114 GB for large EMI).
+    // Sequential processing keeps mmap RSS at ~one-row-group at a time (~4 MB).
     for (size_t idx = 0; idx < row_group_indices.size(); ++idx) {
         const uint32_t rg_idx = row_group_indices[idx];
         if (rg_idx >= num_rg) continue;
