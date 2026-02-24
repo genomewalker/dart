@@ -840,11 +840,8 @@ void ColumnarIndexReader::parallel_scan(RowGroupCallback callback) const {
         }
     };
 
-    #pragma omp parallel
-    {
     std::array<std::vector<char>, static_cast<size_t>(ColumnID::NUM_COLUMNS)> decoded_columns;
 
-    #pragma omp for schedule(static)
     for (uint32_t rg_idx = 0; rg_idx < num_rg; ++rg_idx) {
         const RowGroupMeta& rg = impl_->row_groups[rg_idx];
         prefetch_row_group(rg_idx + kPrefetchDistance);
@@ -921,7 +918,6 @@ void ColumnarIndexReader::parallel_scan(RowGroupCallback callback) const {
                 madvise_dontneed_range(base + rg_min, rg_end - rg_min);
         }
     }
-    } // end omp parallel
 }
 
 void ColumnarIndexReader::parallel_scan_selected(

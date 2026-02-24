@@ -147,11 +147,7 @@ void coverage_accumulate_pass(
     // Determine thread count for thread-local accumulators
     int num_threads = 1;
 #ifdef _OPENMP
-    #pragma omp parallel
-    {
-        #pragma omp single
-        num_threads = omp_get_num_threads();
-    }
+    num_threads = std::max(1, omp_get_max_threads());
 #endif
     num_threads = std::min(num_threads, 256);
 
@@ -181,63 +177,175 @@ void coverage_accumulate_pass(
         const uint16_t* /*mismatch*/,
         const uint16_t* /*gapopen*/
     ) {
-#ifdef _OPENMP
-        int tid = omp_get_thread_num();
-        if (tid >= num_threads) tid = 0;
-#else
-        const int tid = 0;
-#endif
-        auto& local_stats = thread_stats[tid];
+        if (num_rows == 0 || !read_idx || !ref_idx || !bit_score || !damage_score) {
+            return;
+        }
 
-        // Recompute gamma using converged weights (mirrors streaming_em_finalize)
-        thread_local std::vector<double> log_scores;
-        uint32_t row = 0;
-        while (row < num_rows) {
+        std::vector<uint32_t> read_starts;
+        read_starts.reserve(num_rows);
+        for (uint32_t row = 0; row < num_rows;) {
+            read_starts.push_back(row);
             const uint32_t current_read = read_idx[row];
-            uint32_t read_start = row;
             while (row < num_rows && read_idx[row] == current_read) {
                 ++row;
             }
-            uint32_t deg = row - read_start;
+        }
+        if (read_starts.empty()) {
+            return;
+        }
 
-            // Compute gamma for this read's alignments
-            thread_local std::vector<double> gamma_vals;
+        const int read_count = static_cast<int>(read_starts.size());
+        const bool use_aln_dmg = em_params.use_alignment_damage_likelihood && dmg_ll_a && dmg_ll_m;
+
+#ifdef _OPENMP
+#pragma omp parallel num_threads(num_threads)
+        {
+            std::vector<double> log_scores;
+            std::vector<double> gamma_vals;
+            const int tid = omp_get_thread_num();
+            auto& local_stats = thread_stats[static_cast<size_t>(tid)];
+
+#pragma omp for schedule(static)
+            for (int read_i = 0; read_i < read_count; ++read_i) {
+                const uint32_t read_start = read_starts[static_cast<size_t>(read_i)];
+                const uint32_t read_end =
+                    (read_i + 1 < read_count)
+                        ? read_starts[static_cast<size_t>(read_i + 1)]
+                        : num_rows;
+                const uint32_t deg = read_end - read_start;
+                if (deg == 0) continue;
+
+                gamma_vals.resize(deg);
+
+                if (em_params.use_damage) {
+                    log_scores.resize(2 * deg);
+                    for (uint32_t j = 0; j < deg; ++j) {
+                        const uint32_t idx = read_start + j;
+                        double log_w = log_weights[ref_idx[idx]];
+                        if (em_params.normalize_by_length && tlen && tlen[idx] > 0) {
+                            log_w -= half_log_tlen(tlen[idx]);
+                        }
+                        const double score_contrib = em_params.lambda_b * static_cast<double>(bit_score[idx]);
+
+                        if (use_aln_dmg) {
+                            const double p_read = std::clamp(static_cast<double>(damage_score[idx]), eps, 1.0 - eps);
+                            log_scores[2 * j]     = log_w + score_contrib + std::log(p_read) + dmg_ll_a[idx];
+                            log_scores[2 * j + 1] = log_w + score_contrib + std::log(1.0 - p_read) + dmg_ll_m[idx];
+                        } else {
+                            const double ds = std::clamp(static_cast<double>(damage_score[idx]), eps, 1.0 - eps);
+                            log_scores[2 * j]     = log_w + score_contrib + std::log(pi_a) + std::log(ds);
+                            log_scores[2 * j + 1] = log_w + score_contrib + std::log(1.0 - pi_a) + std::log(1.0 - ds);
+                        }
+                    }
+
+                    const double lse = log_sum_exp(log_scores.data(), 2 * deg);
+                    for (uint32_t j = 0; j < deg; ++j) {
+                        const double diff_a = log_scores[2 * j] - lse;
+                        const double diff_m = log_scores[2 * j + 1] - lse;
+                        const double g_a = (diff_a > -700.0) ? std::exp(diff_a) : 0.0;
+                        const double g_m = (diff_m > -700.0) ? std::exp(diff_m) : 0.0;
+                        gamma_vals[j] = g_a + g_m;
+                    }
+                } else {
+                    log_scores.resize(deg);
+                    for (uint32_t j = 0; j < deg; ++j) {
+                        const uint32_t idx = read_start + j;
+                        double log_w = log_weights[ref_idx[idx]];
+                        if (em_params.normalize_by_length && tlen && tlen[idx] > 0) {
+                            log_w -= half_log_tlen(tlen[idx]);
+                        }
+                        log_scores[j] = log_w + em_params.lambda_b * static_cast<double>(bit_score[idx]);
+                    }
+
+                    const double lse = log_sum_exp(log_scores.data(), deg);
+                    for (uint32_t j = 0; j < deg; ++j) {
+                        const double diff = log_scores[j] - lse;
+                        gamma_vals[j] = (diff > -700.0) ? std::exp(diff) : 0.0;
+                    }
+                }
+
+                for (uint32_t j = 0; j < deg; ++j) {
+                    const double g = gamma_vals[j];
+                    if (g < 1e-6) continue;
+
+                    const uint32_t idx = read_start + j;
+                    const uint32_t ri = ref_idx[idx];
+
+                    auto& cs = local_stats[ri];
+                    if (cs.x_bins.empty()) {
+                        cs.ref_idx = ri;
+                        cs.x_bins.assign(B_acc, 0.0f);
+                        cs.q_bins.assign(B_acc, 0.0f);
+                    }
+
+                    const uint16_t tstart_0 = (tstart && tstart[idx] > 0) ? (tstart[idx] - 1) : 0;
+                    const uint16_t target_len = tlen ? tlen[idx] : 0;
+                    const uint16_t alignment_len = aln_len ? aln_len[idx] : 0;
+
+                    if (target_len > 0) {
+                        cs.tlen = target_len;
+                    }
+
+                    const uint32_t bin = start_to_bin(tstart_0, target_len, B_acc);
+                    cs.x_bins[bin] += static_cast<float>(g);
+
+                    compute_q_bin_contribution(cs.q_bins.data(), B_acc,
+                        target_len, alignment_len, static_cast<float>(g));
+
+                    cs.sum_gamma += g;
+                    cs.sum_gamma_sq += g * g;
+                    cs.sum_aln_len += g * static_cast<double>(alignment_len);
+                }
+            }
+        }
+#else
+        auto& local_stats = thread_stats[0];
+        std::vector<double> log_scores;
+        std::vector<double> gamma_vals;
+        for (int read_i = 0; read_i < read_count; ++read_i) {
+            const uint32_t read_start = read_starts[static_cast<size_t>(read_i)];
+            const uint32_t read_end =
+                (read_i + 1 < read_count)
+                    ? read_starts[static_cast<size_t>(read_i + 1)]
+                    : num_rows;
+            const uint32_t deg = read_end - read_start;
+            if (deg == 0) continue;
+
             gamma_vals.resize(deg);
 
             if (em_params.use_damage) {
-                const bool use_aln_dmg = em_params.use_alignment_damage_likelihood && dmg_ll_a && dmg_ll_m;
                 log_scores.resize(2 * deg);
                 for (uint32_t j = 0; j < deg; ++j) {
-                    uint32_t idx = read_start + j;
+                    const uint32_t idx = read_start + j;
                     double log_w = log_weights[ref_idx[idx]];
                     if (em_params.normalize_by_length && tlen && tlen[idx] > 0) {
                         log_w -= half_log_tlen(tlen[idx]);
                     }
-                    double score_contrib = em_params.lambda_b * static_cast<double>(bit_score[idx]);
+                    const double score_contrib = em_params.lambda_b * static_cast<double>(bit_score[idx]);
 
                     if (use_aln_dmg) {
-                        double p_read = std::clamp(static_cast<double>(damage_score[idx]), eps, 1.0 - eps);
+                        const double p_read = std::clamp(static_cast<double>(damage_score[idx]), eps, 1.0 - eps);
                         log_scores[2 * j]     = log_w + score_contrib + std::log(p_read) + dmg_ll_a[idx];
                         log_scores[2 * j + 1] = log_w + score_contrib + std::log(1.0 - p_read) + dmg_ll_m[idx];
                     } else {
-                        double ds = std::clamp(static_cast<double>(damage_score[idx]), eps, 1.0 - eps);
+                        const double ds = std::clamp(static_cast<double>(damage_score[idx]), eps, 1.0 - eps);
                         log_scores[2 * j]     = log_w + score_contrib + std::log(pi_a) + std::log(ds);
                         log_scores[2 * j + 1] = log_w + score_contrib + std::log(1.0 - pi_a) + std::log(1.0 - ds);
                     }
                 }
 
-                double lse = log_sum_exp(log_scores.data(), 2 * deg);
+                const double lse = log_sum_exp(log_scores.data(), 2 * deg);
                 for (uint32_t j = 0; j < deg; ++j) {
-                    double diff_a = log_scores[2 * j] - lse;
-                    double diff_m = log_scores[2 * j + 1] - lse;
-                    double g_a = (diff_a > -700.0) ? std::exp(diff_a) : 0.0;
-                    double g_m = (diff_m > -700.0) ? std::exp(diff_m) : 0.0;
+                    const double diff_a = log_scores[2 * j] - lse;
+                    const double diff_m = log_scores[2 * j + 1] - lse;
+                    const double g_a = (diff_a > -700.0) ? std::exp(diff_a) : 0.0;
+                    const double g_m = (diff_m > -700.0) ? std::exp(diff_m) : 0.0;
                     gamma_vals[j] = g_a + g_m;
                 }
             } else {
                 log_scores.resize(deg);
                 for (uint32_t j = 0; j < deg; ++j) {
-                    uint32_t idx = read_start + j;
+                    const uint32_t idx = read_start + j;
                     double log_w = log_weights[ref_idx[idx]];
                     if (em_params.normalize_by_length && tlen && tlen[idx] > 0) {
                         log_w -= half_log_tlen(tlen[idx]);
@@ -245,20 +353,19 @@ void coverage_accumulate_pass(
                     log_scores[j] = log_w + em_params.lambda_b * static_cast<double>(bit_score[idx]);
                 }
 
-                double lse = log_sum_exp(log_scores.data(), deg);
+                const double lse = log_sum_exp(log_scores.data(), deg);
                 for (uint32_t j = 0; j < deg; ++j) {
-                    double diff = log_scores[j] - lse;
+                    const double diff = log_scores[j] - lse;
                     gamma_vals[j] = (diff > -700.0) ? std::exp(diff) : 0.0;
                 }
             }
 
-            // Accumulate coverage stats per protein
             for (uint32_t j = 0; j < deg; ++j) {
-                double g = gamma_vals[j];
+                const double g = gamma_vals[j];
                 if (g < 1e-6) continue;
 
-                uint32_t idx = read_start + j;
-                uint32_t ri = ref_idx[idx];
+                const uint32_t idx = read_start + j;
+                const uint32_t ri = ref_idx[idx];
 
                 auto& cs = local_stats[ri];
                 if (cs.x_bins.empty()) {
@@ -267,16 +374,15 @@ void coverage_accumulate_pass(
                     cs.q_bins.assign(B_acc, 0.0f);
                 }
 
-                // tstart in EMI is 1-based; subtract 1 for 0-based
-                uint16_t tstart_0 = (tstart && tstart[idx] > 0) ? (tstart[idx] - 1) : 0;
-                uint16_t target_len = tlen ? tlen[idx] : 0;
-                uint16_t alignment_len = aln_len ? aln_len[idx] : 0;
+                const uint16_t tstart_0 = (tstart && tstart[idx] > 0) ? (tstart[idx] - 1) : 0;
+                const uint16_t target_len = tlen ? tlen[idx] : 0;
+                const uint16_t alignment_len = aln_len ? aln_len[idx] : 0;
 
                 if (target_len > 0) {
                     cs.tlen = target_len;
                 }
 
-                uint32_t bin = start_to_bin(tstart_0, target_len, B_acc);
+                const uint32_t bin = start_to_bin(tstart_0, target_len, B_acc);
                 cs.x_bins[bin] += static_cast<float>(g);
 
                 compute_q_bin_contribution(cs.q_bins.data(), B_acc,
@@ -287,6 +393,7 @@ void coverage_accumulate_pass(
                 cs.sum_aln_len += g * static_cast<double>(alignment_len);
             }
         }
+#endif
     });
 
     // Merge thread-local stats into output map
