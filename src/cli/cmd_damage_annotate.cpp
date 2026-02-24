@@ -2387,8 +2387,21 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         em_params.use_alignment_damage_likelihood = true;
 
         const auto em_start = std::chrono::steady_clock::now();
-        // Reset column selection - previous code may have limited columns
-        reader.set_all_columns();
+        // Restrict to the 7 columns streaming_em actually reads.
+        // set_all_columns() would include QALN/TALN (~13 MB/row-group) in
+        // MADV_WILLNEED prefetch, inflating NFS RSS by ~50-100 GB over 100+
+        // EM iterations. Scoring passes that need QALN/TALN run before this
+        // block and restore their own column set; streaming_em_finalize uses
+        // the same 7 columns. No restore needed — reader not used after finalize.
+        reader.set_columns({
+            dart::ColumnID::READ_IDX,
+            dart::ColumnID::REF_IDX,
+            dart::ColumnID::BIT_SCORE,
+            dart::ColumnID::DAMAGE_SCORE,
+            dart::ColumnID::DMG_LL_A,
+            dart::ColumnID::DMG_LL_M,
+            dart::ColumnID::TLEN,
+        });
 
         if (verbose) {
             std::cerr << "  Starting streaming EM"

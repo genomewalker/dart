@@ -652,7 +652,12 @@ ColumnarIndexReader::ColumnarIndexReader(const std::string& path)
         return;
     }
 
-    madvise(impl_->data, impl_->file_size, MADV_SEQUENTIAL);
+    // MADV_RANDOM: disable kernel speculative readahead for the full mmap.
+    // On NFS, MADV_SEQUENTIAL prefaults the entire file (up to 114 GB) into
+    // RSS over time via aggressive readahead, far outpacing per-row-group
+    // MADV_DONTNEED reclaim. With MADV_RANDOM the kernel only faults pages
+    // on explicit access or MADV_WILLNEED from prefetch_row_group().
+    madvise(impl_->data, impl_->file_size, MADV_RANDOM);
 
     // Parse header
     impl_->header = static_cast<const EMIHeader*>(impl_->data);
