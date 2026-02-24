@@ -652,12 +652,12 @@ ColumnarIndexReader::ColumnarIndexReader(const std::string& path)
         return;
     }
 
-    // MADV_RANDOM: disable kernel speculative readahead for the full mmap.
-    // On NFS, MADV_SEQUENTIAL prefaults the entire file (up to 114 GB) into
-    // RSS over time via aggressive readahead, far outpacing per-row-group
-    // MADV_DONTNEED reclaim. With MADV_RANDOM the kernel only faults pages
-    // on explicit access or MADV_WILLNEED from prefetch_row_group().
-    madvise(impl_->data, impl_->file_size, MADV_RANDOM);
+    // MADV_NORMAL: use system-default readahead (128 KB–512 KB) instead of
+    // MADV_SEQUENTIAL (aggressive full-file prefetch) or MADV_RANDOM (no
+    // readahead, 3.7× NFS slowdown). Moderate readahead keeps per-row-group
+    // throughput high so MADV_DONTNEED can keep up; combined with explicit
+    // MADV_WILLNEED from prefetch_row_group() for column-restricted prefetch.
+    madvise(impl_->data, impl_->file_size, MADV_NORMAL);
 
     // Parse header
     impl_->header = static_cast<const EMIHeader*>(impl_->data);
@@ -816,6 +816,22 @@ void ColumnarIndexReader::set_columns(std::initializer_list<ColumnID> cols) {
 void ColumnarIndexReader::set_all_columns() {
     impl_->load_all_columns = true;
     std::fill(std::begin(impl_->column_needed), std::end(impl_->column_needed), true);
+}
+
+void ColumnarIndexReader::flush_pages() {
+    if (!impl_ || !impl_->data || impl_->file_size == 0) return;
+#ifdef __linux__
+    // posix_fadvise DONTNEED on the fd is the most reliable way to release
+    // NFS-backed pages from the OS page cache. madvise(MADV_DONTNEED) on the
+    // mmap region removes pages from this process's page tables but may not
+    // flush the NFS client's page cache. Call this before streaming_em to
+    // clear pages accumulated by Pass 1 and scoring passes (~80-150 GB).
+    if (impl_->fd >= 0)
+        posix_fadvise(impl_->fd, 0, static_cast<off_t>(impl_->file_size),
+                      POSIX_FADV_DONTNEED);
+    // Also remove from our mmap address space
+    madvise(impl_->data, impl_->file_size, MADV_DONTNEED);
+#endif
 }
 
 void ColumnarIndexReader::parallel_scan(RowGroupCallback callback) const {

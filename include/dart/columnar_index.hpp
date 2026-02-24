@@ -273,6 +273,11 @@ public:
     void set_columns(std::initializer_list<ColumnID> cols);
     void set_all_columns();
 
+    // Release all mmap'd file pages from the OS page cache.
+    // Call before streaming_em to flush pages accumulated by Pass 1 / scoring,
+    // ensuring streaming_em starts from a clean RSS baseline.
+    void flush_pages();
+
     // Row group iteration with parallel callback
     // Callback receives (row_group_idx, num_rows, column_data_ptrs)
     // v2: Added read_idx for correct per-read grouping (fixes CSR/row-group issue)

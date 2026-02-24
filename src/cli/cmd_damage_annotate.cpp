@@ -2387,6 +2387,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         em_params.use_alignment_damage_likelihood = true;
 
         const auto em_start = std::chrono::steady_clock::now();
+        // Flush all NFS-backed EMI pages accumulated during Pass 1 and scoring.
+        // Without this, ~80-150 GB of page-cache pages from the sequential scan
+        // stay resident, consuming headroom before streaming_em even starts.
+        reader.flush_pages();
+
         // Restrict to the 7 columns streaming_em actually reads.
         // set_all_columns() would include QALN/TALN (~13 MB/row-group) in
         // MADV_WILLNEED prefetch, inflating NFS RSS by ~50-100 GB over 100+
