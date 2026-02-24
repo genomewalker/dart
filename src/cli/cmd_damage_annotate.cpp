@@ -32,6 +32,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <string_view>
+#ifdef __linux__
+#include <malloc.h>
+#endif
 #include <sstream>
 #include <atomic>
 #include <mutex>
@@ -198,6 +201,17 @@ struct ProteinDamageSummary {
     float bpa = 0.0f;           // bits / alnlen (bits-per-aligned-AA)
     uint8_t length_bin = 0;     // 0=15-24, 1=25-39, 2=40-59, 3=60+
     float z_bpa = 0.0f;         // Length-normalized BPA z-score
+};
+
+// Compact per-read data extracted from ProteinDamageSummary for protein_agg construction.
+// Extracted before building gene_agg so the full summaries vector can be freed early.
+struct ProteinAggInput {
+    uint32_t read_idx;
+    uint32_t ref_idx;
+    uint16_t tlen;
+    float p_damaged;
+    uint32_t damage_consistent;
+    std::vector<DamageSite> sites;  // moved from ProteinDamageSummary
 };
 
 // Parse strand and frame from DART header suffix (e.g., readname_+_1 -> '+', 1)
@@ -2223,8 +2237,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                         summary.read_idx = ridx;
                         filter_sites_by_distance(summary, max_dist);
                         summary.qlen = hit.qlen;
-                        summary.qaln = std::string(qaln_sv);
-                        summary.taln = std::string(taln_sv);
+                        if (!corrected_file.empty()) {
+                            summary.qaln = std::string(qaln_sv);
+                            summary.taln = std::string(taln_sv);
+                        }
                         summary.qstart_0 = hit.qstart_0;
                         summary.tstart_0 = hit.tstart_0;
                         summary.tlen = hit.tlen;
@@ -2877,6 +2893,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         score_params.damage_detectability = damage_detectability;
         // All per-read lookups are done; release the 31 GB index before Bayesian scoring.
         damage_index.reset();
+#ifdef __linux__
+        malloc_trim(0);  // Return freed AGD pages to OS immediately
+#endif
     }
 
     if (verbose) {
@@ -3012,6 +3031,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cerr << "Corrected proteins written: " << corrected_count
                       << " to " << corrected_file << "\n";
         }
+        // Free alignment strings — only needed for corrected protein output
+        for (auto& s : summaries) {
+            std::string{}.swap(s.qaln);
+            std::string{}.swap(s.taln);
+        }
     }
 
     // Write per-protein summary
@@ -3128,6 +3152,31 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         }
         *out << "\n";
     }
+
+    // Extract compact protein_agg inputs from summaries, then free the full summaries
+    // vector before building gene_agg. summaries holds large per-read strings (query_id,
+    // target_id) and sites vectors that together can exceed 20 GB for large EMI files.
+    // protein_agg only needs: read_idx, ref_idx, tlen, p_damaged, damage_consistent, sites.
+    const bool need_protein_agg =
+        !protein_summary_file.empty() || !protein_filtered_file.empty() || !combined_output_file.empty();
+    std::vector<ProteinAggInput> protein_agg_inputs;
+    if (need_protein_agg) {
+        protein_agg_inputs.reserve(summaries.size());
+        for (auto& s : summaries) {
+            ProteinAggInput c;
+            c.read_idx = s.read_idx;
+            c.ref_idx = best_hits[s.read_idx].ref_idx;
+            c.tlen = static_cast<uint16_t>(std::min<size_t>(s.tlen, UINT16_MAX));
+            c.p_damaged = s.p_damaged;
+            c.damage_consistent = static_cast<uint32_t>(s.damage_consistent);
+            c.sites = std::move(s.sites);
+            protein_agg_inputs.push_back(std::move(c));
+        }
+    }
+    { decltype(summaries) tmp; tmp.swap(summaries); }
+#ifdef __linux__
+    malloc_trim(0);  // Return freed summaries heap to OS before gene_agg/protein_agg
+#endif
 
     // Build name->ref_idx reverse map for coverage stats lookup in output
     std::unordered_map<std::string, uint32_t> name_to_ref_idx;
@@ -3526,37 +3575,38 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             }
         }
 
-        for (const auto& s : summaries) {
+        for (const auto& c : protein_agg_inputs) {
             if (use_em) {
-                if (s.read_idx >= em_read_results.size() || !em_read_results[s.read_idx].em_keep) {
+                if (c.read_idx >= em_read_results.size() || !em_read_results[c.read_idx].em_keep) {
                     continue;
                 }
             }
-            auto& agg = protein_agg[s.target_id];
-            if (agg.protein_id.empty()) agg.protein_id = s.target_id;
-            if (agg.tlen == 0) agg.tlen = static_cast<uint32_t>(s.tlen);
+            const std::string target_id(reader.ref_name(c.ref_idx));
+            auto& agg = protein_agg[target_id];
+            if (agg.protein_id.empty()) agg.protein_id = target_id;
+            if (agg.tlen == 0) agg.tlen = static_cast<uint32_t>(c.tlen);
             agg.n_damage_reads++;
-            if (s.p_damaged > 0.5f) agg.n_damaged++;
-            agg.total_damage_sites += s.damage_consistent;
-            if (s.p_damaged > agg.max_p_damaged) agg.max_p_damaged = s.p_damaged;
-            agg.sum_p_damaged += s.p_damaged;
+            if (c.p_damaged > 0.5f) agg.n_damaged++;
+            agg.total_damage_sites += c.damage_consistent;
+            if (c.p_damaged > agg.max_p_damaged) agg.max_p_damaged = c.p_damaged;
+            agg.sum_p_damaged += c.p_damaged;
 
             // Collect per-read observation for Beta-Binomial model
             // info = sum of p_damage at sites (informativeness for weighting)
             float info = 0.0f;
-            for (const auto& site : s.sites) {
+            for (const auto& site : c.sites) {
                 info += site.p_damage;
             }
             ReadDamageObs read_obs;
-            read_obs.p_damaged = s.p_damaged;
+            read_obs.p_damaged = c.p_damaged;
             read_obs.log_lr = 0.0f;  // Could compute from damage_fraction vs expected
             read_obs.info = info;
-            read_obs.n_sites = static_cast<int>(s.damage_consistent);
-            read_obs.is_damaged = s.p_damaged > 0.5f;
+            read_obs.n_sites = static_cast<int>(c.damage_consistent);
+            read_obs.is_damaged = c.p_damaged > 0.5f;
             agg.read_obs.push_back(read_obs);
 
             // Count terminal sites from per-read sites
-            for (const auto& site : s.sites) {
+            for (const auto& site : c.sites) {
                 size_t codon_pos_5 = site.dist_5prime / 3;
                 size_t codon_pos_3 = site.dist_3prime / 3;
                 if (site.damage_class == 'C' && codon_pos_5 < TERMINAL_CODONS) {
@@ -3566,6 +3616,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 }
             }
         }
+        { decltype(protein_agg_inputs) tmp; tmp.swap(protein_agg_inputs); }
 
         // Auto-detect library type from terminal site ratio
         size_t total_5 = 0, total_3 = 0;
