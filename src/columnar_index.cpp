@@ -652,12 +652,11 @@ ColumnarIndexReader::ColumnarIndexReader(const std::string& path)
         return;
     }
 
-    // MADV_NORMAL: use system-default readahead (128 KB–512 KB) instead of
-    // MADV_SEQUENTIAL (aggressive full-file prefetch) or MADV_RANDOM (no
-    // readahead, 3.7× NFS slowdown). Moderate readahead keeps per-row-group
-    // throughput high so MADV_DONTNEED can keep up; combined with explicit
-    // MADV_WILLNEED from prefetch_row_group() for column-restricted prefetch.
-    madvise(impl_->data, impl_->file_size, MADV_NORMAL);
+    // MADV_SEQUENTIAL: aggressive readahead keeps Pass 1 / scoring passes fast
+    // and allows per-row-group MADV_DONTNEED to reclaim pages efficiently.
+    // Switched to MADV_RANDOM in flush_pages() before streaming_em to prevent
+    // speculative readahead from accumulating 100+ GB during 100 EM iterations.
+    madvise(impl_->data, impl_->file_size, MADV_SEQUENTIAL);
 
     // Parse header
     impl_->header = static_cast<const EMIHeader*>(impl_->data);
@@ -821,16 +820,21 @@ void ColumnarIndexReader::set_all_columns() {
 void ColumnarIndexReader::flush_pages() {
     if (!impl_ || !impl_->data || impl_->file_size == 0) return;
 #ifdef __linux__
-    // posix_fadvise DONTNEED on the fd is the most reliable way to release
-    // NFS-backed pages from the OS page cache. madvise(MADV_DONTNEED) on the
-    // mmap region removes pages from this process's page tables but may not
-    // flush the NFS client's page cache. Call this before streaming_em to
-    // clear pages accumulated by Pass 1 and scoring passes (~80-150 GB).
+    // posix_fadvise DONTNEED on the fd releases NFS-backed pages from the OS
+    // page cache (more reliable than madvise alone for NFS). Call before
+    // streaming_em to clear ~50-80 GB accumulated by Pass 1 + scoring passes.
     if (impl_->fd >= 0)
         posix_fadvise(impl_->fd, 0, static_cast<off_t>(impl_->file_size),
                       POSIX_FADV_DONTNEED);
-    // Also remove from our mmap address space
+    // Remove from our mmap address space too
     madvise(impl_->data, impl_->file_size, MADV_DONTNEED);
+    // Switch from MADV_SEQUENTIAL to MADV_RANDOM for the streaming_em phase:
+    // MADV_SEQUENTIAL's aggressive readahead is good for single-pass scans
+    // (Pass 1, scoring) but accumulates 100+ GB over 100 EM iterations even
+    // with per-row-group DONTNEED. MADV_RANDOM disables speculative readahead;
+    // streaming_em still gets its 2-row-group explicit WILLNEED from
+    // prefetch_row_group(), so throughput is not materially affected.
+    madvise(impl_->data, impl_->file_size, MADV_RANDOM);
 #endif
 }
 
