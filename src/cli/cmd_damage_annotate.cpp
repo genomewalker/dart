@@ -2420,6 +2420,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                               << "\n";
                     std::cerr << std::flush;
                 }
+                // Return per-row-group Parquet heap back to OS after each EM iteration.
+                // Without this, 100 sequential EMI scans accumulate ~150 GB of fragmented
+                // glibc arena pages that MADV_DONTNEED alone cannot reclaim on NFS mounts.
+#ifdef __linux__
+                malloc_trim(0);
+#endif
             });
 
         const auto em_end = std::chrono::steady_clock::now();
