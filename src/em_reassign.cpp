@@ -634,7 +634,6 @@ std::vector<std::pair<uint32_t, float>> reassign_reads(
 // For 584M alignments with 10M refs: ~80MB instead of ~18GB
 
 #include "dart/columnar_index.hpp"
-#include <mutex>
 
 namespace {
 
@@ -666,8 +665,9 @@ double streaming_e_step_rowgroup(
     uint32_t num_refs,
     const dart::EMParams& params,
     double pi_ancient,
-    std::vector<double>& ref_sums,        // Accumulated gamma per ref (output)
-    std::vector<double>& ref_sums_ancient // Accumulated gamma_ancient per ref (output)
+    std::vector<std::vector<double>>& thread_ref_sums,
+    std::vector<std::vector<double>>& thread_ref_sums_ancient,
+    int num_threads
 ) {
     const double eps = 1e-12;
     const double pi_a = std::clamp(pi_ancient, eps, 1.0 - eps);
@@ -677,73 +677,164 @@ double streaming_e_step_rowgroup(
     if (!read_idx || !ref_idx || !bit_score || !damage_score || !log_weights) {
         return 0.0;
     }
+    if (num_rows == 0 || num_threads <= 0 || thread_ref_sums.empty()) {
+        return 0.0;
+    }
+
+    // Group alignments by read boundaries so each OpenMP iteration processes
+    // one complete read (all its alignments stay atomic).
+    std::vector<uint32_t> read_starts;
+    read_starts.reserve(num_rows);
+    for (uint32_t row = 0; row < num_rows;) {
+        read_starts.push_back(row);
+        const uint32_t current_read = read_idx[row];
+        while (row < num_rows && read_idx[row] == current_read) {
+            ++row;
+        }
+    }
+    if (read_starts.empty()) {
+        return 0.0;
+    }
 
     // For alignment damage likelihood mode, we need dmg_ll_a/dmg_ll_m
     const bool use_aln_dmg = params.use_alignment_damage_likelihood && dmg_ll_a && dmg_ll_m;
 
-    // Group alignments by read for normalization
-    // Since row groups are sorted by read_idx, we can process in order
-    uint32_t row = 0;
-    uint32_t reads_processed = 0;
-    while (row < num_rows) {
-        const uint32_t current_read = read_idx[row];
-        uint32_t read_start = row;
+    const int read_count = static_cast<int>(read_starts.size());
 
-        // Find all alignments for this read in this row group
-        while (row < num_rows && read_idx[row] == current_read) {
-            ++row;
+#ifdef _OPENMP
+#pragma omp parallel num_threads(num_threads) reduction(+:ll)
+    {
+        std::vector<double> log_scores;
+        const int tid = omp_get_thread_num();
+        auto& local_ref_sums = thread_ref_sums[static_cast<size_t>(tid)];
+        auto& local_ref_sums_ancient = thread_ref_sums_ancient[static_cast<size_t>(tid)];
+
+#pragma omp for schedule(static)
+        for (int read_i = 0; read_i < read_count; ++read_i) {
+            const uint32_t read_start = read_starts[static_cast<size_t>(read_i)];
+            const uint32_t read_end =
+                (read_i + 1 < read_count)
+                    ? read_starts[static_cast<size_t>(read_i + 1)]
+                    : num_rows;
+            const uint32_t deg = read_end - read_start;
+            if (deg == 0) continue;
+
+            if (params.use_damage) {
+                log_scores.resize(2 * deg);
+                for (uint32_t j = 0; j < deg; ++j) {
+                    const uint32_t idx = read_start + j;
+                    double log_w = log_weights[ref_idx[idx]];
+                    if (params.normalize_by_length && tlen && tlen[idx] > 0) {
+                        log_w -= half_log_tlen(tlen[idx]);
+                    }
+                    const double score_contrib = params.lambda_b * static_cast<double>(bit_score[idx]);
+
+                    if (use_aln_dmg) {
+                        const double p_read = std::clamp(static_cast<double>(damage_score[idx]), eps, 1.0 - eps);
+                        log_scores[2 * j]     = log_w + score_contrib + std::log(p_read) + dmg_ll_a[idx];
+                        log_scores[2 * j + 1] = log_w + score_contrib + std::log(1.0 - p_read) + dmg_ll_m[idx];
+                    } else {
+                        const double ds = std::clamp(static_cast<double>(damage_score[idx]), eps, 1.0 - eps);
+                        log_scores[2 * j]     = log_w + score_contrib + std::log(pi_a) + std::log(ds);
+                        log_scores[2 * j + 1] = log_w + score_contrib + std::log(1.0 - pi_a) + std::log(1.0 - ds);
+                    }
+                }
+
+                const double lse = dart::log_sum_exp(log_scores.data(), 2 * deg);
+                ll += lse;
+
+                for (uint32_t j = 0; j < deg; ++j) {
+                    const uint32_t idx = read_start + j;
+                    const double diff_a = log_scores[2 * j] - lse;
+                    const double diff_m = log_scores[2 * j + 1] - lse;
+                    const double g_ancient = (diff_a > -700.0) ? std::exp(diff_a) : 0.0;
+                    const double g_modern  = (diff_m > -700.0) ? std::exp(diff_m) : 0.0;
+                    const double g_total = g_ancient + g_modern;
+
+                    const uint32_t ri = ref_idx[idx];
+                    if (ri >= num_refs) continue;
+                    local_ref_sums[ri] += g_total;
+                    local_ref_sums_ancient[ri] += g_ancient;
+                }
+            } else {
+                log_scores.resize(deg);
+                for (uint32_t j = 0; j < deg; ++j) {
+                    const uint32_t idx = read_start + j;
+                    double log_w = log_weights[ref_idx[idx]];
+                    if (params.normalize_by_length && tlen && tlen[idx] > 0) {
+                        log_w -= half_log_tlen(tlen[idx]);
+                    }
+                    log_scores[j] = log_w + params.lambda_b * static_cast<double>(bit_score[idx]);
+                }
+
+                const double lse = dart::log_sum_exp(log_scores.data(), deg);
+                ll += lse;
+
+                for (uint32_t j = 0; j < deg; ++j) {
+                    const uint32_t idx = read_start + j;
+                    const double diff = log_scores[j] - lse;
+                    const double g_val = (diff > -700.0) ? std::exp(diff) : 0.0;
+                    const uint32_t ri = ref_idx[idx];
+                    if (ri >= num_refs) continue;
+                    local_ref_sums[ri] += g_val;
+                }
+            }
         }
-        uint32_t deg = row - read_start;
-        ++reads_processed;
-
+    }
+#else
+    auto& local_ref_sums = thread_ref_sums[0];
+    auto& local_ref_sums_ancient = thread_ref_sums_ancient[0];
+    std::vector<double> log_scores;
+    for (int read_i = 0; read_i < read_count; ++read_i) {
+        const uint32_t read_start = read_starts[static_cast<size_t>(read_i)];
+        const uint32_t read_end =
+            (read_i + 1 < read_count)
+                ? read_starts[static_cast<size_t>(read_i + 1)]
+                : num_rows;
+        const uint32_t deg = read_end - read_start;
         if (deg == 0) continue;
 
-        // Compute log-scores for E-step
-        thread_local std::vector<double> log_scores;
         if (params.use_damage) {
             log_scores.resize(2 * deg);
             for (uint32_t j = 0; j < deg; ++j) {
-                uint32_t idx = read_start + j;
+                const uint32_t idx = read_start + j;
                 double log_w = log_weights[ref_idx[idx]];
                 if (params.normalize_by_length && tlen && tlen[idx] > 0) {
                     log_w -= half_log_tlen(tlen[idx]);
                 }
-                double score_contrib = params.lambda_b * static_cast<double>(bit_score[idx]);
+                const double score_contrib = params.lambda_b * static_cast<double>(bit_score[idx]);
 
                 if (use_aln_dmg) {
-                    // Use alignment-level damage likelihoods with per-read prior
-                    double p_read = std::clamp(static_cast<double>(damage_score[idx]), eps, 1.0 - eps);
+                    const double p_read = std::clamp(static_cast<double>(damage_score[idx]), eps, 1.0 - eps);
                     log_scores[2 * j]     = log_w + score_contrib + std::log(p_read) + dmg_ll_a[idx];
                     log_scores[2 * j + 1] = log_w + score_contrib + std::log(1.0 - p_read) + dmg_ll_m[idx];
                 } else {
-                    // Simple mode: damage_score as probability, learn pi
-                    double ds = std::clamp(static_cast<double>(damage_score[idx]), eps, 1.0 - eps);
+                    const double ds = std::clamp(static_cast<double>(damage_score[idx]), eps, 1.0 - eps);
                     log_scores[2 * j]     = log_w + score_contrib + std::log(pi_a) + std::log(ds);
                     log_scores[2 * j + 1] = log_w + score_contrib + std::log(1.0 - pi_a) + std::log(1.0 - ds);
                 }
             }
 
-            double lse = dart::log_sum_exp(log_scores.data(), 2 * deg);
+            const double lse = dart::log_sum_exp(log_scores.data(), 2 * deg);
             ll += lse;
 
-            // Accumulate to ref_sums
             for (uint32_t j = 0; j < deg; ++j) {
-                uint32_t idx = read_start + j;
-                double diff_a = log_scores[2 * j] - lse;
-                double diff_m = log_scores[2 * j + 1] - lse;
-                double g_ancient = (diff_a > -700.0) ? std::exp(diff_a) : 0.0;
-                double g_modern  = (diff_m > -700.0) ? std::exp(diff_m) : 0.0;
-                double g_total = g_ancient + g_modern;
+                const uint32_t idx = read_start + j;
+                const double diff_a = log_scores[2 * j] - lse;
+                const double diff_m = log_scores[2 * j + 1] - lse;
+                const double g_ancient = (diff_a > -700.0) ? std::exp(diff_a) : 0.0;
+                const double g_modern  = (diff_m > -700.0) ? std::exp(diff_m) : 0.0;
+                const double g_total = g_ancient + g_modern;
 
-                uint32_t ri = ref_idx[idx];
+                const uint32_t ri = ref_idx[idx];
                 if (ri >= num_refs) continue;
-                ref_sums[ri] += g_total;
-                ref_sums_ancient[ri] += g_ancient;
+                local_ref_sums[ri] += g_total;
+                local_ref_sums_ancient[ri] += g_ancient;
             }
         } else {
             log_scores.resize(deg);
             for (uint32_t j = 0; j < deg; ++j) {
-                uint32_t idx = read_start + j;
+                const uint32_t idx = read_start + j;
                 double log_w = log_weights[ref_idx[idx]];
                 if (params.normalize_by_length && tlen && tlen[idx] > 0) {
                     log_w -= half_log_tlen(tlen[idx]);
@@ -751,17 +842,20 @@ double streaming_e_step_rowgroup(
                 log_scores[j] = log_w + params.lambda_b * static_cast<double>(bit_score[idx]);
             }
 
-            double lse = dart::log_sum_exp(log_scores.data(), deg);
+            const double lse = dart::log_sum_exp(log_scores.data(), deg);
             ll += lse;
 
             for (uint32_t j = 0; j < deg; ++j) {
-                uint32_t idx = read_start + j;
-                double diff = log_scores[j] - lse;
-                double g_val = (diff > -700.0) ? std::exp(diff) : 0.0;
-                ref_sums[ref_idx[idx]] += g_val;
+                const uint32_t idx = read_start + j;
+                const double diff = log_scores[j] - lse;
+                const double g_val = (diff > -700.0) ? std::exp(diff) : 0.0;
+                const uint32_t ri = ref_idx[idx];
+                if (ri >= num_refs) continue;
+                local_ref_sums[ri] += g_val;
             }
         }
     }
+#endif
 
     return ll;
 }
@@ -825,15 +919,10 @@ StreamingEMResult streaming_em(
     }
     result.pi = 0.1;
 
-    // Thread-local accumulators for parallel row group processing
-    // Use a reasonable upper bound that won't cause OOM
+    // Thread-local accumulators for per-row-group read-parallel processing.
     int num_threads = 1;
 #ifdef _OPENMP
-    #pragma omp parallel
-    {
-        #pragma omp single
-        num_threads = omp_get_num_threads();
-    }
+    num_threads = std::max(1, omp_get_max_threads());
 #endif
     // Cap at hardware concurrency to prevent excessive memory use
     const int hw_threads = static_cast<int>(std::thread::hardware_concurrency());
@@ -870,12 +959,10 @@ StreamingEMResult streaming_em(
             log_weights[t] = std::log(std::max(result.weights[t], params.min_weight));
         }
 
-        std::mutex ll_mutex;
         double total_ll = 0.0;
 
-        // E-step: process row groups in parallel via parallel_scan
-        // parallel_scan already creates OMP parallel region internally,
-        // so we use thread-local storage inside the callback
+        // E-step: process row groups sequentially; each row group parallelizes
+        // internally over complete reads in streaming_e_step_rowgroup().
         reader.parallel_scan([&](
             uint32_t /*rg_idx*/,
             uint32_t num_rows,
@@ -899,23 +986,12 @@ StreamingEMResult streaming_em(
             const uint16_t* /*mismatch*/,
             const uint16_t* /*gapopen*/
         ) {
-#ifdef _OPENMP
-            int tid = omp_get_thread_num();
-            if (tid >= num_threads) tid = 0;  // Safety bounds check
-#else
-            const int tid = 0;
-#endif
-            auto& local_ref_sums = thread_ref_sums[tid];
-            auto& local_ref_sums_ancient = thread_ref_sums_ancient[tid];
-
-            double local_ll = streaming_e_step_rowgroup(
+            total_ll += streaming_e_step_rowgroup(
                 num_rows, read_idx, ref_idx, bit_score, damage_score,
                 dmg_ll_a, dmg_ll_m, tlen,
                 log_weights.data(), T, params, result.pi,
-                local_ref_sums, local_ref_sums_ancient
+                thread_ref_sums, thread_ref_sums_ancient, num_threads
             );
-
-            { std::lock_guard<std::mutex> lock(ll_mutex); total_ll += local_ll; }
         });
 
         // Merge thread-local accumulators into pre-allocated buffers
