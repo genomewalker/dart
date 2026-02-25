@@ -2059,6 +2059,14 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                   << dart::log_utils::format_elapsed(pass1_start, pass1_end) << "\n";
     }
 
+    // Release NFS pages accumulated during Pass 1 before the annotation pass.
+    // MADV_SEQUENTIAL readahead holds the entire 114 GB EMI resident even with
+    // per-row-group DONTNEED; flush_pages() calls posix_fadvise+madvise DONTNEED
+    // on the full range and switches to MADV_RANDOM so the annotation
+    // parallel_scan_selected (which uses explicit WILLNEED per selected row group)
+    // won't trigger speculative readahead on the full file.
+    reader.flush_pages();
+
     // Combined Pass 2+3: load strings per row group, annotate inline, release pages.
     // Strings are never copied into best_hits — they are string_views from the mmap,
     // valid only during their row group's callback. Peak string memory ≈ 8 threads ×
