@@ -3331,10 +3331,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         }
     }
     const size_t n_summaries = summaries.size();
-    { decltype(summaries) tmp; tmp.swap(summaries); }
-#ifdef __linux__
-    malloc_trim(0);  // Return freed summaries heap to OS before gene_agg/protein_agg
-#endif
 
     // =====================================================================
     // Streaming output: sort reads by ref_idx, process one ref at a time.
@@ -3347,6 +3343,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         !protein_summary_file.empty() || !protein_filtered_file.empty();
 
     // 1. Build ReadRefEntry list (only em_keep reads), sort by ref_idx.
+    // summaries must remain alive here: e.posterior/e.classification are read from
+    // summaries[si] (populated during the TSV output loop above). In the old code
+    // these were in separate read_posteriors/read_classifications arrays; now they
+    // live directly on the compact summaries structs.
     std::vector<ReadRefEntry> read_ref_entries;
     size_t assigned_kept_reads = 0;
 
@@ -3390,6 +3390,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             ++assigned_kept_reads;
         }
     }
+
+    // Free summaries now that read_ref_entries has extracted posterior/classification.
+    { decltype(summaries) tmp; tmp.swap(summaries); }
+#ifdef __linux__
+    malloc_trim(0);  // Return freed summaries heap to OS before gene_agg/protein_agg
+#endif
 
     // 2. Filter protein_agg_inputs by em_keep, then sort by ref_idx.
     if (!protein_agg_inputs.empty() && use_em) {
