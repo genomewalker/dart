@@ -160,8 +160,7 @@ struct DamageSite {
 
 struct ProteinDamageSummary {
     uint32_t read_idx = 0;
-    std::string query_id;
-    std::string target_id;
+    // query_id and target_id omitted — reconstructed at output time via reader.read_name/ref_name
     float evalue;
     float bits;
     float fident;
@@ -175,7 +174,14 @@ struct ProteinDamageSummary {
     float damage_fraction;
     float max_p_damage;         // Highest p_damage among terminal sites
     float p_damaged;            // Overall probability read is damaged
-    std::vector<DamageSite> sites;
+    std::vector<DamageSite> sites;  // Cleared+shrunk in callback after aggregation
+    // Pre-aggregated site scalars (populated from sites before clearing)
+    float info_sum = 0.0f;      // sum(site.p_damage) → ReadDamageObs.info
+    uint32_t terminal_5 = 0;    // C-terminal 5' site count → pa.terminal_5
+    uint32_t terminal_3 = 0;    // G-terminal 3' site count → pa.terminal_3
+    // Posterior stored after score_params setup for ReadRefEntry building
+    float posterior = 0.0f;
+    uint8_t classification = 0; // dart::AncientClassification cast to uint8_t
     // Synonymous damage (from damage index, invisible at protein level)
     size_t syn_5prime = 0;      // Synonymous C→T at 5' terminus
     size_t syn_3prime = 0;      // Synonymous G→A at 3' terminus
@@ -189,7 +195,7 @@ struct ProteinDamageSummary {
     float aa_sum_qA = 0.0f;
     float aa_sum_log_qA_hits = 0.0f;
     float aa_sum_exp_decay = 0.0f;
-    // Stored for single-pass corrected output
+    // Stored for corrected protein output (empty unless --corrected-proteins requested)
     std::string qaln;
     std::string taln;
     size_t qstart_0;
@@ -204,14 +210,16 @@ struct ProteinDamageSummary {
 };
 
 // Compact per-read data extracted from ProteinDamageSummary for protein_agg construction.
-// Extracted before building gene_agg so the full summaries vector can be freed early.
+// Uses pre-aggregated site scalars to avoid per-read DamageSite vector heap allocations.
 struct ProteinAggInput {
     uint32_t read_idx;
     uint32_t ref_idx;
     uint16_t tlen;
     float p_damaged;
     uint32_t damage_consistent;
-    std::vector<DamageSite> sites;  // moved from ProteinDamageSummary
+    float info_sum;       // sum(site.p_damage) → ReadDamageObs.info
+    uint32_t terminal_5;  // C-terminal 5' site count → pa.terminal_5
+    uint32_t terminal_3;  // G-terminal 3' site count → pa.terminal_3
 };
 
 // Compact per-read assignment data sorted by ref_idx for streaming gene/protein output.
@@ -275,7 +283,7 @@ static inline float evalue_from_log10(float evalue_log10) {
 
 // Annotate a single alignment
 static ProteinDamageSummary annotate_alignment(
-    const std::string& query_id, const std::string& target_id,
+    const std::string& query_id,
     std::string_view qaln, std::string_view taln,
     size_t qstart, size_t tstart, size_t qlen,
     float evalue, float bits, float fident,
@@ -448,8 +456,6 @@ static ProteinDamageSummary annotate_alignment(
 
     ProteinDamageSummary out{};
     out.read_idx = 0;
-    out.query_id = query_id;
-    out.target_id = target_id;
     out.evalue = evalue;
     out.bits = bits;
     out.fident = fident;
@@ -2172,172 +2178,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         std::cerr << "  Passed: " << passed << " (" << (total > 0 ? 100.0 * passed / total : 0.0) << "%)\n\n";
     }
 
-    // Per-read decay and annotation results.
-    const auto annotate_start = std::chrono::steady_clock::now();
+    // per_read_aa_decay declared here for --refine-damage; populated during
+    // annotation pass (which runs after EM to prevent summaries coexisting with
+    // EM state in memory, reducing annotation-phase peak RSS by ~25-42 GB).
     std::vector<float> per_read_aa_decay(n_reads, 0.0f);
-    std::vector<std::pair<uint32_t, ProteinDamageSummary>> all_results;
-
-    if (selected_best_hits > 0) {
-        reader.set_columns({dart::ColumnID::QALN, dart::ColumnID::TALN});
-
-        reader.parallel_scan_selected(selected_row_groups, [&](
-            uint32_t rg_idx, uint32_t num_rows,
-            const uint32_t*, const uint32_t*,
-            const float*, const float*, const float*,
-            const uint16_t*, const uint16_t*,
-            const float*, const float*,
-            const uint16_t*, const uint16_t*,
-            const uint16_t*, const uint16_t*,
-            const uint16_t*, const uint16_t*,
-            const uint16_t*, const uint16_t*,
-            const uint16_t*, const uint16_t*)
-        {
-            const auto& rows = best_rows_by_rg[rg_idx];
-            if (rows.empty()) return;
-
-            // Parallel annotation within this row group.
-            // string_view references into the mmap are valid until MADV_DONTNEED fires
-            // after this callback returns (handled by parallel_scan_selected).
-            #pragma omp parallel
-            {
-                std::vector<std::pair<uint32_t, ProteinDamageSummary>> local_results;
-                std::ostringstream local_blast8;
-
-                #pragma omp for schedule(dynamic, 64) nowait
-                for (size_t i = 0; i < rows.size(); ++i) {
-                    const auto& [row_in_group, ridx] = rows[i];
-                    if (row_in_group >= num_rows) continue;
-                    BestHitData& hit = best_hits[ridx];
-                    if (!hit.has) continue;
-
-                    std::string_view qaln_sv = reader.get_qaln(rg_idx, row_in_group);
-                    std::string_view taln_sv = reader.get_taln(rg_idx, row_in_group);
-
-                    // Compute aln_len_on_target (previously done in the old Pass 2).
-                    uint32_t aln_len_target = 0;
-                    for (char c : taln_sv) if (c != '-') ++aln_len_target;
-                    hit.aln_len_on_target = aln_len_target;
-
-                    std::string query_id(reader.read_name(ridx));
-                    std::string target_id(reader.ref_name(hit.ref_idx));
-
-                    // BLAST8 unique-mapper output.
-                    if (!blast8_unique_file.empty() && need_unique_degree &&
-                        ridx < read_degree.size() && read_degree[ridx] == 1) {
-                        int aln_len = 0, mismatches = 0, gapopen = 0;
-                        int q_aln_non_gap = 0, t_aln_non_gap = 0;
-                        bool in_gap_q = false, in_gap_t = false;
-                        const size_t n = std::min(qaln_sv.size(), taln_sv.size());
-                        for (size_t j = 0; j < n; ++j) {
-                            const char q = qaln_sv[j];
-                            const char t = taln_sv[j];
-                            aln_len++;
-                            if (q == '-') { if (!in_gap_q) { gapopen++; in_gap_q = true; } }
-                            else { in_gap_q = false; q_aln_non_gap++; }
-                            if (t == '-') { if (!in_gap_t) { gapopen++; in_gap_t = true; } }
-                            else { in_gap_t = false; t_aln_non_gap++; }
-                            if (q != '-' && t != '-' && q != t) mismatches++;
-                        }
-                        const int qstart1 = static_cast<int>(hit.qstart_0 + 1);
-                        const int sstart1 = static_cast<int>(hit.tstart_0 + 1);
-                        const int qend1 = (q_aln_non_gap > 0) ? (qstart1 + q_aln_non_gap - 1) : qstart1;
-                        const int send1 = (t_aln_non_gap > 0) ? (sstart1 + t_aln_non_gap - 1) : sstart1;
-                        local_blast8 << query_id << '\t' << target_id << '\t'
-                            << std::fixed << std::setprecision(3) << (hit.fident * 100.0f) << '\t'
-                            << aln_len << '\t' << mismatches << '\t' << gapopen << '\t'
-                            << qstart1 << '\t' << qend1 << '\t'
-                            << sstart1 << '\t' << send1 << '\t'
-                            << std::scientific << std::setprecision(2) << hit.evalue << '\t'
-                            << std::fixed << std::setprecision(1) << hit.bits << '\n';
-                    }
-
-                    // Annotate.
-                    auto summary = annotate_alignment(
-                        query_id, target_id, qaln_sv, taln_sv,
-                        hit.qstart_0, hit.tstart_0, hit.qlen,
-                        hit.evalue, hit.bits, hit.fident, d_max, lambda);
-
-                    per_read_aa_decay[ridx] = summary.aa_sum_exp_decay;
-
-                    if (summary.total_mismatches > 0) {
-                        summary.read_idx = ridx;
-                        filter_sites_by_distance(summary, max_dist);
-                        summary.qlen = hit.qlen;
-                        if (!corrected_file.empty()) {
-                            summary.qaln = std::string(qaln_sv);
-                            summary.taln = std::string(taln_sv);
-                        }
-                        summary.qstart_0 = hit.qstart_0;
-                        summary.tstart_0 = hit.tstart_0;
-                        summary.tlen = hit.tlen;
-                        summary.delta_bits = hit.bits - hit.bits_second;
-                        summary.bpa = (summary.alnlen > 0)
-                            ? hit.bits / static_cast<float>(summary.alnlen) : 0.0f;
-                        summary.length_bin = static_cast<uint8_t>(
-                            dart::LengthBinStats::get_bin(hit.qlen));
-                        summary.p_read = std::clamp(hit.damage_score, 0.0f, 1.0f);
-                        summary.has_p_read = true;
-                        if (damage_index) {
-                            if (const AgdRecord* rec = damage_index->find(query_id)) {
-                                auto syn_result = detect_synonymous_damage(
-                                    *rec, damage_index->d_max(), damage_index->lambda());
-                                summary.syn_5prime = syn_result.synonymous_5prime;
-                                summary.syn_3prime = syn_result.synonymous_3prime;
-                                summary.has_syn_data = true;
-                                summary.p_read = static_cast<float>(rec->p_damaged_q) / 255.0f;
-                                summary.has_p_read = true;
-                            }
-                        }
-                        local_results.emplace_back(ridx, std::move(summary));
-                    }
-                }
-
-                #pragma omp critical
-                {
-                    all_results.insert(all_results.end(),
-                        std::make_move_iterator(local_results.begin()),
-                        std::make_move_iterator(local_results.end()));
-                    if (!blast8_unique_file.empty()) {
-                        std::string s = local_blast8.str();
-                        if (!s.empty()) {
-                            blast8_out << s;
-                            written_unique += static_cast<size_t>(
-                                std::count(s.begin(), s.end(), '\n'));
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    if (!blast8_unique_file.empty() && verbose) {
-        std::cerr << "Unique-mapper BLAST8 written to: " << blast8_unique_file
-                  << " (" << written_unique << " rows)\n";
-    }
-
-    // Sort by read index for deterministic output order.
-    std::sort(all_results.begin(), all_results.end(),
-        [](const auto& a, const auto& b) { return a.first < b.first; });
-    summaries.reserve(all_results.size());
-    for (auto& [ridx, summary] : all_results) {
-        summary_index_by_read[ridx] = static_cast<int32_t>(summaries.size());
-        summaries.push_back(std::move(summary));
-    }
-    all_results.clear();
-    all_results.shrink_to_fit();
-    // Return freed qaln/taln string heap (O(n_reads) total) back to the OS
-    // before flush_pages() + streaming_em, preventing ~40-80 GB of fragmented
-    // glibc arena pages from inflating RSS during 100 EM iterations.
-#ifdef __linux__
-    malloc_trim(0);
-#endif
-
-    const auto annotate_end = std::chrono::steady_clock::now();
-    if (verbose) {
-        std::cerr << "Annotation runtime: "
-                  << dart::log_utils::format_elapsed(annotate_start, annotate_end)
-                  << " (" << summaries.size() << " reads with mismatches)\n";
-    }
 
     const size_t em_aln_count = em_alignments.size();
 
@@ -2862,6 +2706,265 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         }
     }
 
+    // ── Annotation pass (runs after EM) ──────────────────────────────────────
+    // Running EM first means summaries (~8 GB compact) never coexist with EM
+    // state in memory, eliminating ~25-42 GB of peak RSS vs the old order.
+    {
+        const auto annotate_start = std::chrono::steady_clock::now();
+        std::vector<std::pair<uint32_t, ProteinDamageSummary>> all_results;
+
+        // Open per-site and corrected-protein output files before the parallel scan.
+        std::ofstream sites_out_f, corrected_out_f;
+        size_t written_sites = 0, written_corrected = 0;
+        if (!sites_file.empty()) {
+            sites_out_f.open(sites_file);
+            if (!sites_out_f.is_open()) {
+                std::cerr << "Error: Cannot open sites file: " << sites_file << "\n";
+                return 1;
+            }
+            sites_out_f << "query_id\ttarget_id\tquery_pos\ttarget_pos\t"
+                           "target_aa\tquery_aa\tdamage_class\tconfidence\t"
+                           "dist_5prime\tdist_3prime\tp_damage\n";
+        }
+        if (!corrected_file.empty()) {
+            corrected_out_f.open(corrected_file);
+            if (!corrected_out_f.is_open()) {
+                std::cerr << "Error: Cannot open corrected file: " << corrected_file << "\n";
+                return 1;
+            }
+        }
+
+        if (selected_best_hits > 0) {
+            reader.set_columns({dart::ColumnID::QALN, dart::ColumnID::TALN});
+
+            reader.parallel_scan_selected(selected_row_groups, [&](
+                uint32_t rg_idx, uint32_t num_rows,
+                const uint32_t*, const uint32_t*,
+                const float*, const float*, const float*,
+                const uint16_t*, const uint16_t*,
+                const float*, const float*,
+                const uint16_t*, const uint16_t*,
+                const uint16_t*, const uint16_t*,
+                const uint16_t*, const uint16_t*,
+                const uint16_t*, const uint16_t*,
+                const uint16_t*, const uint16_t*)
+            {
+                const auto& rows = best_rows_by_rg[rg_idx];
+                if (rows.empty()) return;
+
+                // Parallel annotation within this row group.
+                // string_view references into the mmap are valid until MADV_DONTNEED fires
+                // after this callback returns (handled by parallel_scan_selected).
+                #pragma omp parallel
+                {
+                    std::vector<std::pair<uint32_t, ProteinDamageSummary>> local_results;
+                    std::ostringstream local_blast8;
+                    std::ostringstream local_sites;
+                    std::ostringstream local_corrected;
+                    size_t local_corrected_count = 0;
+
+                    #pragma omp for schedule(dynamic, 64) nowait
+                    for (size_t i = 0; i < rows.size(); ++i) {
+                        const auto& [row_in_group, ridx] = rows[i];
+                        if (row_in_group >= num_rows) continue;
+                        BestHitData& hit = best_hits[ridx];
+                        if (!hit.has) continue;
+
+                        std::string_view qaln_sv = reader.get_qaln(rg_idx, row_in_group);
+                        std::string_view taln_sv = reader.get_taln(rg_idx, row_in_group);
+
+                        // Compute aln_len_on_target (previously done in the old Pass 2).
+                        uint32_t aln_len_target = 0;
+                        for (char c : taln_sv) if (c != '-') ++aln_len_target;
+                        hit.aln_len_on_target = aln_len_target;
+
+                        std::string query_id(reader.read_name(ridx));
+                        std::string target_id(reader.ref_name(hit.ref_idx));
+
+                        // BLAST8 unique-mapper output.
+                        if (!blast8_unique_file.empty() && need_unique_degree &&
+                            ridx < read_degree.size() && read_degree[ridx] == 1) {
+                            int aln_len = 0, mismatches = 0, gapopen = 0;
+                            int q_aln_non_gap = 0, t_aln_non_gap = 0;
+                            bool in_gap_q = false, in_gap_t = false;
+                            const size_t n = std::min(qaln_sv.size(), taln_sv.size());
+                            for (size_t j = 0; j < n; ++j) {
+                                const char q = qaln_sv[j];
+                                const char t = taln_sv[j];
+                                aln_len++;
+                                if (q == '-') { if (!in_gap_q) { gapopen++; in_gap_q = true; } }
+                                else { in_gap_q = false; q_aln_non_gap++; }
+                                if (t == '-') { if (!in_gap_t) { gapopen++; in_gap_t = true; } }
+                                else { in_gap_t = false; t_aln_non_gap++; }
+                                if (q != '-' && t != '-' && q != t) mismatches++;
+                            }
+                            const int qstart1 = static_cast<int>(hit.qstart_0 + 1);
+                            const int sstart1 = static_cast<int>(hit.tstart_0 + 1);
+                            const int qend1 = (q_aln_non_gap > 0) ? (qstart1 + q_aln_non_gap - 1) : qstart1;
+                            const int send1 = (t_aln_non_gap > 0) ? (sstart1 + t_aln_non_gap - 1) : sstart1;
+                            local_blast8 << query_id << '\t' << target_id << '\t'
+                                << std::fixed << std::setprecision(3) << (hit.fident * 100.0f) << '\t'
+                                << aln_len << '\t' << mismatches << '\t' << gapopen << '\t'
+                                << qstart1 << '\t' << qend1 << '\t'
+                                << sstart1 << '\t' << send1 << '\t'
+                                << std::scientific << std::setprecision(2) << hit.evalue << '\t'
+                                << std::fixed << std::setprecision(1) << hit.bits << '\n';
+                        }
+
+                        // Annotate (target_id not passed — not stored in struct).
+                        auto summary = annotate_alignment(
+                            query_id, qaln_sv, taln_sv,
+                            hit.qstart_0, hit.tstart_0, hit.qlen,
+                            hit.evalue, hit.bits, hit.fident, d_max, lambda);
+
+                        per_read_aa_decay[ridx] = summary.aa_sum_exp_decay;
+
+                        if (summary.total_mismatches > 0) {
+                            summary.read_idx = ridx;
+                            if (!corrected_file.empty()) {
+                                summary.qaln = std::string(qaln_sv);
+                                summary.taln = std::string(taln_sv);
+                            }
+                            filter_sites_by_distance(summary, max_dist);
+                            summary.qlen = hit.qlen;
+                            summary.qstart_0 = hit.qstart_0;
+                            summary.tstart_0 = hit.tstart_0;
+                            summary.tlen = hit.tlen;
+                            summary.delta_bits = hit.bits - hit.bits_second;
+                            summary.bpa = (summary.alnlen > 0)
+                                ? hit.bits / static_cast<float>(summary.alnlen) : 0.0f;
+                            summary.length_bin = static_cast<uint8_t>(
+                                dart::LengthBinStats::get_bin(hit.qlen));
+                            summary.p_read = std::clamp(hit.damage_score, 0.0f, 1.0f);
+                            summary.has_p_read = true;
+                            if (damage_index) {
+                                if (const AgdRecord* rec = damage_index->find(query_id)) {
+                                    auto syn_result = detect_synonymous_damage(
+                                        *rec, damage_index->d_max(), damage_index->lambda());
+                                    summary.syn_5prime = syn_result.synonymous_5prime;
+                                    summary.syn_3prime = syn_result.synonymous_3prime;
+                                    summary.has_syn_data = true;
+                                    summary.p_read = static_cast<float>(rec->p_damaged_q) / 255.0f;
+                                    summary.has_p_read = true;
+                                }
+                            }
+
+                            // Write corrected proteins inline (before clearing sites).
+                            if (!summary.sites.empty() && corrected_out_f.is_open() &&
+                                !summary.qaln.empty()) {
+                                std::string corrected = generate_corrected_protein(
+                                    summary.qaln, summary.taln, summary.sites, summary.qstart_0);
+                                local_corrected << ">" << query_id
+                                    << " corrected_sites=" << summary.sites.size()
+                                    << " damage_frac=" << std::fixed << std::setprecision(3)
+                                    << summary.damage_fraction << "\n";
+                                for (size_t j = 0; j < corrected.size(); j += 60)
+                                    local_corrected << corrected.substr(j, 60) << "\n";
+                                ++local_corrected_count;
+                            }
+
+                            // Write per-site output inline (before clearing sites).
+                            if (sites_out_f.is_open()) {
+                                for (const auto& site : summary.sites) {
+                                    local_sites << query_id << "\t" << target_id << "\t"
+                                        << site.query_pos << "\t" << site.target_pos << "\t"
+                                        << site.target_aa << "\t" << site.query_aa << "\t"
+                                        << (site.damage_class == 'C' ? "CT" : "GA") << "\t"
+                                        << (site.high_confidence ? "high" : "medium") << "\t"
+                                        << site.dist_5prime << "\t" << site.dist_3prime << "\t"
+                                        << std::fixed << std::setprecision(4)
+                                        << site.p_damage << "\n";
+                                }
+                            }
+
+                            // Aggregate sites into compact scalars (replaces sites loop in
+                            // ProteinAggInput and protein aggregate building).
+                            constexpr size_t TERM_COD = 3;  // codons from terminus
+                            for (const auto& site : summary.sites) {
+                                summary.info_sum += site.p_damage;
+                                if (site.damage_class == 'C' && site.dist_5prime / 3 < TERM_COD)
+                                    ++summary.terminal_5;
+                                else if (site.damage_class == 'G' && site.dist_3prime / 3 < TERM_COD)
+                                    ++summary.terminal_3;
+                            }
+
+                            // Return sites heap to allocator immediately (~10 GB for 40M reads).
+                            summary.sites.clear();
+                            summary.sites.shrink_to_fit();
+                            // Return corrected-output strings (already written above).
+                            std::string{}.swap(summary.qaln);
+                            std::string{}.swap(summary.taln);
+
+                            local_results.emplace_back(ridx, std::move(summary));
+                        }
+                    }
+
+                    #pragma omp critical
+                    {
+                        all_results.insert(all_results.end(),
+                            std::make_move_iterator(local_results.begin()),
+                            std::make_move_iterator(local_results.end()));
+                        if (!blast8_unique_file.empty()) {
+                            std::string s = local_blast8.str();
+                            if (!s.empty()) {
+                                blast8_out << s;
+                                written_unique += static_cast<size_t>(
+                                    std::count(s.begin(), s.end(), '\n'));
+                            }
+                        }
+                        if (sites_out_f.is_open()) {
+                            std::string s = local_sites.str();
+                            if (!s.empty()) {
+                                sites_out_f << s;
+                                written_sites += static_cast<size_t>(
+                                    std::count(s.begin(), s.end(), '\n'));
+                            }
+                        }
+                        if (corrected_out_f.is_open() && local_corrected_count > 0) {
+                            corrected_out_f << local_corrected.str();
+                            written_corrected += local_corrected_count;
+                        }
+                    }
+                }
+            });
+        }
+
+        if (!blast8_unique_file.empty() && verbose) {
+            std::cerr << "Unique-mapper BLAST8 written to: " << blast8_unique_file
+                      << " (" << written_unique << " rows)\n";
+        }
+        if (verbose && sites_out_f.is_open()) {
+            std::cerr << "Site calls written to: " << sites_file
+                      << " (" << written_sites << " sites)\n";
+        }
+        if (verbose && corrected_out_f.is_open()) {
+            std::cerr << "Corrected proteins written: " << written_corrected
+                      << " to " << corrected_file << "\n";
+        }
+
+        // Sort by read index for deterministic output order.
+        std::sort(all_results.begin(), all_results.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+        summaries.reserve(all_results.size());
+        for (auto& [ridx, summary] : all_results) {
+            summary_index_by_read[ridx] = static_cast<int32_t>(summaries.size());
+            summaries.push_back(std::move(summary));
+        }
+        all_results.clear();
+        all_results.shrink_to_fit();
+        // Return freed heap to OS before Bayesian scoring.
+#ifdef __linux__
+        malloc_trim(0);
+#endif
+
+        const auto annotate_end = std::chrono::steady_clock::now();
+        if (verbose) {
+            std::cerr << "Annotation runtime: "
+                      << dart::log_utils::format_elapsed(annotate_start, annotate_end)
+                      << " (" << summaries.size() << " reads with mismatches)\n";
+        }
+    }
+
     // Statistics
     size_t total_sites = 0, total_ct = 0, total_ga = 0, total_high = 0;
     size_t proteins_with_damage = 0;
@@ -3086,67 +3189,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         }
     }
 
-    // Write per-site output
-    if (!sites_file.empty()) {
-        std::ofstream sf(sites_file);
-        if (!sf.is_open()) {
-            std::cerr << "Error: Cannot open sites file: " << sites_file << "\n";
-            return 1;
-        }
-        sf << "query_id\ttarget_id\tquery_pos\ttarget_pos\t"
-              "target_aa\tquery_aa\tdamage_class\tconfidence\t"
-              "dist_5prime\tdist_3prime\tp_damage\n";
-        for (const auto& s : summaries) {
-            for (const auto& site : s.sites) {
-                sf << s.query_id << "\t" << s.target_id << "\t"
-                   << site.query_pos << "\t" << site.target_pos << "\t"
-                   << site.target_aa << "\t" << site.query_aa << "\t"
-                   << (site.damage_class == 'C' ? "CT" : "GA") << "\t"
-                   << (site.high_confidence ? "high" : "medium") << "\t"
-                   << site.dist_5prime << "\t" << site.dist_3prime << "\t"
-                   << std::fixed << std::setprecision(4) << site.p_damage << "\n";
-            }
-        }
-        if (verbose) {
-            std::cerr << "Site calls written to: " << sites_file << "\n";
-        }
-    }
-
-    // Write corrected proteins (single pass — alignment data stored during parsing)
-    if (!corrected_file.empty()) {
-        std::ofstream cf(corrected_file);
-        if (!cf.is_open()) {
-            std::cerr << "Error: Cannot open corrected file: " << corrected_file << "\n";
-            return 1;
-        }
-
-        size_t corrected_count = 0;
-        for (const auto& s : summaries) {
-            if (s.sites.empty() || s.qaln.empty()) continue;
-
-            std::string corrected = generate_corrected_protein(
-                s.qaln, s.taln, s.sites, s.qstart_0);
-
-            cf << ">" << s.query_id << " corrected_sites=" << s.sites.size()
-               << " damage_frac=" << std::fixed << std::setprecision(3)
-               << s.damage_fraction << "\n";
-
-            for (size_t j = 0; j < corrected.size(); j += 60) {
-                cf << corrected.substr(j, 60) << "\n";
-            }
-            corrected_count++;
-        }
-
-        if (verbose) {
-            std::cerr << "Corrected proteins written: " << corrected_count
-                      << " to " << corrected_file << "\n";
-        }
-        // Free alignment strings — only needed for corrected protein output
-        for (auto& s : summaries) {
-            std::string{}.swap(s.qaln);
-            std::string{}.swap(s.taln);
-        }
-    }
+    // Note: per-site and corrected-protein output are written during the annotation
+    // pass (above), before sites are cleared. Nothing to do here.
 
     // Write per-protein summary
     std::ostream* out = &std::cout;
@@ -3175,12 +3219,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
     *out << "\n";
 
-    // Store per-read posteriors and classifications for gene summary aggregation
-    std::vector<float> read_posteriors(summaries.size());
-    std::vector<dart::AncientClassification> read_classifications(summaries.size());
-
+    // Compute and write per-read posteriors; store in summaries[si] for ReadRefEntry building.
+    // query_id and target_id are reconstructed from read_idx via reader (not stored in struct).
     for (size_t si = 0; si < summaries.size(); ++si) {
-        const auto& s = summaries[si];
+        auto& s = summaries[si];
         // Compute Bayesian score with decomposition
         float posterior = s.p_damaged;  // fallback when AGD p_read is unavailable
         dart::BayesianScoreOutput bayes_out{};
@@ -3201,7 +3243,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             posterior = bayes_out.posterior;
         }
 
-        *out << s.query_id << "\t" << s.target_id << "\t"
+        // Reconstruct names at output time (O(1), no heap allocation).
+        const std::string_view qname = reader.read_name(s.read_idx);
+        const std::string_view tname = reader.ref_name(best_hits[s.read_idx].ref_idx);
+
+        *out << qname << "\t" << tname << "\t"
              << std::scientific << std::setprecision(2) << s.evalue << "\t"
              << std::fixed << std::setprecision(1) << s.bits << "\t"
              << std::fixed << std::setprecision(3) << s.fident << "\t"
@@ -3218,8 +3264,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             bayes_out.informative, posterior, s.fident, s.z_bpa, s.delta_bits,
             score_params.ancient_threshold, score_params.modern_threshold);
 
-        read_posteriors[si] = posterior;
-        read_classifications[si] = classification;
+        s.posterior = posterior;
+        s.classification = static_cast<uint8_t>(classification);
 
         // Always output posterior (computed from site + identity evidence even when
         // terminal is uninformative). is_damaged classification only applies when informative.
@@ -3264,23 +3310,24 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
 
     // Extract compact protein_agg inputs from summaries, then free the full summaries
-    // vector before building gene_agg. summaries holds large per-read strings (query_id,
-    // target_id) and sites vectors that together can exceed 20 GB for large EMI files.
-    // protein_agg only needs: read_idx, ref_idx, tlen, p_damaged, damage_consistent, sites.
+    // vector before building gene_agg. Uses pre-aggregated site scalars (info_sum,
+    // terminal_5, terminal_3) populated during annotation — no per-read sites heap.
     const bool need_protein_agg =
         !protein_summary_file.empty() || !protein_filtered_file.empty() || !combined_output_file.empty();
     std::vector<ProteinAggInput> protein_agg_inputs;
     if (need_protein_agg) {
         protein_agg_inputs.reserve(summaries.size());
-        for (auto& s : summaries) {
+        for (const auto& s : summaries) {
             ProteinAggInput c;
             c.read_idx = s.read_idx;
             c.ref_idx = best_hits[s.read_idx].ref_idx;
             c.tlen = static_cast<uint16_t>(std::min<size_t>(s.tlen, UINT16_MAX));
             c.p_damaged = s.p_damaged;
             c.damage_consistent = static_cast<uint32_t>(s.damage_consistent);
-            c.sites = std::move(s.sites);
-            protein_agg_inputs.push_back(std::move(c));
+            c.info_sum = s.info_sum;
+            c.terminal_5 = s.terminal_5;
+            c.terminal_3 = s.terminal_3;
+            protein_agg_inputs.push_back(c);
         }
     }
     const size_t n_summaries = summaries.size();
@@ -3323,9 +3370,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             const int32_t si       = (ridx < summary_index_by_read.size())
                                      ? summary_index_by_read[ridx] : -1;
             e.has_damage_obs       = (si >= 0);
-            if (si >= 0 && static_cast<size_t>(si) < read_posteriors.size()) {
-                e.posterior        = read_posteriors[static_cast<size_t>(si)];
-                e.classification   = static_cast<uint8_t>(read_classifications[static_cast<size_t>(si)]);
+            if (si >= 0 && static_cast<size_t>(si) < summaries.size()) {
+                e.posterior        = summaries[static_cast<size_t>(si)].posterior;
+                e.classification   = summaries[static_cast<size_t>(si)].classification;
             } else {
                 e.posterior        = 0.0f;
                 e.classification   = 0;
@@ -3364,8 +3411,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     { decltype(best_hits) tmp; tmp.swap(best_hits); }
     { decltype(em_read_results) tmp; tmp.swap(em_read_results); }
     { decltype(summary_index_by_read) tmp; tmp.swap(summary_index_by_read); }
-    { decltype(read_posteriors) tmp; tmp.swap(read_posteriors); }
-    { decltype(read_classifications) tmp; tmp.swap(read_classifications); }
 #ifdef __linux__
     malloc_trim(0);
 #endif
@@ -3438,10 +3483,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     } else {
         size_t total_5 = 0, total_3 = 0;
         for (const auto& c : protein_agg_inputs) {
-            for (const auto& site : c.sites) {
-                if (site.damage_class == 'C' && site.dist_5prime / 3 < 3) ++total_5;
-                else if (site.damage_class == 'G' && site.dist_3prime / 3 < 3) ++total_3;
-            }
+            total_5 += c.terminal_5;
+            total_3 += c.terminal_3;
         }
         float ratio = (total_5 > 0) ? static_cast<float>(total_3) / static_cast<float>(total_5) : 0.0f;
         use_both_ends = (ratio > 0.3f);
@@ -3614,21 +3657,15 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             pa.total_damage_sites += it->damage_consistent;
             if (it->p_damaged > pa.max_p_damaged) pa.max_p_damaged = it->p_damaged;
             pa.sum_p_damaged += it->p_damaged;
-            float info = 0.0f;
-            for (const auto& site : it->sites) info += site.p_damage;
             ReadDamageObs obs;
             obs.p_damaged = it->p_damaged;
             obs.log_lr    = 0.0f;
-            obs.info      = info;
+            obs.info      = it->info_sum;
             obs.n_sites   = static_cast<int>(it->damage_consistent);
             obs.is_damaged = it->p_damaged > 0.5f;
             pa.read_obs.push_back(obs);
-            for (const auto& site : it->sites) {
-                if (site.damage_class == 'C' && site.dist_5prime / 3 < TERMINAL_CODONS_S)
-                    ++pa.terminal_5;
-                else if (site.damage_class == 'G' && site.dist_3prime / 3 < TERMINAL_CODONS_S)
-                    ++pa.terminal_3;
-            }
+            pa.terminal_5 += it->terminal_5;
+            pa.terminal_3 += it->terminal_3;
         }
 
         // --- Coverage EM stats for this ref ---
