@@ -939,8 +939,13 @@ void ColumnarIndexReader::parallel_scan(RowGroupCallback callback) const {
                 rg_min = std::min(rg_min, off);
                 rg_end = std::max(rg_end, off + sz);
             }
-            if (rg_end > rg_min)
+            if (rg_end > rg_min) {
+#ifdef __linux__
+                posix_fadvise(impl_->fd, static_cast<off_t>(rg_min),
+                              static_cast<off_t>(rg_end - rg_min), POSIX_FADV_DONTNEED);
+#endif
                 madvise_dontneed_range(base + rg_min, rg_end - rg_min);
+            }
         }
     }
 }
@@ -1057,8 +1062,13 @@ void ColumnarIndexReader::parallel_scan_selected(
                 rg_min_off = std::min(rg_min_off, off);
                 rg_max_end = std::max(rg_max_end, off + sz);
             }
-            if (rg_max_end > rg_min_off)
+            if (rg_max_end > rg_min_off) {
+#ifdef __linux__
+                posix_fadvise(impl_->fd, static_cast<off_t>(rg_min_off),
+                              static_cast<off_t>(rg_max_end - rg_min_off), POSIX_FADV_DONTNEED);
+#endif
                 madvise_dontneed_range(base + rg_min_off, rg_max_end - rg_min_off);
+            }
         }
     }
 }
