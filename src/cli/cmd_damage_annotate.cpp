@@ -2325,6 +2325,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
     all_results.clear();
     all_results.shrink_to_fit();
+    // Return freed qaln/taln string heap (O(n_reads) total) back to the OS
+    // before flush_pages() + streaming_em, preventing ~40-80 GB of fragmented
+    // glibc arena pages from inflating RSS during 100 EM iterations.
+#ifdef __linux__
+    malloc_trim(0);
+#endif
 
     const auto annotate_end = std::chrono::steady_clock::now();
     if (verbose) {
