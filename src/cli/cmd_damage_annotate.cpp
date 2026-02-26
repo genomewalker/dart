@@ -3503,7 +3503,14 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
     // 6. Load mapping file.
     std::unordered_map<std::string, std::string> group_map;
-    if (!map_file.empty()) group_map = load_mapping_file(map_file, verbose);
+    if (!map_file.empty()) {
+        group_map = load_mapping_file(map_file, verbose);
+        if (verbose && !group_map.empty()) {
+            const auto& first = *group_map.cbegin();
+            std::cerr << "  Mapping sample — first key: \"" << first.first
+                      << "\" -> \"" << first.second << "\"\n";
+        }
+    }
 
     // 7. Open output files.
     std::ofstream gf, pf_os, pff_os, cof_os, af_f;
@@ -3750,6 +3757,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 const float mean_post = gene_acc.avg_posterior();
                 const bool gene_damaged = (mean_post >= threshold);
                 fa.add_gene(static_cast<uint32_t>(std::round(eff)), n_anc, n_mod, n_und, mean_post, gene_damaged);
+            } else if (verbose && func_acc.empty()) {
+                std::cerr << "  Warning: first gene_passes target not found in map: \""
+                          << target_name << "\"\n";
             }
         }
 
