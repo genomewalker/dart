@@ -2065,13 +2065,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                   << dart::log_utils::format_elapsed(pass1_start, pass1_end) << "\n";
     }
 
-    // Cache all ref names and read names to heap BEFORE flush_pages() evicts NFS pages.
-    // flush_pages() calls posix_fadvise+madvise DONTNEED on the entire file; on NFS +
-    // Linux 4.18 MAP_PRIVATE, re-faulting evicted pages returns garbage instead of file
-    // content under heavy memory pressure. Materialise once while pages are still clean.
-    std::vector<std::string> cached_ref_names(reader.num_refs());
-    for (uint32_t i = 0; i < reader.num_refs(); ++i)
-        cached_ref_names[i] = std::string(reader.ref_name(i));
+    // Cache all ref names via pread() — bypasses the mmap page cache entirely.
+    // On NFS + Linux 4.18 MAP_PRIVATE, the kernel evicts pages under memory pressure
+    // regardless of when we read them; re-faulting returns garbage. pread() reads
+    // directly from the file descriptor and is immune to page-cache state.
+    std::vector<std::string> cached_ref_names = reader.ref_names_pread();
 
     // Release NFS pages accumulated during Pass 1 before the annotation pass.
     // MADV_SEQUENTIAL readahead holds the entire 114 GB EMI resident even with
