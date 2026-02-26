@@ -2101,6 +2101,14 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // regardless of when we read them; re-faulting returns garbage. pread() reads
     // directly from the file descriptor and is immune to page-cache state.
     std::vector<std::string> cached_ref_names = reader.ref_names_pread();
+    if (cached_ref_names.size() != reader.num_refs()) {
+        std::cerr << "[ERROR] Failed to load ref names via pread: got "
+                  << cached_ref_names.size() << ", expected " << reader.num_refs()
+                  << ". Falling back to mmap (may be unreliable on NFS).\n";
+        cached_ref_names.resize(reader.num_refs());
+        for (uint32_t i = 0; i < reader.num_refs(); ++i)
+            cached_ref_names[i] = std::string(reader.ref_name(i));
+    }
 
     // Release NFS pages accumulated during Pass 1 before the annotation pass.
     // MADV_SEQUENTIAL readahead holds the entire 114 GB EMI resident even with
