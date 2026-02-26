@@ -612,6 +612,11 @@ struct ColumnarIndexReader::Impl {
     const char* ref_names = nullptr;
     uint32_t num_ref_names = 0;
 
+    // File offsets for pread()-based access to ref_name data (NFS-safe, bypasses mmap).
+    size_t ref_name_offsets_file_off = 0;
+    size_t ref_names_file_off = 0;
+    uint32_t ref_names_bytes = 0;
+
     // Filters
     std::vector<FilterPredicate> filters;
 
@@ -695,6 +700,12 @@ ColumnarIndexReader::ColumnarIndexReader(const std::string& path)
     dict_ptr += sizeof(uint32_t);
     impl_->ref_names = dict_ptr;
 
+    // Record file offsets for pread()-based access (immune to NFS page eviction).
+    impl_->ref_name_offsets_file_off = static_cast<size_t>(
+        reinterpret_cast<const char*>(impl_->ref_name_offsets) - base);
+    impl_->ref_names_file_off = static_cast<size_t>(impl_->ref_names - base);
+    impl_->ref_names_bytes = ref_names_size;
+
     // CSR offsets
     impl_->csr_offsets = reinterpret_cast<const uint64_t*>(
         base + impl_->header->csr_offsets_offset);
@@ -773,6 +784,28 @@ std::string_view ColumnarIndexReader::ref_name(uint32_t idx) const {
     if (idx >= impl_->num_ref_names) return {};
     const char* p = impl_->ref_names + impl_->ref_name_offsets[idx];
     return {p, strlen(p)};
+}
+
+// Read all ref names via pread() — bypasses the mmap page cache entirely.
+// On NFS + Linux 4.18 with MAP_PRIVATE, the kernel can evict pages at any time
+// under memory pressure; re-faulting those pages from NFS returns garbage.
+// pread() reads directly from the file descriptor without touching the mmap.
+std::vector<std::string> ColumnarIndexReader::ref_names_pread() const {
+    const uint32_t n = impl_->num_ref_names;
+    std::vector<uint32_t> off_buf(n);
+    const ssize_t off_bytes = static_cast<ssize_t>(n * sizeof(uint32_t));
+    if (pread(impl_->fd, off_buf.data(), off_bytes,
+              static_cast<off_t>(impl_->ref_name_offsets_file_off)) != off_bytes)
+        return {};
+    std::vector<char> blob(impl_->ref_names_bytes);
+    const ssize_t blob_bytes = static_cast<ssize_t>(impl_->ref_names_bytes);
+    if (pread(impl_->fd, blob.data(), blob_bytes,
+              static_cast<off_t>(impl_->ref_names_file_off)) != blob_bytes)
+        return {};
+    std::vector<std::string> result(n);
+    for (uint32_t i = 0; i < n; ++i)
+        result[i] = blob.data() + off_buf[i];
+    return result;
 }
 
 uint64_t ColumnarIndexReader::read_offset(uint32_t read_idx) const {

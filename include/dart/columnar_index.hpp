@@ -259,6 +259,8 @@ public:
     // Name lookup
     std::string_view read_name(uint32_t idx) const;
     std::string_view ref_name(uint32_t idx) const;
+    // NFS-safe: read all ref names via pread(), bypassing the mmap page cache.
+    std::vector<std::string> ref_names_pread() const;
 
     // CSR access for per-read iteration
     uint64_t read_offset(uint32_t read_idx) const;
