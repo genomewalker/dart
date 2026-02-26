@@ -3192,6 +3192,13 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // Note: per-site and corrected-protein output are written during the annotation
     // pass (above), before sites are cleared. Nothing to do here.
 
+    // Cache ref names to heap — NFS MAP_PRIVATE pages can be kernel-evicted under heavy
+    // memory pressure during the output phase; re-faulting on Linux 4.18 sometimes
+    // returns garbage instead of file content. Materialise once to avoid the hazard.
+    std::vector<std::string> cached_ref_names(reader.num_refs());
+    for (uint32_t i = 0; i < reader.num_refs(); ++i)
+        cached_ref_names[i] = std::string(reader.ref_name(i));
+
     // Write per-protein summary
     std::ostream* out = &std::cout;
     std::ofstream file_out;
@@ -3245,7 +3252,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
         // Reconstruct names at output time (O(1), no heap allocation).
         const std::string_view qname = reader.read_name(s.read_idx);
-        const std::string_view tname = reader.ref_name(best_hits[s.read_idx].ref_idx);
+        const std::string_view tname = cached_ref_names[best_hits[s.read_idx].ref_idx];
 
         *out << qname << "\t" << tname << "\t"
              << std::scientific << std::setprecision(2) << s.evalue << "\t"
@@ -3606,7 +3613,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         auto pi_end = pi_cur;
         while (pi_end != protein_agg_inputs.cend() && pi_end->ref_idx == cur_ref) ++pi_end;
 
-        const std::string target_name(reader.ref_name(cur_ref));
+        const std::string& target_name = cached_ref_names[cur_ref];
 
         // --- Gene accumulator ---
         GeneSummaryAccumulator gene_acc;
