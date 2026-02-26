@@ -2065,6 +2065,14 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                   << dart::log_utils::format_elapsed(pass1_start, pass1_end) << "\n";
     }
 
+    // Cache all ref names and read names to heap BEFORE flush_pages() evicts NFS pages.
+    // flush_pages() calls posix_fadvise+madvise DONTNEED on the entire file; on NFS +
+    // Linux 4.18 MAP_PRIVATE, re-faulting evicted pages returns garbage instead of file
+    // content under heavy memory pressure. Materialise once while pages are still clean.
+    std::vector<std::string> cached_ref_names(reader.num_refs());
+    for (uint32_t i = 0; i < reader.num_refs(); ++i)
+        cached_ref_names[i] = std::string(reader.ref_name(i));
+
     // Release NFS pages accumulated during Pass 1 before the annotation pass.
     // MADV_SEQUENTIAL readahead holds the entire 114 GB EMI resident even with
     // per-row-group DONTNEED; flush_pages() calls posix_fadvise+madvise DONTNEED
@@ -3191,13 +3199,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
     // Note: per-site and corrected-protein output are written during the annotation
     // pass (above), before sites are cleared. Nothing to do here.
-
-    // Cache ref names to heap — NFS MAP_PRIVATE pages can be kernel-evicted under heavy
-    // memory pressure during the output phase; re-faulting on Linux 4.18 sometimes
-    // returns garbage instead of file content. Materialise once to avoid the hazard.
-    std::vector<std::string> cached_ref_names(reader.num_refs());
-    for (uint32_t i = 0; i < reader.num_refs(); ++i)
-        cached_ref_names[i] = std::string(reader.ref_name(i));
 
     // Write per-protein summary
     std::ostream* out = &std::cout;
