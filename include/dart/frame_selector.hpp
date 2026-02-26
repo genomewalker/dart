@@ -255,6 +255,88 @@ struct SampleDamageProfile {
     bool channel_b_inverted = false;     // True if slope <= 0 (terminal stops LOWER than baseline)
 
     // =========================================================================
+    // CHANNEL C: Oxidative stop codon tracking (G→T transversions)
+    // Tracks GAG→TAG, GAA→TAA, GGA→TGA conversions by nucleotide position
+    // Unlike deamination (terminal-enriched), oxidation is UNIFORM across reads
+    // Real oxidation: should be uniform (no position dependence)
+    // Deamination: should show exponential decay at termini
+    // =========================================================================
+
+    // Oxidative convertible codon pair counts at ALL positions (for uniform distribution check)
+    // Position = nucleotide position of the G/T in the codon (from read start)
+    // For GAG/TAG: position of the first base (G or T)
+    std::array<double, 15> convertible_gag_5prime = {};  // GAG (Glu) codons at 5'
+    std::array<double, 15> convertible_tag_ox_5prime = {};  // TAG (Stop) from G→T at 5'
+    std::array<double, 15> convertible_gaa_5prime = {};  // GAA (Glu) codons at 5'
+    std::array<double, 15> convertible_taa_ox_5prime = {};  // TAA (Stop) from G→T at 5'
+    std::array<double, 15> convertible_gga_5prime = {};  // GGA (Gly) codons at 5'
+    std::array<double, 15> convertible_tga_ox_5prime = {};  // TGA (Stop) from G→T at 5'
+
+    // Interior reference counts for oxidative stops (positions 30+)
+    double convertible_gag_interior = 0.0;
+    double convertible_tag_ox_interior = 0.0;  // _ox suffix to distinguish from deamination TAG
+    double convertible_gaa_interior = 0.0;
+    double convertible_taa_ox_interior = 0.0;
+    double convertible_gga_interior = 0.0;
+    double convertible_tga_ox_interior = 0.0;
+
+    // Computed statistics for Channel C (oxidative stops)
+    float ox_stop_conversion_rate_baseline = 0.0f;  // Interior stop/(pre+stop) ratio
+    float ox_stop_rate_terminal = 0.0f;             // Terminal (pos 0-4) stop rate
+    float ox_stop_rate_interior = 0.0f;             // Interior (pos 5-14) stop rate
+    float ox_uniformity_ratio = 0.0f;               // terminal/interior (≈1 = uniform = real oxidation)
+    bool channel_c_valid = false;                   // True if sufficient data for Channel C
+
+    // =========================================================================
+    // CHANNEL D: G→T / C→A transversion tracking (oxidative damage)
+    // 8-oxoG causes G→T on one strand, appears as C→A on complement
+    // Key distinguishing feature: UNIFORM across read (not terminal-enriched)
+    // =========================================================================
+
+    // G→T counts by position (5' end)
+    std::array<double, 15> g_count_5prime = {};   // G count at each 5' position
+    std::array<double, 15> t_from_g_5prime = {};  // T where G expected (from G→T)
+    // C→A counts by position (5' end) - complement of G→T on opposite strand
+    std::array<double, 15> c_count_ox_5prime = {};  // C count for oxidation tracking
+    std::array<double, 15> a_from_c_5prime = {};    // A where C expected (from C→A)
+
+    // Interior baseline for G→T and C→A (middle third of reads)
+    double baseline_g_to_t_count = 0.0;  // G→T events in middle
+    double baseline_g_total = 0.0;       // Total G in middle
+    double baseline_c_to_a_count = 0.0;  // C→A events in middle
+    double baseline_c_ox_total = 0.0;    // Total C in middle (for oxidation)
+
+    // Computed oxidation statistics
+    float ox_gt_rate_terminal = 0.0f;    // G→T rate at positions 0-4
+    float ox_gt_rate_interior = 0.0f;    // G→T rate at positions 5-14
+    float ox_gt_baseline = 0.0f;         // G→T rate in middle of reads
+    float ox_gt_uniformity = 0.0f;       // terminal/interior ratio (≈1 = uniform)
+    float ox_gt_asymmetry = 0.0f;        // G→T vs T→G ratio (>1 = real oxidation)
+
+    float ox_ca_rate_terminal = 0.0f;    // C→A rate at positions 0-4
+    float ox_ca_rate_interior = 0.0f;    // C→A rate at positions 5-14
+    float ox_ca_baseline = 0.0f;         // C→A rate in middle of reads
+    float ox_ca_uniformity = 0.0f;       // terminal/interior ratio
+
+    // Combined oxidation estimate
+    float ox_d_max = 0.0f;               // Estimated oxidative damage rate
+    bool ox_damage_detected = false;     // True if significant oxidation detected
+    bool ox_is_artifact = false;         // True if pattern suggests library prep artifact
+
+    // =========================================================================
+    // CHANNEL E: Depurination detection (purine loss at strand breaks)
+    // Depurination creates fragment boundaries, not clean substitutions
+    // Detect via purine (A/G) enrichment at read termini
+    // =========================================================================
+
+    // Purine counts at terminal vs interior positions
+    float purine_rate_terminal_5prime = 0.0f;   // (A+G)/(A+C+G+T) at pos 0-4
+    float purine_rate_interior = 0.0f;          // (A+G)/(A+C+G+T) in middle
+    float purine_enrichment_5prime = 0.0f;      // terminal - interior
+    float purine_enrichment_3prime = 0.0f;      // terminal - interior at 3' end
+    bool depurination_detected = false;         // True if terminal purine excess detected
+
+    // =========================================================================
     // GC-STRATIFIED DAMAGE ESTIMATION
     // Separate damage calculation per GC bin to handle metagenome heterogeneity
     // GC computed from interior positions (5+) to avoid damage bias

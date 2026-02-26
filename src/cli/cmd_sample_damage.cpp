@@ -359,6 +359,20 @@ int cmd_sample_damage(int argc, char* argv[]) {
     *out << "    \"metamatch_high_damage_reads\": " << n_high_damage_reads << ",\n";
     *out << "    \"metamatch_high_damage_pct\": " << std::fixed << std::setprecision(2)
          << (total_reads > 0 ? 100.0f * n_high_damage_reads / total_reads : 0.0f) << ",\n";
+
+    // Channel C: Oxidative damage (G→T transversions)
+    *out << "    \"channel_c_valid\": " << (profile.channel_c_valid ? "true" : "false") << ",\n";
+    *out << "    \"ox_stop_rate_terminal\": " << std::fixed << std::setprecision(4) << profile.ox_stop_rate_terminal << ",\n";
+    *out << "    \"ox_stop_rate_interior\": " << std::fixed << std::setprecision(4) << profile.ox_stop_rate_interior << ",\n";
+    *out << "    \"ox_uniformity_ratio\": " << std::fixed << std::setprecision(3) << profile.ox_uniformity_ratio << ",\n";
+    *out << "    \"ox_d_max\": " << std::fixed << std::setprecision(2) << (profile.ox_d_max * 100.0f) << ",\n";
+    *out << "    \"ox_damage_detected\": " << (profile.ox_damage_detected ? "true" : "false") << ",\n";
+    *out << "    \"ox_is_artifact\": " << (profile.ox_is_artifact ? "true" : "false") << ",\n";
+
+    // Channel E: Depurination
+    *out << "    \"purine_enrichment_5prime\": " << std::fixed << std::setprecision(4) << profile.purine_enrichment_5prime << ",\n";
+    *out << "    \"depurination_detected\": " << (profile.depurination_detected ? "true" : "false") << ",\n";
+
     *out << "    \"library_type\": \"" << profile.library_type_str() << "\"\n";
     *out << "  }\n";
     *out << "}\n";

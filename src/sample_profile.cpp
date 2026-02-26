@@ -380,6 +380,111 @@ void FrameSelector::update_sample_profile(
     }
 
     // =========================================================================
+    // CHANNEL C: Oxidative stop codon tracking (G→T transversions)
+    // Track GAG→TAG, GAA→TAA, GGA→TGA pairs by nucleotide position
+    // Unlike deamination, oxidative damage is UNIFORM across read length
+    // =========================================================================
+    if (len >= 18) {
+        // Track oxidative convertible codons at 5' end
+        for (int frame = 0; frame < 3; ++frame) {
+            for (size_t k = 0; ; ++k) {
+                size_t codon_start = frame + 3 * k;
+                if (codon_start + 3 > len || codon_start > 14) break;
+
+                size_t p = codon_start;
+                if (p >= 15) break;
+
+                char b0 = fast_upper(seq[codon_start]);
+                char b1 = fast_upper(seq[codon_start + 1]);
+                char b2 = fast_upper(seq[codon_start + 2]);
+
+                if ((b0 != 'A' && b0 != 'C' && b0 != 'G' && b0 != 'T') ||
+                    (b1 != 'A' && b1 != 'C' && b1 != 'G' && b1 != 'T') ||
+                    (b2 != 'A' && b2 != 'C' && b2 != 'G' && b2 != 'T')) {
+                    continue;
+                }
+
+                // GAG (Glu) → TAG (Stop) via G→T at position 0
+                if (b1 == 'A' && b2 == 'G') {
+                    if (b0 == 'G') profile.convertible_gag_5prime[p]++;
+                    else if (b0 == 'T') profile.convertible_tag_ox_5prime[p]++;
+                }
+                // GAA (Glu) → TAA (Stop) via G→T at position 0
+                if (b1 == 'A' && b2 == 'A') {
+                    if (b0 == 'G') profile.convertible_gaa_5prime[p]++;
+                    else if (b0 == 'T') profile.convertible_taa_ox_5prime[p]++;
+                }
+                // GGA (Gly) → TGA (Stop) via G→T at position 0
+                if (b1 == 'G' && b2 == 'A') {
+                    if (b0 == 'G') profile.convertible_gga_5prime[p]++;
+                    else if (b0 == 'T') profile.convertible_tga_ox_5prime[p]++;
+                }
+            }
+        }
+
+        // Track interior oxidative convertible codons (positions 30+)
+        constexpr size_t INTERIOR_MIN_LEN_OX = 63;
+        if (len >= INTERIOR_MIN_LEN_OX) {
+            for (int frame = 0; frame < 3; ++frame) {
+                for (size_t k = 0; ; ++k) {
+                    size_t codon_start = frame + 3 * k;
+                    if (codon_start < 30 || codon_start + 3 > len - 30) {
+                        if (codon_start + 3 > len - 30) break;
+                        continue;
+                    }
+
+                    char b0 = fast_upper(seq[codon_start]);
+                    char b1 = fast_upper(seq[codon_start + 1]);
+                    char b2 = fast_upper(seq[codon_start + 2]);
+
+                    if ((b0 != 'A' && b0 != 'C' && b0 != 'G' && b0 != 'T') ||
+                        (b1 != 'A' && b1 != 'C' && b1 != 'G' && b1 != 'T') ||
+                        (b2 != 'A' && b2 != 'C' && b2 != 'G' && b2 != 'T')) {
+                        continue;
+                    }
+
+                    // Track GAG, GAA, GGA (oxidation pre-images) and TAG, TAA, TGA (stops)
+                    if (b1 == 'A' && b2 == 'G') {
+                        if (b0 == 'G') profile.convertible_gag_interior++;
+                        else if (b0 == 'T') profile.convertible_tag_ox_interior++;
+                    }
+                    if (b1 == 'A' && b2 == 'A') {
+                        if (b0 == 'G') profile.convertible_gaa_interior++;
+                        else if (b0 == 'T') profile.convertible_taa_ox_interior++;
+                    }
+                    if (b1 == 'G' && b2 == 'A') {
+                        if (b0 == 'G') profile.convertible_gga_interior++;
+                        else if (b0 == 'T') profile.convertible_tga_ox_interior++;
+                    }
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // CHANNEL D: G→T / C→A transversion tracking (oxidative damage)
+    // Track G and T counts at each position for G→T rate calculation
+    // Also track asymmetry: G→T vs T→G (real oxidation shows G→T > T→G)
+    // =========================================================================
+    // Count G and T at 5' end positions for G→T tracking
+    for (size_t i = 0; i < std::min(size_t(15), len); ++i) {
+        char base = fast_upper(seq[i]);
+        if (base == 'G') {
+            profile.g_count_5prime[i]++;
+        }
+        // Note: T counts for oxidation tracking come from T where we'd expect G
+        // This requires reference alignment, so for reference-free we use asymmetry instead
+    }
+
+    // =========================================================================
+    // CHANNEL E: Depurination detection (purine enrichment at termini)
+    // Depurination creates strand breaks preferentially at purine sites
+    // Detection: terminal purine (A+G) rate vs interior purine rate
+    // =========================================================================
+    // Purine tracking is already done via a_freq/g_freq arrays
+    // We'll compute purine enrichment in finalize_sample_profile()
+
+    // =========================================================================
     // GC-STRATIFIED DAMAGE ACCUMULATION
     // Bin reads by interior GC content (positions 5+ to avoid terminal damage)
     // This handles metagenome heterogeneity where different organisms have
@@ -1014,6 +1119,172 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
             // =========================================================================
             (void)profile.delta_llr_5prime;  // Used in debug output
             (void)profile.stop_decay_llr_5prime;
+        }
+    }
+
+    // =========================================================================
+    // CHANNEL C: Oxidative stop codon analysis (G→T transversions)
+    // Unlike deamination (terminal decay), oxidation is UNIFORM across reads
+    // Real oxidation: terminal rate ≈ interior rate (uniformity ratio ≈ 1)
+    // =========================================================================
+    {
+        // Compute interior baseline for oxidative stops
+        double ox_pre_interior = profile.convertible_gag_interior +
+                                 profile.convertible_gaa_interior +
+                                 profile.convertible_gga_interior;
+        double ox_stop_interior = profile.convertible_tag_ox_interior +
+                                  profile.convertible_taa_ox_interior +
+                                  profile.convertible_tga_ox_interior;
+        double ox_total_interior = ox_pre_interior + ox_stop_interior;
+
+        if (ox_total_interior > 100) {
+            profile.ox_stop_conversion_rate_baseline = static_cast<float>(
+                ox_stop_interior / ox_total_interior);
+            profile.channel_c_valid = true;
+        }
+
+        // Compute terminal (pos 0-4) vs interior (pos 5-14) stop rates
+        double ox_pre_terminal = 0.0, ox_stop_terminal = 0.0;
+        double ox_pre_mid = 0.0, ox_stop_mid = 0.0;
+
+        for (int p = 0; p < 5; ++p) {
+            ox_pre_terminal += profile.convertible_gag_5prime[p] +
+                              profile.convertible_gaa_5prime[p] +
+                              profile.convertible_gga_5prime[p];
+            ox_stop_terminal += profile.convertible_tag_ox_5prime[p] +
+                               profile.convertible_taa_ox_5prime[p] +
+                               profile.convertible_tga_ox_5prime[p];
+        }
+        for (int p = 5; p < 15; ++p) {
+            ox_pre_mid += profile.convertible_gag_5prime[p] +
+                         profile.convertible_gaa_5prime[p] +
+                         profile.convertible_gga_5prime[p];
+            ox_stop_mid += profile.convertible_tag_ox_5prime[p] +
+                          profile.convertible_taa_ox_5prime[p] +
+                          profile.convertible_tga_ox_5prime[p];
+        }
+
+        double ox_total_terminal = ox_pre_terminal + ox_stop_terminal;
+        double ox_total_mid = ox_pre_mid + ox_stop_mid;
+
+        if (ox_total_terminal > 50 && ox_total_mid > 50) {
+            profile.ox_stop_rate_terminal = static_cast<float>(ox_stop_terminal / ox_total_terminal);
+            profile.ox_stop_rate_interior = static_cast<float>(ox_stop_mid / ox_total_mid);
+
+            // Uniformity ratio: terminal/interior (≈1 for uniform oxidation)
+            if (profile.ox_stop_rate_interior > 0.001f) {
+                profile.ox_uniformity_ratio = profile.ox_stop_rate_terminal / profile.ox_stop_rate_interior;
+            }
+        }
+
+        // Detect oxidative damage: elevated stop rate AND uniform distribution
+        // Oxidation is characterized by:
+        // 1. Elevated stop conversion rate (above baseline)
+        // 2. Uniform distribution (uniformity ratio 0.8-1.2)
+        // 3. NOT correlated with deamination damage (which also elevates terminal regions)
+        float ox_stop_excess = profile.ox_stop_rate_terminal - profile.ox_stop_conversion_rate_baseline;
+
+        // Use stricter threshold if deamination is present (correlated damage)
+        // Deamination enriches ALL terminal damage, including G→T via adjacent effects
+        float threshold = 0.02f;  // 2% excess required (was 0.5%)
+        if (profile.d_max_combined > 5.0f || profile.damage_validated) {
+            threshold = 0.05f;  // 5% excess if deamination present
+        }
+
+        bool elevated = ox_stop_excess > threshold;
+        bool uniform = profile.ox_uniformity_ratio > 0.85f && profile.ox_uniformity_ratio < 1.15f;
+
+        if (profile.channel_c_valid && elevated && uniform) {
+            profile.ox_damage_detected = true;
+            profile.ox_d_max = std::max(0.0f, ox_stop_excess * 100.0f);  // Convert to percentage
+        }
+
+        // Check for artifact pattern: terminal much higher than interior (like deamination)
+        // This suggests contamination with C→T damage signal, not true G→T oxidation
+        if (profile.ox_uniformity_ratio > 1.5f) {
+            profile.ox_is_artifact = true;
+            profile.ox_damage_detected = false;  // Override - not true oxidation
+        }
+
+        // Also flag as artifact if terminal is LOWER than interior (inverted pattern)
+        // This suggests library prep bias or compositional artifact
+        if (profile.ox_uniformity_ratio < 0.7f) {
+            profile.ox_is_artifact = true;
+            profile.ox_damage_detected = false;
+        }
+    }
+
+    // =========================================================================
+    // CHANNEL D: G→T / C→A transversion asymmetry analysis
+    // Real oxidation: G→T rate > T→G rate (asymmetric)
+    // Sequencing error: G→T ≈ T→G (symmetric)
+    // =========================================================================
+    {
+        // G→T asymmetry is already captured in the control channel (A/(A+G))
+        // For reference-free analysis, we use the existing a_freq/g_freq arrays
+        // and check if G→T shows asymmetry relative to the complement
+
+        // Compute G→T rate from g_count_5prime (tracked during accumulation)
+        // Note: Without a reference, we can't directly measure G→T vs T→G
+        // Instead, we infer from the oxidative stop codon pattern
+
+        // For now, set asymmetry based on Channel C results
+        if (profile.channel_c_valid) {
+            // Use stop codon data to infer asymmetry
+            // If oxidative stops are elevated, G→T is the driver
+            profile.ox_gt_asymmetry = profile.ox_uniformity_ratio;
+        }
+    }
+
+    // =========================================================================
+    // CHANNEL E: Depurination detection (purine enrichment at termini)
+    // Depurination creates strand breaks at purine sites
+    // Detection: terminal purine (A+G) rate vs interior purine rate
+    // =========================================================================
+    {
+        // Compute purine rate at terminal positions (5' end, pos 0-4)
+        double purine_terminal = 0.0, total_terminal = 0.0;
+        for (int p = 0; p < 5; ++p) {
+            // Use the raw counts before normalization
+            // a_freq_5prime and g_freq_5prime are now normalized (0-1 ratios)
+            // We need to use tc_total_5prime for scaling
+            double ag = profile.a_freq_5prime[p] + profile.g_freq_5prime[p];
+            double tc = profile.t_freq_5prime[p] + profile.c_freq_5prime[p];
+            // After normalization, a+g ≈ 1 and t+c ≈ 1, so total is meaningless
+            // Use the raw totals instead
+            purine_terminal += profile.tc_total_5prime[p] * (1.0 - profile.t_freq_5prime[p] - profile.c_freq_5prime[p]);
+            total_terminal += profile.tc_total_5prime[p];
+        }
+
+        // Compute purine rate in middle of reads (from baseline)
+        double purine_baseline = profile.baseline_a_freq + profile.baseline_g_freq;
+        // baseline values are already normalized to sum to 1
+
+        if (total_terminal > 100 && purine_baseline > 0.01) {
+            // Use baseline A+G ratio as reference
+            profile.purine_rate_interior = static_cast<float>(purine_baseline);
+
+            // Terminal purine rate requires raw A+G counts
+            // Since we don't have separate AG totals at 5', estimate from existing data
+            // The a_freq_5prime and g_freq_5prime were captured before normalization
+            // but are now ratios. We can reconstruct approximate purine enrichment
+            // by comparing A/(A+G) and G totals
+
+            // Simpler approach: use the existing terminal shift metrics
+            // If both T/(T+C) AND A/(A+G) are elevated at termini, it's composition bias
+            // If only T/(T+C) is elevated, it's damage
+            // If A/(A+G) is elevated more than T/(T+C), check for depurination
+
+            profile.purine_enrichment_5prime = profile.ctrl_shift_5prime;  // A/(A+G) shift at 5'
+            profile.purine_enrichment_3prime = profile.ctrl_shift_3prime;  // T/(T+C) shift at 3'
+
+            // Depurination detected if:
+            // 1. Purine enrichment at 5' is significantly positive (>2%)
+            // 2. AND it's not explained by composition bias (divergence from damage channel)
+            if (profile.purine_enrichment_5prime > 0.02f &&
+                profile.channel_divergence_5prime > 0.01f) {
+                profile.depurination_detected = true;
+            }
         }
     }
 
@@ -1955,6 +2226,24 @@ void FrameSelector::merge_sample_profiles(SampleDamageProfile& dst, const Sample
     dst.convertible_cga_interior += src.convertible_cga_interior;
     dst.convertible_tga_interior += src.convertible_tga_interior;
     dst.total_codons_interior += src.total_codons_interior;
+
+    // Merge Channel C oxidative codon counts (G→T transversions)
+    for (int i = 0; i < 15; ++i) {
+        dst.convertible_gag_5prime[i] += src.convertible_gag_5prime[i];
+        dst.convertible_tag_ox_5prime[i] += src.convertible_tag_ox_5prime[i];
+        dst.convertible_gaa_5prime[i] += src.convertible_gaa_5prime[i];
+        dst.convertible_taa_ox_5prime[i] += src.convertible_taa_ox_5prime[i];
+        dst.convertible_gga_5prime[i] += src.convertible_gga_5prime[i];
+        dst.convertible_tga_ox_5prime[i] += src.convertible_tga_ox_5prime[i];
+        // Channel D: G count for asymmetry tracking
+        dst.g_count_5prime[i] += src.g_count_5prime[i];
+    }
+    dst.convertible_gag_interior += src.convertible_gag_interior;
+    dst.convertible_tag_ox_interior += src.convertible_tag_ox_interior;
+    dst.convertible_gaa_interior += src.convertible_gaa_interior;
+    dst.convertible_taa_ox_interior += src.convertible_taa_ox_interior;
+    dst.convertible_gga_interior += src.convertible_gga_interior;
+    dst.convertible_tga_ox_interior += src.convertible_tga_ox_interior;
 
     // Merge GC-stratified bin counts
     for (int bin = 0; bin < SampleDamageProfile::N_GC_BINS; ++bin) {

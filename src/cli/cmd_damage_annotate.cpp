@@ -175,6 +175,13 @@ struct ProteinDamageSummary {
     float max_p_damage;         // Highest p_damage among terminal sites
     float p_damaged;            // Overall probability read is damaged
     std::vector<DamageSite> sites;  // Cleared+shrunk in callback after aggregation
+    // Channel D: Oxidative damage tracking (G→T at DNA level)
+    // Gly→Cys (GGN→TGN) and Gly→Trp indicate G→T at codon position 1
+    uint32_t gly_to_cys = 0;    // Gly→Cys substitutions (oxidation signature)
+    uint32_t cys_to_gly = 0;    // Cys→Gly substitutions (reverse for ratio)
+    uint32_t gly_to_trp = 0;    // Gly→Trp substitutions (strong oxidation signal)
+    uint32_t trp_to_gly = 0;    // Trp→Gly substitutions (reverse)
+    uint32_t gly_total = 0;     // Total Gly positions in target (denominator)
     // Pre-aggregated site scalars (populated from sites before clearing)
     float info_sum = 0.0f;      // sum(site.p_damage) → ReadDamageObs.info
     uint32_t terminal_5 = 0;    // C-terminal 5' site count → pa.terminal_5
@@ -307,6 +314,12 @@ static ProteinDamageSummary annotate_alignment(
 
     float sum_exp_decay = 0.0f;  // Fix 2: data-driven w = sum_exp_decay / m
 
+    // Channel D: Oxidative damage tracking (G→T at DNA level)
+    // Gly→Cys (GGN→TGN) and Gly→Trp indicate G→T at codon position 1
+    uint32_t gly_to_cys = 0, cys_to_gly = 0;
+    uint32_t gly_to_trp = 0, trp_to_gly = 0;
+    uint32_t gly_total = 0;
+
     size_t q_pos = qstart;  // 0-based
     size_t t_pos = tstart;
 
@@ -393,6 +406,18 @@ static ProteinDamageSummary annotate_alignment(
             }
         }
 
+        // Channel D: Track Gly substitutions for oxidative damage detection
+        // G→T at DNA codon pos 1: GGN→TGN = Gly→Cys, GGN→TGG = Gly→Trp
+        if (t_aa == 'G') {
+            gly_total++;
+            if (q_aa == 'C') gly_to_cys++;
+            else if (q_aa == 'W') gly_to_trp++;
+        } else if (t_aa == 'C' && q_aa == 'G') {
+            cys_to_gly++;
+        } else if (t_aa == 'W' && q_aa == 'G') {
+            trp_to_gly++;
+        }
+
         q_pos++;
         t_pos++;
     }
@@ -477,6 +502,12 @@ static ProteinDamageSummary annotate_alignment(
     out.aa_sum_qA = aa_sum_qA;
     out.aa_sum_log_qA_hits = aa_sum_log_qA_hits;
     out.aa_sum_exp_decay = sum_exp_decay;
+    // Channel D: Oxidative damage counts
+    out.gly_to_cys = gly_to_cys;
+    out.cys_to_gly = cys_to_gly;
+    out.gly_to_trp = gly_to_trp;
+    out.trp_to_gly = trp_to_gly;
+    out.gly_total = gly_total;
     return out;
 }
 
@@ -2974,12 +3005,22 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // Statistics
     size_t total_sites = 0, total_ct = 0, total_ga = 0, total_high = 0;
     size_t proteins_with_damage = 0;
+    // Channel D: Oxidative damage statistics (G→T at DNA level)
+    uint64_t total_gly_to_cys = 0, total_cys_to_gly = 0;
+    uint64_t total_gly_to_trp = 0, total_trp_to_gly = 0;
+    uint64_t total_gly = 0;
     for (const auto& s : summaries) {
         total_sites += s.damage_consistent;
         total_ct += s.ct_sites;
         total_ga += s.ga_sites;
         total_high += s.high_conf_sites;
         if (s.damage_consistent > 0) proteins_with_damage++;
+        // Oxidative damage accumulation
+        total_gly_to_cys += s.gly_to_cys;
+        total_cys_to_gly += s.cys_to_gly;
+        total_gly_to_trp += s.gly_to_trp;
+        total_trp_to_gly += s.trp_to_gly;
+        total_gly += s.gly_total;
     }
 
     // Auto-derive min_damage_sites from median read length if not set
@@ -3003,6 +3044,22 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         std::cerr << "  C->T class: " << total_ct << "\n";
         std::cerr << "  G->A class: " << total_ga << "\n";
         std::cerr << "  High confidence: " << total_high << "\n";
+        // Channel D: Oxidative damage statistics
+        const float gly_cys_ratio = total_cys_to_gly > 0
+            ? static_cast<float>(total_gly_to_cys) / static_cast<float>(total_cys_to_gly)
+            : 0.0f;
+        const float gly_trp_ratio = total_trp_to_gly > 0
+            ? static_cast<float>(total_gly_to_trp) / static_cast<float>(total_trp_to_gly)
+            : 0.0f;
+        std::cerr << "Channel D (oxidative damage, G→T at DNA):\n";
+        std::cerr << "  Gly positions: " << total_gly << "\n";
+        std::cerr << "  Gly→Cys: " << total_gly_to_cys << " | Cys→Gly: " << total_cys_to_gly
+                  << " | Ratio: " << std::fixed << std::setprecision(2) << gly_cys_ratio << "x\n";
+        std::cerr << "  Gly→Trp: " << total_gly_to_trp << " | Trp→Gly: " << total_trp_to_gly
+                  << " | Ratio: " << std::fixed << std::setprecision(2) << gly_trp_ratio << "x\n";
+        if (gly_cys_ratio > 1.15f || gly_trp_ratio > 1.15f) {
+            std::cerr << "  [!] Elevated oxidative damage detected (ratio > 1.15x)\n";
+        }
     }
 
     // Bayesian scoring setup
