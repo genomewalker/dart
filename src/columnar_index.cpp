@@ -9,6 +9,7 @@
 #include "dart/columnar_index.hpp"
 
 #include <algorithm>
+#include <iostream>
 #include <array>
 #include <atomic>
 #include <numeric>
@@ -786,21 +787,53 @@ std::string_view ColumnarIndexReader::ref_name(uint32_t idx) const {
     return {p, strlen(p)};
 }
 
+// Helper: pread with retry loop for partial reads (common on NFS).
+static bool pread_full(int fd, void* buf, size_t count, off_t offset) {
+    char* p = static_cast<char*>(buf);
+    size_t remaining = count;
+    while (remaining > 0) {
+        ssize_t n = pread(fd, p, remaining, offset);
+        if (n <= 0) return false;  // EOF or error
+        p += n;
+        offset += n;
+        remaining -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
 // Read all ref names via pread() — bypasses the mmap page cache entirely.
 // On NFS + Linux 4.18 with MAP_PRIVATE, the kernel can evict pages at any time
 // under memory pressure; re-faulting those pages from NFS returns garbage.
 // pread() reads directly from the file descriptor without touching the mmap.
+//
+// CRITICAL: Re-read ref_names_bytes from file via pread, not from impl_->ref_names_bytes.
+// The mmap page holding that value may have been evicted and corrupted during the
+// long damage index warmup phase.
 std::vector<std::string> ColumnarIndexReader::ref_names_pread() const {
     const uint32_t n = impl_->num_ref_names;
-    std::vector<uint32_t> off_buf(n);
-    const ssize_t off_bytes = static_cast<ssize_t>(n * sizeof(uint32_t));
-    if (pread(impl_->fd, off_buf.data(), off_bytes,
-              static_cast<off_t>(impl_->ref_name_offsets_file_off)) != off_bytes)
+
+    // Re-read ref_names_bytes from file (4 bytes before ref_names data).
+    // This bypasses potentially corrupted mmap pages.
+    uint32_t ref_names_bytes = 0;
+    const off_t size_offset = static_cast<off_t>(impl_->ref_names_file_off) - sizeof(uint32_t);
+    if (pread(impl_->fd, &ref_names_bytes, sizeof(uint32_t), size_offset) != sizeof(uint32_t))
         return {};
-    std::vector<char> blob(impl_->ref_names_bytes);
-    const ssize_t blob_bytes = static_cast<ssize_t>(impl_->ref_names_bytes);
-    if (pread(impl_->fd, blob.data(), blob_bytes,
-              static_cast<off_t>(impl_->ref_names_file_off)) != blob_bytes)
+
+    // Sanity check: ref names blob should be < 2 GB (generous limit for ~10M refs).
+    constexpr uint32_t MAX_REF_NAMES_BYTES = 2UL * 1024 * 1024 * 1024;
+    if (ref_names_bytes > MAX_REF_NAMES_BYTES) {
+        std::cerr << "[ERROR] ref_names_bytes=" << ref_names_bytes
+                  << " exceeds 2GB limit, likely NFS corruption\n";
+        return {};
+    }
+
+    std::vector<uint32_t> off_buf(n);
+    if (!pread_full(impl_->fd, off_buf.data(), n * sizeof(uint32_t),
+                    static_cast<off_t>(impl_->ref_name_offsets_file_off)))
+        return {};
+    std::vector<char> blob(ref_names_bytes);
+    if (!pread_full(impl_->fd, blob.data(), ref_names_bytes,
+                    static_cast<off_t>(impl_->ref_names_file_off)))
         return {};
     std::vector<std::string> result(n);
     for (uint32_t i = 0; i < n; ++i)
