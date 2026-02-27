@@ -57,15 +57,17 @@ namespace dart {
 // v4 adds TSV parity columns: qstart/qend/mismatch/gapopen
 // v5 adds per-alignment damage evidence for reassignment:
 //    dmg_k, dmg_m, dmg_ll_a, dmg_ll_m
+// v6 adds 64-bit string dict sizes to support >4GB name blobs
 constexpr uint64_t EMI_MAGIC = 0x3230494D45504741ULL;  // "AGPEMI02"
 constexpr uint64_t EMI_MAGIC_V1 = 0x3130494D45504741ULL;  // "AGPEMI01" (legacy)
-constexpr uint32_t EMI_VERSION = 5;
+constexpr uint32_t EMI_VERSION = 6;
 constexpr uint32_t ROW_GROUP_SIZE = 65536;  // 64K rows per group
 
 // Header flags (AGP execution hints/capabilities)
 constexpr uint32_t EMI_FLAG_SORTED_BY_READ_THEN_SCORE = 1u << 0;
 constexpr uint32_t EMI_FLAG_HAS_ALIGNMENT_STRINGS = 1u << 1;
 constexpr uint32_t EMI_FLAG_HAS_ROW_GROUP_READ_INDEX = 1u << 2;
+constexpr uint32_t EMI_FLAG_64BIT_STRING_DICT = 1u << 3;  // v6: 64-bit sizes in string dict
 
 // Column IDs for selective loading
 // v2: Added READ_IDX to store read index per alignment (fixes CSR/row-group issue)
