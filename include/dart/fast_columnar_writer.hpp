@@ -1073,6 +1073,17 @@ private:
             throw std::runtime_error("Cannot open damage index: " + config.damage_index_path);
         }
 
+        // Force AGD into OS page cache before main loop.
+        // madvise(MADV_WILLNEED) is ignored by NFS on Linux 4.18; synchronous
+        // warmup reads all pages sequentially (1.5 GB/s NFS → ~21s for 31 GB).
+        // Without this, every random AGD lookup causes a blocking NFS page fault,
+        // keeping the process in D-state and limiting throughput to ~6 MB/s.
+        if (config.verbose) {
+            std::cerr << "Warming AGD page cache ("
+                      << (reader->record_count() * 32 / (1024*1024)) << " MB)...\n";
+        }
+        reader->warmup_cache();
+
         if (!config.d_max_set_by_user && reader->d_max() > 0.0f) {
             d_max_out = reader->d_max();
         }
