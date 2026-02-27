@@ -157,11 +157,11 @@ struct ColumnarIndexWriter::Impl {
     std::string path;
     std::ofstream out;
 
-    // String dictionaries
+    // String dictionaries (v6: 64-bit offsets to support >4GB name blobs)
     std::vector<char> read_names;
-    std::vector<uint32_t> read_name_offsets;
+    std::vector<uint64_t> read_name_offsets;
     std::vector<char> ref_names;
-    std::vector<uint32_t> ref_name_offsets;
+    std::vector<uint64_t> ref_name_offsets;
     std::unordered_map<std::string, uint32_t> read_name_index;
     std::unordered_map<std::string, uint32_t> ref_name_index;
 
@@ -396,7 +396,7 @@ uint32_t ColumnarIndexWriter::add_ref(std::string_view name) {
         return it->second;
     }
     uint32_t idx = static_cast<uint32_t>(impl_->ref_name_offsets.size());
-    impl_->ref_name_offsets.push_back(static_cast<uint32_t>(impl_->ref_names.size()));
+    impl_->ref_name_offsets.push_back(static_cast<uint64_t>(impl_->ref_names.size()));
     impl_->ref_names.insert(impl_->ref_names.end(), name.begin(), name.end());
     impl_->ref_names.push_back('\0');
     impl_->ref_name_index[key] = idx;
@@ -410,7 +410,7 @@ uint32_t ColumnarIndexWriter::add_read(std::string_view name) {
         return it->second;
     }
     uint32_t idx = static_cast<uint32_t>(impl_->read_name_offsets.size());
-    impl_->read_name_offsets.push_back(static_cast<uint32_t>(impl_->read_names.size()));
+    impl_->read_name_offsets.push_back(static_cast<uint64_t>(impl_->read_names.size()));
     impl_->read_names.insert(impl_->read_names.end(), name.begin(), name.end());
     impl_->read_names.push_back('\0');
     impl_->read_name_index[key] = idx;
@@ -527,23 +527,25 @@ void ColumnarIndexWriter::finalize(float d_max, float lambda) {
     out.write(reinterpret_cast<const char*>(impl_->row_groups.data()),
               impl_->row_groups.size() * sizeof(RowGroupMeta));
 
-    // Write string dictionaries
+    // Write string dictionaries (v6: 64-bit offsets and sizes)
     header.string_dict_offset = out.tellp();
-    // Read names: offsets then data
+    header.flags |= EMI_FLAG_64BIT_STRING_DICT;
+
+    // Read names: count, offsets (64-bit), size (64-bit), data
     uint32_t read_names_count = static_cast<uint32_t>(impl_->read_name_offsets.size());
     out.write(reinterpret_cast<const char*>(&read_names_count), sizeof(read_names_count));
     out.write(reinterpret_cast<const char*>(impl_->read_name_offsets.data()),
-              impl_->read_name_offsets.size() * sizeof(uint32_t));
-    uint32_t read_names_size = static_cast<uint32_t>(impl_->read_names.size());
+              impl_->read_name_offsets.size() * sizeof(uint64_t));
+    uint64_t read_names_size = impl_->read_names.size();
     out.write(reinterpret_cast<const char*>(&read_names_size), sizeof(read_names_size));
     out.write(impl_->read_names.data(), impl_->read_names.size());
 
-    // Ref names: offsets then data
+    // Ref names: count, offsets (64-bit), size (64-bit), data
     uint32_t ref_names_count = static_cast<uint32_t>(impl_->ref_name_offsets.size());
     out.write(reinterpret_cast<const char*>(&ref_names_count), sizeof(ref_names_count));
     out.write(reinterpret_cast<const char*>(impl_->ref_name_offsets.data()),
-              impl_->ref_name_offsets.size() * sizeof(uint32_t));
-    uint32_t ref_names_size = static_cast<uint32_t>(impl_->ref_names.size());
+              impl_->ref_name_offsets.size() * sizeof(uint64_t));
+    uint64_t ref_names_size = impl_->ref_names.size();
     out.write(reinterpret_cast<const char*>(&ref_names_size), sizeof(ref_names_size));
     out.write(impl_->ref_names.data(), impl_->ref_names.size());
 
@@ -604,19 +606,20 @@ struct ColumnarIndexReader::Impl {
     const uint64_t* csr_offsets = nullptr;
     const RowGroupReadIndex* row_group_read_index = nullptr;
 
-    // String dictionaries
-    const uint32_t* read_name_offsets = nullptr;
+    // String dictionaries (v5: 32-bit offsets, v6: 64-bit offsets)
+    bool use_64bit_string_dict = false;
+    const void* read_name_offsets = nullptr;  // uint32_t* or uint64_t* depending on flag
     const char* read_names = nullptr;
     uint32_t num_read_names = 0;
 
-    const uint32_t* ref_name_offsets = nullptr;
+    const void* ref_name_offsets = nullptr;   // uint32_t* or uint64_t* depending on flag
     const char* ref_names = nullptr;
     uint32_t num_ref_names = 0;
 
     // File offsets for pread()-based access to ref_name data (NFS-safe, bypasses mmap).
     size_t ref_name_offsets_file_off = 0;
     size_t ref_names_file_off = 0;
-    uint32_t ref_names_bytes = 0;
+    uint64_t ref_names_bytes = 0;
 
     // Filters
     std::vector<FilterPredicate> filters;
@@ -681,29 +684,45 @@ ColumnarIndexReader::ColumnarIndexReader(const std::string& path)
     impl_->row_groups = reinterpret_cast<const RowGroupMeta*>(
         base + impl_->header->row_group_dir_offset);
 
-    // String dictionaries
+    // String dictionaries (v5: 32-bit offsets, v6: 64-bit offsets)
     const char* dict_ptr = base + impl_->header->string_dict_offset;
+    impl_->use_64bit_string_dict = (impl_->header->flags & EMI_FLAG_64BIT_STRING_DICT) != 0;
+
+    uint64_t read_names_size = 0;
+    uint64_t ref_names_size = 0;
 
     impl_->num_read_names = *reinterpret_cast<const uint32_t*>(dict_ptr);
     dict_ptr += sizeof(uint32_t);
-    impl_->read_name_offsets = reinterpret_cast<const uint32_t*>(dict_ptr);
-    dict_ptr += impl_->num_read_names * sizeof(uint32_t);
-    uint32_t read_names_size = *reinterpret_cast<const uint32_t*>(dict_ptr);
-    dict_ptr += sizeof(uint32_t);
+    impl_->read_name_offsets = dict_ptr;
+    if (impl_->use_64bit_string_dict) {
+        dict_ptr += impl_->num_read_names * sizeof(uint64_t);
+        read_names_size = *reinterpret_cast<const uint64_t*>(dict_ptr);
+        dict_ptr += sizeof(uint64_t);
+    } else {
+        dict_ptr += impl_->num_read_names * sizeof(uint32_t);
+        read_names_size = *reinterpret_cast<const uint32_t*>(dict_ptr);
+        dict_ptr += sizeof(uint32_t);
+    }
     impl_->read_names = dict_ptr;
     dict_ptr += read_names_size;
 
     impl_->num_ref_names = *reinterpret_cast<const uint32_t*>(dict_ptr);
     dict_ptr += sizeof(uint32_t);
-    impl_->ref_name_offsets = reinterpret_cast<const uint32_t*>(dict_ptr);
-    dict_ptr += impl_->num_ref_names * sizeof(uint32_t);
-    uint32_t ref_names_size = *reinterpret_cast<const uint32_t*>(dict_ptr);
-    dict_ptr += sizeof(uint32_t);
+    impl_->ref_name_offsets = dict_ptr;
+    if (impl_->use_64bit_string_dict) {
+        dict_ptr += impl_->num_ref_names * sizeof(uint64_t);
+        ref_names_size = *reinterpret_cast<const uint64_t*>(dict_ptr);
+        dict_ptr += sizeof(uint64_t);
+    } else {
+        dict_ptr += impl_->num_ref_names * sizeof(uint32_t);
+        ref_names_size = *reinterpret_cast<const uint32_t*>(dict_ptr);
+        dict_ptr += sizeof(uint32_t);
+    }
     impl_->ref_names = dict_ptr;
 
     // Record file offsets for pread()-based access (immune to NFS page eviction).
     impl_->ref_name_offsets_file_off = static_cast<size_t>(
-        reinterpret_cast<const char*>(impl_->ref_name_offsets) - base);
+        static_cast<const char*>(impl_->ref_name_offsets) - base);
     impl_->ref_names_file_off = static_cast<size_t>(impl_->ref_names - base);
     impl_->ref_names_bytes = ref_names_size;
 
@@ -777,13 +796,25 @@ float ColumnarIndexReader::lambda() const {
 
 std::string_view ColumnarIndexReader::read_name(uint32_t idx) const {
     if (idx >= impl_->num_read_names) return {};
-    const char* p = impl_->read_names + impl_->read_name_offsets[idx];
+    uint64_t offset;
+    if (impl_->use_64bit_string_dict) {
+        offset = static_cast<const uint64_t*>(impl_->read_name_offsets)[idx];
+    } else {
+        offset = static_cast<const uint32_t*>(impl_->read_name_offsets)[idx];
+    }
+    const char* p = impl_->read_names + offset;
     return {p, strlen(p)};
 }
 
 std::string_view ColumnarIndexReader::ref_name(uint32_t idx) const {
     if (idx >= impl_->num_ref_names) return {};
-    const char* p = impl_->ref_names + impl_->ref_name_offsets[idx];
+    uint64_t offset;
+    if (impl_->use_64bit_string_dict) {
+        offset = static_cast<const uint64_t*>(impl_->ref_name_offsets)[idx];
+    } else {
+        offset = static_cast<const uint32_t*>(impl_->ref_name_offsets)[idx];
+    }
+    const char* p = impl_->ref_names + offset;
     return {p, strlen(p)};
 }
 
@@ -811,26 +842,46 @@ static bool pread_full(int fd, void* buf, size_t count, off_t offset) {
 // long damage index warmup phase.
 std::vector<std::string> ColumnarIndexReader::ref_names_pread() const {
     const uint32_t n = impl_->num_ref_names;
+    const bool use_64bit = impl_->use_64bit_string_dict;
 
-    // Re-read ref_names_bytes from file (4 bytes before ref_names data).
+    // Re-read ref_names_bytes from file (4 or 8 bytes before ref_names data).
     // This bypasses potentially corrupted mmap pages.
-    uint32_t ref_names_bytes = 0;
-    const off_t size_offset = static_cast<off_t>(impl_->ref_names_file_off) - sizeof(uint32_t);
-    if (pread(impl_->fd, &ref_names_bytes, sizeof(uint32_t), size_offset) != sizeof(uint32_t))
-        return {};
+    uint64_t ref_names_bytes = 0;
+    if (use_64bit) {
+        const off_t size_offset = static_cast<off_t>(impl_->ref_names_file_off) - sizeof(uint64_t);
+        if (pread(impl_->fd, &ref_names_bytes, sizeof(uint64_t), size_offset) != sizeof(uint64_t))
+            return {};
+    } else {
+        uint32_t ref_names_bytes_32 = 0;
+        const off_t size_offset = static_cast<off_t>(impl_->ref_names_file_off) - sizeof(uint32_t);
+        if (pread(impl_->fd, &ref_names_bytes_32, sizeof(uint32_t), size_offset) != sizeof(uint32_t))
+            return {};
+        ref_names_bytes = ref_names_bytes_32;
+    }
 
-    // Sanity check: ref names blob should be < 2 GB (generous limit for ~10M refs).
-    constexpr uint32_t MAX_REF_NAMES_BYTES = 2UL * 1024 * 1024 * 1024;
+    // Sanity check: ref names blob should be < 8 GB (generous limit).
+    constexpr uint64_t MAX_REF_NAMES_BYTES = 8ULL * 1024 * 1024 * 1024;
     if (ref_names_bytes > MAX_REF_NAMES_BYTES) {
         std::cerr << "[ERROR] ref_names_bytes=" << ref_names_bytes
-                  << " exceeds 2GB limit, likely NFS corruption\n";
+                  << " exceeds 8GB limit, likely file corruption\n";
         return {};
     }
 
-    std::vector<uint32_t> off_buf(n);
-    if (!pread_full(impl_->fd, off_buf.data(), n * sizeof(uint32_t),
-                    static_cast<off_t>(impl_->ref_name_offsets_file_off)))
-        return {};
+    // Read offsets (64-bit or 32-bit depending on format)
+    std::vector<uint64_t> off_buf(n);
+    if (use_64bit) {
+        if (!pread_full(impl_->fd, off_buf.data(), n * sizeof(uint64_t),
+                        static_cast<off_t>(impl_->ref_name_offsets_file_off)))
+            return {};
+    } else {
+        std::vector<uint32_t> off_buf_32(n);
+        if (!pread_full(impl_->fd, off_buf_32.data(), n * sizeof(uint32_t),
+                        static_cast<off_t>(impl_->ref_name_offsets_file_off)))
+            return {};
+        for (uint32_t i = 0; i < n; ++i)
+            off_buf[i] = off_buf_32[i];
+    }
+
     std::vector<char> blob(ref_names_bytes);
     if (!pread_full(impl_->fd, blob.data(), ref_names_bytes,
                     static_cast<off_t>(impl_->ref_names_file_off)))
