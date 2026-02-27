@@ -176,13 +176,28 @@ const AgdRecord* DamageIndexReader::get_record(size_t idx) const {
 size_t DamageIndexReader::warmup_cache() const {
     if (!is_valid() || file_size_ == 0) return 0;
 
-    // Touch every page to force it into page cache
-    // This is critical for NFS where MADV_WILLNEED may be ignored
+    // Use pread() with large blocks to get full NFS bandwidth (matches dd throughput).
+    // The mmap page-touch approach sends one NFS RPC per 4KB page and is 5-10x slower
+    // on NFS than reading with 64MB blocks. pread() populates the OS page cache exactly
+    // as mmap accesses would, so subsequent random lookups via the mmap'd pointer hit
+    // cached pages instead of incurring blocking NFS page faults.
+    if (fd_ >= 0) {
+        constexpr size_t BLOCK = 64 * 1024 * 1024;
+        std::vector<char> buf(BLOCK);
+        size_t total = 0;
+        for (size_t off = 0; off < file_size_; off += BLOCK) {
+            size_t n = std::min(BLOCK, file_size_ - off);
+            ssize_t r = pread(fd_, buf.data(), n, static_cast<off_t>(off));
+            if (r > 0) total += static_cast<size_t>(r);
+        }
+        return total;
+    }
+
+    // Fallback: mmap page-touch (no fd available, e.g. after explicit close)
     const char* ptr = reinterpret_cast<const char*>(data_);
     const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) return 0;
-
-    volatile size_t sum = 0;  // volatile prevents optimizer from removing the loop
+    volatile size_t sum = 0;
     for (size_t offset = 0; offset < file_size_; offset += static_cast<size_t>(page_size)) {
         sum = sum + static_cast<unsigned char>(ptr[offset]);
     }
