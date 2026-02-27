@@ -36,6 +36,26 @@ DamageIndexWriter::DamageIndexWriter(const std::string& path,
     header_.stop_decay_llr = profile.stop_decay_llr_5prime;
     header_.terminal_shift = profile.terminal_shift_5prime;
 
+    // v4: environmental damage channels
+    // Channel C: Oxidation (quantize 0-100% to 0-255)
+    header_.ox_rate_terminal_q = static_cast<uint8_t>(
+        std::min(255.0f, std::max(0.0f, profile.ox_stop_rate_terminal * 255.0f)));
+    header_.ox_rate_interior_q = static_cast<uint8_t>(
+        std::min(255.0f, std::max(0.0f, profile.ox_stop_rate_interior * 255.0f)));
+    header_.ox_uniformity_q = static_cast<uint8_t>(
+        std::min(255.0f, std::max(0.0f, profile.ox_uniformity_ratio * 127.5f)));  // 0-2.0 -> 0-255
+
+    // Channel D: Depurination (quantize -50% to +50% to -128 to 127)
+    header_.purine_enrich_5p_q = static_cast<int8_t>(
+        std::min(127.0f, std::max(-128.0f, profile.purine_enrichment_5prime * 255.0f)));
+    header_.purine_enrich_3p_q = static_cast<int8_t>(
+        std::min(127.0f, std::max(-128.0f, profile.purine_enrichment_3prime * 255.0f)));
+
+    // Detection flags
+    header_.env_flags = 0;
+    if (profile.ox_damage_detected) header_.env_flags |= 0x01;
+    if (profile.depurination_detected) header_.env_flags |= 0x02;
+
     // Reserve space for typical dataset
     records_.reserve(100000);
 }

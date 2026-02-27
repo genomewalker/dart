@@ -114,6 +114,45 @@ public:
         return damage_validated() && !damage_artifact();
     }
 
+    // =========================================================================
+    // Environmental damage channels (v4+, return 0/false for older files)
+    // =========================================================================
+
+    /** @brief Channel C: Oxidative G→T rate at terminal positions (0-1). */
+    float ox_rate_terminal() const {
+        return header_->version >= 4 ? header_->ox_rate_terminal_q / 255.0f : 0.0f;
+    }
+
+    /** @brief Channel C: Oxidative G→T rate at interior positions (0-1). */
+    float ox_rate_interior() const {
+        return header_->version >= 4 ? header_->ox_rate_interior_q / 255.0f : 0.0f;
+    }
+
+    /** @brief Channel C: Oxidation uniformity ratio (terminal/interior, ~1.0 = uniform). */
+    float ox_uniformity_ratio() const {
+        return header_->version >= 4 ? header_->ox_uniformity_q / 127.5f : 0.0f;
+    }
+
+    /** @brief Channel C: Whether oxidative damage was detected. */
+    bool ox_damage_detected() const {
+        return header_->version >= 4 && (header_->env_flags & 0x01) != 0;
+    }
+
+    /** @brief Channel D: Purine enrichment at 5' terminus (-0.5 to +0.5). */
+    float purine_enrichment_5prime() const {
+        return header_->version >= 4 ? header_->purine_enrich_5p_q / 255.0f : 0.0f;
+    }
+
+    /** @brief Channel D: Purine enrichment at 3' terminus (-0.5 to +0.5). */
+    float purine_enrichment_3prime() const {
+        return header_->version >= 4 ? header_->purine_enrich_3p_q / 255.0f : 0.0f;
+    }
+
+    /** @brief Channel D: Whether depurination was detected. */
+    bool depurination_detected() const {
+        return header_->version >= 4 && (header_->env_flags & 0x02) != 0;
+    }
+
     /**
      * @brief Get total number of records.
      */
