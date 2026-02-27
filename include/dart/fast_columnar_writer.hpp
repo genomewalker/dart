@@ -1819,15 +1819,110 @@ public:
         }
         reader.skip_header_if_present();
 
+        // Compact flat map for refs: key index into ref_names_vec + value id.
+        struct FlatRefMap {
+            struct Slot {
+                uint32_t key_idx = empty_sentinel();
+                uint32_t value = 0;
+            };
+
+            std::vector<Slot> slots;
+            size_t mask = 0;
+            size_t size = 0;
+
+            static uint32_t empty_sentinel() { return 0xFFFFFFFFu; }
+
+            static uint64_t hash_sv(std::string_view sv) {
+                uint64_t h = 14695981039346656037ULL;
+                for (unsigned char c : sv) {
+                    h ^= c;
+                    h *= 1099511628211ULL;
+                }
+                return h;
+            }
+
+            static size_t next_pow2(size_t x) {
+                size_t p = 1;
+                while (p < x) p <<= 1;
+                return p;
+            }
+
+            void reserve(size_t expected_entries) {
+                const size_t min_buckets = std::max<size_t>(16, (expected_entries * 10) / 6 + 1);
+                const size_t cap = next_pow2(min_buckets);
+                slots.assign(cap, Slot{});
+                mask = cap - 1;
+                size = 0;
+            }
+
+            const uint32_t* find(std::string_view key,
+                                 const std::vector<std::string>& keys) const {
+                if (slots.empty()) return nullptr;
+                size_t i = static_cast<size_t>(hash_sv(key)) & mask;
+                while (true) {
+                    const Slot& s = slots[i];
+                    if (s.key_idx == empty_sentinel()) return nullptr;
+                    if (keys[s.key_idx] == key) return &s.value;
+                    i = (i + 1) & mask;
+                }
+            }
+
+            void emplace(uint32_t key_idx,
+                         uint32_t value,
+                         const std::vector<std::string>& keys) {
+                if (slots.empty()) reserve(1024);
+                if ((size + 1) * 10 >= slots.size() * 6) {
+                    rehash(slots.size() * 2, keys);
+                }
+
+                const std::string_view key = keys[key_idx];
+                size_t i = static_cast<size_t>(hash_sv(key)) & mask;
+                while (true) {
+                    Slot& s = slots[i];
+                    if (s.key_idx == empty_sentinel()) {
+                        s.key_idx = key_idx;
+                        s.value = value;
+                        ++size;
+                        return;
+                    }
+                    if (keys[s.key_idx] == key) {
+                        s.value = value;
+                        return;
+                    }
+                    i = (i + 1) & mask;
+                }
+            }
+
+        private:
+            void rehash(size_t new_cap,
+                        const std::vector<std::string>& keys) {
+                const size_t cap = next_pow2(new_cap);
+                std::vector<Slot> old;
+                old.swap(slots);
+                slots.assign(cap, Slot{});
+                mask = cap - 1;
+                size = 0;
+
+                for (const Slot& old_slot : old) {
+                    if (old_slot.key_idx == empty_sentinel()) continue;
+                    const std::string_view key = keys[old_slot.key_idx];
+                    size_t i = static_cast<size_t>(hash_sv(key)) & mask;
+                    while (slots[i].key_idx != empty_sentinel()) i = (i + 1) & mask;
+                    slots[i] = old_slot;
+                    ++size;
+                }
+            }
+        };
+
         // Inline dictionaries (first-appearance order for both reads and refs)
-        SpillingStringDict::StringToIdMap read_lookup;
-        read_lookup.reserve(1 << 27);  // 128M buckets — avoids rehashing for up to ~89M reads
         std::vector<std::string> read_names_vec;
-        SpillingStringDict::StringToIdMap ref_lookup;
-        ref_lookup.reserve(1 << 24);   // 16M buckets — avoids rehashing for up to ~11M refs
+        read_names_vec.reserve(1 << 26);  // 64M slots — avoids reallocs up to ~64M reads
+        FlatRefMap ref_lookup;
+        ref_lookup.reserve(1 << 24);   // Pre-size for ~16M refs at ~0.6 load factor
         std::vector<std::string> ref_names_vec;
         // Quantized per-read damage score — grows in sync with read_names_vec
         std::vector<uint8_t> read_damage_q;
+        read_damage_q.reserve(1 << 26);
         // Cache for consecutive identical queries (MMseqs2 output sorted by query)
         std::string last_read_name;
         uint32_t last_read_idx_cached = 0;
@@ -1837,6 +1932,7 @@ public:
         std::vector<RowGroupReadIndex> row_group_read_index_vec;
         // Per-read alignment counts for CSR prefix sum — grows with read_names_vec
         std::vector<uint32_t> read_counts;
+        read_counts.reserve(1 << 26);
 
         uint64_t n_lines = 0;
         uint64_t global_row_cursor = 0;
@@ -2169,41 +2265,34 @@ public:
             const std::string_view q(fields[0], lens[0]);
             const std::string_view t(fields[1], lens[1]);
 
-            // Read dict: first-appearance order, with cache for sorted queries
+            // Read dict: queries are contiguous in MMseqs2 output; cache miss => new read.
             uint32_t rid;
             if (q == last_read_name) {
                 rid = last_read_idx_cached;
             } else {
-                auto it_q = read_lookup.find(q);
-                if (it_q == read_lookup.end()) {
-                    rid = static_cast<uint32_t>(read_names_vec.size());
-                    read_names_vec.emplace_back(q);
-                    read_lookup.emplace(read_names_vec.back(), rid);
-                    // Lazy damage score lookup — O(1) hash lookup per new read
-                    uint8_t dmg_q = 0;
-                    if (damage_reader) {
-                        if (const AgdRecord* rec = damage_reader->find(read_names_vec.back()))
-                            dmg_q = rec->p_damaged_q;
-                    }
-                    read_damage_q.push_back(dmg_q);
-                    read_counts.push_back(0);
-                } else {
-                    rid = it_q->second;
+                rid = static_cast<uint32_t>(read_names_vec.size());
+                read_names_vec.emplace_back(q);
+                // Lazy damage score lookup — O(1) hash lookup per new read
+                uint8_t dmg_q = 0;
+                if (damage_reader) {
+                    if (const AgdRecord* rec = damage_reader->find(read_names_vec.back()))
+                        dmg_q = rec->p_damaged_q;
                 }
-                last_read_name = std::string(q);
+                read_damage_q.push_back(dmg_q);
+                read_counts.push_back(0);
+                last_read_name = read_names_vec.back();
                 last_read_idx_cached = rid;
             }
             read_counts[rid]++;
 
             // Ref dict: first-appearance order
             uint32_t tid;
-            auto it_t = ref_lookup.find(t);
-            if (it_t == ref_lookup.end()) {
+            if (const uint32_t* tid_ptr = ref_lookup.find(t, ref_names_vec)) {
+                tid = *tid_ptr;
+            } else {
                 tid = static_cast<uint32_t>(ref_names_vec.size());
                 ref_names_vec.emplace_back(t);
-                ref_lookup.emplace(ref_names_vec.back(), tid);
-            } else {
-                tid = it_t->second;
+                ref_lookup.emplace(tid, tid, ref_names_vec);
             }
 
             const float dmg_score = static_cast<float>(read_damage_q[rid]) * (1.0f / 255.0f);
