@@ -1812,11 +1812,16 @@ public:
 
         // Inline dictionaries (first-appearance order for both reads and refs)
         SpillingStringDict::StringToIdMap read_lookup;
+        read_lookup.reserve(1 << 27);  // 128M buckets — avoids rehashing for up to ~89M reads
         std::vector<std::string> read_names_vec;
         SpillingStringDict::StringToIdMap ref_lookup;
+        ref_lookup.reserve(1 << 24);   // 16M buckets — avoids rehashing for up to ~11M refs
         std::vector<std::string> ref_names_vec;
         // Quantized per-read damage score — grows in sync with read_names_vec
         std::vector<uint8_t> read_damage_q;
+        // Cache for consecutive identical queries (MMseqs2 output sorted by query)
+        std::string last_read_name;
+        uint32_t last_read_idx_cached = 0;
 
         const size_t rg_size = ROW_GROUP_SIZE;
         std::vector<RowGroupMeta> row_groups;
@@ -2171,23 +2176,29 @@ public:
             std::string_view q, t;
             if (!parse_first_two_fields(p, line_end, q, t)) continue;
 
-            // Read dict: first-appearance order
+            // Read dict: first-appearance order, with cache for sorted queries
             uint32_t rid;
-            auto it_q = read_lookup.find(q);
-            if (it_q == read_lookup.end()) {
-                rid = static_cast<uint32_t>(read_names_vec.size());
-                read_names_vec.emplace_back(q);
-                read_lookup.emplace(read_names_vec.back(), rid);
-                // Lazy damage score lookup — O(1) hash lookup per new read
-                uint8_t dmg_q = 0;
-                if (damage_reader) {
-                    if (const AgdRecord* rec = damage_reader->find(read_names_vec.back()))
-                        dmg_q = rec->p_damaged_q;
-                }
-                read_damage_q.push_back(dmg_q);
-                read_counts.push_back(0);
+            if (q == last_read_name) {
+                rid = last_read_idx_cached;
             } else {
-                rid = it_q->second;
+                auto it_q = read_lookup.find(q);
+                if (it_q == read_lookup.end()) {
+                    rid = static_cast<uint32_t>(read_names_vec.size());
+                    read_names_vec.emplace_back(q);
+                    read_lookup.emplace(read_names_vec.back(), rid);
+                    // Lazy damage score lookup — O(1) hash lookup per new read
+                    uint8_t dmg_q = 0;
+                    if (damage_reader) {
+                        if (const AgdRecord* rec = damage_reader->find(read_names_vec.back()))
+                            dmg_q = rec->p_damaged_q;
+                    }
+                    read_damage_q.push_back(dmg_q);
+                    read_counts.push_back(0);
+                } else {
+                    rid = it_q->second;
+                }
+                last_read_name = std::string(q);
+                last_read_idx_cached = rid;
             }
             read_counts[rid]++;
 
