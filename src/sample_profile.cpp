@@ -2029,12 +2029,35 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
                 profile.d_max_combined = std::max(raw_d_max_5prime, raw_d_max_3prime);
                 profile.d_max_source = SampleDamageProfile::DmaxSource::MAX_SS_ASYMMETRY;
             } else {
-                // For ds libraries: do not fall back to Channel A raw values here;
-                // that reintroduces the compositional false positives the joint model suppresses.
-                profile.d_max_5prime = 0.0f;
-                profile.d_max_3prime = 0.0f;
-                profile.d_max_combined = 0.0f;
-                profile.d_max_source = SampleDamageProfile::DmaxSource::NONE;
+                // For ds libraries: check if BOTH channels show positive signal
+                // This is the key insight: if terminal_shift > 0 AND stop_decay_llr > 0,
+                // we have concordant evidence from two independent channels = real damage.
+                // Only zero out if channels disagree or both are negative.
+                bool channel_a_positive = profile.terminal_shift_5prime > 0.005f || profile.terminal_shift_3prime > 0.005f;
+                bool channel_b_positive = profile.stop_decay_llr_5prime > 0.0f;
+
+                if (channel_a_positive && channel_b_positive) {
+                    // Concordant positive signal from both channels = real damage
+                    // Use Channel B d_max if quantifiable, otherwise use raw Channel A
+                    if (profile.channel_b_quantifiable && profile.d_max_from_channel_b > 0.001f) {
+                        profile.d_max_5prime = raw_d_max_5prime;
+                        profile.d_max_3prime = raw_d_max_3prime;
+                        profile.d_max_combined = profile.d_max_from_channel_b;
+                        profile.d_max_source = SampleDamageProfile::DmaxSource::CHANNEL_B_STRUCTURAL;
+                    } else {
+                        // Use raw Channel A values (symmetric for ds)
+                        profile.d_max_5prime = raw_d_max_5prime;
+                        profile.d_max_3prime = raw_d_max_3prime;
+                        profile.d_max_combined = (raw_d_max_5prime + raw_d_max_3prime) / 2.0f;
+                        profile.d_max_source = SampleDamageProfile::DmaxSource::AVERAGE;
+                    }
+                } else {
+                    // Channels disagree or both negative - compositional artifact
+                    profile.d_max_5prime = 0.0f;
+                    profile.d_max_3prime = 0.0f;
+                    profile.d_max_combined = 0.0f;
+                    profile.d_max_source = SampleDamageProfile::DmaxSource::NONE;
+                }
             }
         } else if (profile.channel_b_quantifiable) {
             // Channel B WLS fit succeeded - use its d_max directly
