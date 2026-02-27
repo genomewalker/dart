@@ -1791,142 +1791,79 @@ public:
 
         reader.skip_header_if_present();
 
-        // Thread-local dictionary builders
+        // Pass 1: single sequential scan - reads in first-appearance order (no remap needed),
+        // refs via sharded SpillingStringDict (order doesn't matter for refs).
+        //
+        // Previously: parallel sharded dicts (3 file reads: dict + remap + row-groups)
+        // Now:        sequential read dict + sharded ref dict (2 file reads: dict + row-groups)
+        // Eliminates the remap pass that caused NFS page-cache stalls on large (>100 GB) TSVs.
+
+        // Sharded ref dict (refs don't need ordering; sharding keeps spill files small)
         int n_threads = 1;
 #ifdef _OPENMP
         n_threads = omp_get_max_threads();
 #endif
-
-        // Use sharded spilling dictionaries for parallel inserts.
         size_t num_shards = 1;
         size_t target_shards = static_cast<size_t>(std::max(1, n_threads)) * 4;
         while (num_shards < target_shards) num_shards <<= 1;
         const size_t shard_mask = num_shards - 1;
-
-        size_t read_cap_total = std::max<size_t>(config.memory_limit / 2, 64ULL * 1024ULL * 1024ULL);
-        size_t ref_cap_total = std::max<size_t>(config.memory_limit / 4, 32ULL * 1024ULL * 1024ULL);
-        size_t read_cap_per_shard = std::max<size_t>(read_cap_total / num_shards, 8ULL * 1024ULL * 1024ULL);
-        size_t ref_cap_per_shard = std::max<size_t>(ref_cap_total / num_shards, 8ULL * 1024ULL * 1024ULL);
-
-        std::vector<std::unique_ptr<SpillingStringDict>> read_dict_shards;
+        size_t ref_cap_per_shard = std::max<size_t>(
+            config.memory_limit / (4 * num_shards), 8ULL * 1024ULL * 1024ULL);
         std::vector<std::unique_ptr<SpillingStringDict>> ref_dict_shards;
-        read_dict_shards.reserve(num_shards);
         ref_dict_shards.reserve(num_shards);
         for (size_t s = 0; s < num_shards; ++s) {
-            read_dict_shards.emplace_back(std::make_unique<SpillingStringDict>(
-                "reads_" + std::to_string(s), read_cap_per_shard));
             ref_dict_shards.emplace_back(std::make_unique<SpillingStringDict>(
                 "refs_" + std::to_string(s), ref_cap_per_shard));
         }
-        std::vector<std::mutex> read_shard_mutex(num_shards);
         std::vector<std::mutex> ref_shard_mutex(num_shards);
+
+        // Sequential read dict: insertion order == first-appearance order in input.
+        SpillingStringDict::StringToIdMap read_lookup;
+        std::vector<std::string> read_names_vec_str;
 
         uint64_t n_lines = 0;
 
         while (true) {
-            std::vector<std::string> morsel_lines;
-            morsel_lines.reserve(MORSEL_SIZE);
-            for (size_t i = 0; i < MORSEL_SIZE; ++i) {
-                std::string_view line = reader.next_line();
-                if (line.empty() && reader.bytes_read() > 0) break;
-                if (line.empty()) break;
-                morsel_lines.emplace_back(line);
-            }
-            if (morsel_lines.empty()) break;
-            n_lines += morsel_lines.size();
+            std::string_view line = reader.next_line();
+            if (line.empty()) break;
+            ++n_lines;
 
-#ifdef _OPENMP
-#pragma omp parallel for schedule(static)
-#endif
-            for (size_t i = 0; i < morsel_lines.size(); ++i) {
-                const std::string& line = morsel_lines[i];
-                const char* p = line.data();
-                const char* line_end = p + line.size();
-                std::string_view q, t;
-                if (!parse_first_two_fields(p, line_end, q, t)) continue;
+            const char* p = line.data();
+            const char* line_end = p + line.size();
+            std::string_view q, t;
+            if (!parse_first_two_fields(p, line_end, q, t)) continue;
 
-                size_t q_shard = static_cast<size_t>(FlatSVU32Map::hash_sv(q)) & shard_mask;
-                {
-                    std::lock_guard<std::mutex> lock(read_shard_mutex[q_shard]);
-                    read_dict_shards[q_shard]->insert(q);
-                }
-                size_t t_shard = static_cast<size_t>(FlatSVU32Map::hash_sv(t)) & shard_mask;
-                {
-                    std::lock_guard<std::mutex> lock(ref_shard_mutex[t_shard]);
-                    ref_dict_shards[t_shard]->insert(t);
-                }
+            // Read: sequential ordered insert (first-appearance = insertion order)
+            if (read_lookup.find(q) == read_lookup.end()) {
+                uint32_t id = static_cast<uint32_t>(read_names_vec_str.size());
+                read_names_vec_str.emplace_back(q);
+                read_lookup.emplace(read_names_vec_str.back(), id);
             }
 
-            if (config.verbose && n_lines % 1000000 == 0) {
+            // Ref: sharded insert (no ordering constraint)
+            size_t t_shard = static_cast<size_t>(FlatSVU32Map::hash_sv(t)) & shard_mask;
+            ref_dict_shards[t_shard]->insert(t);
+
+            if (config.verbose && n_lines % (128ULL * 1024 * 1024) == 0) {
                 std::cerr << "\rPass 1: " << (n_lines / 1000000) << "M lines, "
                           << (reader.bytes_read() / (1024*1024)) << " MB read...";
             }
         }
 
-        // Finalize shards into global dictionaries.
-        std::vector<std::string> read_names_vec_str;
+        // Finalize ref dict shards into global lookup.
         std::vector<std::string> ref_names_vec_str;
-        SpillingStringDict::StringToIdMap read_lookup;
         SpillingStringDict::StringToIdMap ref_lookup;
-        size_t read_spill_total = 0;
         size_t ref_spill_total = 0;
 
         for (size_t s = 0; s < num_shards; ++s) {
-            read_spill_total += read_dict_shards[s]->spill_count();
             ref_spill_total += ref_dict_shards[s]->spill_count();
-
-            auto [read_names_local, _read_lookup_local] = read_dict_shards[s]->finalize();
-            for (auto& name : read_names_local) {
-                uint32_t id = static_cast<uint32_t>(read_names_vec_str.size());
-                read_lookup.emplace(name, id);
-                read_names_vec_str.push_back(std::move(name));
-            }
-
-            auto [ref_names_local, _ref_lookup_local] = ref_dict_shards[s]->finalize();
+            auto [ref_names_local, _] = ref_dict_shards[s]->finalize();
             for (auto& name : ref_names_local) {
                 uint32_t id = static_cast<uint32_t>(ref_names_vec_str.size());
                 ref_lookup.emplace(name, id);
                 ref_names_vec_str.push_back(std::move(name));
             }
         }
-
-        std::vector<uint32_t> read_old_to_new(
-            read_names_vec_str.size(), std::numeric_limits<uint32_t>::max());
-        std::vector<uint32_t> read_new_to_old;
-        read_new_to_old.reserve(read_names_vec_str.size());
-
-        // Remap read IDs by first appearance in input.
-        {
-            ChunkedFileReader remap_reader(tsv_path);
-            if (!remap_reader.valid()) {
-                throw std::runtime_error("Cannot open TSV for read remap: " + tsv_path);
-            }
-            remap_reader.skip_header_if_present();
-            while (true) {
-                std::string_view line = remap_reader.next_line();
-                if (line.empty()) break;
-                const char* p = line.data();
-                const char* line_end = p + line.size();
-                std::string_view q, t;
-                if (!parse_first_two_fields(p, line_end, q, t)) continue;
-                auto it = read_lookup.find(q);
-                if (it == read_lookup.end()) continue;
-                uint32_t old_idx = it->second;
-                uint32_t& mapped = read_old_to_new[old_idx];
-                if (mapped == std::numeric_limits<uint32_t>::max()) {
-                    mapped = static_cast<uint32_t>(read_new_to_old.size());
-                    read_new_to_old.push_back(old_idx);
-                }
-            }
-        }
-        if (read_new_to_old.size() != read_names_vec_str.size()) {
-            throw std::runtime_error("Read-ID remap incomplete while building EMI");
-        }
-        std::vector<std::string> read_names_ordered(read_names_vec_str.size());
-        for (uint32_t new_idx = 0; new_idx < read_new_to_old.size(); ++new_idx) {
-            read_names_ordered[new_idx] = std::move(read_names_vec_str[read_new_to_old[new_idx]]);
-        }
-        read_names_vec_str.swap(read_names_ordered);
 
         auto pass1_end = std::chrono::high_resolution_clock::now();
         auto pass1_ms = std::chrono::duration_cast<std::chrono::milliseconds>(pass1_end - pass1_start).count();
@@ -1936,9 +1873,8 @@ public:
                       << read_names_vec_str.size() << " reads, "
                       << ref_names_vec_str.size() << " refs"
                       << " (" << dart::log_utils::format_duration_ms(pass1_ms) << ")";
-            if (read_spill_total > 0 || ref_spill_total > 0) {
-                std::cerr << " [spilled: " << read_spill_total
-                          << "+" << ref_spill_total << " files]";
+            if (ref_spill_total > 0) {
+                std::cerr << " [ref spilled: " << ref_spill_total << " files]";
             }
             std::cerr << "\n";
         }
@@ -2113,14 +2049,7 @@ public:
                 std::string_view t(fields[1], lens[1]);
                 auto it_q = read_lookup.find(q);
                 auto it_t = ref_lookup.find(t);
-                uint32_t old_read_idx = (it_q != read_lookup.end()) ? it_q->second : 0;
-                if (old_read_idx < read_old_to_new.size()) {
-                    uint32_t mapped = read_old_to_new[old_read_idx];
-                    res.read_idx[local_idx] =
-                        (mapped != std::numeric_limits<uint32_t>::max()) ? mapped : 0;
-                } else {
-                    res.read_idx[local_idx] = 0;
-                }
+                res.read_idx[local_idx] = (it_q != read_lookup.end()) ? it_q->second : 0;
                 res.ref_idx[local_idx] = (it_t != ref_lookup.end()) ? it_t->second : 0;
 
                 float fident = fast_stof({fields[2], lens[2]});
