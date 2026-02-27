@@ -22,13 +22,14 @@ namespace dart {
 
 // Magic bytes: "AGD\x01" (AGP Damage index, version 1)
 constexpr uint32_t AGD_MAGIC = 0x01444741;  // Little-endian "AGD\x01"
-constexpr uint32_t AGD_VERSION = 3;
+constexpr uint32_t AGD_VERSION = 4;
 
 /**
  * @brief File header (64 bytes, fixed size).
  *
  * v3 adds damage informativeness fields (offsets 33-43) from the reserved area.
- * v2 files are still readable via version-gated accessors in DamageIndexReader.
+ * v4 adds environmental damage channels C/D (offsets 44-49).
+ * v2/v3 files are still readable via version-gated accessors in DamageIndexReader.
  */
 struct AgdHeader {
     uint32_t magic;              // offset 0, 4 bytes
@@ -43,7 +44,19 @@ struct AgdHeader {
     uint8_t channel_b_valid;     // offset 35, 1 byte (v3+: 0 or 1)
     float stop_decay_llr;        // offset 36, 4 bytes (v3+: Channel B LLR)
     float terminal_shift;        // offset 40, 4 bytes (v3+: terminal T/(T+C) shift)
-    uint8_t _reserved[20];       // offset 44, 20 bytes (pad to 64)
+
+    // Environmental damage channels (v4+, offsets 44-49)
+    // Channel C: Oxidation (8-oxoG, G→T transversions)
+    uint8_t ox_rate_terminal_q;  // offset 44, quantized (0-255 = 0-100%)
+    uint8_t ox_rate_interior_q;  // offset 45, quantized (0-255 = 0-100%)
+    uint8_t ox_uniformity_q;     // offset 46, quantized (0-255 = 0.0-2.0)
+    // Channel D: Depurination (purine enrichment at termini)
+    int8_t purine_enrich_5p_q;   // offset 47, quantized (-128 to 127 = -50% to +50%)
+    int8_t purine_enrich_3p_q;   // offset 48, quantized
+    // Detection flags (bit field)
+    uint8_t env_flags;           // offset 49: bit0=ox_detected, bit1=depurination
+
+    uint8_t _reserved[14];       // offset 50-63, 14 bytes (pad to 64)
 };
 static_assert(sizeof(AgdHeader) == 64, "AgdHeader must be 64 bytes");
 
