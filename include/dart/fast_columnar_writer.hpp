@@ -1836,14 +1836,18 @@ public:
         uint32_t prev_read_idx_s = 0;
         float prev_bit_score_s = 0.0f;
 
-        // RowGroupTask stores pre-assigned indices computed by the main thread
-        // so that process_row_group can run without touching the shared dicts.
+        // RowGroupTask stores pre-parsed columns built in the main loop so
+        // process_row_group only needs to sort + finalize write buffers.
         struct RowGroupTask {
             size_t rg_idx = 0;
-            std::vector<std::string> lines;
-            std::vector<uint32_t> pre_read_idx;
-            std::vector<uint32_t> pre_ref_idx;
-            std::vector<float>    pre_damage_score;
+            std::vector<uint32_t> read_idx, ref_idx;
+            std::vector<float> bit_score, damage_score, evalue_log10;
+            std::vector<uint16_t> dmg_k, dmg_m;
+            std::vector<float> dmg_ll_a, dmg_ll_m;
+            std::vector<uint16_t> identity_q, aln_len, qstart, qend, tstart, tend, tlen, qlen;
+            std::vector<uint16_t> mismatch, gapopen;
+            std::vector<uint32_t> qaln_offsets, taln_offsets;
+            std::vector<char> qaln_data, taln_data;
         };
         struct RowGroupResult {
             size_t rg_idx = 0;
@@ -1861,111 +1865,78 @@ public:
             uint32_t last_read_idx = 0;
         };
 
+        auto make_row_group_task = [&](size_t rg_idx) -> RowGroupTask {
+            RowGroupTask task;
+            task.rg_idx = rg_idx;
+            task.read_idx.reserve(rg_size);
+            task.ref_idx.reserve(rg_size);
+            task.bit_score.reserve(rg_size);
+            task.damage_score.reserve(rg_size);
+            task.evalue_log10.reserve(rg_size);
+            task.dmg_k.reserve(rg_size);
+            task.dmg_m.reserve(rg_size);
+            task.dmg_ll_a.reserve(rg_size);
+            task.dmg_ll_m.reserve(rg_size);
+            task.identity_q.reserve(rg_size);
+            task.aln_len.reserve(rg_size);
+            task.qstart.reserve(rg_size);
+            task.qend.reserve(rg_size);
+            task.tstart.reserve(rg_size);
+            task.tend.reserve(rg_size);
+            task.tlen.reserve(rg_size);
+            task.qlen.reserve(rg_size);
+            task.mismatch.reserve(rg_size);
+            task.gapopen.reserve(rg_size);
+            if (!config.skip_alignments) {
+                task.qaln_offsets.reserve(rg_size + 1);
+                task.taln_offsets.reserve(rg_size + 1);
+                task.qaln_data.reserve(rg_size * 50);
+                task.taln_data.reserve(rg_size * 50);
+            }
+            return task;
+        };
+
         auto process_row_group = [&](RowGroupTask&& task) -> RowGroupResult {
             RowGroupResult res;
             res.rg_idx = task.rg_idx;
-            res.rg_rows = static_cast<uint32_t>(task.lines.size());
+            res.rg_rows = static_cast<uint32_t>(task.read_idx.size());
             const uint32_t rg_rows = res.rg_rows;
 
-            res.read_idx.resize(rg_rows);
-            res.ref_idx.resize(rg_rows);
-            res.bit_score.resize(rg_rows);
-            res.damage_score.resize(rg_rows);
-            res.evalue_log10.resize(rg_rows);
-            res.dmg_k.resize(rg_rows, 0);
-            res.dmg_m.resize(rg_rows, 0);
-            res.dmg_ll_a.resize(rg_rows, 0.0f);
-            res.dmg_ll_m.resize(rg_rows, 0.0f);
-            res.identity_q.resize(rg_rows);
-            res.aln_len.resize(rg_rows);
-            res.qstart.resize(rg_rows);
-            res.qend.resize(rg_rows);
-            res.tstart.resize(rg_rows);
-            res.tend.resize(rg_rows);
-            res.tlen.resize(rg_rows);
-            res.qlen.resize(rg_rows);
-            res.mismatch.resize(rg_rows);
-            res.gapopen.resize(rg_rows);
-            res.qaln_offsets.resize(rg_rows + 1, 0);
-            res.taln_offsets.resize(rg_rows + 1, 0);
+            res.read_idx = std::move(task.read_idx);
+            res.ref_idx = std::move(task.ref_idx);
+            res.bit_score = std::move(task.bit_score);
+            res.damage_score = std::move(task.damage_score);
+            res.evalue_log10 = std::move(task.evalue_log10);
+            res.dmg_k = std::move(task.dmg_k);
+            res.dmg_m = std::move(task.dmg_m);
+            res.dmg_ll_a = std::move(task.dmg_ll_a);
+            res.dmg_ll_m = std::move(task.dmg_ll_m);
+            res.identity_q = std::move(task.identity_q);
+            res.aln_len = std::move(task.aln_len);
+            res.qstart = std::move(task.qstart);
+            res.qend = std::move(task.qend);
+            res.tstart = std::move(task.tstart);
+            res.tend = std::move(task.tend);
+            res.tlen = std::move(task.tlen);
+            res.qlen = std::move(task.qlen);
+            res.mismatch = std::move(task.mismatch);
+            res.gapopen = std::move(task.gapopen);
+            res.qaln_offsets = std::move(task.qaln_offsets);
+            res.taln_offsets = std::move(task.taln_offsets);
+            res.qaln_data = std::move(task.qaln_data);
+            res.taln_data = std::move(task.taln_data);
+
             if (!config.skip_alignments) {
-                res.qaln_data.reserve(rg_rows * 50);
-                res.taln_data.reserve(rg_rows * 50);
-            }
-
-            for (uint32_t local_idx = 0; local_idx < rg_rows; ++local_idx) {
-                const std::string& line = task.lines[local_idx];
-                const char* p = line.data();
-                const char* line_end = p + line.size();
-
-                const char* fields[16];
-                size_t lens[16];
-                const char* fp = p;
-                for (int f = 0; f < 16; ++f) {
-                    fields[f] = fp;
-                    const char* tab = (f == 15) ? line_end : simd_find_tab(fp, line_end);
-                    lens[f] = static_cast<size_t>(tab - fp);
-                    fp = (tab < line_end) ? tab + 1 : line_end;
+                if (res.qaln_offsets.size() == rg_rows) {
+                    res.qaln_offsets.push_back(static_cast<uint32_t>(res.qaln_data.size()));
                 }
-
-                // Use pre-assigned indices — no dict access needed, thread-safe
-                res.read_idx[local_idx]     = task.pre_read_idx[local_idx];
-                res.ref_idx[local_idx]      = task.pre_ref_idx[local_idx];
-                res.damage_score[local_idx] = task.pre_damage_score[local_idx];
-
-                float fident     = fast_stof({fields[2], lens[2]});
-                uint32_t alnlen_v  = fast_stou({fields[3], lens[3]});
-                uint32_t mismatch_v = fast_stou({fields[4], lens[4]});
-                uint32_t gapopen_v  = fast_stou({fields[5], lens[5]});
-                uint32_t qstart_v   = fast_stou({fields[6], lens[6]});
-                uint32_t qend_v     = fast_stou({fields[7], lens[7]});
-                uint32_t tstart_v   = fast_stou({fields[8], lens[8]});
-                uint32_t tend_v     = fast_stou({fields[9], lens[9]});
-                float evalue     = fast_stof({fields[10], lens[10]});
-                float bits       = fast_stof({fields[11], lens[11]});
-                uint32_t qlen_v    = fast_stou({fields[12], lens[12]});
-                uint32_t tlen_v    = fast_stou({fields[13], lens[13]});
-
-                res.bit_score[local_idx]    = bits;
-                res.evalue_log10[local_idx] = (evalue > 0) ? std::log10(evalue) : -300.0f;
-                res.identity_q[local_idx]   = static_cast<uint16_t>(std::clamp(fident, 0.0f, 1.0f) * 65535.0f);
-                res.aln_len[local_idx]      = static_cast<uint16_t>(std::min(alnlen_v, 65535u));
-                res.qstart[local_idx]       = static_cast<uint16_t>(std::min(qstart_v, 65535u));
-                res.qend[local_idx]         = static_cast<uint16_t>(std::min(qend_v, 65535u));
-                res.tstart[local_idx]       = static_cast<uint16_t>(std::min(tstart_v, 65535u));
-                res.tend[local_idx]         = static_cast<uint16_t>(std::min(tend_v, 65535u));
-                res.tlen[local_idx]         = static_cast<uint16_t>(std::min(tlen_v, 65535u));
-                res.qlen[local_idx]         = static_cast<uint16_t>(std::min(qlen_v, 65535u));
-                res.mismatch[local_idx]     = static_cast<uint16_t>(std::min(mismatch_v, 65535u));
-                res.gapopen[local_idx]      = static_cast<uint16_t>(std::min(gapopen_v, 65535u));
-
-                if (!config.skip_alignments) {
-                    const char* qaln_start = fields[14];
-                    const char* qaln_end   = fields[14] + lens[14];
-                    const char* taln_start = fields[15];
-                    const char* taln_end   = fields[15] + lens[15];
-                    const std::string_view q_sv(fields[0], lens[0]);
-                    const std::string_view qaln_sv(qaln_start, lens[14]);
-                    const std::string_view taln_sv(taln_start, lens[15]);
-                    const auto dmg = compute_alignment_damage_evidence(
-                        q_sv, qaln_sv, taln_sv,
-                        res.qstart[local_idx],
-                        res.qlen[local_idx],
-                        header_d_max, header_lambda);
-                    res.dmg_k[local_idx]    = dmg.k_hits;
-                    res.dmg_m[local_idx]    = dmg.m_sites;
-                    res.dmg_ll_a[local_idx] = dmg.ll_ancient;
-                    res.dmg_ll_m[local_idx] = dmg.ll_modern;
-
-                    res.qaln_offsets[local_idx] = static_cast<uint32_t>(res.qaln_data.size());
-                    res.qaln_data.insert(res.qaln_data.end(), qaln_start, qaln_end);
-                    res.taln_offsets[local_idx] = static_cast<uint32_t>(res.taln_data.size());
-                    res.taln_data.insert(res.taln_data.end(), taln_start, taln_end);
+                if (res.taln_offsets.size() == rg_rows) {
+                    res.taln_offsets.push_back(static_cast<uint32_t>(res.taln_data.size()));
                 }
-            }
-            if (!config.skip_alignments) {
-                res.qaln_offsets[rg_rows] = static_cast<uint32_t>(res.qaln_data.size());
-                res.taln_offsets[rg_rows] = static_cast<uint32_t>(res.taln_data.size());
+                if (res.qaln_offsets.size() != rg_rows + 1 ||
+                    res.taln_offsets.size() != rg_rows + 1) {
+                    throw std::runtime_error("Invalid alignment offset vector size in row-group task");
+                }
             }
 
             std::vector<uint32_t> perm(rg_rows);
@@ -2163,8 +2134,7 @@ public:
         // Main streaming loop: read one line at a time, build dicts inline,
         // accumulate into RowGroupTask, flush synchronously when full.
         size_t cur_rg_idx = 0;
-        RowGroupTask current_task;
-        current_task.rg_idx = 0;
+        RowGroupTask current_task = make_row_group_task(0);
 
         while (true) {
             std::string_view line = reader.next_line();
@@ -2173,8 +2143,22 @@ public:
 
             const char* p = line.data();
             const char* line_end = p + line.size();
-            std::string_view q, t;
-            if (!parse_first_two_fields(p, line_end, q, t)) continue;
+            const char* fields[16];
+            size_t lens[16];
+            const char* tab1 = simd_find_tab(p, line_end);
+            if (tab1 >= line_end) continue;
+            fields[0] = p;
+            lens[0] = static_cast<size_t>(tab1 - p);
+
+            const char* fp = tab1 + 1;
+            for (int f = 1; f < 16; ++f) {
+                fields[f] = fp;
+                const char* tab = (f == 15) ? line_end : simd_find_tab(fp, line_end);
+                lens[f] = static_cast<size_t>(tab - fp);
+                fp = (tab < line_end) ? tab + 1 : line_end;
+            }
+            const std::string_view q(fields[0], lens[0]);
+            const std::string_view t(fields[1], lens[1]);
 
             // Read dict: first-appearance order, with cache for sorted queries
             uint32_t rid;
@@ -2214,21 +2198,83 @@ public:
             }
 
             const float dmg_score = static_cast<float>(read_damage_q[rid]) * (1.0f / 255.0f);
-            current_task.lines.emplace_back(line);
-            current_task.pre_read_idx.push_back(rid);
-            current_task.pre_ref_idx.push_back(tid);
-            current_task.pre_damage_score.push_back(dmg_score);
+            float fident       = fast_stof({fields[2], lens[2]});
+            uint32_t alnlen_v  = fast_stou({fields[3], lens[3]});
+            uint32_t mismatch_v = fast_stou({fields[4], lens[4]});
+            uint32_t gapopen_v  = fast_stou({fields[5], lens[5]});
+            uint32_t qstart_v   = fast_stou({fields[6], lens[6]});
+            uint32_t qend_v     = fast_stou({fields[7], lens[7]});
+            uint32_t tstart_v   = fast_stou({fields[8], lens[8]});
+            uint32_t tend_v     = fast_stou({fields[9], lens[9]});
+            float evalue        = fast_stof({fields[10], lens[10]});
+            float bits          = fast_stof({fields[11], lens[11]});
+            uint32_t qlen_v     = fast_stou({fields[12], lens[12]});
+            uint32_t tlen_v     = fast_stou({fields[13], lens[13]});
 
-            if (current_task.lines.size() == rg_size) {
+            const uint16_t qstart_q = static_cast<uint16_t>(std::min(qstart_v, 65535u));
+            const uint16_t qlen_q   = static_cast<uint16_t>(std::min(qlen_v, 65535u));
+
+            current_task.read_idx.push_back(rid);
+            current_task.ref_idx.push_back(tid);
+            current_task.bit_score.push_back(bits);
+            current_task.damage_score.push_back(dmg_score);
+            current_task.evalue_log10.push_back((evalue > 0) ? std::log10(evalue) : -300.0f);
+            current_task.identity_q.push_back(
+                static_cast<uint16_t>(std::clamp(fident, 0.0f, 1.0f) * 65535.0f));
+            current_task.aln_len.push_back(static_cast<uint16_t>(std::min(alnlen_v, 65535u)));
+            current_task.qstart.push_back(qstart_q);
+            current_task.qend.push_back(static_cast<uint16_t>(std::min(qend_v, 65535u)));
+            current_task.tstart.push_back(static_cast<uint16_t>(std::min(tstart_v, 65535u)));
+            current_task.tend.push_back(static_cast<uint16_t>(std::min(tend_v, 65535u)));
+            current_task.tlen.push_back(static_cast<uint16_t>(std::min(tlen_v, 65535u)));
+            current_task.qlen.push_back(qlen_q);
+            current_task.mismatch.push_back(static_cast<uint16_t>(std::min(mismatch_v, 65535u)));
+            current_task.gapopen.push_back(static_cast<uint16_t>(std::min(gapopen_v, 65535u)));
+
+            if (!config.skip_alignments) {
+                const char* qaln_start = fields[14];
+                const char* qaln_end = fields[14] + lens[14];
+                const char* taln_start = fields[15];
+                const char* taln_end = fields[15] + lens[15];
+
+                const std::string_view qaln_sv(qaln_start, lens[14]);
+                const std::string_view taln_sv(taln_start, lens[15]);
+                const auto dmg = compute_alignment_damage_evidence(
+                    q, qaln_sv, taln_sv, qstart_q, qlen_q, header_d_max, header_lambda);
+
+                current_task.dmg_k.push_back(dmg.k_hits);
+                current_task.dmg_m.push_back(dmg.m_sites);
+                current_task.dmg_ll_a.push_back(dmg.ll_ancient);
+                current_task.dmg_ll_m.push_back(dmg.ll_modern);
+
+                current_task.qaln_offsets.push_back(static_cast<uint32_t>(current_task.qaln_data.size()));
+                current_task.qaln_data.insert(current_task.qaln_data.end(), qaln_start, qaln_end);
+                current_task.taln_offsets.push_back(static_cast<uint32_t>(current_task.taln_data.size()));
+                current_task.taln_data.insert(current_task.taln_data.end(), taln_start, taln_end);
+            } else {
+                current_task.dmg_k.push_back(0);
+                current_task.dmg_m.push_back(0);
+                current_task.dmg_ll_a.push_back(0.0f);
+                current_task.dmg_ll_m.push_back(0.0f);
+            }
+
+            if (current_task.read_idx.size() == rg_size) {
+                if (!config.skip_alignments) {
+                    current_task.qaln_offsets.push_back(static_cast<uint32_t>(current_task.qaln_data.size()));
+                    current_task.taln_offsets.push_back(static_cast<uint32_t>(current_task.taln_data.size()));
+                }
                 auto result = process_row_group(std::move(current_task));
                 flush_result(result);
-                current_task = RowGroupTask{};
-                current_task.rg_idx = ++cur_rg_idx;
+                current_task = make_row_group_task(++cur_rg_idx);
             }
         }
 
         // Flush final (possibly partial) row group
-        if (!current_task.lines.empty()) {
+        if (!current_task.read_idx.empty()) {
+            if (!config.skip_alignments) {
+                current_task.qaln_offsets.push_back(static_cast<uint32_t>(current_task.qaln_data.size()));
+                current_task.taln_offsets.push_back(static_cast<uint32_t>(current_task.taln_data.size()));
+            }
             auto result = process_row_group(std::move(current_task));
             flush_result(result);
         }
