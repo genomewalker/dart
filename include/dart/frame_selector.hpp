@@ -148,13 +148,14 @@ struct SampleDamageProfile {
     bool high_asymmetry = false;  // True if asymmetry > 0.5 (possible artifact)
 
     // Track source of d_max_combined estimate
-    enum class DmaxSource { AVERAGE, MIN_ASYMMETRY, FIVE_PRIME_ONLY, THREE_PRIME_ONLY, CHANNEL_B_STRUCTURAL, NONE };
+    enum class DmaxSource { AVERAGE, MIN_ASYMMETRY, MAX_SS_ASYMMETRY, FIVE_PRIME_ONLY, THREE_PRIME_ONLY, CHANNEL_B_STRUCTURAL, NONE };
     DmaxSource d_max_source = DmaxSource::AVERAGE;
 
     const char* d_max_source_str() const {
         switch (d_max_source) {
             case DmaxSource::AVERAGE: return "average";
             case DmaxSource::MIN_ASYMMETRY: return "min_asymmetry";
+            case DmaxSource::MAX_SS_ASYMMETRY: return "max_ss_asymmetry";
             case DmaxSource::FIVE_PRIME_ONLY: return "5prime_only";
             case DmaxSource::THREE_PRIME_ONLY: return "3prime_only";
             case DmaxSource::CHANNEL_B_STRUCTURAL: return "channel_b_structural";

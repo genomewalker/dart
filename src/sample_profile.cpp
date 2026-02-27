@@ -2018,12 +2018,24 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
             }
         } else if (profile.joint_model_valid) {
             // Joint model valid and does NOT support damage.
-            // Do not fall back to Channel A raw values here; that reintroduces the exact
-            // compositional false positives the joint model was designed to suppress.
-            profile.d_max_5prime = 0.0f;
-            profile.d_max_3prime = 0.0f;
-            profile.d_max_combined = 0.0f;
-            profile.d_max_source = SampleDamageProfile::DmaxSource::NONE;
+            // EXCEPTION: For single-stranded libraries, Channel B tracks 5' C→T stops which
+            // are absent in ss libraries (ss damage is G→A at 3'). Fall back to Channel A.
+            const bool is_ss = (profile.forced_library_type == SampleDamageProfile::LibraryType::SINGLE_STRANDED) ||
+                               (profile.library_type == SampleDamageProfile::LibraryType::SINGLE_STRANDED);
+            if (is_ss) {
+                // Use Channel A for ss libraries since Channel B is not applicable
+                profile.d_max_5prime = raw_d_max_5prime;
+                profile.d_max_3prime = raw_d_max_3prime;
+                profile.d_max_combined = std::max(raw_d_max_5prime, raw_d_max_3prime);
+                profile.d_max_source = SampleDamageProfile::DmaxSource::MAX_SS_ASYMMETRY;
+            } else {
+                // For ds libraries: do not fall back to Channel A raw values here;
+                // that reintroduces the compositional false positives the joint model suppresses.
+                profile.d_max_5prime = 0.0f;
+                profile.d_max_3prime = 0.0f;
+                profile.d_max_combined = 0.0f;
+                profile.d_max_source = SampleDamageProfile::DmaxSource::NONE;
+            }
         } else if (profile.channel_b_quantifiable) {
             // Channel B WLS fit succeeded - use its d_max directly
             // This path is for samples with some stop signal but not validated
@@ -2037,8 +2049,18 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
             profile.d_max_3prime = raw_d_max_3prime;
 
             if (profile.high_asymmetry) {
-                profile.d_max_combined = std::min(profile.d_max_5prime, profile.d_max_3prime);
-                profile.d_max_source = SampleDamageProfile::DmaxSource::MIN_ASYMMETRY;
+                // For single-stranded libraries, asymmetry is EXPECTED (damage at one terminus only)
+                // Use max() to capture the damaged terminus, not min() which would give 0%
+                const bool is_ss = (profile.forced_library_type == SampleDamageProfile::LibraryType::SINGLE_STRANDED) ||
+                                   (profile.library_type == SampleDamageProfile::LibraryType::SINGLE_STRANDED);
+                if (is_ss) {
+                    profile.d_max_combined = std::max(profile.d_max_5prime, profile.d_max_3prime);
+                    profile.d_max_source = SampleDamageProfile::DmaxSource::MAX_SS_ASYMMETRY;
+                } else {
+                    // For ds libraries, high asymmetry suggests artifact - use conservative min
+                    profile.d_max_combined = std::min(profile.d_max_5prime, profile.d_max_3prime);
+                    profile.d_max_source = SampleDamageProfile::DmaxSource::MIN_ASYMMETRY;
+                }
             } else {
                 profile.d_max_combined = (profile.d_max_5prime + profile.d_max_3prime) / 2.0f;
                 profile.d_max_source = SampleDamageProfile::DmaxSource::AVERAGE;
