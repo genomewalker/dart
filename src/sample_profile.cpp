@@ -280,12 +280,10 @@ void FrameSelector::update_sample_profile(
         }
     }
 
-    // =========================================================================
     // CHANNEL B: Convertible stop codon tracking
     // Track CAA→TAA, CAG→TAG, CGA→TGA pairs by nucleotide position
     // This is BEFORE frame selection, so no circularity issue
     // For forward frames (f=0,1,2), the C/T position is at f + 3*k
-    // =========================================================================
     if (len >= 18) {
         // Track convertible codons for all 3 forward frames at 5' end
         for (int frame = 0; frame < 3; ++frame) {
@@ -375,11 +373,9 @@ void FrameSelector::update_sample_profile(
         }
     }
 
-    // =========================================================================
     // CHANNEL C: Oxidative stop codon tracking (G→T transversions)
     // Track GAG→TAG, GAA→TAA, GGA→TGA pairs by nucleotide position
     // Unlike deamination, oxidative damage is UNIFORM across read length
-    // =========================================================================
     if (len >= 18) {
         // Track oxidative convertible codons at 5' end
         for (int frame = 0; frame < 3; ++frame) {
@@ -457,11 +453,9 @@ void FrameSelector::update_sample_profile(
         }
     }
 
-    // =========================================================================
     // CHANNEL D: G→T / C→A transversion tracking (oxidative damage)
     // Track G and T counts at each position for G→T rate calculation
     // Also track asymmetry: G→T vs T→G (real oxidation shows G→T > T→G)
-    // =========================================================================
     // Count G and T at 5' end positions for G→T tracking
     for (size_t i = 0; i < std::min(size_t(15), len); ++i) {
         char base = fast_upper(seq[i]);
@@ -567,11 +561,9 @@ void FrameSelector::update_sample_profile(
         }
     }
 
-    // =========================================================================
     // Hexamer-based damage detection
     // Collect hexamers from ALL reads - works regardless of sample composition
     // Using position 0 (standard); inversion correction handles unusual cases
-    // =========================================================================
     if (len >= 18) {  // Need at least 18 bases for hexamers
         // 5' terminal hexamer starting at position 0
         char hex_5prime[7];
@@ -730,10 +722,8 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
     double baseline_ag = profile.baseline_a_freq /
                         (profile.baseline_a_freq + profile.baseline_g_freq + 0.001);
 
-    // =========================================================================
     // JOINT PROBABILISTIC MODEL
     // Fit unified model BEFORE normalization (need raw counts)
-    // =========================================================================
     {
         JointDamageSuffStats jstats;
 
@@ -898,12 +888,10 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         profile.delta_llr_3prime = profile.decay_llr_3prime - profile.ctrl_decay_llr_3prime;
     }
 
-    // =========================================================================
     // CHANNEL B: Convertible stop codon decay analysis
     // Compute stop conversion rate decay and compare to Channel A
     // This is the "smoking gun" test: real C→T damage MUST create stops
     // in damage-susceptible contexts (CAA→TAA, CAG→TAG, CGA→TGA)
-    // =========================================================================
     {
         // Compute interior baseline: stop / (pre-image + stop) ratio
         double total_pre_interior = profile.convertible_caa_interior +
@@ -1008,7 +996,6 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
                 profile.stop_decay_llr_5prime = -std::abs(profile.stop_decay_llr_5prime);
             }
 
-            // =========================================================================
             // CHANNEL B STRUCTURAL QUANTIFICATION
             // Compute d_max directly from stop codon conversion rate at position 0.
             // Formula: d_max_B = stops_excess / convertible_original
@@ -1016,15 +1003,12 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
             // Convertible codons (CAA, CAG, CGA) only become stops when their
             // first-position C is damaged, giving us a direct damage measurement.
             // Since d_max is a RATE (not a count), no multiplication factor needed.
-            // =========================================================================
             {
-                // =====================================================================
                 // JOINT WLS FIT FOR b0 AND d_max (corrects baseline contamination)
                 // Model: r_p = b0 + (1-b0) * d_max * x_p, where x_p = exp(-λp)
                 // Fit via weighted least squares: y_p = a + c*x_p
                 // Then: b0 = a, d_max = c / (1 - b0)
                 // Use per-sample fitted lambda from Channel A (NOT fixed 0.3)
-                // =====================================================================
                 const double lambda = std::clamp(static_cast<double>(fit_lambda_5p), 0.1, 0.5);
                 const int N_POSITIONS = 15;  // Use all available positions
 
@@ -1090,20 +1074,16 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
                 }
             }
 
-            // =========================================================================
             // LEGACY LLR DIAGNOSTICS (kept for debug output)
             // Decision now made by joint probabilistic model earlier
-            // =========================================================================
             (void)profile.delta_llr_5prime;  // Used in debug output
             (void)profile.stop_decay_llr_5prime;
         }
     }
 
-    // =========================================================================
     // CHANNEL C: Oxidative stop codon analysis (G→T transversions)
     // Unlike deamination (terminal decay), oxidation is UNIFORM across reads
     // Real oxidation: terminal rate ≈ interior rate (uniformity ratio ≈ 1)
-    // =========================================================================
     {
         // Compute interior baseline for oxidative stops
         double ox_pre_interior = profile.convertible_gag_interior +
@@ -1431,10 +1411,8 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         profile.inverted_pattern_5prime = true;
     }
 
-    // =========================================================================
     // Hexamer-based damage detection (reference-independent)
     // Compare hexamer frequencies at 5' terminal vs interior positions
-    // =========================================================================
     if (profile.n_hexamers_5prime >= 1000 && profile.n_hexamers_interior >= 1000) {
         double llr_sum = 0.0;
         double weight_sum = 0.0;
@@ -1504,9 +1482,7 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         }
     }
 
-    // =========================================================================
     // Composition bias detection using negative controls
-    // =========================================================================
     // If the negative control (A/(A+G) at 5', T/(T+C) at 3') shows comparable
     // enrichment to the "damage" signal, it's likely composition bias, not damage.
     // Decision rule:
@@ -1594,14 +1570,12 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         profile.sample_damage_prob = 0.20f;
     }
 
-    // =========================================================================
     // D_max estimation - JOINT EVIDENCE from Channel A + Channel B
     //
     // NEW APPROACH: Use Channel B (stop conversion) as independent validator
     // - If Channel A fires AND Channel B fires: real damage → report d_max
     // - If Channel A fires BUT Channel B is flat: compositional artifact → d_max = 0
     // - If neither fires: no damage → d_max = 0
-    // =========================================================================
     {
         // First compute raw d_max values from Channel A (nucleotide frequencies)
         float raw_d_max_5prime = profile.damage_rate_5prime[0];
@@ -1621,10 +1595,8 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         }
         profile.high_asymmetry = (profile.asymmetry > 0.5f);
 
-        // =========================================================================
         // GC-STRATIFIED DAMAGE CALCULATION
         // Calculate d_max for each GC bin, then aggregate
-        // =========================================================================
         {
             const uint64_t MIN_C_SITES = 10000;  // Minimum C sites for valid estimate
             float weighted_sum = 0.0f;
@@ -1848,11 +1820,9 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
             }
         }
 
-        // =========================================================================
         // JOINT MODEL FOR CLASSIFICATION + MIXTURE MODEL FOR QUANTIFICATION
         // Joint model P(damage) for hypothesis testing
         // Mixture model d_reference for metaDMG-comparable magnitude
-        // =========================================================================
         profile.d_max_5prime = raw_d_max_5prime;  // Keep raw estimates for reference
         profile.d_max_3prime = raw_d_max_3prime;
 
@@ -1977,7 +1947,6 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
 
     }
 
-    // =========================================================================
     // D_METAMATCH CALCULATION: Channel B-anchored damage estimate
     //
     // metaDMG uses aligned reads (selection bias toward well-preserved sequences).
@@ -1994,7 +1963,6 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
     // Where γ is based on Channel B confidence (higher LLR = more trust in
     // Channel B estimate). For highly damaged, validated samples, this pulls
     // d_global toward the Channel B structural estimate.
-    // =========================================================================
     {
         // Step 1: Compute GC-weighted d_max for diagnostics (kept for reporting)
         double weighted_sum = 0.0;
