@@ -24,6 +24,12 @@ public:
     // line length (excluding newline).  Pointer is valid until the next call.
     // Returns nullptr on EOF.
     virtual const char* readline_fast(size_t& len) = 0;
+
+    // Raw chunk read — returns bytes copied into buf (0 = EOF).
+    // Drains any internal line-buffer first, then reads directly from the
+    // decompressor.  Use this for bulk callers (e.g., TSV chunk parser)
+    // that do NOT interleave readline() calls.
+    virtual size_t read_raw(char* buf, size_t n) = 0;
 };
 
 // Factory — implemented in src/sequence_io_backend.cpp.
