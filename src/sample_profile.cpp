@@ -33,7 +33,6 @@ static float compute_decay_llr(
     const double MIN_COVERAGE = 100.0;
 
     // First, compute best-fit amplitude from data (without clamping to positive)
-    // This lets us detect both positive decay (damage) and negative decay (inverted)
     double sum_signal = 0.0, sum_weight = 0.0;
     for (int i = 1; i < 10; ++i) {
         if (total[i] < MIN_COVERAGE) continue;
@@ -71,7 +70,6 @@ static float compute_decay_llr(
     float llr = static_cast<float>(ll_exp - ll_const);
 
     // If amplitude is negative (inverted pattern), negate the LLR
-    // This makes decay_llr negative for inverted patterns, positive for true damage
     if (raw_amplitude < 0) {
         return -std::abs(llr);  // Negative LLR for inverted patterns
     }
@@ -82,7 +80,6 @@ static float compute_decay_llr(
 // Uses weighted least squares with coverage-based weights
 // Returns: {baseline (b), amplitude (A), lambda, rmse}
 // If external_baseline >= 0, use it instead of estimating from positions 10-14
-// This allows using middle-of-read baseline which is more reliable
 static std::array<float, 4> fit_exponential_decay(
     const std::array<double, 15>& freq,      // T/(T+C) or A/(A+G) at each position
     const std::array<double, 15>& coverage,  // T+C or A+G counts at each position
@@ -283,12 +280,10 @@ void FrameSelector::update_sample_profile(
         }
     }
 
-    // =========================================================================
     // CHANNEL B: Convertible stop codon tracking
     // Track CAA→TAA, CAG→TAG, CGA→TGA pairs by nucleotide position
     // This is BEFORE frame selection, so no circularity issue
     // For forward frames (f=0,1,2), the C/T position is at f + 3*k
-    // =========================================================================
     if (len >= 18) {
         // Track convertible codons for all 3 forward frames at 5' end
         for (int frame = 0; frame < 3; ++frame) {
@@ -336,7 +331,6 @@ void FrameSelector::update_sample_profile(
         }
 
         // Track interior convertible codons (positions 30+ from start)
-        // This gives us the baseline stop conversion rate
         // Guard: len >= 63 required to have valid interior region [30, len-30)
         // Without this, len - 30 underflows for short reads causing OOB access
         constexpr size_t INTERIOR_MIN_LEN = 63;  // 30 + 3 + 30
@@ -379,11 +373,9 @@ void FrameSelector::update_sample_profile(
         }
     }
 
-    // =========================================================================
     // CHANNEL C: Oxidative stop codon tracking (G→T transversions)
     // Track GAG→TAG, GAA→TAA, GGA→TGA pairs by nucleotide position
     // Unlike deamination, oxidative damage is UNIFORM across read length
-    // =========================================================================
     if (len >= 18) {
         // Track oxidative convertible codons at 5' end
         for (int frame = 0; frame < 3; ++frame) {
@@ -461,37 +453,20 @@ void FrameSelector::update_sample_profile(
         }
     }
 
-    // =========================================================================
     // CHANNEL D: G→T / C→A transversion tracking (oxidative damage)
     // Track G and T counts at each position for G→T rate calculation
     // Also track asymmetry: G→T vs T→G (real oxidation shows G→T > T→G)
-    // =========================================================================
     // Count G and T at 5' end positions for G→T tracking
     for (size_t i = 0; i < std::min(size_t(15), len); ++i) {
         char base = fast_upper(seq[i]);
         if (base == 'G') {
             profile.g_count_5prime[i]++;
         }
-        // Note: T counts for oxidation tracking come from T where we'd expect G
-        // This requires reference alignment, so for reference-free we use asymmetry instead
     }
 
-    // =========================================================================
-    // CHANNEL E: Depurination detection (purine enrichment at termini)
-    // Depurination creates strand breaks preferentially at purine sites
-    // Detection: terminal purine (A+G) rate vs interior purine rate
-    // =========================================================================
-    // Purine tracking is already done via a_freq/g_freq arrays
-    // We'll compute purine enrichment in finalize_sample_profile()
+    // Purine tracking done via a_freq/g_freq arrays; enrichment computed in finalize_sample_profile()
 
-    // =========================================================================
-    // GC-STRATIFIED DAMAGE ACCUMULATION
-    // Bin reads by interior GC content (positions 5+ to avoid terminal damage)
-    // This handles metagenome heterogeneity where different organisms have
-    // different GC content and damage levels
-    // =========================================================================
     if (len >= 30) {
-        // Compute interior GC from positions 5 to end-5 (avoid both terminal regions)
         size_t interior_start = 5;
         size_t interior_end = len > 10 ? len - 5 : len;
         uint64_t gc_count = 0;
@@ -586,11 +561,9 @@ void FrameSelector::update_sample_profile(
         }
     }
 
-    // =========================================================================
     // Hexamer-based damage detection
     // Collect hexamers from ALL reads - works regardless of sample composition
     // Using position 0 (standard); inversion correction handles unusual cases
-    // =========================================================================
     if (len >= 18) {  // Need at least 18 bases for hexamers
         // 5' terminal hexamer starting at position 0
         char hex_5prime[7];
@@ -678,7 +651,6 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         pos0_artifact_5 = true;
     } else if (stats_5_pos1.first > 0.02f && (stats_5_pos1.first - stats_5_pos0.first) > 0.03f) {
         // Large pos0-to-pos1 jump pattern: pos1 clearly elevated but pos0 isn't
-        // This indicates adapter artifact masking damage at pos0
         pos0_artifact_5 = true;
     }
 
@@ -750,10 +722,8 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
     double baseline_ag = profile.baseline_a_freq /
                         (profile.baseline_a_freq + profile.baseline_g_freq + 0.001);
 
-    // =========================================================================
     // JOINT PROBABILISTIC MODEL
     // Fit unified model BEFORE normalization (need raw counts)
-    // =========================================================================
     {
         JointDamageSuffStats jstats;
 
@@ -872,7 +842,6 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
 
     // Compute decay log-likelihood ratio (exponential vs constant model)
     // Positive LLR = exponential fits better (real decay pattern)
-    // This helps distinguish real damage (exponential decay) from composition bias (uniform)
     profile.decay_llr_5prime = compute_decay_llr(
         profile.t_freq_5prime, profile.tc_total_5prime,
         profile.fit_baseline_5prime, profile.fit_amplitude_5prime, fit_lambda_5p);
@@ -919,12 +888,10 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         profile.delta_llr_3prime = profile.decay_llr_3prime - profile.ctrl_decay_llr_3prime;
     }
 
-    // =========================================================================
     // CHANNEL B: Convertible stop codon decay analysis
     // Compute stop conversion rate decay and compare to Channel A
     // This is the "smoking gun" test: real C→T damage MUST create stops
     // in damage-susceptible contexts (CAA→TAA, CAG→TAG, CGA→TGA)
-    // =========================================================================
     {
         // Compute interior baseline: stop / (pre-image + stop) ratio
         double total_pre_interior = profile.convertible_caa_interior +
@@ -961,7 +928,6 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         }
 
         // Compute LOCAL baseline from positions 5-14 (same reads, past damage zone)
-        // This avoids bias from interior baseline which comes from longer reads only
         double local_pre = 0.0, local_stop = 0.0;
         for (int p = 5; p < 15; ++p) {
             local_pre += profile.convertible_caa_5prime[p] +
@@ -1030,24 +996,19 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
                 profile.stop_decay_llr_5prime = -std::abs(profile.stop_decay_llr_5prime);
             }
 
-            // =========================================================================
             // CHANNEL B STRUCTURAL QUANTIFICATION
             // Compute d_max directly from stop codon conversion rate at position 0.
             // Formula: d_max_B = stops_excess / convertible_original
             //
-            // This directly measures the C→T damage rate at terminal positions.
             // Convertible codons (CAA, CAG, CGA) only become stops when their
             // first-position C is damaged, giving us a direct damage measurement.
             // Since d_max is a RATE (not a count), no multiplication factor needed.
-            // =========================================================================
             {
-                // =====================================================================
                 // JOINT WLS FIT FOR b0 AND d_max (corrects baseline contamination)
                 // Model: r_p = b0 + (1-b0) * d_max * x_p, where x_p = exp(-λp)
                 // Fit via weighted least squares: y_p = a + c*x_p
                 // Then: b0 = a, d_max = c / (1 - b0)
                 // Use per-sample fitted lambda from Channel A (NOT fixed 0.3)
-                // =====================================================================
                 const double lambda = std::clamp(static_cast<double>(fit_lambda_5p), 0.1, 0.5);
                 const int N_POSITIONS = 15;  // Use all available positions
 
@@ -1113,20 +1074,16 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
                 }
             }
 
-            // =========================================================================
             // LEGACY LLR DIAGNOSTICS (kept for debug output)
             // Decision now made by joint probabilistic model earlier
-            // =========================================================================
             (void)profile.delta_llr_5prime;  // Used in debug output
             (void)profile.stop_decay_llr_5prime;
         }
     }
 
-    // =========================================================================
     // CHANNEL C: Oxidative stop codon analysis (G→T transversions)
     // Unlike deamination (terminal decay), oxidation is UNIFORM across reads
     // Real oxidation: terminal rate ≈ interior rate (uniformity ratio ≈ 1)
-    // =========================================================================
     {
         // Compute interior baseline for oxidative stops
         double ox_pre_interior = profile.convertible_gag_interior +
@@ -1214,73 +1171,29 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         }
     }
 
-    // =========================================================================
-    // CHANNEL D: G→T / C→A transversion asymmetry analysis
-    // Real oxidation: G→T rate > T→G rate (asymmetric)
-    // Sequencing error: G→T ≈ T→G (symmetric)
-    // =========================================================================
+    // Channel D: G→T asymmetry inferred from Channel C (no reference available)
     {
-        // G→T asymmetry is already captured in the control channel (A/(A+G))
-        // For reference-free analysis, we use the existing a_freq/g_freq arrays
-        // and check if G→T shows asymmetry relative to the complement
-
-        // Compute G→T rate from g_count_5prime (tracked during accumulation)
-        // Note: Without a reference, we can't directly measure G→T vs T→G
-        // Instead, we infer from the oxidative stop codon pattern
-
-        // For now, set asymmetry based on Channel C results
         if (profile.channel_c_valid) {
-            // Use stop codon data to infer asymmetry
-            // If oxidative stops are elevated, G→T is the driver
             profile.ox_gt_asymmetry = profile.ox_uniformity_ratio;
         }
     }
 
-    // =========================================================================
-    // CHANNEL E: Depurination detection (purine enrichment at termini)
-    // Depurination creates strand breaks at purine sites
-    // Detection: terminal purine (A+G) rate vs interior purine rate
-    // =========================================================================
+    // Channel E: Depurination (purine enrichment at termini)
     {
-        // Compute purine rate at terminal positions (5' end, pos 0-4)
         double purine_terminal = 0.0, total_terminal = 0.0;
         for (int p = 0; p < 5; ++p) {
-            // Use the raw counts before normalization
-            // a_freq_5prime and g_freq_5prime are now normalized (0-1 ratios)
-            // We need to use tc_total_5prime for scaling
-            double ag = profile.a_freq_5prime[p] + profile.g_freq_5prime[p];
-            double tc = profile.t_freq_5prime[p] + profile.c_freq_5prime[p];
-            // After normalization, a+g ≈ 1 and t+c ≈ 1, so total is meaningless
-            // Use the raw totals instead
             purine_terminal += profile.tc_total_5prime[p] * (1.0 - profile.t_freq_5prime[p] - profile.c_freq_5prime[p]);
             total_terminal += profile.tc_total_5prime[p];
         }
 
-        // Compute purine rate in middle of reads (from baseline)
         double purine_baseline = profile.baseline_a_freq + profile.baseline_g_freq;
-        // baseline values are already normalized to sum to 1
 
         if (total_terminal > 100 && purine_baseline > 0.01) {
-            // Use baseline A+G ratio as reference
             profile.purine_rate_interior = static_cast<float>(purine_baseline);
 
-            // Terminal purine rate requires raw A+G counts
-            // Since we don't have separate AG totals at 5', estimate from existing data
-            // The a_freq_5prime and g_freq_5prime were captured before normalization
-            // but are now ratios. We can reconstruct approximate purine enrichment
-            // by comparing A/(A+G) and G totals
+            profile.purine_enrichment_5prime = profile.ctrl_shift_5prime;
+            profile.purine_enrichment_3prime = profile.ctrl_shift_3prime;
 
-            // Simpler approach: use the existing terminal shift metrics
-            // If both T/(T+C) AND A/(A+G) are elevated at termini, it's composition bias
-            // If only T/(T+C) is elevated, it's damage
-            // If A/(A+G) is elevated more than T/(T+C), check for depurination
-
-            profile.purine_enrichment_5prime = profile.ctrl_shift_5prime;  // A/(A+G) shift at 5'
-            profile.purine_enrichment_3prime = profile.ctrl_shift_3prime;  // T/(T+C) shift at 3'
-
-            // Depurination detected if:
-            // 1. Purine enrichment at 5' is significantly positive (>2%)
-            // 2. AND it's not explained by composition bias (divergence from damage channel)
             if (profile.purine_enrichment_5prime > 0.02f &&
                 profile.channel_divergence_5prime > 0.01f) {
                 profile.depurination_detected = true;
@@ -1297,7 +1210,6 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
     }
 
     // Step 3: Compute per-position damage rates using FIT baseline (not middle-of-read)
-    // This produces rates that are comparable to metaDMG and consistent with d_max
     float fit_baseline_c_frac_5p = 1.0f - profile.fit_baseline_5prime;
     float fit_baseline_g_frac_3p = 1.0f - profile.fit_baseline_3prime;
 
@@ -1319,44 +1231,21 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         }
     }
 
-    // =========================================================================
-    // Inverted pattern detection
-    // Detect when terminal T/(T+C) < baseline from middle of reads (opposite of damage pattern)
-    // This indicates reference-free detection failure due to:
-    // - AT-rich organisms with terminal artifacts
-    // - Adapter contamination
-    // - Quality trimming bias
-    //
-    // NOTE: We compare terminal position 0 against TRUE baseline (middle of reads),
-    // NOT against positions 10-14 which are still in the terminal region and may
-    // share composition bias with position 0.
-    // =========================================================================
+    // Terminal gradients (for reporting only; inverted_pattern_5prime set later via hexamer detection)
     {
-        // Compute terminal gradients for reporting (but DON'T set inverted patterns here)
-        // Position 0 has artifacts - we use hexamer-based detection (positions 1-6) instead.
-        // The hexamer detection at the end of this function sets inverted_pattern_5prime.
-
-        // 5' end: terminal T/(T+C) - baseline (for reporting only)
-        double terminal_tc_5 = profile.t_freq_5prime[0];  // Already normalized
+        double terminal_tc_5 = profile.t_freq_5prime[0];
         profile.terminal_gradient_5prime = static_cast<float>(terminal_tc_5 - baseline_tc);
 
-        // 3' end: terminal A/(A+G) - baseline (for reporting only)
-        double terminal_ag_3 = profile.a_freq_3prime[0];  // Already normalized
+        double terminal_ag_3 = profile.a_freq_3prime[0];
         profile.terminal_gradient_3prime = static_cast<float>(terminal_ag_3 - baseline_ag);
-
-        // NOTE: inverted_pattern flags are set later by hexamer-based detection,
-        // which uses positions 1-6 and is more reliable than position 0.
     }
 
-    // Compute codon-position-aware damage rates
     for (int p = 0; p < 3; p++) {
-        // 5' end codon position rates
         size_t tc_total = profile.codon_pos_t_count_5prime[p] + profile.codon_pos_c_count_5prime[p];
         if (tc_total > 0) {
             profile.codon_pos_t_rate_5prime[p] = static_cast<float>(profile.codon_pos_t_count_5prime[p]) / tc_total;
         }
 
-        // 3' end codon position rates
         size_t ag_total = profile.codon_pos_a_count_3prime[p] + profile.codon_pos_g_count_3prime[p];
         if (ag_total > 0) {
             profile.codon_pos_a_rate_3prime[p] = static_cast<float>(profile.codon_pos_a_count_3prime[p]) / ag_total;
@@ -1514,8 +1403,7 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
                            || profile.terminal_z_3prime < -10.0f;  // Very strong depletion signal
     profile.terminal_inversion = inversion_5 || inversion_3;
 
-    // Set individual inverted pattern flags (used for asymmetric pattern handling)
-    // Note: inverted_pattern_5prime may also be set later by hexamer-based detection
+    // inverted_pattern_5prime may also be set later by hexamer-based detection
     if (inversion_3) {
         profile.inverted_pattern_3prime = true;
     }
@@ -1523,10 +1411,8 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         profile.inverted_pattern_5prime = true;
     }
 
-    // =========================================================================
     // Hexamer-based damage detection (reference-independent)
     // Compare hexamer frequencies at 5' terminal vs interior positions
-    // =========================================================================
     if (profile.n_hexamers_5prime >= 1000 && profile.n_hexamers_interior >= 1000) {
         double llr_sum = 0.0;
         double weight_sum = 0.0;
@@ -1562,13 +1448,9 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         if (weight_sum > 0) {
             float raw_llr = static_cast<float>(llr_sum / weight_sum);
 
-            // Store raw hexamer LLR without inversion correction
-            // The raw value is the actual terminal-vs-interior hexamer composition difference
-            // Positive = T-starting hexamers enriched at terminal (damage pattern)
-            // Negative = C-starting hexamers enriched at terminal (AT-rich composition bias)
+            // positive = T-starting hexamers enriched at terminal (damage)
+            // negative = C-starting enriched at terminal (AT-rich composition bias)
             profile.hexamer_damage_llr = raw_llr;
-
-            (void)raw_llr;  // Used for hexamer_damage_llr
         }
 
         // Compute hexamer-based T/(T+C) ratios (more reliable than position 0 or 1 alone)
@@ -1600,9 +1482,7 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         }
     }
 
-    // =========================================================================
     // Composition bias detection using negative controls
-    // =========================================================================
     // If the negative control (A/(A+G) at 5', T/(T+C) at 3') shows comparable
     // enrichment to the "damage" signal, it's likely composition bias, not damage.
     // Decision rule:
@@ -1690,18 +1570,12 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         profile.sample_damage_prob = 0.20f;
     }
 
-    // =========================================================================
     // D_max estimation - JOINT EVIDENCE from Channel A + Channel B
     //
     // NEW APPROACH: Use Channel B (stop conversion) as independent validator
     // - If Channel A fires AND Channel B fires: real damage → report d_max
     // - If Channel A fires BUT Channel B is flat: compositional artifact → d_max = 0
     // - If neither fires: no damage → d_max = 0
-    //
-    // This solves the fundamental limitation of reference-free detection:
-    // T/(T+C) elevation can be from composition OR damage, but stop codons
-    // appearing in damage-susceptible contexts can ONLY be from real C→T damage.
-    // =========================================================================
     {
         // First compute raw d_max values from Channel A (nucleotide frequencies)
         float raw_d_max_5prime = profile.damage_rate_5prime[0];
@@ -1721,10 +1595,8 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         }
         profile.high_asymmetry = (profile.asymmetry > 0.5f);
 
-        // =========================================================================
         // GC-STRATIFIED DAMAGE CALCULATION
         // Calculate d_max for each GC bin, then aggregate
-        // =========================================================================
         {
             const uint64_t MIN_C_SITES = 10000;  // Minimum C sites for valid estimate
             float weighted_sum = 0.0f;
@@ -1796,11 +1668,6 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
                 profile.gc_stratified_valid = true;
 
 
-                // =========================================================================
-                // GC-CONDITIONAL DAMAGE CLASSIFICATION
-                // Per-bin LLR classification and aggregate metrics (π_damaged, d_ancient)
-                // This is the principled approach recommended by OpenCode discussion
-                // =========================================================================
                 {
                     constexpr float LLR_THRESHOLD = 10.0f;  // Log-likelihood ratio threshold for classification
                     constexpr float MIN_DMAX_THRESHOLD = 0.01f;  // Minimum d_max to consider as damaged
@@ -1897,11 +1764,6 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
 
                 }
 
-                // =========================================================================
-                // DURBIN-STYLE K-COMPONENT MIXTURE MODEL
-                // Models organism-class heterogeneity for principled damage quantification
-                // d_population = what we observe, d_reference = metaDMG proxy
-                // =========================================================================
                 double total_c_sites = static_cast<double>(weight_sum);
                 std::array<SuperRead, N_GC_BINS> super_reads;
                 for (int bin = 0; bin < N_GC_BINS; ++bin) {
@@ -1958,11 +1820,9 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
             }
         }
 
-        // =========================================================================
         // JOINT MODEL FOR CLASSIFICATION + MIXTURE MODEL FOR QUANTIFICATION
         // Joint model P(damage) for hypothesis testing
         // Mixture model d_reference for metaDMG-comparable magnitude
-        // =========================================================================
         profile.d_max_5prime = raw_d_max_5prime;  // Keep raw estimates for reference
         profile.d_max_3prime = raw_d_max_3prime;
 
@@ -2029,35 +1889,12 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
                 profile.d_max_combined = std::max(raw_d_max_5prime, raw_d_max_3prime);
                 profile.d_max_source = SampleDamageProfile::DmaxSource::MAX_SS_ASYMMETRY;
             } else {
-                // For ds libraries: check if BOTH channels show positive signal
-                // This is the key insight: if terminal_shift > 0 AND stop_decay_llr > 0,
-                // we have concordant evidence from two independent channels = real damage.
-                // Only zero out if channels disagree or both are negative.
-                bool channel_a_positive = profile.terminal_shift_5prime > 0.005f || profile.terminal_shift_3prime > 0.005f;
-                bool channel_b_positive = profile.stop_decay_llr_5prime > 0.0f;
-
-                if (channel_a_positive && channel_b_positive) {
-                    // Concordant positive signal from both channels = real damage
-                    // Use Channel B d_max if quantifiable, otherwise use raw Channel A
-                    if (profile.channel_b_quantifiable && profile.d_max_from_channel_b > 0.001f) {
-                        profile.d_max_5prime = raw_d_max_5prime;
-                        profile.d_max_3prime = raw_d_max_3prime;
-                        profile.d_max_combined = profile.d_max_from_channel_b;
-                        profile.d_max_source = SampleDamageProfile::DmaxSource::CHANNEL_B_STRUCTURAL;
-                    } else {
-                        // Use raw Channel A values (symmetric for ds)
-                        profile.d_max_5prime = raw_d_max_5prime;
-                        profile.d_max_3prime = raw_d_max_3prime;
-                        profile.d_max_combined = (raw_d_max_5prime + raw_d_max_3prime) / 2.0f;
-                        profile.d_max_source = SampleDamageProfile::DmaxSource::AVERAGE;
-                    }
-                } else {
-                    // Channels disagree or both negative - compositional artifact
-                    profile.d_max_5prime = 0.0f;
-                    profile.d_max_3prime = 0.0f;
-                    profile.d_max_combined = 0.0f;
-                    profile.d_max_source = SampleDamageProfile::DmaxSource::NONE;
-                }
+                // For ds libraries: do not fall back to Channel A raw values here;
+                // that reintroduces the compositional false positives the joint model suppresses.
+                profile.d_max_5prime = 0.0f;
+                profile.d_max_3prime = 0.0f;
+                profile.d_max_combined = 0.0f;
+                profile.d_max_source = SampleDamageProfile::DmaxSource::NONE;
             }
         } else if (profile.channel_b_quantifiable) {
             // Channel B WLS fit succeeded - use its d_max directly
@@ -2110,7 +1947,6 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
 
     }
 
-    // =========================================================================
     // D_METAMATCH CALCULATION: Channel B-anchored damage estimate
     //
     // metaDMG uses aligned reads (selection bias toward well-preserved sequences).
@@ -2127,7 +1963,6 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
     // Where γ is based on Channel B confidence (higher LLR = more trust in
     // Channel B estimate). For highly damaged, validated samples, this pulls
     // d_global toward the Channel B structural estimate.
-    // =========================================================================
     {
         // Step 1: Compute GC-weighted d_max for diagnostics (kept for reporting)
         double weighted_sum = 0.0;
@@ -2488,7 +2323,6 @@ void FrameSelector::reset_sample_profile(SampleDamageProfile& profile) {
     profile.joint_p_damage = 0.0f;
     profile.joint_model_valid = false;
 
-    // Durbin-style mixture model
     profile.mixture_K = 0;
     profile.mixture_d_population = 0.0f;
     profile.mixture_d_ancient = 0.0f;

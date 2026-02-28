@@ -9,7 +9,6 @@
 
 namespace dart {
 
-// Note: Use encode_hexamer() from hexamer_tables.hpp
 
 constexpr float VERTEBRATE_MAMMALIAN_HEXAMER_FREQ[4096] = {
     6.699878e-04f, 4.318141e-04f, 8.482399e-04f, 5.887459e-04f, 5.105874e-04f, 4.072931e-04f, 1.152465e-04f, 4.152399e-04f, 

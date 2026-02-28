@@ -77,7 +77,6 @@ inline uint64_t splitmix64(uint64_t x) {
 /**
  * Extract canonical minimizers from a sequence.
  * Canonical = min(k-mer, reverse_complement(k-mer))
- * This ensures strand-agnostic clustering.
  */
 inline void extract_minimizers(const std::string& seq,
                                const ClusterParams& p,

@@ -1,11 +1,3 @@
-// dart hits2emi: Convert MMseqs2 hits TSV to columnar EM index (.emi)
-//
-// DuckDB-style streaming architecture:
-// - Hybrid mode: mmap for small files, streaming for large
-// - Spilling dictionary for billion-row support
-// - Row groups for parallel EM processing
-// - Lossless storage including qaln/taln
-
 #include "subcommand.hpp"
 #include "dart/version.h"
 #include "dart/fast_columnar_writer.hpp"

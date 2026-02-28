@@ -1,5 +1,3 @@
-// DamageAnalyzer and CodonDamageAnalyzer implementations
-
 #include "dart/damage_model.hpp"
 #include "dart/codon_tables.hpp"
 #include <cmath>
@@ -8,23 +6,17 @@
 
 namespace dart {
 
-// DamageAnalyzer implementation
 DamageModel DamageAnalyzer::analyze(const std::vector<std::string>& sequences) {
     if (sequences.empty()) {
         return DamageModel::from_parameters(0.1f, 0.1f, 0.4f, 0.01f);
     }
 
-    // Calculate C->T profile from 5' end
     auto ct_profile = calculate_ct_profile(sequences, 25);
-
-    // Calculate G->A profile from 3' end
     auto ga_profile = calculate_ga_profile(sequences, 25);
 
-    // Fit exponential decay model
     auto [lambda_5, delta_max_5, delta_bg_5] = fit_decay_model(ct_profile);
     auto [lambda_3, delta_max_3, delta_bg_3] = fit_decay_model(ga_profile);
 
-    // Average parameters
     float lambda = (lambda_5 + lambda_3) / 2.0f;
     float delta_max = (delta_max_5 + delta_max_3) / 2.0f;
     float delta_bg = (delta_bg_5 + delta_bg_3) / 2.0f;
@@ -158,7 +150,6 @@ DamageModel DamageAnalyzer::infer_from_codon_usage(
     return DamageModel::from_parameters(lambda, lambda, delta_max, delta_bg);
 }
 
-// CodonDamageAnalyzer implementation
 Score CodonDamageAnalyzer::stop_codon_probability(const std::string& codon,
                                                  float ct_rate, float ga_rate) {
     if (codon.length() != 3) return 0.0f;
