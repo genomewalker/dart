@@ -1462,7 +1462,6 @@ inline CodonPosteriors compute_codon_posteriors_joint_fast(
 }
 
 // SPARSE OPTIMIZATION: Only iterate over viable codons (1-8 instead of 64)
-// This exploits the fact that damage emission returns 0 for most base combinations
 inline CodonPosteriors compute_codon_posteriors_sparse(
     const char* oriented,
     int codon_start,
@@ -1582,7 +1581,6 @@ inline CodonPosteriors compute_codon_posteriors_sparse(
     }
 
     // OPTIMIZATION: Fused exp loop - compute exp once, then normalize
-    // This saves n_viable exp calls by computing unnormalized posteriors first
     float unnorm[8];
     float sum = 0.0f;
     for (int i = 0; i < n_viable; ++i) {

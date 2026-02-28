@@ -9,7 +9,6 @@
 
 namespace dart {
 
-// Note: Use encode_hexamer() from hexamer_tables.hpp
 
 constexpr float FUNGI_HEXAMER_FREQ[4096] = {
     2.961452e-04f, 2.774725e-04f, 5.509602e-04f, 2.980395e-04f, 2.556434e-04f, 2.582781e-04f, 1.676208e-04f, 2.110168e-04f, 

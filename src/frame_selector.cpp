@@ -178,10 +178,6 @@ float calculate_damage_strand_preference(
     return fwd_signal - rev_signal;
 }
 
-// ============================================================================
-// ORF ENUMERATION: Damage-aware length-based frame selection
-// ============================================================================
-
 // Damage probability at a nucleotide position using exponential decay model
 static float compute_position_damage_prob(
     size_t nt_pos,
@@ -410,7 +406,7 @@ static std::string generate_search_protein(
         }
     }
 
-    // NOTE: We intentionally do NOT modify non-stop amino acids in search_protein.
+    // We intentionally do NOT modify non-stop amino acids in search_protein.
     //
     // All damage-induced substitutions (W←R, C←R, Y←H, I←T, V←A, K←E, N←D, etc.)
     // are kept as-observed because:
@@ -429,17 +425,6 @@ static std::string generate_search_protein(
 }
 
 
-// ============================================================================
-// compute_per_read_damage_prior: Hierarchical Beta-Binomial MAP estimator
-//
-// Infers per-read damage propensity θ_r using:
-// 1. Opportunity accounting (C_eff) - normalizes by convertible sites
-// 2. MAP estimation with Beta prior from sample d_max
-// 3. 2-step Newton optimization for θ_MAP
-//
-// Calibrated against sample-level damage statistics.
-// Expected improvement: ρ ~0.20-0.25 (vs 0.134 baseline)
-// ============================================================================
 float FrameSelector::compute_per_read_damage_prior(
     const std::string& seq,
     const SampleDamageProfile& sample_profile) {
@@ -455,7 +440,6 @@ float FrameSelector::compute_per_read_damage_prior(
     }
 
     // Use d_max_combined which accounts for Channel A/B arbitration
-    // This respects artifact detection and Channel B fallback when Channel A is unreliable
     const float d_max = sample_profile.d_max_combined > 0.0f
         ? sample_profile.d_max_combined
         : std::max(sample_profile.d_max_5prime, sample_profile.d_max_3prime);
@@ -528,7 +512,6 @@ float FrameSelector::compute_per_read_damage_prior(
         return d_max * 0.2f;  // Uninformative read, return weak prior
     }
 
-    // ---- MAP-Newton for θ (2 iterations) ----
     // Prior: θ ~ Beta(α, β) with mean = d_max
     float alpha = std::max(1e-3f, d_max * KAPPA);
     float beta_prior = std::max(1e-3f, (1.0f - d_max) * KAPPA);
@@ -629,7 +612,6 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
     rev_fragments.reserve(18);
 
     // Compute hexamer/codon scores for all 6 hypotheses
-    // This populates the thread-local buffers
     auto dmg = make_codon_damage_params(&sample_profile);
     auto all_scores = codon::score_all_hypotheses(seq, dmg, codon::ScoringWeights(), true);
     auto& buf = codon::get_thread_buffers();
@@ -1263,10 +1245,6 @@ float FrameSelector::infer_per_read_aa_damage(
     return p_read_damaged;
 }
 
-// ============================================================================
-// FRAMESHIFT DETECTION via HMM/Viterbi
-// ============================================================================
-
 FrameSelector::FrameshiftResult FrameSelector::detect_frameshifts(
     const std::string& seq,
     const SampleDamageProfile& sample_profile,
@@ -1301,9 +1279,6 @@ FrameSelector::FrameshiftResult FrameSelector::detect_frameshifts(
         return result;
     }
 
-    // =========================================================================
-    // Step 1: Find best single-frame score (baseline for comparison)
-    // =========================================================================
     for (int h = 0; h < 6; ++h) {
         if (all_scores[h].log_likelihood > result.best_single_frame_score) {
             result.best_single_frame_score = all_scores[h].log_likelihood;
@@ -1311,15 +1286,7 @@ FrameSelector::FrameshiftResult FrameSelector::detect_frameshifts(
         }
     }
 
-    // =========================================================================
-    // Step 2: Viterbi DP for optimal frame path
-    // States: 6 frame/strand combinations (fwd 0,1,2 and rev 0,1,2)
-    // Emissions: per-codon log marginals from codon_scores
-    // Transitions: 0 for same frame, frameshift_penalty for different frame
-    // =========================================================================
-
     // dp[h][i] = best score ending at codon i in hypothesis h
-    // backtrack[h][i] = previous hypothesis for backtracking
     std::vector<std::array<float, 6>> dp(num_codons);
     std::vector<std::array<int, 6>> backtrack(num_codons);
 
@@ -1361,18 +1328,12 @@ FrameSelector::FrameshiftResult FrameSelector::detect_frameshifts(
     }
     result.viterbi_score = best_final;
 
-    // =========================================================================
-    // Step 3: Backtrack to find the frame path
-    // =========================================================================
     std::vector<int> path(num_codons);
     path[num_codons - 1] = best_final_h;
     for (int i = static_cast<int>(num_codons) - 2; i >= 0; --i) {
         path[i] = backtrack[i + 1][path[i + 1]];
     }
 
-    // =========================================================================
-    // Step 4: Check if frameshift is worthwhile
-    // =========================================================================
     float score_improvement = result.viterbi_score - result.best_single_frame_score;
 
     // Count frame transitions
@@ -1403,9 +1364,6 @@ FrameSelector::FrameshiftResult FrameSelector::detect_frameshifts(
         return result;
     }
 
-    // =========================================================================
-    // Step 5: Extract regions from path, enforcing minimum segment length
-    // =========================================================================
     std::vector<std::pair<size_t, size_t>> raw_regions;  // (start, end) codon indices
     std::vector<int> region_frames;
 
@@ -1451,9 +1409,6 @@ FrameSelector::FrameshiftResult FrameSelector::detect_frameshifts(
         return result;
     }
 
-    // =========================================================================
-    // Step 6: Build output regions with proteins
-    // =========================================================================
     result.has_frameshift = true;
     result.frameshift_position = valid_regions[0].second;  // First transition point
 

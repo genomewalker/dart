@@ -500,7 +500,7 @@ PerReadDamageResult compute_per_read_damage(
         sum_post += p;
         ++n_post;
 
-        // X-mask decision using principled risk minimization
+        // X-mask decision
         if (DamagePosterior::should_xmask(p, s.depth, s.freq, frame_posterior,
                                           params.d_max, params.lambda,
                                           static_cast<float>(i), params.kappa_mis_over_fp)) {

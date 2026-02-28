@@ -59,9 +59,6 @@ alignas(64) constexpr uint8_t RARE_CODON[64] = {
     0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,0   // 48-63
 };
 
-//==============================================================================
-// 1. FORBIDDEN PATTERNS (Stop-containing hexamers)
-//==============================================================================
 
 /**
  * Check if hexamer starts with a stop codon (TAA, TAG, TGA)
@@ -112,9 +109,6 @@ inline float calculate_forbidden_score(const char* seq, size_t len, int frame) {
     return std::exp(-3.0f * forbidden);  // Softer penalty
 }
 
-//==============================================================================
-// 2. NUCLEOTIDE PERIODICITY (Position-specific frequencies)
-//==============================================================================
 
 /**
  * Calculate nucleotide periodicity score based on codon position preferences.
@@ -159,9 +153,6 @@ inline float calculate_periodicity_score(const char* seq, size_t len, int frame)
     return std::max(0.0f, std::min(1.0f, 0.5f + score));
 }
 
-//==============================================================================
-// 3. RARE CODON AVOIDANCE
-//==============================================================================
 
 /**
  * Count rare codons in a frame using numeric lookup.
@@ -197,9 +188,6 @@ inline float calculate_rare_codon_score(const char* seq, size_t len, int frame) 
     return std::exp(-10.0f * rare_frac);
 }
 
-//==============================================================================
-// 4. DINUCLEOTIDE BIAS (CpG depletion, etc.)
-//==============================================================================
 
 /**
  * Calculate dinucleotide bias score.
@@ -243,9 +231,6 @@ inline float calculate_dinucleotide_score(const char* seq, size_t len, int frame
     return std::max(0.0f, std::min(1.0f, score + 0.1f));
 }
 
-//==============================================================================
-// 5. RNY RULE (Purine-aNy-pYrimidine pattern)
-//==============================================================================
 
 /**
  * Calculate RNY rule compliance.
@@ -285,9 +270,6 @@ inline float calculate_rny_score(const char* seq, size_t len, int frame) {
     return 0.5f + (rny_frac - 0.25f) * 1.5f;
 }
 
-//==============================================================================
-// 6. AMINO ACID COMPOSITION PATTERNS
-//==============================================================================
 
 /**
  * Quick codon to amino acid (returns single char, 'X' for unknown, '*' for stop)
@@ -370,9 +352,6 @@ inline float calculate_aa_composition_score(const char* seq, size_t len, int fra
     return std::max(0.0f, std::min(1.0f, score + 0.2f));
 }
 
-//==============================================================================
-// 7. LOW-COMPLEXITY PENALTY
-//==============================================================================
 
 /**
  * Calculate low-complexity penalty.
@@ -406,9 +385,6 @@ inline float calculate_complexity_score(const char* seq, size_t len, int frame) 
     return std::exp(-20.0f * homo_frac);
 }
 
-//==============================================================================
-// 8. HEXAMER RARITY SCORE (use hexamer table to find unusual patterns)
-//==============================================================================
 
 /**
  * Calculate hexamer rarity score using the hexamer frequency table.
@@ -458,9 +434,6 @@ inline float calculate_hexamer_rarity_score(const char* seq, size_t len, int fra
     return std::max(0.0f, std::min(1.0f, 0.3f + normalized * 0.5f));
 }
 
-//==============================================================================
-// COMBINED SCORING
-//==============================================================================
 
 /**
  * Structure to hold all frame discrimination scores

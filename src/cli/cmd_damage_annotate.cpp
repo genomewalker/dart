@@ -362,9 +362,8 @@ static ProteinDamageSummary annotate_alignment(
 
             // Compute q1 = P(damage | ancient) using bounded combine
             // h = d_max * exp(-lambda * dist)
-            // NOTE: AA_SCALE is NOT applied here - it's only for the fixed-average fallback.
-            // The position-weighted formula uses raw d_max because we're computing
-            // P(damage at this position | ancient) directly from the damage model.
+            // AA_SCALE is not applied here: position-weighted formula uses raw d_max
+            // to compute P(damage at this position | ancient) directly.
             const float h = d_max * decay;
             const float q0 = Q_BASELINE;
             // Bounded combine: q1 = 1 - (1-q0)*(1-h) to handle large hazards
@@ -1788,7 +1787,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         std::unordered_map<uint32_t, float> local_em_read_damage;
         if (use_em) {
             local_em_read_damage.reserve(std::max<uint32_t>(1, num_rows / 8));
-        }  // Note: local_em_read_damage always needed for damage-variation detection
+        }
 
         bool local_sorted_hits = true;
         for (uint32_t i = 1; i < num_rows; ++i) {
@@ -2372,9 +2371,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         em_state.log_likelihood = streaming_result.log_likelihood;
         em_state.iterations = streaming_result.iterations;
 
-        // Compute per-read stats via streaming finalize
-        // Process gamma per row group without storing all values
-        // Note: parallel_scan runs in parallel, need mutex for shared updates
+        // Compute per-read stats via streaming finalize (parallel_scan → mutex per shard)
         std::vector<float> read_top1(n_reads, 0.0f);
         std::vector<float> read_top2(n_reads, 0.0f);
         std::vector<double> read_sum_sq(n_reads, 0.0);
@@ -3275,9 +3272,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             s.z_bpa = bpa_stats.z_score(s.qlen, s.bpa);
         }
     }
-
-    // Note: per-site and corrected-protein output are written during the annotation
-    // pass (above), before sites are cleared. Nothing to do here.
 
     // Write per-protein summary
     std::ostream* out = &std::cout;
