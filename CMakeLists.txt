@@ -104,6 +104,57 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(librapidarchive)
 
+# libdart-damage: shared damage type definitions
+# Use headers-only (INTERFACE) — dart/sample_profile.cpp provides the full implementation;
+# libdart-damage/damage_estimation.cpp is partial and would cause duplicate symbols.
+FetchContent_Declare(
+    libdart_damage
+    GIT_REPOSITORY https://github.com/genomewalker/libdart-damage.git
+    GIT_TAG        main
+    GIT_SHALLOW    TRUE
+    UPDATE_DISCONNECTED TRUE
+)
+# Use Populate (not MakeAvailable) to download headers only — we don't want
+# the library's damage_estimation.cpp compiled (it's a partial implementation
+# and would cause duplicate symbols with dart's sample_profile.cpp).
+FetchContent_GetProperties(libdart_damage)
+if(NOT libdart_damage_POPULATED)
+    FetchContent_Populate(libdart_damage)
+endif()
+
+# Patch the fetched headers so they coexist with dart's own headers:
+
+# 1. Remove FrameSelector class — it belongs to dart's frame_selector.hpp.
+set(_sdp "${libdart_damage_SOURCE_DIR}/include/dart/sample_damage_profile.hpp")
+if(EXISTS "${_sdp}")
+    file(READ "${_sdp}" _sdp_content)
+    string(FIND "${_sdp_content}" "\nclass FrameSelector {" _fs_pos)
+    if(_fs_pos GREATER -1)
+        string(SUBSTRING "${_sdp_content}" 0 ${_fs_pos} _sdp_trimmed)
+        file(WRITE "${_sdp}" "${_sdp_trimmed}\n} // namespace dart\n")
+        message(STATUS "libdart-damage: patched sample_damage_profile.hpp (removed FrameSelector)")
+    endif()
+endif()
+
+# 2. Stub out the library's types.hpp.
+# sample_damage_profile.hpp does #include "types.hpp" (relative), which would find
+# the library's own types.hpp, causing redefinitions against dart's types.hpp.
+# dart's include/dart/types.hpp (on -I path) provides all needed types; the stub
+# prevents double-definition when sample_damage_profile.hpp is included by dart TUs.
+set(_types "${libdart_damage_SOURCE_DIR}/include/dart/types.hpp")
+if(EXISTS "${_types}")
+    file(READ "${_types}" _types_content)
+    string(LENGTH "${_types_content}" _types_len)
+    if(_types_len GREATER 40)  # Not yet patched (stub is ~40 bytes)
+        file(WRITE "${_types}" "#pragma once\n// Stub: dart's include/dart/types.hpp provides all types.\n")
+        message(STATUS "libdart-damage: patched types.hpp (stub to avoid redefinitions)")
+    endif()
+endif()
+
+add_library(dart-damage-headers INTERFACE)
+target_include_directories(dart-damage-headers INTERFACE
+    $<BUILD_INTERFACE:${libdart_damage_SOURCE_DIR}/include>)
+
 # Find zlib for compressed file support
 find_package(ZLIB REQUIRED)
 
@@ -172,7 +223,7 @@ set(DART_SUBCOMMAND_SOURCES
 
 # Main executable with subcommands
 add_executable(dart ${DART_CORE_SOURCES} ${DART_SUBCOMMAND_SOURCES})
-target_link_libraries(dart ${ZLIB_LIBRARIES} PkgConfig::ZSTD rapidgzip::rapidgzip)
+target_link_libraries(dart ${ZLIB_LIBRARIES} PkgConfig::ZSTD rapidgzip::rapidgzip dart-damage-headers)
 target_compile_definitions(dart PRIVATE HAVE_RAPIDGZIP)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(dart OpenMP::OpenMP_CXX)
@@ -180,7 +231,7 @@ endif()
 
 # Legacy standalone validation tool (for backwards compatibility)
 add_executable(dart-validate-standalone src/validate.cpp ${DART_CORE_SOURCES})
-target_link_libraries(dart-validate-standalone ${ZLIB_LIBRARIES} PkgConfig::ZSTD)
+target_link_libraries(dart-validate-standalone ${ZLIB_LIBRARIES} PkgConfig::ZSTD dart-damage-headers)
 target_compile_definitions(dart-validate-standalone PRIVATE DART_STANDALONE_VALIDATE)
 
 # Error analysis tool
@@ -193,7 +244,7 @@ target_link_libraries(dart-benchmark-damage ${ZLIB_LIBRARIES})
 
 # Streaming EM comparison test
 add_executable(test-streaming-em tests/test_streaming_em.cpp ${DART_CORE_SOURCES})
-target_link_libraries(test-streaming-em ${ZLIB_LIBRARIES} PkgConfig::ZSTD)
+target_link_libraries(test-streaming-em ${ZLIB_LIBRARIES} PkgConfig::ZSTD dart-damage-headers)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(test-streaming-em OpenMP::OpenMP_CXX)
 endif()
@@ -232,7 +283,7 @@ if(BUILD_TESTING)
         tests/test_formal_model.cpp
         ${DART_CORE_SOURCES}
     )
-    target_link_libraries(dart-formal-model-tests ${ZLIB_LIBRARIES} PkgConfig::ZSTD)
+    target_link_libraries(dart-formal-model-tests ${ZLIB_LIBRARIES} PkgConfig::ZSTD dart-damage-headers)
     if(OpenMP_CXX_FOUND)
         target_link_libraries(dart-formal-model-tests OpenMP::OpenMP_CXX)
     endif()
