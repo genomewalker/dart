@@ -52,9 +52,6 @@ public:
      */
     void finalize();
 
-    /**
-     * @brief Get number of records added.
-     */
     size_t record_count() const { return records_.size(); }
 
 private:
