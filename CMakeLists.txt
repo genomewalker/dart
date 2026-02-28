@@ -1,6 +1,7 @@
 cmake_minimum_required(VERSION 3.18)
 project(AncientGenePredictor VERSION 1.0.0 LANGUAGES CXX)
 include(CTest)
+include(FetchContent)
 
 # Git-based version detection
 find_package(Git QUIET)
@@ -89,6 +90,20 @@ if(USE_OPENMP)
     endif()
 endif()
 
+# rapidgzip (via indexed_bzip2) — in-process parallel gzip decompression.
+# Replaces the pigz subprocess; no PATH dependency, true multi-threaded inflate.
+set(LIBRAPIDARCHIVE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(LIBRAPIDARCHIVE_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(LIBRAPIDARCHIVE_WITH_ISAL   OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    librapidarchive
+    GIT_REPOSITORY https://github.com/mxmlnkn/indexed_bzip2.git
+    GIT_TAG        master
+    GIT_SHALLOW    TRUE
+    UPDATE_DISCONNECTED TRUE
+)
+FetchContent_MakeAvailable(librapidarchive)
+
 # Find zlib for compressed file support
 find_package(ZLIB REQUIRED)
 
@@ -140,6 +155,7 @@ set(DART_CORE_SOURCES
     src/em_index.cpp
     src/columnar_index.cpp
     src/coverage_em.cpp
+    src/sequence_io_backend.cpp
 )
 
 # Subcommand sources
@@ -155,7 +171,8 @@ set(DART_SUBCOMMAND_SOURCES
 
 # Main executable with subcommands
 add_executable(dart ${DART_CORE_SOURCES} ${DART_SUBCOMMAND_SOURCES})
-target_link_libraries(dart ${ZLIB_LIBRARIES} PkgConfig::ZSTD)
+target_link_libraries(dart ${ZLIB_LIBRARIES} PkgConfig::ZSTD rapidgzip::rapidgzip)
+target_compile_definitions(dart PRIVATE HAVE_RAPIDGZIP)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(dart OpenMP::OpenMP_CXX)
 endif()
