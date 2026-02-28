@@ -1,4 +1,5 @@
 #include "dart/sequence_io.hpp"
+#include "dart/gz_reader_base.hpp"
 #include "dart/codon_tables.hpp"
 #include <fstream>
 #include <sstream>
@@ -41,7 +42,8 @@ class SequenceReader::Impl {
 public:
     std::ifstream file_;
     gzFile gz_file_ = nullptr;
-    FILE* pipe_file_ = nullptr;  // For pigz
+    FILE* pipe_file_ = nullptr;  // For pigz (fallback when rapidgzip unavailable)
+    std::unique_ptr<GzLineReader> rg_reader_;  // rapidgzip backend (preferred)
     Format format_ = Format::UNKNOWN;
     bool is_gzipped_ = false;
     bool use_pigz_ = false;
@@ -55,8 +57,19 @@ public:
             filename.substr(filename.size() - 3) == ".gz") {
             is_gzipped_ = true;
 
-            // Try pigz first for parallel decompression (disable with DART_NO_PIGZ=1)
-            // Use DART_PIGZ_THREADS to set threads (default: 4)
+            // Try rapidgzip first: in-process parallel decompression, no PATH dependency.
+            rg_reader_ = make_gz_reader(filename);
+            if (rg_reader_) {
+                // Detect format from first line, then reopen to reset to BOF.
+                std::string first_line;
+                if (rg_reader_->readline(first_line) && !first_line.empty())
+                    format_ = first_line[0] == '>' ? Format::FASTA :
+                              first_line[0] == '@' ? Format::FASTQ : Format::UNKNOWN;
+                rg_reader_ = make_gz_reader(filename);
+                return bool(rg_reader_);
+            }
+
+            // Fallback: pigz subprocess (disable with DART_NO_PIGZ=1)
             const char* no_pigz = std::getenv("DART_NO_PIGZ");
             if (!no_pigz && command_exists("pigz")) {
                 const char* pigz_threads_env = std::getenv("DART_PIGZ_THREADS");
@@ -113,6 +126,7 @@ public:
     // Read line into existing string (avoids allocation if string has capacity)
     bool getline(std::string& line) {
         line.clear();
+        if (is_gzipped_ && rg_reader_) return rg_reader_->readline(line);
         if (is_gzipped_) {
             auto read_chunk = [&](auto getter) -> bool {
                 while (true) {
@@ -139,6 +153,8 @@ public:
 
     // Fast path: read directly into buffer, return pointer and length (no string copy)
     const char* getline_fast(size_t& len) {
+        if (is_gzipped_ && rg_reader_) return rg_reader_->readline_fast(len);
+
         static thread_local std::string dyn_buffer;
 
         if (is_gzipped_) {
@@ -191,12 +207,14 @@ public:
 
     bool is_open() const {
         if (is_gzipped_) {
+            if (rg_reader_) return true;
             return use_pigz_ ? (pipe_file_ != nullptr) : (gz_file_ != nullptr);
         }
         return file_.is_open();
     }
 
     void close() {
+        rg_reader_.reset();
         if (is_gzipped_) {
             if (use_pigz_ && pipe_file_) {
                 pclose(pipe_file_);
