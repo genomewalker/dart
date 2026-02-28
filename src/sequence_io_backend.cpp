@@ -12,6 +12,7 @@
 #include <vector>
 #include <string>
 #include <cstdio>
+#include <cstring>
 
 namespace {
 
@@ -45,6 +46,26 @@ public:
             if (eof_) return !line.empty();
             if (!refill()) return !line.empty();
         }
+    }
+
+    size_t read_raw(char* buf, size_t n) override {
+        size_t written = 0;
+        // Drain internal line-buffer first.
+        if (buf_pos_ < buf_used_) {
+            const size_t avail = buf_used_ - buf_pos_;
+            const size_t take  = std::min(avail, n);
+            std::memcpy(buf, buf_.data() + buf_pos_, take);
+            buf_pos_ += take;
+            written  += take;
+            if (written == n) return written;
+        }
+        // Read directly from the decompressor for the remainder.
+        if (!eof_) {
+            const size_t got = reader_->read(buf + written, n - written);
+            if (got == 0) eof_ = true;
+            written += got;
+        }
+        return written;
     }
 
     const char* readline_fast(size_t& len) override {

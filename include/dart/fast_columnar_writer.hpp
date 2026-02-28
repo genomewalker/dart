@@ -52,6 +52,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <zlib.h>
+#include "dart/gz_reader_base.hpp"
 
 #ifdef HAVE_ZSTD
 #include <zstd.h>
@@ -913,55 +914,56 @@ namespace dart {
 /**
  * @brief Streaming gzip reader using ring buffer
  *
- * Uses zlib for decompression with a chunked ring buffer,
- * allowing overlap between decompression and parsing.
+ * Prefers rapidgzip (parallel, in-process) when available; falls back to zlib.
  */
 class GzipStreamReader {
 public:
     static constexpr size_t CHUNK_SIZE = 16 * 1024 * 1024;  // 16MB chunks
 
     explicit GzipStreamReader(const std::string& path) {
+        buffer_.resize(CHUNK_SIZE);
+        // Try rapidgzip first (faster, parallel, no PATH dependency).
+        rg_reader_ = dart::make_gz_reader(path);
+        if (rg_reader_) return;
+
+        // Fall back to zlib.
         gz_ = gzopen(path.c_str(), "rb");
         if (!gz_) return;
-
-        // Set large buffer for better throughput
         gzbuffer(gz_, 1024 * 1024);  // 1MB internal buffer
-
-        // Pre-allocate ring buffer
-        buffer_.resize(CHUNK_SIZE * 2);
     }
 
     ~GzipStreamReader() {
         if (gz_) gzclose(gz_);
     }
 
-    bool valid() const { return gz_ != nullptr; }
+    bool valid() const { return rg_reader_ != nullptr || gz_ != nullptr; }
 
-    // Read next chunk, returns (data, size) - data valid until next read
+    // Read next chunk, returns (data, size) — data valid until next call.
     std::pair<const char*, size_t> read_chunk() {
+        if (rg_reader_) {
+            const size_t n = rg_reader_->read_raw(buffer_.data(), CHUNK_SIZE);
+            return n > 0 ? std::pair{buffer_.data(), n} : std::pair{nullptr, size_t{0}};
+        }
         if (!gz_ || gzeof(gz_)) return {nullptr, 0};
-
-        int bytes = gzread(gz_, buffer_.data(), static_cast<unsigned>(CHUNK_SIZE));
+        const int bytes = gzread(gz_, buffer_.data(), static_cast<unsigned>(CHUNK_SIZE));
         if (bytes <= 0) return {nullptr, 0};
-
         return {buffer_.data(), static_cast<size_t>(bytes)};
     }
 
-    // Read entire file into memory (for smaller files)
+    // Read entire file into memory.
     std::vector<char> read_all() {
         std::vector<char> result;
-        result.reserve(100 * 1024 * 1024);  // Assume ~100MB uncompressed
-
+        result.reserve(100 * 1024 * 1024);
         while (true) {
             auto [data, size] = read_chunk();
             if (!data || size == 0) break;
             result.insert(result.end(), data, data + size);
         }
-
         return result;
     }
 
 private:
+    std::unique_ptr<dart::GzLineReader> rg_reader_;
     gzFile gz_ = nullptr;
     std::vector<char> buffer_;
 };

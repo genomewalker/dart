@@ -227,6 +227,9 @@ struct ProteinAggInput {
     float info_sum;       // sum(site.p_damage) → ReadDamageObs.info
     uint32_t terminal_5;  // C-terminal 5' site count → pa.terminal_5
     uint32_t terminal_3;  // G-terminal 3' site count → pa.terminal_3
+    float posterior;      // Bayesian posterior (p_read + AA evidence); 0 if unavailable
+    uint32_t gly_to_cys;  // Gly→Cys substitutions (oxidation signal)
+    uint32_t gly_total;   // Total Gly positions in target (denominator)
 };
 
 // Compact per-read assignment data sorted by ref_idx for streaming gene/protein output.
@@ -3284,7 +3287,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             "m_opportunities\tk_hits\tq_eff\ttier\tdamage_class\t"
             "syn_5prime\tsyn_3prime\t"
             "delta_bits\tbpa\tlength_bin\tz_bpa\t"
-            "damage_informative";
+            "damage_informative\t"
+            "ox_hits\tox_total\tox_fraction";
     if (use_em) {
         *out << "\tgamma\tgamma_ancient\tbest_hit\tem_keep\tem_keep_threshold\tem_margin\tem_ref_neff";
     }
@@ -3361,7 +3365,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
              << std::fixed << std::setprecision(3) << s.bpa << "\t"
              << static_cast<int>(s.length_bin) << "\t"
              << std::fixed << std::setprecision(3) << s.z_bpa << "\t"
-             << (bayes_out.informative ? 1 : 0);
+             << (bayes_out.informative ? 1 : 0)
+             << "\t" << s.gly_to_cys
+             << "\t" << s.gly_total
+             << "\t" << std::fixed << std::setprecision(4)
+             << (s.gly_total > 0 ? s.gly_to_cys / static_cast<float>(s.gly_total) : 0.0f);
 
         if (use_em) {
             if (s.read_idx < em_read_results.size()) {
@@ -3398,6 +3406,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             c.info_sum = s.info_sum;
             c.terminal_5 = s.terminal_5;
             c.terminal_3 = s.terminal_3;
+            c.posterior = s.posterior;
+            c.gly_to_cys = s.gly_to_cys;
+            c.gly_total = s.gly_total;
             protein_agg_inputs.push_back(c);
         }
     }
@@ -3624,6 +3635,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         "assign_mean_posterior\tassign_mean_identity\t"
         "assign_breadth\tassign_abundance\tassign_depth_std\tassign_depth_evenness\t"
         "coverage_deviance\tcompleteness_fhat\tcoverage_weight\tabundance_adjusted\t"
+        "ox_hits\tox_total\tp_ox_protein\tp_any_damage\t"
+        "ox_detected\tox_rate_terminal\t"
+        "depurination_detected\tpurine_enrich_5p\tpurine_enrich_3p\t"
         "pass_mapping_filter\tfilter_fail\n";
     if (!protein_summary_file.empty()) {
         pf_os.open(protein_summary_file);
@@ -3655,6 +3669,13 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
     // 8. Functional accumulator (written after streaming pass).
     std::unordered_map<std::string, FunctionalAccumulator> func_acc;
+
+    // Sample-level damage flags from AGD header (v4+), emitted on every protein.tsv row.
+    const bool  sample_ox_detected      = damage_index ? damage_index->ox_damage_detected()      : false;
+    const float sample_ox_rate_terminal = damage_index ? damage_index->ox_rate_terminal()         : 0.0f;
+    const bool  sample_depurination     = damage_index ? damage_index->depurination_detected()    : false;
+    const float sample_purine_enrich_5p = damage_index ? damage_index->purine_enrichment_5prime() : 0.0f;
+    const float sample_purine_enrich_3p = damage_index ? damage_index->purine_enrichment_3prime() : 0.0f;
 
     // 9. Main streaming pass: one ref at a time.
     constexpr size_t TERMINAL_CODONS_S = 3;
@@ -3734,22 +3755,28 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 pa.middle_cov += it->gamma * static_cast<double>(mo);
             }
         }
+        uint32_t total_ox_hits = 0;
+        uint32_t total_ox_total = 0;
         for (auto it = pi_cur; it != pi_end; ++it) {
             if (pa.tlen == 0 && it->tlen > 0) pa.tlen = it->tlen;
             pa.n_damage_reads++;
-            if (it->p_damaged > 0.5f) pa.n_damaged++;
+            // Use posterior (p_read + AA evidence) when available; fall back to AA-only p_damaged
+            const float p_eff = (it->posterior > 0.0f) ? it->posterior : it->p_damaged;
+            if (p_eff > 0.5f) pa.n_damaged++;
             pa.total_damage_sites += it->damage_consistent;
-            if (it->p_damaged > pa.max_p_damaged) pa.max_p_damaged = it->p_damaged;
-            pa.sum_p_damaged += it->p_damaged;
+            if (p_eff > pa.max_p_damaged) pa.max_p_damaged = p_eff;
+            pa.sum_p_damaged += p_eff;
             ReadDamageObs obs;
-            obs.p_damaged = it->p_damaged;
+            obs.p_damaged = p_eff;
             obs.log_lr    = 0.0f;
             obs.info      = it->info_sum;
             obs.n_sites   = static_cast<int>(it->damage_consistent);
-            obs.is_damaged = it->p_damaged > 0.5f;
+            obs.is_damaged = p_eff > 0.5f;
             pa.read_obs.push_back(obs);
             pa.terminal_5 += it->terminal_5;
             pa.terminal_3 += it->terminal_3;
+            total_ox_hits  += it->gly_to_cys;
+            total_ox_total += it->gly_total;
         }
 
         // --- Coverage EM stats for this ref ---
@@ -3867,6 +3894,15 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             const float lrt_p   = static_cast<float>(result.p_value);
             const float log_bf  = static_cast<float>(result.log_bayes_factor);
 
+            // Oxidation posterior: Beta(1+hits, 9+misses) with ~10% prior oxidation rate
+            float p_ox_protein = 0.0f;
+            if (total_ox_total > 0) {
+                const float ox_alpha = 1.0f + static_cast<float>(total_ox_hits);
+                const float ox_beta  = 9.0f + (static_cast<float>(total_ox_total) - static_cast<float>(total_ox_hits));
+                p_ox_protein = ox_alpha / (ox_alpha + ox_beta);
+            }
+            const float p_any_damage = 1.0f - (1.0f - p_prot) * (1.0f - p_ox_protein);
+
             const float observed= use_both_ends
                 ? static_cast<float>(pa.terminal_5 + pa.terminal_3)
                 : static_cast<float>(pa.terminal_5);
@@ -3949,6 +3985,15 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 << '\t' << std::setprecision(4) << cov_fhat
                 << '\t' << std::setprecision(4) << cov_weight
                 << '\t' << std::setprecision(2) << abundance_adj
+                << '\t' << total_ox_hits
+                << '\t' << total_ox_total
+                << '\t' << std::setprecision(4) << p_ox_protein
+                << '\t' << std::setprecision(4) << p_any_damage
+                << '\t' << (sample_ox_detected ? 1 : 0)
+                << '\t' << std::setprecision(4) << sample_ox_rate_terminal
+                << '\t' << (sample_depurination ? 1 : 0)
+                << '\t' << std::setprecision(4) << sample_purine_enrich_5p
+                << '\t' << std::setprecision(4) << sample_purine_enrich_3p
                 << '\t' << (protein_passes ? 1 : 0)
                 << '\t' << filter_fail_p
                 << '\n';
