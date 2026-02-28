@@ -3,7 +3,7 @@
 #include "types.hpp"
 #include "hexamer_tables.hpp"  // For Domain enum
 #include "joint_damage_model.hpp"  // Joint probabilistic damage model
-#include "mixture_damage_model.hpp"  // Durbin-style mixture model
+#include "mixture_damage_model.hpp"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -416,11 +416,6 @@ struct SampleDamageProfile {
     float joint_p_damage = 0.0f;       // P(damage | data)
     bool joint_model_valid = false;    // Sufficient data for joint model
 
-    // =========================================================================
-    // DURBIN-STYLE MIXTURE MODEL RESULTS
-    // K-component mixture over organism classes for principled quantification
-    // d_population = what we observe, d_reference = metaDMG proxy
-    // =========================================================================
     int mixture_K = 0;                 // Number of classes selected by BIC
     float mixture_d_population = 0.0f; // E[δ] over all C-sites
     float mixture_d_ancient = 0.0f;    // E[δ | δ > 5%] (ancient tail)

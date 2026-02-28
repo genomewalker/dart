@@ -8,20 +8,6 @@
 
 namespace dart {
 
-/**
- * Durbin-Style Mixture Model for Metagenome Damage Quantification
- *
- * Generative story:
- * 1. Each C-site comes from latent organism class k ~ Categorical(π)
- * 2. Class k has GC distribution P(gc_bin | k) and damage rate δ_max,k
- * 3. Terminal C→T follows: P(T | C, position p, class k) = δ_max,k · exp(-λp)
- * 4. Shared artifact affects both damage and control channels
- *
- * This elegantly resolves the "reference-free vs metaDMG" gap:
- * - d_population = E[δ] over all C-sites (what we observe)
- * - d_reference = E[δ | GC > 50%] (what metaDMG approximates)
- */
-
 static constexpr int N_GC_BINS = 10;
 static constexpr int MAX_K = 4;
 static constexpr int N_POSITIONS = 15;
