@@ -1,7 +1,3 @@
-/**
- * Frame scoring functions
- */
-
 #include "dart/frame_selector.hpp"
 #include "dart/codon_tables.hpp"
 #include "dart/hexamer_tables.hpp"
@@ -13,7 +9,6 @@
 
 namespace dart {
 
-// Translate sequence to protein (no intermediate string allocations)
 std::string translate_sequence(const std::string& seq, int frame) {
     std::string protein;
     size_t num_codons = (seq.length() - frame) / 3;
@@ -26,7 +21,6 @@ std::string translate_sequence(const std::string& seq, int frame) {
     return protein;
 }
 
-// Calculate codon usage score directly (no vector allocation)
 float calculate_codon_usage_score_direct(const std::string& seq, int frame) {
     float log_prob_sum = 0.0f;
     int valid_codons = 0;
@@ -51,34 +45,24 @@ float calculate_codon_usage_score_direct(const std::string& seq, int frame) {
     return std::max(0.0f, std::min(1.0f, score));
 }
 
-// Dicodon (hexamer) scoring using domain-specific frequencies
-// Uses log-likelihood ratio against uniform background
-// Now uses the active domain set via set_active_domain()
-// In ensemble mode, uses weighted scoring across all domains
 float calculate_dicodon_score(const std::string& seq, int frame) {
     if (seq.length() < static_cast<size_t>(frame + 6)) return 0.0f;
 
-    // Check for ensemble mode (metagenome weighted scoring)
     if (get_ensemble_mode()) {
-        // Use probability-weighted scoring across all domains
         return calculate_dicodon_score_weighted(seq, frame, get_domain_probs());
     }
 
     float log_prob_sum = 0.0f;
     int hexamer_count = 0;
 
-    // Background frequency (uniform = 1/4096)
     static constexpr float BACKGROUND_FREQ = 1.0f / 4096.0f;
 
-    // Get the active domain for scoring
     Domain active_domain = get_active_domain();
 
-    // Buffer for uppercase hexamer
     char hexbuf[7];
     hexbuf[6] = '\0';
 
     for (size_t i = frame; i + 5 < seq.length(); i += 3) {
-        // Uppercase all 6 bases
         hexbuf[0] = fast_upper(seq[i]);
         hexbuf[1] = fast_upper(seq[i + 1]);
         hexbuf[2] = fast_upper(seq[i + 2]);
@@ -86,35 +70,22 @@ float calculate_dicodon_score(const std::string& seq, int frame) {
         hexbuf[4] = fast_upper(seq[i + 4]);
         hexbuf[5] = fast_upper(seq[i + 5]);
 
-        // Skip if any N
         if (hexbuf[0] == 'N' || hexbuf[1] == 'N' || hexbuf[2] == 'N' ||
             hexbuf[3] == 'N' || hexbuf[4] == 'N' || hexbuf[5] == 'N') continue;
 
-        // Get domain-specific frequency (uses active domain)
         float freq = get_domain_hexamer_freq(active_domain, hexbuf);
 
-        // If hexamer has 0 frequency (rare with N's filtered),
-        // use a small pseudocount
         if (freq < 1e-9f) {
-            freq = BACKGROUND_FREQ * 0.01f;  // Very rare
+            freq = BACKGROUND_FREQ * 0.01f;
         }
 
-        // Log-likelihood ratio: log(P_coding / P_background)
         log_prob_sum += std::log(freq / BACKGROUND_FREQ);
         hexamer_count++;
     }
 
     if (hexamer_count == 0) return 0.5f;
 
-    // Normalize: average log-likelihood ratio
-    // Transform to 0-1 range using sigmoid-like scaling
-    // Typical range for real coding: 1-3 bits per hexamer
     float avg_llr = log_prob_sum / hexamer_count;
-
-    // Map typical range [-2, 4] to [0.1, 0.9]
-    // avg_llr of 0 = neutral (0.5 score)
-    // avg_llr of +2 = strong coding signal (0.7-0.8)
-    // avg_llr of -2 = strong non-coding signal (0.2-0.3)
     float score = 0.5f + 0.15f * avg_llr;
 
     return std::max(0.0f, std::min(1.0f, score));
@@ -234,7 +205,6 @@ float FrameSelector::calculate_stop_penalty(const std::string& protein) {
 float FrameSelector::calculate_aa_composition_score(const std::string& protein) {
     if (protein.empty()) return 0.0f;
 
-    // Use array instead of map for AA counts
     std::array<int, 26> aa_counts{};
     int total = 0;
 
@@ -317,18 +287,14 @@ float FrameSelector::calculate_damage_consistency(
     return std::max(0.0f, std::min(1.0f, score));
 }
 
-// Calculate hexamer log-likelihood score for frame selection
-// Higher score = more likely to be real coding sequence
-// Uses GTDB hexamer frequencies vs uniform background
 float calculate_hexamer_llr_score(const std::string& seq, int frame) {
     if (seq.length() < static_cast<size_t>(frame + 6)) return 0.0f;
 
     float log_prob_sum = 0.0f;
     int hexamer_count = 0;
 
-    // Background frequency (uniform = 1/4096)
     static constexpr float BACKGROUND_FREQ = 1.0f / 4096.0f;
-    static constexpr float LOG_BACKGROUND = -8.317766f;  // log(1/4096)
+    static constexpr float LOG_BACKGROUND = -8.317766f;
 
     char hexbuf[7];
     hexbuf[6] = '\0';
@@ -351,18 +317,15 @@ float calculate_hexamer_llr_score(const std::string& seq, int frame) {
         // use the frequency of the corrected (C instead of T) version
         float damage_prob = get_hexamer_damage_prob(hexbuf);
         if (damage_prob > 0.5f && hexbuf[0] == 'T') {
-            // Try corrected version (T->C at position 0)
             char corrected_hex[7];
             corrected_hex[0] = 'C';
             for (int j = 1; j < 6; j++) corrected_hex[j] = hexbuf[j];
             corrected_hex[6] = '\0';
 
             float corrected_freq = get_hexamer_freq(corrected_hex);
-            // Use weighted average based on damage probability
             freq = (1.0f - damage_prob) * freq + damage_prob * corrected_freq;
         }
 
-        // Pseudocount for zero frequencies
         if (freq < 1e-9f) {
             freq = BACKGROUND_FREQ * 0.01f;
         }

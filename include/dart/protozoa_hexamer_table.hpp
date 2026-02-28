@@ -9,7 +9,6 @@
 
 namespace dart {
 
-// Note: Use encode_hexamer() from hexamer_tables.hpp
 
 constexpr float PROTOZOA_HEXAMER_FREQ[4096] = {
     2.164156e-03f, 6.232795e-04f, 1.067347e-03f, 2.030280e-03f, 7.044806e-04f, 2.385242e-04f, 2.639432e-04f, 4.687453e-04f, 

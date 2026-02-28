@@ -1,8 +1,3 @@
-/**
- * @file adaptive_damage.cpp
- * @brief Implementation of adaptive damage calibration
- */
-
 #include "dart/adaptive_damage.hpp"
 #include "dart/hexamer_tables.hpp"
 #include <cmath>
@@ -10,7 +5,6 @@
 
 namespace dart {
 
-// Check if a codon is a stop codon
 static inline bool is_stop_codon(const char* codon) {
     char c1 = std::toupper(static_cast<unsigned char>(codon[0]));
     char c2 = std::toupper(static_cast<unsigned char>(codon[1]));
@@ -21,15 +15,11 @@ static inline bool is_stop_codon(const char* codon) {
            (c1 == 'T' && c2 == 'G' && c3 == 'A');    // TGA
 }
 
-// Core implementation for ensemble hexamer LLR calculation (const char* version)
 float AdaptiveDamageCalibrator::get_ensemble_hexamer_llr(
     const char* seq, size_t len, int frame) const {
 
     if (len < 6) return 0.0f;
 
-    // Compute hexamer LLRs for each domain
-    // Uses same formula as score_all_domains(): log2(freq * 4096 + 1e-10)
-    // This ensures consistent scaling for ensemble weight learning
     std::array<float, 8> domain_llrs = {};
     static const std::array<Domain, 8> domains = {
         Domain::GTDB, Domain::FUNGI, Domain::PROTOZOA, Domain::INVERTEBRATE,
@@ -45,7 +35,6 @@ float AdaptiveDamageCalibrator::get_ensemble_hexamer_llr(
 
         for (size_t d = 0; d < 8; ++d) {
             float freq = get_hexamer_freq(code, domains[d]);
-            // Same formula as score_all_domains: log2(freq * 4096 + 1e-10)
             domain_llrs[d] += std::log2(freq * 4096.0f + 1e-10f);
         }
         n_hexamers++;
@@ -53,16 +42,13 @@ float AdaptiveDamageCalibrator::get_ensemble_hexamer_llr(
 
     if (n_hexamers == 0) return 0.0f;
 
-    // Normalize by hexamer count
     for (auto& llr : domain_llrs) {
         llr /= static_cast<float>(n_hexamers);
     }
 
-    // Return ensemble-weighted LLR
     return ensemble_weights_.get_weighted_llr(domain_llrs);
 }
 
-// std::string wrapper - delegates to const char* version
 float AdaptiveDamageCalibrator::get_ensemble_hexamer_llr(
     const std::string& seq, int frame) const {
     return get_ensemble_hexamer_llr(seq.data(), seq.length(), frame);
