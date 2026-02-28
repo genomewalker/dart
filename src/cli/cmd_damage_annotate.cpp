@@ -3167,6 +3167,13 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     score_params.identity_baseline = 0.90f;
     score_params.d_max = d_max;  // For fixed-average site evidence formula
 
+    // Sample-level env-damage flags (v4+) — captured before damage_index is released.
+    bool  sample_ox_detected      = false;
+    float sample_ox_rate_terminal = 0.0f;
+    bool  sample_depurination     = false;
+    float sample_purine_enrich_5p = 0.0f;
+    float sample_purine_enrich_3p = 0.0f;
+
     // Damage informativeness gating from AGD v3 header
     // When uninformative: terminal evidence is zeroed (posterior still computed from sites+identity)
     float damage_detectability = 1.0f;
@@ -3178,6 +3185,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             damage_index->damage_artifact(), damage_index->channel_b_valid(),
             damage_index->stop_decay_llr(), damage_index->terminal_shift());
         score_params.damage_detectability = damage_detectability;
+        // Capture v4 env-damage header fields before releasing the index.
+        sample_ox_detected      = damage_index->ox_damage_detected();
+        sample_ox_rate_terminal = damage_index->ox_rate_terminal();
+        sample_depurination     = damage_index->depurination_detected();
+        sample_purine_enrich_5p = damage_index->purine_enrichment_5prime();
+        sample_purine_enrich_3p = damage_index->purine_enrichment_3prime();
         // All per-read lookups are done; release the 31 GB index before Bayesian scoring.
         damage_index.reset();
 #ifdef __linux__
@@ -3669,13 +3682,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
     // 8. Functional accumulator (written after streaming pass).
     std::unordered_map<std::string, FunctionalAccumulator> func_acc;
-
-    // Sample-level damage flags from AGD header (v4+), emitted on every protein.tsv row.
-    const bool  sample_ox_detected      = damage_index ? damage_index->ox_damage_detected()      : false;
-    const float sample_ox_rate_terminal = damage_index ? damage_index->ox_rate_terminal()         : 0.0f;
-    const bool  sample_depurination     = damage_index ? damage_index->depurination_detected()    : false;
-    const float sample_purine_enrich_5p = damage_index ? damage_index->purine_enrichment_5prime() : 0.0f;
-    const float sample_purine_enrich_3p = damage_index ? damage_index->purine_enrichment_3prime() : 0.0f;
 
     // 9. Main streaming pass: one ref at a time.
     constexpr size_t TERMINAL_CODONS_S = 3;
