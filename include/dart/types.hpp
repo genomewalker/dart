@@ -1,4 +1,6 @@
 #pragma once
+// Tell libdart-damage's types.hpp to skip its definitions (dart provides them).
+#define DART_TYPES_HPP_DEFINED
 
 #include <cstdint>
 #include <string>
