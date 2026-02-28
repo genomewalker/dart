@@ -11,13 +11,11 @@
 namespace dart {
 
 DamageIndexReader::DamageIndexReader(const std::string& path, bool prefetch) {
-    // Open file
     fd_ = open(path.c_str(), O_RDONLY);
     if (fd_ < 0) {
         throw std::runtime_error("Failed to open damage index: " + path);
     }
 
-    // Get file size
     struct stat st;
     if (fstat(fd_, &st) < 0) {
         ::close(fd_);
@@ -26,14 +24,12 @@ DamageIndexReader::DamageIndexReader(const std::string& path, bool prefetch) {
     }
     file_size_ = st.st_size;
 
-    // Validate minimum size
     if (file_size_ < sizeof(AgdHeader)) {
         ::close(fd_);
         fd_ = -1;
         throw std::runtime_error("Damage index too small: " + path);
     }
 
-    // Memory-map the file
     data_ = mmap(nullptr, file_size_, PROT_READ, MAP_PRIVATE, fd_, 0);
     if (data_ == MAP_FAILED) {
         data_ = nullptr;
@@ -43,17 +39,13 @@ DamageIndexReader::DamageIndexReader(const std::string& path, bool prefetch) {
     }
 
     if (prefetch) {
-        // Optional: pull file into page cache before random access (useful on some NFS setups).
+        // Pull into page cache before random access (useful on NFS).
         madvise(data_, file_size_, MADV_WILLNEED);
     }
-
-    // Then tell kernel we'll do random access (no sequential readahead needed)
     madvise(data_, file_size_, MADV_RANDOM);
 
-    // Parse header
     header_ = reinterpret_cast<const AgdHeader*>(data_);
 
-    // Validate magic and version
     if (header_->magic != AGD_MAGIC) {
         close();
         throw std::runtime_error("Invalid damage index magic: " + path);
@@ -65,22 +57,17 @@ DamageIndexReader::DamageIndexReader(const std::string& path, bool prefetch) {
                                  std::to_string(AGD_VERSION) + "): " + path);
     }
 
-    // Calculate section offsets
     const char* base = reinterpret_cast<const char*>(data_);
     size_t offset = sizeof(AgdHeader);
 
-    // Hash table buckets
     buckets_ = reinterpret_cast<const AgdBucket*>(base + offset);
     offset += header_->num_buckets * sizeof(AgdBucket);
 
-    // Records
     records_ = reinterpret_cast<const AgdRecord*>(base + offset);
     offset += header_->num_records * sizeof(AgdRecord);
 
-    // Chain pointers (for hash collision resolution)
-    chain_ = reinterpret_cast<const uint32_t*>(base + offset);
+    chain_ = reinterpret_cast<const uint32_t*>(base + offset);  // collision chain
 
-    // Validate file size
     size_t expected_size = sizeof(AgdHeader) +
                            header_->num_buckets * sizeof(AgdBucket) +
                            header_->num_records * sizeof(AgdRecord) +
@@ -237,17 +224,12 @@ constexpr char CODON_TO_AA[64] = {
 bool is_ct_synonymous(uint8_t codon_idx, int nt_pos) {
     if (codon_idx > 63) return false;
 
-    // Get observed nucleotide at position
-    int shift = 4 - 2 * nt_pos;  // Position 0 is bits 4-5, pos 1 is bits 2-3, pos 2 is bits 0-1
+    int shift = 4 - 2 * nt_pos;  // pos 0 = bits 4-5, pos 1 = bits 2-3, pos 2 = bits 0-1
     int observed_nt = (codon_idx >> shift) & 3;  // 0=T, 1=C, 2=A, 3=G
 
-    // If not T, no C→T damage possible
-    if (observed_nt != 0) return false;
+    if (observed_nt != 0) return false;  // not T → no C→T damage possible
 
-    // Compute the alternative codon with C instead of T
     int alt_codon_idx = codon_idx ^ (1 << shift);  // T(0) XOR 1 = C(1)
-
-    // Compare amino acids
     return CODON_TO_AA[codon_idx] == CODON_TO_AA[alt_codon_idx];
 }
 
@@ -258,10 +240,8 @@ bool is_ga_synonymous(uint8_t codon_idx, int nt_pos) {
     int shift = 4 - 2 * nt_pos;
     int observed_nt = (codon_idx >> shift) & 3;
 
-    // If not A, no G→A damage possible
-    if (observed_nt != 2) return false;
+    if (observed_nt != 2) return false;  // not A → no G→A damage possible
 
-    // Compute alternative with G instead of A
     int alt_codon_idx = codon_idx ^ (1 << shift);  // A(2) XOR 1 = G(3)
 
     return CODON_TO_AA[codon_idx] == CODON_TO_AA[alt_codon_idx];

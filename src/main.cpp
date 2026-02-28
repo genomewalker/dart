@@ -46,7 +46,6 @@ int cmd_predict(int argc, char* argv[]) {
         auto run_start = std::chrono::steady_clock::now();
         Options opts = dart::cli::parse_args(argc, argv);
 
-        // Set up threading
         int num_threads = opts.num_threads;
 #ifdef _OPENMP
         if (num_threads == 0) {
@@ -59,7 +58,6 @@ int cmd_predict(int argc, char* argv[]) {
 
         bool is_tty = isatty(fileno(stderr));
 
-        // Set active domain for hexamer scoring
         dart::Domain active_domain = dart::parse_domain(opts.domain_name);
         dart::set_active_domain(active_domain);
 
@@ -78,10 +76,8 @@ int cmd_predict(int argc, char* argv[]) {
         }
         std::cerr << "\n";
 
-        // Initialize damage model
         dart::DamageModel damage_model;
 
-        // Open output files
         dart::GeneWriter writer(opts.output_file);
         std::unique_ptr<dart::FastaWriter> fasta_nt_writer;
         std::unique_ptr<dart::FastaWriter> fasta_nt_corr_writer;
@@ -101,11 +97,9 @@ int cmd_predict(int argc, char* argv[]) {
             fasta_aa_masked_writer = std::make_unique<dart::FastaWriter>(opts.fasta_aa_masked);
         }
 
-        // Sample-level damage profile
         dart::SampleDamageProfile sample_profile;
         sample_profile.forced_library_type = to_sample_library_type(opts.forced_library_type);
 
-        // Adaptive damage calibrator
         dart::AdaptiveDamageCalibrator calibrator;
 
         // Pass 1: Damage detection
@@ -119,7 +113,6 @@ int cmd_predict(int argc, char* argv[]) {
             batch.reserve(BATCH_SIZE);
             size_t count = 0;
 
-            // Thread-local profiles
             std::vector<dart::SampleDamageProfile> thread_profiles(num_threads);
             for (auto& tp : thread_profiles) {
                 tp.forced_library_type = to_sample_library_type(opts.forced_library_type);
@@ -163,7 +156,6 @@ int cmd_predict(int argc, char* argv[]) {
                 }
             }
 
-            // Merge thread profiles
             for (int t = 0; t < num_threads; ++t) {
                 dart::FrameSelector::merge_sample_profiles(sample_profile, thread_profiles[t]);
             }
@@ -173,11 +165,6 @@ int cmd_predict(int argc, char* argv[]) {
 
             dart::FrameSelector::finalize_sample_profile(sample_profile);
 
-            // =========================================================================
-            // Pass 1.5: Compute d_metamatch for high-damage samples
-            // This re-weights reads by P(damaged) to better estimate the damage rate
-            // in the ancient DNA fraction, matching metaDMG's selection bias.
-            // =========================================================================
             if (sample_profile.damage_validated && sample_profile.d_max_combined > 0.15f) {
                 bool needs_metamatch = false;
                 if (sample_profile.inverted_pattern_5prime || sample_profile.inverted_pattern_3prime) {
@@ -267,7 +254,6 @@ int cmd_predict(int argc, char* argv[]) {
         if (opts.damage_only) {
             std::cerr << "Done (damage-only mode).\n";
 
-            // Write summary if requested
             if (!opts.summary_file.empty()) {
                 std::ofstream summary(opts.summary_file);
                 summary << "{\n";
@@ -406,7 +392,6 @@ int cmd_predict(int argc, char* argv[]) {
                 results[i] = {std::move(id), std::move(genes)};
             }
 
-            // Write results
             {
                 std::lock_guard<std::mutex> lock(write_mutex);
                 for (const auto& [id, genes] : results) {
@@ -430,7 +415,6 @@ int cmd_predict(int argc, char* argv[]) {
             }
         }
 
-        // Finalize damage index if enabled
         if (damage_index_writer) {
             damage_index_writer->finalize();
             std::cerr << "  Damage index: " << damage_index_writer->record_count() << " records\n";
@@ -444,7 +428,6 @@ int cmd_predict(int argc, char* argv[]) {
                   << " | " << dart::log_utils::format_duration_ms(pass2_duration.count())
                   << " (" << (total_seqs.load() * 1000 / std::max(1LL, (long long)pass2_duration.count())) << " seq/s)\n";
 
-        // Write summary if requested
         if (!opts.summary_file.empty()) {
             std::ofstream summary(opts.summary_file);
             summary << "{\n";

@@ -513,7 +513,6 @@ float FrameSelector::compute_per_read_damage_prior(
         return d_max * 0.2f;  // Uninformative read, return weak prior
     }
 
-    // ---- MAP-Newton for θ (2 iterations) ----
     // Prior: θ ~ Beta(α, β) with mean = d_max
     float alpha = std::max(1e-3f, d_max * KAPPA);
     float beta_prior = std::max(1e-3f, (1.0f - d_max) * KAPPA);
@@ -1282,9 +1281,6 @@ FrameSelector::FrameshiftResult FrameSelector::detect_frameshifts(
         return result;
     }
 
-    // =========================================================================
-    // Step 1: Find best single-frame score (baseline for comparison)
-    // =========================================================================
     for (int h = 0; h < 6; ++h) {
         if (all_scores[h].log_likelihood > result.best_single_frame_score) {
             result.best_single_frame_score = all_scores[h].log_likelihood;
@@ -1292,15 +1288,7 @@ FrameSelector::FrameshiftResult FrameSelector::detect_frameshifts(
         }
     }
 
-    // =========================================================================
-    // Step 2: Viterbi DP for optimal frame path
-    // States: 6 frame/strand combinations (fwd 0,1,2 and rev 0,1,2)
-    // Emissions: per-codon log marginals from codon_scores
-    // Transitions: 0 for same frame, frameshift_penalty for different frame
-    // =========================================================================
-
     // dp[h][i] = best score ending at codon i in hypothesis h
-    // backtrack[h][i] = previous hypothesis for backtracking
     std::vector<std::array<float, 6>> dp(num_codons);
     std::vector<std::array<int, 6>> backtrack(num_codons);
 
@@ -1342,18 +1330,12 @@ FrameSelector::FrameshiftResult FrameSelector::detect_frameshifts(
     }
     result.viterbi_score = best_final;
 
-    // =========================================================================
-    // Step 3: Backtrack to find the frame path
-    // =========================================================================
     std::vector<int> path(num_codons);
     path[num_codons - 1] = best_final_h;
     for (int i = static_cast<int>(num_codons) - 2; i >= 0; --i) {
         path[i] = backtrack[i + 1][path[i + 1]];
     }
 
-    // =========================================================================
-    // Step 4: Check if frameshift is worthwhile
-    // =========================================================================
     float score_improvement = result.viterbi_score - result.best_single_frame_score;
 
     // Count frame transitions
@@ -1384,9 +1366,6 @@ FrameSelector::FrameshiftResult FrameSelector::detect_frameshifts(
         return result;
     }
 
-    // =========================================================================
-    // Step 5: Extract regions from path, enforcing minimum segment length
-    // =========================================================================
     std::vector<std::pair<size_t, size_t>> raw_regions;  // (start, end) codon indices
     std::vector<int> region_frames;
 
@@ -1432,9 +1411,6 @@ FrameSelector::FrameshiftResult FrameSelector::detect_frameshifts(
         return result;
     }
 
-    // =========================================================================
-    // Step 6: Build output regions with proteins
-    // =========================================================================
     result.has_frameshift = true;
     result.frameshift_position = valid_regions[0].second;  // First transition point
 
