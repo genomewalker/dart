@@ -440,7 +440,6 @@ float FrameSelector::compute_per_read_damage_prior(
     }
 
     // Use d_max_combined which accounts for Channel A/B arbitration
-    // This respects artifact detection and Channel B fallback when Channel A is unreliable
     const float d_max = sample_profile.d_max_combined > 0.0f
         ? sample_profile.d_max_combined
         : std::max(sample_profile.d_max_5prime, sample_profile.d_max_3prime);
@@ -613,7 +612,6 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
     rev_fragments.reserve(18);
 
     // Compute hexamer/codon scores for all 6 hypotheses
-    // This populates the thread-local buffers
     auto dmg = make_codon_damage_params(&sample_profile);
     auto all_scores = codon::score_all_hypotheses(seq, dmg, codon::ScoringWeights(), true);
     auto& buf = codon::get_thread_buffers();

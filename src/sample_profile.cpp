@@ -33,7 +33,6 @@ static float compute_decay_llr(
     const double MIN_COVERAGE = 100.0;
 
     // First, compute best-fit amplitude from data (without clamping to positive)
-    // This lets us detect both positive decay (damage) and negative decay (inverted)
     double sum_signal = 0.0, sum_weight = 0.0;
     for (int i = 1; i < 10; ++i) {
         if (total[i] < MIN_COVERAGE) continue;
@@ -71,7 +70,6 @@ static float compute_decay_llr(
     float llr = static_cast<float>(ll_exp - ll_const);
 
     // If amplitude is negative (inverted pattern), negate the LLR
-    // This makes decay_llr negative for inverted patterns, positive for true damage
     if (raw_amplitude < 0) {
         return -std::abs(llr);  // Negative LLR for inverted patterns
     }
@@ -82,7 +80,6 @@ static float compute_decay_llr(
 // Uses weighted least squares with coverage-based weights
 // Returns: {baseline (b), amplitude (A), lambda, rmse}
 // If external_baseline >= 0, use it instead of estimating from positions 10-14
-// This allows using middle-of-read baseline which is more reliable
 static std::array<float, 4> fit_exponential_decay(
     const std::array<double, 15>& freq,      // T/(T+C) or A/(A+G) at each position
     const std::array<double, 15>& coverage,  // T+C or A+G counts at each position
@@ -336,7 +333,6 @@ void FrameSelector::update_sample_profile(
         }
 
         // Track interior convertible codons (positions 30+ from start)
-        // This gives us the baseline stop conversion rate
         // Guard: len >= 63 required to have valid interior region [30, len-30)
         // Without this, len - 30 underflows for short reads causing OOB access
         constexpr size_t INTERIOR_MIN_LEN = 63;  // 30 + 3 + 30
@@ -663,7 +659,6 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         pos0_artifact_5 = true;
     } else if (stats_5_pos1.first > 0.02f && (stats_5_pos1.first - stats_5_pos0.first) > 0.03f) {
         // Large pos0-to-pos1 jump pattern: pos1 clearly elevated but pos0 isn't
-        // This indicates adapter artifact masking damage at pos0
         pos0_artifact_5 = true;
     }
 
@@ -857,7 +852,6 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
 
     // Compute decay log-likelihood ratio (exponential vs constant model)
     // Positive LLR = exponential fits better (real decay pattern)
-    // This helps distinguish real damage (exponential decay) from composition bias (uniform)
     profile.decay_llr_5prime = compute_decay_llr(
         profile.t_freq_5prime, profile.tc_total_5prime,
         profile.fit_baseline_5prime, profile.fit_amplitude_5prime, fit_lambda_5p);
@@ -946,7 +940,6 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         }
 
         // Compute LOCAL baseline from positions 5-14 (same reads, past damage zone)
-        // This avoids bias from interior baseline which comes from longer reads only
         double local_pre = 0.0, local_stop = 0.0;
         for (int p = 5; p < 15; ++p) {
             local_pre += profile.convertible_caa_5prime[p] +
@@ -1020,7 +1013,6 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
             // Compute d_max directly from stop codon conversion rate at position 0.
             // Formula: d_max_B = stops_excess / convertible_original
             //
-            // This directly measures the C→T damage rate at terminal positions.
             // Convertible codons (CAA, CAG, CGA) only become stops when their
             // first-position C is damaged, giving us a direct damage measurement.
             // Since d_max is a RATE (not a count), no multiplication factor needed.
@@ -1238,7 +1230,6 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
     }
 
     // Step 3: Compute per-position damage rates using FIT baseline (not middle-of-read)
-    // This produces rates that are comparable to metaDMG and consistent with d_max
     float fit_baseline_c_frac_5p = 1.0f - profile.fit_baseline_5prime;
     float fit_baseline_g_frac_3p = 1.0f - profile.fit_baseline_3prime;
 
@@ -1610,10 +1601,6 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
     // - If Channel A fires AND Channel B fires: real damage → report d_max
     // - If Channel A fires BUT Channel B is flat: compositional artifact → d_max = 0
     // - If neither fires: no damage → d_max = 0
-    //
-    // This solves the fundamental limitation of reference-free detection:
-    // T/(T+C) elevation can be from composition OR damage, but stop codons
-    // appearing in damage-susceptible contexts can ONLY be from real C→T damage.
     // =========================================================================
     {
         // First compute raw d_max values from Channel A (nucleotide frequencies)

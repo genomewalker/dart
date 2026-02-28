@@ -104,7 +104,6 @@ public:
 
     /**
      * Update damage model from sample-wide damage profile (Pass 1 results)
-     * This ensures Pass 2 predictions use the actual observed damage patterns
      */
     void update_from_sample_profile(const struct SampleDamageProfile& profile);
 
