@@ -19,6 +19,7 @@
 #include <vector>
 #include <cstring>
 #include <unistd.h>
+#include <sstream>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -40,6 +41,81 @@ inline dart::SampleDamageProfile::LibraryType to_sample_library_type(dart::cli::
 
 namespace dart {
 namespace cli {
+
+// Thread-local output buffer for parallel gene prediction
+struct ThreadOutputBuffer {
+    std::ostringstream gff;
+    std::ostringstream fasta_nt;
+    std::ostringstream fasta_aa;
+    std::ostringstream fasta_aa_masked;
+    std::vector<std::tuple<std::string, Gene, std::string>> damage_records;
+    size_t gene_count = 0;
+
+    void clear() {
+        gff.str("");
+        gff.clear();
+        fasta_nt.str("");
+        fasta_nt.clear();
+        fasta_aa.str("");
+        fasta_aa.clear();
+        fasta_aa_masked.str("");
+        fasta_aa_masked.clear();
+        damage_records.clear();
+        gene_count = 0;
+    }
+
+    // Format GFF line for a gene
+    void write_gff(const std::string& seq_id, const Gene& gene, int gene_num,
+                   const std::string& source = "AncientGenePredictor") {
+        gff << seq_id << "\t"
+            << source << "\t"
+            << "CDS\t"
+            << (gene.start + 1) << "\t"
+            << gene.end << "\t"
+            << std::fixed << std::setprecision(3) << gene.score << "\t"
+            << (gene.is_forward ? "+" : "-") << "\t"
+            << gene.frame << "\t"
+            << "ID=" << seq_id << "_gene" << gene_num
+            << ";damage_pct=" << std::fixed << std::setprecision(1) << gene.damage_score
+            << ";p_damaged=" << std::fixed << std::setprecision(3) << gene.p_read_damaged
+            << ";aa_corr=" << gene.aa_corrections
+            << ";stop_fix=" << gene.stop_restorations
+            << "\n";
+    }
+
+    // Format FASTA entry for nucleotide
+    void write_fasta_nt(const std::string& seq_id, const Gene& gene, int gene_num) {
+        fasta_nt << ">" << seq_id << "_" << (gene.is_forward ? "+" : "-") << "_" << gene.frame
+                 << " " << (gene.start + 1) << ".." << gene.end
+                 << " length=" << gene.sequence.length() << "nt"
+                 << "\n" << gene.sequence << "\n";
+    }
+
+    // Format FASTA entry for protein
+    void write_fasta_aa(const std::string& seq_id, const Gene& gene, int gene_num) {
+        fasta_aa << ">" << seq_id << "_" << (gene.is_forward ? "+" : "-") << "_" << gene.frame
+                 << " " << (gene.start + 1) << ".." << gene.end
+                 << " length=" << gene.protein.length() << "aa"
+                 << " damage_pct=" << static_cast<int>(gene.damage_score)
+                 << " p_damaged=" << static_cast<int>(gene.p_read_damaged * 100) / 100.0
+                 << " log_lr=" << static_cast<int>(gene.damage_signal * 100) / 100.0
+                 << " dmg_info=" << gene.dna_corrections
+                 << " aa_corr=" << gene.aa_corrections
+                 << " stop_fix=" << gene.stop_restorations
+                 << " corr_score=" << gene.orf_rank
+                 << "\n" << gene.protein << "\n";
+    }
+
+    // Format FASTA entry for search protein (X-masked)
+    void write_fasta_aa_masked(const std::string& seq_id, const Gene& gene, int gene_num) {
+        const std::string& prot = gene.search_protein.empty() ? gene.protein : gene.search_protein;
+        fasta_aa_masked << ">" << seq_id << "_" << (gene.is_forward ? "+" : "-") << "_" << gene.frame
+                        << " " << (gene.start + 1) << ".." << gene.end
+                        << " length=" << prot.length() << "aa"
+                        << " x_count=" << gene.x_count
+                        << "\n" << prot << "\n";
+    }
+};
 
 int cmd_predict(int argc, char* argv[]) {
     try {
@@ -81,24 +157,47 @@ int cmd_predict(int argc, char* argv[]) {
         // Initialize damage model
         dart::DamageModel damage_model;
 
-        // Open output files
-        dart::GeneWriter writer(opts.output_file);
-        std::unique_ptr<dart::FastaWriter> fasta_nt_writer;
-        std::unique_ptr<dart::FastaWriter> fasta_nt_corr_writer;
-        std::unique_ptr<dart::FastaWriter> fasta_aa_writer;
-        std::unique_ptr<dart::FastaWriter> fasta_aa_masked_writer;
+        // Open output files - using direct streams for parallel-friendly writes
+        std::ofstream gff_file(opts.output_file);
+        if (!gff_file) {
+            throw std::runtime_error("Cannot open output file: " + opts.output_file);
+        }
+        // Write GFF3 header
+        gff_file << "##gff-version 3\n";
 
-        if (!opts.fasta_nt.empty()) {
-            fasta_nt_writer = std::make_unique<dart::FastaWriter>(opts.fasta_nt);
+        // Direct file streams for parallel output buffering
+        std::ofstream fasta_nt_file;
+        std::ofstream fasta_aa_file;
+        std::ofstream fasta_aa_masked_file;
+
+        // Flags to check if outputs are enabled
+        bool write_fasta_nt = !opts.fasta_nt.empty();
+        bool write_fasta_aa = !opts.fasta_aa.empty();
+        bool write_fasta_aa_masked = !opts.fasta_aa_masked.empty();
+
+        // Keep corrected writer for backward compatibility (not optimized)
+        std::unique_ptr<dart::FastaWriter> fasta_nt_corr_writer;
+
+        if (write_fasta_nt) {
+            fasta_nt_file.open(opts.fasta_nt);
+            if (!fasta_nt_file) {
+                throw std::runtime_error("Cannot open FASTA NT file: " + opts.fasta_nt);
+            }
         }
         if (!opts.fasta_nt_corrected.empty()) {
             fasta_nt_corr_writer = std::make_unique<dart::FastaWriter>(opts.fasta_nt_corrected);
         }
-        if (!opts.fasta_aa.empty()) {
-            fasta_aa_writer = std::make_unique<dart::FastaWriter>(opts.fasta_aa);
+        if (write_fasta_aa) {
+            fasta_aa_file.open(opts.fasta_aa);
+            if (!fasta_aa_file) {
+                throw std::runtime_error("Cannot open FASTA AA file: " + opts.fasta_aa);
+            }
         }
-        if (!opts.fasta_aa_masked.empty()) {
-            fasta_aa_masked_writer = std::make_unique<dart::FastaWriter>(opts.fasta_aa_masked);
+        if (write_fasta_aa_masked) {
+            fasta_aa_masked_file.open(opts.fasta_aa_masked);
+            if (!fasta_aa_masked_file) {
+                throw std::runtime_error("Cannot open FASTA AA masked file: " + opts.fasta_aa_masked);
+            }
         }
 
         // Sample-level damage profile
@@ -292,7 +391,6 @@ int cmd_predict(int argc, char* argv[]) {
 
         std::atomic<size_t> total_seqs{0};
         std::atomic<size_t> total_genes{0};
-        std::mutex write_mutex;
 
         // Optional damage index writer for post-mapping annotation
         std::unique_ptr<dart::DamageIndexWriter> damage_index_writer;
@@ -300,6 +398,9 @@ int cmd_predict(int argc, char* argv[]) {
             damage_index_writer = std::make_unique<dart::DamageIndexWriter>(
                 opts.damage_index, sample_profile);
         }
+
+        // Thread-local output buffers for parallel formatting
+        std::vector<ThreadOutputBuffer> thread_buffers(num_threads);
 
         while (true) {
             batch.clear();
@@ -309,16 +410,18 @@ int cmd_predict(int argc, char* argv[]) {
             }
             if (batch.empty()) break;
 
-            // Process batch - collect results
-            std::vector<std::pair<std::string, std::vector<dart::Gene>>> results(batch.size());
+            // Clear thread buffers for this batch
+            for (auto& buf : thread_buffers) {
+                buf.clear();
+            }
 
+            // Process batch in parallel - format output to thread-local buffers
             #pragma omp parallel for schedule(dynamic, 100)
             for (size_t i = 0; i < batch.size(); ++i) {
                 std::string seq = dart::SequenceUtils::clean(batch[i].sequence);
                 if (seq.length() < opts.min_length) continue;
 
                 std::string id = batch[i].id;
-                std::vector<dart::Gene> genes;
 
                 // Compute per-read damage prior BEFORE ORF enumeration
                 // This allows damage-aware scoring during ORF selection
@@ -341,8 +444,16 @@ int cmd_predict(int argc, char* argv[]) {
                 // Refine per-read damage using ORF-specific evidence (stops, pre-stops)
                 float per_read_damage = dart::FrameSelector::infer_per_read_aa_damage(seq, orfs, sample_profile);
 
+                // Get thread-local buffer
+                int tid = 0;
+                #ifdef _OPENMP
+                tid = omp_get_thread_num();
+                #endif
+                auto& buf = thread_buffers[tid];
+
                 // Pre-compute reverse complement once (not per-ORF)
                 std::string rc;
+                int gene_num = 0;
                 for (size_t orf_idx = 0; orf_idx < orfs.size(); ++orf_idx) {
                     const auto& orf = orfs[orf_idx];
                     // Use effective length (max of protein and search_protein) for filtering
@@ -400,28 +511,40 @@ int cmd_predict(int argc, char* argv[]) {
                     }
                     gene.frame_pmax = gene.coding_prob;
 
-                    genes.push_back(std::move(gene));
+                    // Write to thread-local buffers (no locking needed)
+                    buf.write_gff(id, gene, gene_num);
+                    if (write_fasta_nt) buf.write_fasta_nt(id, gene, gene_num);
+                    if (write_fasta_aa) buf.write_fasta_aa(id, gene, gene_num);
+                    if (write_fasta_aa_masked) buf.write_fasta_aa_masked(id, gene, gene_num);
+                    if (damage_index_writer) {
+                        buf.damage_records.emplace_back(id, gene, gene.sequence);
+                    }
+                    buf.gene_count++;
+                    gene_num++;
                 }
-
-                results[i] = {std::move(id), std::move(genes)};
             }
 
-            // Write results
-            {
-                std::lock_guard<std::mutex> lock(write_mutex);
-                for (const auto& [id, genes] : results) {
-                    if (genes.empty()) continue;
-                    writer.write_genes(id, genes);
-                    if (fasta_nt_writer) fasta_nt_writer->write_genes_nucleotide(id, genes);
-                    if (fasta_aa_writer) fasta_aa_writer->write_genes_protein(id, genes);
-                    if (fasta_aa_masked_writer) fasta_aa_masked_writer->write_genes_protein_search(id, genes);
-                    if (damage_index_writer) {
-                        for (const auto& gene : genes) {
-                            damage_index_writer->add_record(id, gene, gene.sequence);
-                        }
-                    }
-                    total_genes += genes.size();
+            // Merge and write thread buffers (sequential I/O, but no formatting overhead)
+            for (const auto& buf : thread_buffers) {
+                if (buf.gene_count == 0) continue;
+
+                // Write pre-formatted strings directly to files
+                gff_file << buf.gff.str();
+                if (write_fasta_nt) {
+                    fasta_nt_file << buf.fasta_nt.str();
                 }
+                if (write_fasta_aa) {
+                    fasta_aa_file << buf.fasta_aa.str();
+                }
+                if (write_fasta_aa_masked) {
+                    fasta_aa_masked_file << buf.fasta_aa_masked.str();
+                }
+                if (damage_index_writer) {
+                    for (const auto& [id, gene, seq] : buf.damage_records) {
+                        damage_index_writer->add_record(id, gene, seq);
+                    }
+                }
+                total_genes += buf.gene_count;
             }
 
             total_seqs += batch.size();

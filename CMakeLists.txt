@@ -122,35 +122,6 @@ if(NOT libdart_damage_POPULATED)
     FetchContent_Populate(libdart_damage)
 endif()
 
-# Patch the fetched headers so they coexist with dart's own headers:
-
-# 1. Remove FrameSelector class — it belongs to dart's frame_selector.hpp.
-set(_sdp "${libdart_damage_SOURCE_DIR}/include/dart/sample_damage_profile.hpp")
-if(EXISTS "${_sdp}")
-    file(READ "${_sdp}" _sdp_content)
-    string(FIND "${_sdp_content}" "\nclass FrameSelector {" _fs_pos)
-    if(_fs_pos GREATER -1)
-        string(SUBSTRING "${_sdp_content}" 0 ${_fs_pos} _sdp_trimmed)
-        file(WRITE "${_sdp}" "${_sdp_trimmed}\n} // namespace dart\n")
-        message(STATUS "libdart-damage: patched sample_damage_profile.hpp (removed FrameSelector)")
-    endif()
-endif()
-
-# 2. Stub out the library's types.hpp.
-# sample_damage_profile.hpp does #include "types.hpp" (relative), which would find
-# the library's own types.hpp, causing redefinitions against dart's types.hpp.
-# dart's include/dart/types.hpp (on -I path) provides all needed types; the stub
-# prevents double-definition when sample_damage_profile.hpp is included by dart TUs.
-set(_types "${libdart_damage_SOURCE_DIR}/include/dart/types.hpp")
-if(EXISTS "${_types}")
-    file(READ "${_types}" _types_content)
-    string(LENGTH "${_types_content}" _types_len)
-    if(_types_len GREATER 40)  # Not yet patched (stub is ~40 bytes)
-        file(WRITE "${_types}" "#pragma once\n// Stub: dart's include/dart/types.hpp provides all types.\n")
-        message(STATUS "libdart-damage: patched types.hpp (stub to avoid redefinitions)")
-    endif()
-endif()
-
 add_library(dart-damage-headers INTERFACE)
 target_include_directories(dart-damage-headers INTERFACE
     $<BUILD_INTERFACE:${libdart_damage_SOURCE_DIR}/include>)
