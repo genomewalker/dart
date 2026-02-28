@@ -401,11 +401,6 @@ struct SampleDamageProfile {
     bool damage_validated = false;  // True if both channels agree on damage
     bool damage_artifact = false;   // True if Channel A fires but Channel B doesn't
 
-    // =========================================================================
-    // JOINT PROBABILISTIC MODEL RESULTS
-    // Unified Bayesian model combining Channel A, Control, and Channel B
-    // Replaces ad-hoc two-channel thresholds with principled BIC comparison
-    // =========================================================================
     float joint_delta_max = 0.0f;      // MLE estimate of damage rate
     float joint_lambda = 0.0f;         // Decay constant
     float joint_a_max = 0.0f;          // Artifact amplitude (signed)

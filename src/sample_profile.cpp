@@ -1709,11 +1709,6 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
                 profile.gc_stratified_valid = true;
 
 
-                // =========================================================================
-                // GC-CONDITIONAL DAMAGE CLASSIFICATION
-                // Per-bin LLR classification and aggregate metrics (π_damaged, d_ancient)
-                // This is the principled approach recommended by OpenCode discussion
-                // =========================================================================
                 {
                     constexpr float LLR_THRESHOLD = 10.0f;  // Log-likelihood ratio threshold for classification
                     constexpr float MIN_DMAX_THRESHOLD = 0.01f;  // Minimum d_max to consider as damaged

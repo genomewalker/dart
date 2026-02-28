@@ -515,9 +515,6 @@ private:
     }
 
     void apply_learned_weights_(DamageClusteringResult& result, size_t n_reads) {
-        // Recompute posteriors using learned weights instead of hardcoded 0.60/0.28/0.12
-        // This requires access to per-read feature vectors, which we don't currently store
-        // For now, trust the clustering result but could be enhanced
         (void)result;
         (void)n_reads;
     }
@@ -612,9 +609,6 @@ inline LearnedParams calibrate_params_from_warmup(
 
     SeedIndex index;
     builder.build(index, cfg.min_df, cfg.max_df);
-
-    // Collect df statistics (would need to expose bucket df values from index)
-    // For now, use defaults with d_max adjustment
 
     return stats.compute_params(d_max, budget);
 }
