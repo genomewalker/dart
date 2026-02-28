@@ -66,8 +66,6 @@ Score DamageModel::calculate_ancient_likelihood(const Sequence& seq) const {
     return 1.0f / (1.0f + std::exp(-log_likelihood_ratio));
 }
 
-// Calculate amino acid probability distribution for a codon considering damage
-// String overload - delegates to 3-char version
 std::array<float, 21> DamageModel::calculate_aa_probabilities(
     const std::string& codon,
     size_t codon_start,
@@ -76,22 +74,18 @@ std::array<float, 21> DamageModel::calculate_aa_probabilities(
     return calculate_aa_probabilities(codon[0], codon[1], codon[2], codon_start, seq_len);
 }
 
-// Allocation-free overload - takes 3 chars directly
 std::array<float, 21> DamageModel::calculate_aa_probabilities(
     char c0, char c1, char c2,
     size_t codon_start,
     size_t seq_len) const {
 
-    // Initialize all probabilities to zero
-    // Indices: A=0, C=1, D=2, E=3, F=4, G=5, H=6, I=7, K=8, L=9,
-    //          M=10, N=11, P=12, Q=13, R=14, S=15, T=16, V=17, W=18, Y=19, *=20
+    // A=0, C=1, D=2, E=3, F=4, G=5, H=6, I=7, K=8, L=9,
+    // M=10, N=11, P=12, Q=13, R=14, S=15, T=16, V=17, W=18, Y=19, *=20
     std::array<float, 21> aa_probs{};
     aa_probs.fill(0.0f);
 
-    // Get damage profile for this sequence length (cached to avoid O(N²))
     const auto& profile = create_profile_cached(seq_len);
 
-    // Positions of each nucleotide
     size_t pos0 = codon_start;
     size_t pos1 = codon_start + 1;
     size_t pos2 = codon_start + 2;
@@ -107,7 +101,6 @@ std::array<float, 21> DamageModel::calculate_aa_probabilities(
     float ga_rate_1 = (pos1 < profile.ga_prob_3prime.size()) ? profile.ga_prob_3prime[pos1] : delta_background_;
     float ga_rate_2 = (pos2 < profile.ga_prob_3prime.size()) ? profile.ga_prob_3prime[pos2] : delta_background_;
 
-    // Helper to convert amino acid char to index
     auto aa_to_idx = [](char aa) -> int {
         switch (aa) {
             case 'A': return 0;  case 'C': return 1;  case 'D': return 2;
@@ -210,10 +203,8 @@ std::pair<std::string, std::vector<float>> DamageModel::translate_with_confidenc
     };
 
     for (size_t i = start; i + 2 < seq_len; i += 3) {
-        // Calculate AA probability distribution (allocation-free - no substr)
         auto aa_probs = calculate_aa_probabilities(seq[i], seq[i+1], seq[i+2], i, seq_len);
 
-        // Find the most likely amino acid
         int best_idx = 0;
         float best_prob = aa_probs[0];
         for (int j = 1; j < 21; ++j) {

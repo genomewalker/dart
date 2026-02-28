@@ -140,9 +140,7 @@ public:
         float d_ct = ct_rate(abs_pos, seq_len, is_reverse);
         float d_ga = ga_rate(abs_pos, seq_len, is_reverse);
 
-        // Get base priors from domain-specific tables
         float pT = 0.25f, pC = 0.25f, pA = 0.25f, pG = 0.25f;
-        // TODO: Could use hexamer context for more accurate priors
 
         float llr = 0.0f;
 

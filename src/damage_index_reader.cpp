@@ -317,8 +317,7 @@ SynonymousDamageResult detect_synonymous_damage(
         }
     }
 
-    // Check 3' terminal codons for G→A damage
-    // Note: 3' codons are stored from the end, so codon 0 is the last codon
+    // Check 3' terminal codons for G→A damage (codon 0 = last codon)
     for (int i = 0; i < rec.n_3prime; ++i) {
         uint8_t codon_idx = rec.codons_3prime[i];
         if (codon_idx > 63) continue;

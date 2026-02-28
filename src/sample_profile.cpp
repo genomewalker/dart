@@ -472,26 +472,11 @@ void FrameSelector::update_sample_profile(
         if (base == 'G') {
             profile.g_count_5prime[i]++;
         }
-        // Note: T counts for oxidation tracking come from T where we'd expect G
-        // This requires reference alignment, so for reference-free we use asymmetry instead
     }
 
-    // =========================================================================
-    // CHANNEL E: Depurination detection (purine enrichment at termini)
-    // Depurination creates strand breaks preferentially at purine sites
-    // Detection: terminal purine (A+G) rate vs interior purine rate
-    // =========================================================================
-    // Purine tracking is already done via a_freq/g_freq arrays
-    // We'll compute purine enrichment in finalize_sample_profile()
+    // Purine tracking done via a_freq/g_freq arrays; enrichment computed in finalize_sample_profile()
 
-    // =========================================================================
-    // GC-STRATIFIED DAMAGE ACCUMULATION
-    // Bin reads by interior GC content (positions 5+ to avoid terminal damage)
-    // This handles metagenome heterogeneity where different organisms have
-    // different GC content and damage levels
-    // =========================================================================
     if (len >= 30) {
-        // Compute interior GC from positions 5 to end-5 (avoid both terminal regions)
         size_t interior_start = 5;
         size_t interior_end = len > 10 ? len - 5 : len;
         uint64_t gc_count = 0;
@@ -1214,73 +1199,29 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         }
     }
 
-    // =========================================================================
-    // CHANNEL D: G→T / C→A transversion asymmetry analysis
-    // Real oxidation: G→T rate > T→G rate (asymmetric)
-    // Sequencing error: G→T ≈ T→G (symmetric)
-    // =========================================================================
+    // Channel D: G→T asymmetry inferred from Channel C (no reference available)
     {
-        // G→T asymmetry is already captured in the control channel (A/(A+G))
-        // For reference-free analysis, we use the existing a_freq/g_freq arrays
-        // and check if G→T shows asymmetry relative to the complement
-
-        // Compute G→T rate from g_count_5prime (tracked during accumulation)
-        // Note: Without a reference, we can't directly measure G→T vs T→G
-        // Instead, we infer from the oxidative stop codon pattern
-
-        // For now, set asymmetry based on Channel C results
         if (profile.channel_c_valid) {
-            // Use stop codon data to infer asymmetry
-            // If oxidative stops are elevated, G→T is the driver
             profile.ox_gt_asymmetry = profile.ox_uniformity_ratio;
         }
     }
 
-    // =========================================================================
-    // CHANNEL E: Depurination detection (purine enrichment at termini)
-    // Depurination creates strand breaks at purine sites
-    // Detection: terminal purine (A+G) rate vs interior purine rate
-    // =========================================================================
+    // Channel E: Depurination (purine enrichment at termini)
     {
-        // Compute purine rate at terminal positions (5' end, pos 0-4)
         double purine_terminal = 0.0, total_terminal = 0.0;
         for (int p = 0; p < 5; ++p) {
-            // Use the raw counts before normalization
-            // a_freq_5prime and g_freq_5prime are now normalized (0-1 ratios)
-            // We need to use tc_total_5prime for scaling
-            double ag = profile.a_freq_5prime[p] + profile.g_freq_5prime[p];
-            double tc = profile.t_freq_5prime[p] + profile.c_freq_5prime[p];
-            // After normalization, a+g ≈ 1 and t+c ≈ 1, so total is meaningless
-            // Use the raw totals instead
             purine_terminal += profile.tc_total_5prime[p] * (1.0 - profile.t_freq_5prime[p] - profile.c_freq_5prime[p]);
             total_terminal += profile.tc_total_5prime[p];
         }
 
-        // Compute purine rate in middle of reads (from baseline)
         double purine_baseline = profile.baseline_a_freq + profile.baseline_g_freq;
-        // baseline values are already normalized to sum to 1
 
         if (total_terminal > 100 && purine_baseline > 0.01) {
-            // Use baseline A+G ratio as reference
             profile.purine_rate_interior = static_cast<float>(purine_baseline);
 
-            // Terminal purine rate requires raw A+G counts
-            // Since we don't have separate AG totals at 5', estimate from existing data
-            // The a_freq_5prime and g_freq_5prime were captured before normalization
-            // but are now ratios. We can reconstruct approximate purine enrichment
-            // by comparing A/(A+G) and G totals
+            profile.purine_enrichment_5prime = profile.ctrl_shift_5prime;
+            profile.purine_enrichment_3prime = profile.ctrl_shift_3prime;
 
-            // Simpler approach: use the existing terminal shift metrics
-            // If both T/(T+C) AND A/(A+G) are elevated at termini, it's composition bias
-            // If only T/(T+C) is elevated, it's damage
-            // If A/(A+G) is elevated more than T/(T+C), check for depurination
-
-            profile.purine_enrichment_5prime = profile.ctrl_shift_5prime;  // A/(A+G) shift at 5'
-            profile.purine_enrichment_3prime = profile.ctrl_shift_3prime;  // T/(T+C) shift at 3'
-
-            // Depurination detected if:
-            // 1. Purine enrichment at 5' is significantly positive (>2%)
-            // 2. AND it's not explained by composition bias (divergence from damage channel)
             if (profile.purine_enrichment_5prime > 0.02f &&
                 profile.channel_divergence_5prime > 0.01f) {
                 profile.depurination_detected = true;
@@ -1319,44 +1260,21 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         }
     }
 
-    // =========================================================================
-    // Inverted pattern detection
-    // Detect when terminal T/(T+C) < baseline from middle of reads (opposite of damage pattern)
-    // This indicates reference-free detection failure due to:
-    // - AT-rich organisms with terminal artifacts
-    // - Adapter contamination
-    // - Quality trimming bias
-    //
-    // NOTE: We compare terminal position 0 against TRUE baseline (middle of reads),
-    // NOT against positions 10-14 which are still in the terminal region and may
-    // share composition bias with position 0.
-    // =========================================================================
+    // Terminal gradients (for reporting only; inverted_pattern_5prime set later via hexamer detection)
     {
-        // Compute terminal gradients for reporting (but DON'T set inverted patterns here)
-        // Position 0 has artifacts - we use hexamer-based detection (positions 1-6) instead.
-        // The hexamer detection at the end of this function sets inverted_pattern_5prime.
-
-        // 5' end: terminal T/(T+C) - baseline (for reporting only)
-        double terminal_tc_5 = profile.t_freq_5prime[0];  // Already normalized
+        double terminal_tc_5 = profile.t_freq_5prime[0];
         profile.terminal_gradient_5prime = static_cast<float>(terminal_tc_5 - baseline_tc);
 
-        // 3' end: terminal A/(A+G) - baseline (for reporting only)
-        double terminal_ag_3 = profile.a_freq_3prime[0];  // Already normalized
+        double terminal_ag_3 = profile.a_freq_3prime[0];
         profile.terminal_gradient_3prime = static_cast<float>(terminal_ag_3 - baseline_ag);
-
-        // NOTE: inverted_pattern flags are set later by hexamer-based detection,
-        // which uses positions 1-6 and is more reliable than position 0.
     }
 
-    // Compute codon-position-aware damage rates
     for (int p = 0; p < 3; p++) {
-        // 5' end codon position rates
         size_t tc_total = profile.codon_pos_t_count_5prime[p] + profile.codon_pos_c_count_5prime[p];
         if (tc_total > 0) {
             profile.codon_pos_t_rate_5prime[p] = static_cast<float>(profile.codon_pos_t_count_5prime[p]) / tc_total;
         }
 
-        // 3' end codon position rates
         size_t ag_total = profile.codon_pos_a_count_3prime[p] + profile.codon_pos_g_count_3prime[p];
         if (ag_total > 0) {
             profile.codon_pos_a_rate_3prime[p] = static_cast<float>(profile.codon_pos_a_count_3prime[p]) / ag_total;
@@ -1514,8 +1432,7 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
                            || profile.terminal_z_3prime < -10.0f;  // Very strong depletion signal
     profile.terminal_inversion = inversion_5 || inversion_3;
 
-    // Set individual inverted pattern flags (used for asymmetric pattern handling)
-    // Note: inverted_pattern_5prime may also be set later by hexamer-based detection
+    // inverted_pattern_5prime may also be set later by hexamer-based detection
     if (inversion_3) {
         profile.inverted_pattern_3prime = true;
     }
@@ -1562,13 +1479,9 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         if (weight_sum > 0) {
             float raw_llr = static_cast<float>(llr_sum / weight_sum);
 
-            // Store raw hexamer LLR without inversion correction
-            // The raw value is the actual terminal-vs-interior hexamer composition difference
-            // Positive = T-starting hexamers enriched at terminal (damage pattern)
-            // Negative = C-starting hexamers enriched at terminal (AT-rich composition bias)
+            // positive = T-starting hexamers enriched at terminal (damage)
+            // negative = C-starting enriched at terminal (AT-rich composition bias)
             profile.hexamer_damage_llr = raw_llr;
-
-            (void)raw_llr;  // Used for hexamer_damage_llr
         }
 
         // Compute hexamer-based T/(T+C) ratios (more reliable than position 0 or 1 alone)

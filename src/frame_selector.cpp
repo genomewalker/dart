@@ -178,10 +178,6 @@ float calculate_damage_strand_preference(
     return fwd_signal - rev_signal;
 }
 
-// ============================================================================
-// ORF ENUMERATION: Damage-aware length-based frame selection
-// ============================================================================
-
 // Damage probability at a nucleotide position using exponential decay model
 static float compute_position_damage_prob(
     size_t nt_pos,
@@ -410,7 +406,7 @@ static std::string generate_search_protein(
         }
     }
 
-    // NOTE: We intentionally do NOT modify non-stop amino acids in search_protein.
+    // We intentionally do NOT modify non-stop amino acids in search_protein.
     //
     // All damage-induced substitutions (W←R, C←R, Y←H, I←T, V←A, K←E, N←D, etc.)
     // are kept as-observed because:
@@ -429,17 +425,6 @@ static std::string generate_search_protein(
 }
 
 
-// ============================================================================
-// compute_per_read_damage_prior: Hierarchical Beta-Binomial MAP estimator
-//
-// Infers per-read damage propensity θ_r using:
-// 1. Opportunity accounting (C_eff) - normalizes by convertible sites
-// 2. MAP estimation with Beta prior from sample d_max
-// 3. 2-step Newton optimization for θ_MAP
-//
-// Calibrated against sample-level damage statistics.
-// Expected improvement: ρ ~0.20-0.25 (vs 0.134 baseline)
-// ============================================================================
 float FrameSelector::compute_per_read_damage_prior(
     const std::string& seq,
     const SampleDamageProfile& sample_profile) {
@@ -1262,10 +1247,6 @@ float FrameSelector::infer_per_read_aa_damage(
 
     return p_read_damaged;
 }
-
-// ============================================================================
-// FRAMESHIFT DETECTION via HMM/Viterbi
-// ============================================================================
 
 FrameSelector::FrameshiftResult FrameSelector::detect_frameshifts(
     const std::string& seq,

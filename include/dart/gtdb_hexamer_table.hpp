@@ -9,7 +9,6 @@
 
 namespace dart {
 
-// Note: Use encode_hexamer() from hexamer_tables.hpp
 
 constexpr float GTDB_HEXAMER_FREQ[4096] = {
     1.137866e-03f, 5.138387e-04f, 6.331654e-04f, 7.802642e-04f, 4.422874e-04f, 4.250319e-04f, 2.517432e-04f, 2.700550e-04f, 

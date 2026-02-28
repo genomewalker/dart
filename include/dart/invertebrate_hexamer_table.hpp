@@ -9,7 +9,6 @@
 
 namespace dart {
 
-// Note: Use encode_hexamer() from hexamer_tables.hpp
 
 constexpr float INVERTEBRATE_HEXAMER_FREQ[4096] = {
     1.095388e-03f, 5.488980e-04f, 9.950663e-04f, 1.086669e-03f, 7.116814e-04f, 3.632741e-04f, 3.590667e-04f, 6.273302e-04f, 
