@@ -1810,11 +1810,6 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
 
                 }
 
-                // =========================================================================
-                // DURBIN-STYLE K-COMPONENT MIXTURE MODEL
-                // Models organism-class heterogeneity for principled damage quantification
-                // d_population = what we observe, d_reference = metaDMG proxy
-                // =========================================================================
                 double total_c_sites = static_cast<double>(weight_sum);
                 std::array<SuperRead, N_GC_BINS> super_reads;
                 for (int bin = 0; bin < N_GC_BINS; ++bin) {
@@ -2378,7 +2373,6 @@ void FrameSelector::reset_sample_profile(SampleDamageProfile& profile) {
     profile.joint_p_damage = 0.0f;
     profile.joint_model_valid = false;
 
-    // Durbin-style mixture model
     profile.mixture_K = 0;
     profile.mixture_d_population = 0.0f;
     profile.mixture_d_ancient = 0.0f;
