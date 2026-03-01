@@ -20,7 +20,7 @@
 #include <cstring>
 #include <unistd.h>
 #include <sstream>
-#include <cstdio>
+#include <zlib.h>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -29,20 +29,11 @@
 using Options = dart::cli::Options;
 
 // Output file wrapper: supports both plain and gzip-compressed (.gz) output.
-// For .gz paths, pipes through "gzip -c > path" via popen.
+// Uses zlib (already linked) for in-process gz writing — no subprocess needed.
 class OutputFile {
-    FILE*         pipe_ = nullptr;
+    gzFile        gz_    = nullptr;
     std::ofstream plain_;
-    bool          gz_   = false;
-
-    static std::string shell_escape(const std::string& s) {
-        std::string out = "'";
-        for (char c : s) {
-            if (c == '\'') out += "'\\''";
-            else           out += c;
-        }
-        return out + "'";
-    }
+    bool          is_gz_ = false;
 
 public:
     OutputFile() = default;
@@ -50,32 +41,31 @@ public:
     ~OutputFile() { close(); }
 
     void open(const std::string& path) {
-        gz_ = path.size() > 3 && path.compare(path.size() - 3, 3, ".gz") == 0;
-        if (gz_) {
-            std::string cmd = "gzip -c > " + shell_escape(path);
-            pipe_ = popen(cmd.c_str(), "w");
+        is_gz_ = path.size() > 3 && path.compare(path.size() - 3, 3, ".gz") == 0;
+        if (is_gz_) {
+            gz_ = gzopen(path.c_str(), "wb");
         } else {
             plain_.open(path);
         }
     }
 
     void close() {
-        if (pipe_) { pclose(pipe_); pipe_ = nullptr; }
+        if (gz_) { gzclose(gz_); gz_ = nullptr; }
         if (plain_.is_open()) plain_.close();
     }
 
     explicit operator bool() const {
-        return gz_ ? pipe_ != nullptr : plain_.good();
+        return is_gz_ ? gz_ != nullptr : plain_.good();
     }
 
     OutputFile& operator<<(const std::string& s) {
-        if (gz_) fwrite(s.data(), 1, s.size(), pipe_);
-        else     plain_ << s;
+        if (is_gz_) gzwrite(gz_, s.data(), static_cast<unsigned>(s.size()));
+        else        plain_ << s;
         return *this;
     }
     OutputFile& operator<<(const char* s) {
-        if (gz_) fputs(s, pipe_);
-        else     plain_ << s;
+        if (is_gz_) gzputs(gz_, s);
+        else        plain_ << s;
         return *this;
     }
 };
