@@ -1259,10 +1259,9 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
                 }
             }
 
-            // For SS libraries: if 3' Channel B validates, override damage_artifact decision
-            const bool is_ss_b3 = (profile.forced_library_type == SampleDamageProfile::LibraryType::SINGLE_STRANDED) ||
-                                   (profile.library_type == SampleDamageProfile::LibraryType::SINGLE_STRANDED);
-            if (is_ss_b3 && profile.channel_b3_quantifiable && profile.stop_decay_llr_3prime > 0.0f) {
+            // Channel B₃' is a standalone structural signal (real G→A stop codon conversion).
+            // Validates damage regardless of library type — no channel A or library-type dependency.
+            if (profile.channel_b3_quantifiable && profile.stop_decay_llr_3prime > 0.0f) {
                 profile.damage_validated = true;
                 profile.damage_artifact  = false;
             }
@@ -2038,6 +2037,9 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
             } else if (profile.inverted_pattern_5prime && !profile.inverted_pattern_3prime) {
                 // 5' inverted but 3' valid - prefer Channel B₃' (structural), fall back to raw 3'
                 if (profile.channel_b3_quantifiable && profile.d_max_from_channel_b3 > 0.01f) {
+                    // Channel A 3' may be flat/zero; override with B₃' structural estimate
+                    // so frame_selector gets the correct d_max_3p.
+                    profile.d_max_3prime  = profile.d_max_from_channel_b3;
                     profile.d_max_combined = profile.d_max_from_channel_b3;
                     profile.d_max_source = SampleDamageProfile::DmaxSource::CHANNEL_B3_STRUCTURAL;
                 } else {
