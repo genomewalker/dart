@@ -20,12 +20,65 @@
 #include <cstring>
 #include <unistd.h>
 #include <sstream>
+#include <cstdio>
 
 #ifdef _OPENMP
 #include <omp.h>
 #endif
 
 using Options = dart::cli::Options;
+
+// Output file wrapper: supports both plain and gzip-compressed (.gz) output.
+// For .gz paths, pipes through "gzip -c > path" via popen.
+class OutputFile {
+    FILE*         pipe_ = nullptr;
+    std::ofstream plain_;
+    bool          gz_   = false;
+
+    static std::string shell_escape(const std::string& s) {
+        std::string out = "'";
+        for (char c : s) {
+            if (c == '\'') out += "'\\''";
+            else           out += c;
+        }
+        return out + "'";
+    }
+
+public:
+    OutputFile() = default;
+    explicit OutputFile(const std::string& path) { open(path); }
+    ~OutputFile() { close(); }
+
+    void open(const std::string& path) {
+        gz_ = path.size() > 3 && path.compare(path.size() - 3, 3, ".gz") == 0;
+        if (gz_) {
+            std::string cmd = "gzip -c > " + shell_escape(path);
+            pipe_ = popen(cmd.c_str(), "w");
+        } else {
+            plain_.open(path);
+        }
+    }
+
+    void close() {
+        if (pipe_) { pclose(pipe_); pipe_ = nullptr; }
+        if (plain_.is_open()) plain_.close();
+    }
+
+    explicit operator bool() const {
+        return gz_ ? pipe_ != nullptr : plain_.good();
+    }
+
+    OutputFile& operator<<(const std::string& s) {
+        if (gz_) fwrite(s.data(), 1, s.size(), pipe_);
+        else     plain_ << s;
+        return *this;
+    }
+    OutputFile& operator<<(const char* s) {
+        if (gz_) fputs(s, pipe_);
+        else     plain_ << s;
+        return *this;
+    }
+};
 
 // Convert CLI library type to SampleDamageProfile library type
 inline dart::SampleDamageProfile::LibraryType to_sample_library_type(dart::cli::LibraryType lt) {
@@ -157,8 +210,8 @@ int cmd_predict(int argc, char* argv[]) {
         // Initialize damage model
         dart::DamageModel damage_model;
 
-        // Open output files - using direct streams for parallel-friendly writes
-        std::ofstream gff_file(opts.output_file);
+        // Open output files — supports plain and .gz paths transparently
+        OutputFile gff_file(opts.output_file);
         if (!gff_file) {
             throw std::runtime_error("Cannot open output file: " + opts.output_file);
         }
@@ -166,9 +219,9 @@ int cmd_predict(int argc, char* argv[]) {
         gff_file << "##gff-version 3\n";
 
         // Direct file streams for parallel output buffering
-        std::ofstream fasta_nt_file;
-        std::ofstream fasta_aa_file;
-        std::ofstream fasta_aa_masked_file;
+        OutputFile fasta_nt_file;
+        OutputFile fasta_aa_file;
+        OutputFile fasta_aa_masked_file;
 
         // Flags to check if outputs are enabled
         bool write_fasta_nt = !opts.fasta_nt.empty();
