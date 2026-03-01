@@ -384,8 +384,16 @@ int cmd_sample_damage(int argc, char* argv[]) {
         std::cerr << "\nDamage profile:\n";
         std::cerr << "  Level: " << damage_level_str(d_max) << "\n";
         std::cerr << "  D_max: " << std::fixed << std::setprecision(1) << (d_max * 100.0f) << "%\n";
-        std::cerr << "  Channel B LLR: " << std::fixed << std::setprecision(1) << profile.stop_decay_llr_5prime << "\n";
-        std::cerr << "  Channel B3 LLR: " << std::fixed << std::setprecision(1) << profile.stop_decay_llr_3prime << "\n";
+        std::cerr << "  Channel B LLR:  " << std::fixed << std::setprecision(1) << profile.stop_decay_llr_5prime << " (5' C→T stop conversion)\n";
+        std::cerr << "  Channel B3 LLR: " << std::fixed << std::setprecision(1) << profile.stop_decay_llr_3prime << " (3' G→A stop conversion)\n";
+        if (profile.channel_c_valid) {
+            std::cerr << "  Channel C: ox_d_max=" << std::fixed << std::setprecision(1) << (profile.ox_d_max * 100.0f)
+                      << "% uniformity=" << std::setprecision(2) << profile.ox_uniformity_ratio
+                      << (profile.ox_damage_detected ? " DETECTED" : "") << " (G→T oxidation)\n";
+        }
+        if (profile.depurination_detected) {
+            std::cerr << "  Channel E: depurination detected (purine enrichment at 5' termini)\n";
+        }
         std::cerr << "  Validated: " << (profile.damage_validated ? "yes" : "no") << "\n";
         auto run_end = std::chrono::steady_clock::now();
         std::cerr << "  Runtime: " << dart::log_utils::format_elapsed(run_start, run_end) << "\n";

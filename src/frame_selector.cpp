@@ -51,6 +51,10 @@ static codon::DamageParams make_codon_damage_params(const SampleDamageProfile* s
         dmg.d_max_3p = sample->d_max_3prime;
         dmg.lambda_5p = sample->lambda_5prime;
         dmg.lambda_3p = sample->lambda_3prime;
+        // Channel C: oxidative G→T (GAA→TAA, GAG→TAG, GGA→TGA), uniform rate
+        if (sample->ox_damage_detected) {
+            dmg.d_max_gt = sample->ox_d_max;
+        }
     }
     return dmg;
 }
@@ -119,10 +123,23 @@ std::pair<FrameScore, FrameScore> FrameSelector::select_best_per_strand(
     // Use sample profile if available
     auto dmg = sample_profile ? make_codon_damage_params(sample_profile) : make_codon_damage_params(damage);
 
-    // If damage not validated by Channel B, disable damage model
-    if (sample_profile && !sample_profile->damage_validated) {
-        dmg.d_max_5p = 0.0f;
-        dmg.d_max_3p = 0.0f;
+    if (sample_profile) {
+        // Channel B/B₃': gate deamination — require Channel B validation before applying C→T/G→A model
+        if (!sample_profile->damage_validated) {
+            dmg.d_max_5p = 0.0f;
+            dmg.d_max_3p = 0.0f;
+        }
+
+        // Channel E (depurination): when Channel B₃' does NOT validate the 3' G→A signal,
+        // depurination-induced purine enrichment at 3' termini may be inflating d_max_3p.
+        // Suppress 3' correction to avoid rescuing false stops from a spurious G→A signal.
+        if (sample_profile->depurination_detected && sample_profile->stop_decay_llr_3prime <= 0.0f) {
+            dmg.d_max_3p = 0.0f;
+        }
+
+        // Channel C (oxidative): d_max_gt already set in make_codon_damage_params when
+        // ox_damage_detected; no further gating needed — oxidation is self-validated by
+        // its uniformity check (channel_c_valid + elevated + uniform in sample_profile.cpp).
     }
 
     auto [best_fwd, best_rev] = codon::select_best_per_strand(seq, dmg);
