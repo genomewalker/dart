@@ -33,7 +33,7 @@ void print_usage(const char* program_name) {
     std::cout << "  --library-type <type>    Force library type: ds, ss, or auto (default)\n";
     std::cout << "\nORF Parameters:\n";
     std::cout << "  --orf-min-aa <int>       Minimum ORF length in amino acids (default: 10)\n";
-    std::cout << "  --adaptive               Adaptive ORF selection (score-based threshold)\n";
+    std::cout << "  --no-adaptive            Disable adaptive ORF selection (output all 6 frames)\n";
     std::cout << "\n";
     std::cout << "  -v, --verbose            Verbose output\n";
     std::cout << "  -V, --version            Show version and exit\n";
@@ -145,8 +145,8 @@ Options parse_args(int argc, char* argv[]) {
             if (opts.orf_min_aa < 1) {
                 throw ParseArgsExit(1, "Error: --orf-min-aa must be >= 1");
             }
-        } else if (arg == "--adaptive") {
-            opts.adaptive_orf = true;
+        } else if (arg == "--no-adaptive") {
+            opts.adaptive_orf = false;
         } else {
             throw ParseArgsExit(1, "Error: Unknown option: " + arg);
         }

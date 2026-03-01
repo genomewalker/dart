@@ -41,7 +41,7 @@ struct Options {
 
     // ORF enumeration parameters
     size_t orf_min_aa = 10;          // Minimum ORF length in amino acids
-    bool adaptive_orf = false;       // Adaptive mode: output ORFs within score threshold
+    bool adaptive_orf = true;        // Adaptive mode: output ORFs within score threshold
 };
 
 // Exception used by parse_args to signal an early/controlled CLI exit.
