@@ -1341,7 +1341,7 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
 
         if (profile.channel_c_valid && elevated && uniform) {
             profile.ox_damage_detected = true;
-            profile.ox_d_max = std::max(0.0f, ox_stop_excess * 100.0f);  // Convert to percentage
+            profile.ox_d_max = std::max(0.0f, ox_stop_excess);  // fraction 0-1, consistent with other d_max fields
         }
 
         // Check for artifact pattern: terminal much higher than interior (like deamination)

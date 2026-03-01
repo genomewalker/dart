@@ -101,11 +101,17 @@ struct DamageParams {
     float lambda_5p = 0.3f;
     float lambda_3p = 0.3f;
 
+    // Channel C: oxidative G→T damage (8-oxoG), position-independent (uniform across read)
+    float d_max_gt = 0.0f;
+
     // CpG context boost: methylated CpG → C→T is elevated
     // Typical boost is 2-5x in ancient DNA
     float cpg_boost = 5.0f;
 
-    bool has_damage() const { return d_max_5p > 0.01f || d_max_3p > 0.01f; }
+    bool has_damage() const { return d_max_5p > 0.01f || d_max_3p > 0.01f || d_max_gt > 0.01f; }
+
+    // Uniform G→T oxidation rate (no position decay)
+    float delta_GT() const { return d_max_gt; }
 
     float delta_CT(int phys_pos) const {
         return d_max_5p * std::exp(-lambda_5p * static_cast<float>(phys_pos));
@@ -766,35 +772,41 @@ inline float codon_prior_joint(
 // Sparse candidate enumeration for observed base
 // Returns viable true bases and their emission probabilities
 struct ViableBases {
-    char bases[2];       // Up to 2 viable true bases
-    float emissions[2];  // Their emission probabilities
-    int count;           // 1 or 2
+    char bases[3];       // Up to 3 viable true bases (T can be: true-T, C→T, or G→T)
+    float emissions[3];  // Their emission probabilities
+    int count;           // 1, 2, or 3
 };
 
-inline ViableBases get_viable_bases_physical(char obs_phys, float delta_CT, float delta_GA) {
+inline ViableBases get_viable_bases_physical(char obs_phys, float delta_CT, float delta_GA,
+                                              float delta_GT = 0.0f) {
     ViableBases v;
     delta_CT = std::clamp(delta_CT, 0.0f, 1.0f);
     delta_GA = std::clamp(delta_GA, 0.0f, 1.0f);
+    delta_GT = std::clamp(delta_GT, 0.0f, 1.0f);
 
     switch (obs_phys) {
         case 'A':
-            // Could be true A (1.0) or true G that became A (delta_GA)
+            // Could be true A (1.0) or true G that became A via G→A deamination (delta_GA)
             v.bases[0] = 'A'; v.emissions[0] = 1.0f;
+            v.count = 1;
             if (delta_GA > 1e-6f) {
-                v.bases[1] = 'G'; v.emissions[1] = delta_GA;
-                v.count = 2;
-            } else {
-                v.count = 1;
+                v.bases[v.count] = 'G'; v.emissions[v.count] = delta_GA;
+                v.count++;
             }
             break;
         case 'T':
-            // Could be true T (1.0) or true C that became T (delta_CT)
+            // Could be true T (1.0), true C→T deamination (delta_CT), or true G→T oxidation (delta_GT)
+            // Channel B (5' C→T): CAA→TAA, CAG→TAG, CGA→TGA
+            // Channel C (G→T):    GAA→TAA, GAG→TAG, GGA→TGA
             v.bases[0] = 'T'; v.emissions[0] = 1.0f;
+            v.count = 1;
             if (delta_CT > 1e-6f) {
-                v.bases[1] = 'C'; v.emissions[1] = delta_CT;
-                v.count = 2;
-            } else {
-                v.count = 1;
+                v.bases[v.count] = 'C'; v.emissions[v.count] = delta_CT;
+                v.count++;
+            }
+            if (delta_GT > 1e-6f) {
+                v.bases[v.count] = 'G'; v.emissions[v.count] = delta_GT;
+                v.count++;
             }
             break;
         case 'C':
@@ -803,8 +815,8 @@ inline ViableBases get_viable_bases_physical(char obs_phys, float delta_CT, floa
             v.count = 1;
             break;
         case 'G':
-            // Only true G can produce observed G (with prob 1-delta_GA)
-            v.bases[0] = 'G'; v.emissions[0] = 1.0f - delta_GA;
+            // Only true G can produce observed G (reduced by G→A deamination and G→T oxidation)
+            v.bases[0] = 'G'; v.emissions[0] = 1.0f - delta_GA - delta_GT;
             v.count = 1;
             break;
         default:
@@ -816,9 +828,11 @@ inline ViableBases get_viable_bases_physical(char obs_phys, float delta_CT, floa
     return v;
 }
 
-inline float damage_emission_physical(char true_phys, char obs_phys, float delta_CT, float delta_GA) {
+inline float damage_emission_physical(char true_phys, char obs_phys, float delta_CT, float delta_GA,
+                                      float delta_GT = 0.0f) {
     delta_CT = std::clamp(delta_CT, 0.0f, 1.0f);
     delta_GA = std::clamp(delta_GA, 0.0f, 1.0f);
+    delta_GT = std::clamp(delta_GT, 0.0f, 1.0f);
 
     switch (true_phys) {
         case 'A': return (obs_phys == 'A') ? 1.0f : 0.0f;
@@ -828,8 +842,10 @@ inline float damage_emission_physical(char true_phys, char obs_phys, float delta
             if (obs_phys == 'T') return delta_CT;
             return 0.0f;
         case 'G':
-            if (obs_phys == 'G') return 1.0f - delta_GA;
+            // G→A deamination (3' terminal) + G→T oxidation (uniform, Channel C)
+            if (obs_phys == 'G') return 1.0f - delta_GA - delta_GT;
             if (obs_phys == 'A') return delta_GA;
+            if (obs_phys == 'T') return delta_GT;
             return 0.0f;
         default: return 0.25f;
     }
@@ -847,7 +863,7 @@ inline float damage_emission_oriented(
     char true_phys = forward ? true_oriented : complement(true_oriented);
     char obs_phys = forward ? obs_oriented : complement(obs_oriented);
 
-    return damage_emission_physical(true_phys, obs_phys, delta_CT, delta_GA);
+    return damage_emission_physical(true_phys, obs_phys, delta_CT, delta_GA, dmg.d_max_gt);
 }
 
 /**
@@ -889,7 +905,7 @@ inline float damage_emission_oriented_cpg(
     float delta_CT = dmg.delta_CT_context(phys_pos, next_is_G);
     float delta_GA = dmg.delta_GA_context(phys_pos, L, prev_is_C);
 
-    return damage_emission_physical(true_phys, obs_phys, delta_CT, delta_GA);
+    return damage_emission_physical(true_phys, obs_phys, delta_CT, delta_GA, dmg.d_max_gt);
 }
 
 // ============================================================================
@@ -914,13 +930,16 @@ inline float position_marginal_ll(
     // True = T: P(obs|T) = 1 if obs=T, else 0
     if (obs == 'T') prob += pi['T'];
 
+    const float delta_GT = dmg.d_max_gt;  // uniform G→T oxidation (Channel C)
+
     // True = C: P(obs=C|C) = 1-delta_CT, P(obs=T|C) = delta_CT
     if (obs == 'C') prob += pi['C'] * (1.0f - delta_CT);
     if (obs == 'T') prob += pi['C'] * delta_CT;
 
-    // True = G: P(obs=G|G) = 1-delta_GA, P(obs=A|G) = delta_GA
-    if (obs == 'G') prob += pi['G'] * (1.0f - delta_GA);
+    // True = G: P(obs=G|G) = 1-delta_GA-delta_GT, P(obs=A|G) = delta_GA, P(obs=T|G) = delta_GT
+    if (obs == 'G') prob += pi['G'] * (1.0f - delta_GA - delta_GT);
     if (obs == 'A') prob += pi['G'] * delta_GA;
+    if (obs == 'T') prob += pi['G'] * delta_GT;
 
     return std::log(prob + 1e-30f);
 }
@@ -1386,6 +1405,8 @@ inline CodonPosteriors compute_codon_posteriors_joint_fast(
     const float delta_GA_0 = dmg.delta_GA(phys0, L);
     const float delta_GA_1 = dmg.delta_GA(phys1, L);
     const float delta_GA_2 = dmg.delta_GA(phys2, L);
+    // G→T oxidation: uniform (no position decay)
+    const float delta_GT   = dmg.delta_GT();
 
     alignas(64) float log_terms[64];
     float max_log = -1e30f;
@@ -1410,15 +1431,15 @@ inline CodonPosteriors compute_codon_posteriors_joint_fast(
         float e0 = damage_emission_physical(
             forward ? t0 : COMPLEMENT_TABLE[static_cast<unsigned char>(t0)],
             forward ? o0 : COMPLEMENT_TABLE[static_cast<unsigned char>(o0)],
-            delta_CT_0, delta_GA_0);
+            delta_CT_0, delta_GA_0, delta_GT);
         float e1 = damage_emission_physical(
             forward ? t1 : COMPLEMENT_TABLE[static_cast<unsigned char>(t1)],
             forward ? o1 : COMPLEMENT_TABLE[static_cast<unsigned char>(o1)],
-            delta_CT_1, delta_GA_1);
+            delta_CT_1, delta_GA_1, delta_GT);
         float e2 = damage_emission_physical(
             forward ? t2 : COMPLEMENT_TABLE[static_cast<unsigned char>(t2)],
             forward ? o2 : COMPLEMENT_TABLE[static_cast<unsigned char>(o2)],
-            delta_CT_2, delta_GA_2);
+            delta_CT_2, delta_GA_2, delta_GT);
 
         float likelihood = e0 * e1 * e2;
         log_terms[c] = (likelihood > 0.0f) ? (std::log(prior) + std::log(likelihood)) : -1e30f;
@@ -1511,21 +1532,23 @@ inline CodonPosteriors compute_codon_posteriors_sparse(
     const float delta_GA_0 = dmg.delta_GA(phys0, L);
     const float delta_GA_1 = dmg.delta_GA(phys1, L);
     const float delta_GA_2 = dmg.delta_GA(phys2, L);
+    // G→T oxidation: uniform rate, no position decay
+    const float delta_GT   = dmg.delta_GT();
 
-    // Get viable bases for each position (1-2 candidates each)
+    // Get viable bases for each position (up to 3 candidates: T can be true-T, C→T, or G→T)
     // For forward strand, use observed bases directly
     // For reverse strand, complement the observed bases for physical interpretation
     char eff_o0 = forward ? o0 : COMPLEMENT_TABLE[static_cast<unsigned char>(o0)];
     char eff_o1 = forward ? o1 : COMPLEMENT_TABLE[static_cast<unsigned char>(o1)];
     char eff_o2 = forward ? o2 : COMPLEMENT_TABLE[static_cast<unsigned char>(o2)];
 
-    ViableBases v0 = get_viable_bases_physical(eff_o0, delta_CT_0, delta_GA_0);
-    ViableBases v1 = get_viable_bases_physical(eff_o1, delta_CT_1, delta_GA_1);
-    ViableBases v2 = get_viable_bases_physical(eff_o2, delta_CT_2, delta_GA_2);
+    ViableBases v0 = get_viable_bases_physical(eff_o0, delta_CT_0, delta_GA_0, delta_GT);
+    ViableBases v1 = get_viable_bases_physical(eff_o1, delta_CT_1, delta_GA_1, delta_GT);
+    ViableBases v2 = get_viable_bases_physical(eff_o2, delta_CT_2, delta_GA_2, delta_GT);
 
-    // Maximum 2×2×2 = 8 viable codons
-    float log_terms[8];
-    int codon_indices[8];
+    // Maximum 3×3×3 = 27 viable codons (T expands to 3 with C→T and G→T damage)
+    float log_terms[27];
+    int codon_indices[27];
     int n_viable = 0;
     float max_log = -1e30f;
 
@@ -1581,7 +1604,7 @@ inline CodonPosteriors compute_codon_posteriors_sparse(
     }
 
     // OPTIMIZATION: Fused exp loop - compute exp once, then normalize
-    float unnorm[8];
+    float unnorm[27];
     float sum = 0.0f;
     for (int i = 0; i < n_viable; ++i) {
         float u = std::exp(log_terms[i] - max_log);
