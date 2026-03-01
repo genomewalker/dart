@@ -349,6 +349,9 @@ int cmd_sample_damage(int argc, char* argv[]) {
     *out << "    \"lambda_3prime\": " << std::fixed << std::setprecision(3) << profile.lambda_3prime << ",\n";
     *out << "    \"channel_b_valid\": " << (profile.channel_b_valid ? "true" : "false") << ",\n";
     *out << "    \"channel_b_llr\": " << std::fixed << std::setprecision(2) << profile.stop_decay_llr_5prime << ",\n";
+    *out << "    \"channel_b3_valid\": " << (profile.channel_b3_valid ? "true" : "false") << ",\n";
+    *out << "    \"channel_b3_llr\": " << std::fixed << std::setprecision(2) << profile.stop_decay_llr_3prime << ",\n";
+    *out << "    \"d_max_from_channel_b3\": " << std::fixed << std::setprecision(2) << (profile.d_max_from_channel_b3 * 100.0f) << ",\n";
     *out << "    \"damage_validated\": " << (profile.damage_validated ? "true" : "false") << ",\n";
     *out << "    \"position_0_artifact_5prime\": " << (profile.position_0_artifact_5prime ? "true" : "false") << ",\n";
     *out << "    \"terminal_shift_5prime\": " << std::fixed << std::setprecision(4) << profile.terminal_shift_5prime << ",\n";
@@ -382,6 +385,7 @@ int cmd_sample_damage(int argc, char* argv[]) {
         std::cerr << "  Level: " << damage_level_str(d_max) << "\n";
         std::cerr << "  D_max: " << std::fixed << std::setprecision(1) << (d_max * 100.0f) << "%\n";
         std::cerr << "  Channel B LLR: " << std::fixed << std::setprecision(1) << profile.stop_decay_llr_5prime << "\n";
+        std::cerr << "  Channel B3 LLR: " << std::fixed << std::setprecision(1) << profile.stop_decay_llr_3prime << "\n";
         std::cerr << "  Validated: " << (profile.damage_validated ? "yes" : "no") << "\n";
         auto run_end = std::chrono::steady_clock::now();
         std::cerr << "  Runtime: " << dart::log_utils::format_elapsed(run_start, run_end) << "\n";

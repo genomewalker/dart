@@ -373,6 +373,80 @@ void FrameSelector::update_sample_profile(
         }
     }
 
+    // CHANNEL B₃': G→A convertible stop codon tracking at 3' end
+    // TGG (Trp) converts to TAG (b1 G→A) or TGA (b2 G→A) near the 3' terminus.
+    // Position p = distance of codon's last base from the 3' end (p=0: most terminal codon).
+    if (len >= 18) {
+        for (int frame = 0; frame < 3; ++frame) {
+            for (size_t k = 0; ; ++k) {
+                if (len < static_cast<size_t>(3 + frame) + 3 * k) break;
+                size_t codon_start = len - static_cast<size_t>(3 + frame) - 3 * k;
+                size_t p = static_cast<size_t>(frame) + 3 * k;
+                if (p >= 15) break;
+
+                char b0 = fast_upper(seq[codon_start]);
+                char b1 = fast_upper(seq[codon_start + 1]);
+                char b2 = fast_upper(seq[codon_start + 2]);
+
+                if ((b0 != 'A' && b0 != 'C' && b0 != 'G' && b0 != 'T') ||
+                    (b1 != 'A' && b1 != 'C' && b1 != 'G' && b1 != 'T') ||
+                    (b2 != 'A' && b2 != 'C' && b2 != 'G' && b2 != 'T')) {
+                    continue;
+                }
+
+                if (b0 == 'T') {
+                    if (b1 == 'G') {
+                        if (b2 == 'G') {
+                            // TGG (Trp): pre-image for both G→A conversions
+                            profile.convertible_tgg_3prime[p]++;
+                        } else if (b2 == 'A') {
+                            // TGA: potential TGG→TGA via b2 G→A
+                            profile.convertible_tga_ga_3prime[p]++;
+                        }
+                    } else if (b1 == 'A' && b2 == 'G') {
+                        // TAG: potential TGG→TAG via b1 G→A
+                        profile.convertible_tag_ga_3prime[p]++;
+                    }
+                }
+            }
+        }
+
+        constexpr size_t INTERIOR_MIN_LEN_B3 = 63;
+        if (len >= INTERIOR_MIN_LEN_B3) {
+            for (int frame = 0; frame < 3; ++frame) {
+                for (size_t k = 0; ; ++k) {
+                    size_t codon_start = frame + 3 * k;
+                    if (codon_start < 30 || codon_start + 3 > len - 30) {
+                        if (codon_start + 3 > len - 30) break;
+                        continue;
+                    }
+
+                    char b0 = fast_upper(seq[codon_start]);
+                    char b1 = fast_upper(seq[codon_start + 1]);
+                    char b2 = fast_upper(seq[codon_start + 2]);
+
+                    if ((b0 != 'A' && b0 != 'C' && b0 != 'G' && b0 != 'T') ||
+                        (b1 != 'A' && b1 != 'C' && b1 != 'G' && b1 != 'T') ||
+                        (b2 != 'A' && b2 != 'C' && b2 != 'G' && b2 != 'T')) {
+                        continue;
+                    }
+
+                    if (b0 == 'T') {
+                        if (b1 == 'G') {
+                            if (b2 == 'G') {
+                                profile.convertible_tgg_interior++;
+                            } else if (b2 == 'A') {
+                                profile.convertible_tga_ga_interior++;
+                            }
+                        } else if (b1 == 'A' && b2 == 'G') {
+                            profile.convertible_tag_ga_interior++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // CHANNEL C: Oxidative stop codon tracking (G→T transversions)
     // Track GAG→TAG, GAA→TAA, GGA→TGA pairs by nucleotide position
     // Unlike deamination, oxidative damage is UNIFORM across read length
@@ -1078,6 +1152,120 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
             // Decision now made by joint probabilistic model earlier
             (void)profile.delta_llr_5prime;  // Used in debug output
             (void)profile.stop_decay_llr_5prime;
+        }
+    }
+
+    // CHANNEL B₃': G→A stop codon conversion at 3' end
+    // Analogous to 5' Channel B but for SS libraries where the damage signal is at the 3' end.
+    // TGG (Trp) → TAG (b1 G→A) or TGA (b2 G→A). Positive LLR = real terminal G→A damage.
+    {
+        double total_pre_3 = profile.convertible_tgg_interior;
+        double total_stop_3 = profile.convertible_tag_ga_interior + profile.convertible_tga_ga_interior;
+        double total_conv_3 = total_pre_3 + total_stop_3;
+
+        if (total_conv_3 > 100) {
+            profile.stop_conversion_rate_baseline_3prime = static_cast<float>(total_stop_3 / total_conv_3);
+            profile.channel_b3_valid = true;
+        }
+
+        std::array<double, 15> stop_rate_3 = {};
+        std::array<double, 15> stop_exp_3 = {};
+        for (int p = 0; p < 15; ++p) {
+            double pre = profile.convertible_tgg_3prime[p];
+            double stp = profile.convertible_tag_ga_3prime[p] + profile.convertible_tga_ga_3prime[p];
+            stop_exp_3[p] = pre + stp;
+            stop_rate_3[p] = (stop_exp_3[p] > 10)
+                ? stp / stop_exp_3[p]
+                : profile.stop_conversion_rate_baseline_3prime;
+        }
+
+        // Local baseline from positions 5-14 (past the damage zone)
+        double lp3 = 0.0, ls3 = 0.0;
+        for (int p = 5; p < 15; ++p) {
+            lp3 += profile.convertible_tgg_3prime[p];
+            ls3 += profile.convertible_tag_ga_3prime[p] + profile.convertible_tga_ga_3prime[p];
+        }
+        float local_base3 = (lp3 + ls3 > 100)
+            ? static_cast<float>(ls3 / (lp3 + ls3))
+            : profile.stop_conversion_rate_baseline_3prime;
+
+        if (profile.channel_b3_valid) {
+            float baseline3 = local_base3;
+            float lambda3   = fit_lambda_3p;
+
+            // Amplitude estimate from positions 0-4
+            double sum_exc3 = 0.0, sum_w3 = 0.0;
+            for (int i = 0; i < 5; ++i) {
+                if (stop_exp_3[i] > 50) {
+                    double wt = std::exp(-lambda3 * i);
+                    sum_exc3 += stop_exp_3[i] * (stop_rate_3[i] - baseline3) / wt;
+                    sum_w3   += stop_exp_3[i];
+                }
+            }
+            float amp3 = (sum_w3 > 0) ? static_cast<float>(sum_exc3 / sum_w3) : 0.0f;
+            profile.stop_amplitude_3prime = std::max(0.0f, amp3);
+
+            // LLR: exponential model vs constant
+            double ll_exp3 = 0.0, ll_cst3 = 0.0;
+            for (int p = 0; p < 10; ++p) {
+                if (stop_exp_3[p] < 50) continue;
+                double n = stop_exp_3[p];
+                double k = profile.convertible_tag_ga_3prime[p] + profile.convertible_tga_ga_3prime[p];
+                double pe = std::clamp(static_cast<double>(baseline3) + static_cast<double>(amp3) * std::exp(-static_cast<double>(lambda3) * p), 0.001, 0.999);
+                double pc = std::clamp(static_cast<double>(baseline3), 0.001, 0.999);
+                ll_exp3 += binomial_ll(k, n, pe);
+                ll_cst3 += binomial_ll(k, n, pc);
+            }
+            profile.stop_decay_llr_3prime = static_cast<float>(ll_exp3 - ll_cst3);
+            if (amp3 < 0) profile.stop_decay_llr_3prime = -std::abs(profile.stop_decay_llr_3prime);
+
+            // WLS quantification of d_max from 3' stop conversions
+            {
+                const double lambda = std::clamp(static_cast<double>(fit_lambda_3p), 0.1, 0.5);
+                double S_w = 0, S_x = 0, S_xx = 0, S_y = 0, S_xy = 0, tot_exp = 0;
+                for (int p = 0; p < 15; ++p) {
+                    double stops_p = profile.convertible_tag_ga_3prime[p] + profile.convertible_tga_ga_3prime[p];
+                    double exp_p   = stops_p + profile.convertible_tgg_3prime[p];
+                    if (exp_p < 100) continue;
+                    double x_p = std::exp(-lambda * p);
+                    double y_p = stops_p / exp_p;
+                    S_w  += exp_p;       S_x  += exp_p * x_p;
+                    S_xx += exp_p * x_p * x_p;
+                    S_y  += exp_p * y_p; S_xy += exp_p * x_p * y_p;
+                    tot_exp += exp_p;
+                }
+                double denom = S_w * S_xx - S_x * S_x;
+                if (tot_exp > 1000 && std::abs(denom) > 1e-10) {
+                    double c = (S_w * S_xy - S_x * S_y) / denom;
+                    double a = (S_y  - c * S_x) / S_w;
+                    profile.channel_b3_slope = static_cast<float>(c);
+                    if (c > 0) {
+                        double b0v = std::clamp(a, 0.01, 0.99);
+                        profile.d_max_from_channel_b3  = static_cast<float>(std::clamp(c / (1.0 - b0v), 0.0, 1.0));
+                        profile.channel_b3_weight      = static_cast<float>(S_w);
+                        profile.channel_b3_quantifiable = true;
+                        profile.channel_b3_inverted    = false;
+                    } else {
+                        profile.d_max_from_channel_b3  = 0.0f;
+                        profile.channel_b3_weight      = 0.0f;
+                        profile.channel_b3_quantifiable = false;
+                        profile.channel_b3_inverted    = true;
+                    }
+                } else {
+                    profile.d_max_from_channel_b3  = 0.0f;
+                    profile.channel_b3_weight      = 0.0f;
+                    profile.channel_b3_quantifiable = false;
+                    profile.channel_b3_slope       = 0.0f;
+                }
+            }
+
+            // For SS libraries: if 3' Channel B validates, override damage_artifact decision
+            const bool is_ss_b3 = (profile.forced_library_type == SampleDamageProfile::LibraryType::SINGLE_STRANDED) ||
+                                   (profile.library_type == SampleDamageProfile::LibraryType::SINGLE_STRANDED);
+            if (is_ss_b3 && profile.channel_b3_quantifiable && profile.stop_decay_llr_3prime > 0.0f) {
+                profile.damage_validated = true;
+                profile.damage_artifact  = false;
+            }
         }
     }
 
@@ -1848,9 +2036,14 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
                 profile.d_max_combined = raw_d_max_5prime;
                 profile.d_max_source = SampleDamageProfile::DmaxSource::FIVE_PRIME_ONLY;
             } else if (profile.inverted_pattern_5prime && !profile.inverted_pattern_3prime) {
-                // 5' inverted but 3' valid - use 3' raw estimate
-                profile.d_max_combined = raw_d_max_3prime;
-                profile.d_max_source = SampleDamageProfile::DmaxSource::THREE_PRIME_ONLY;
+                // 5' inverted but 3' valid - prefer Channel B₃' (structural), fall back to raw 3'
+                if (profile.channel_b3_quantifiable && profile.d_max_from_channel_b3 > 0.01f) {
+                    profile.d_max_combined = profile.d_max_from_channel_b3;
+                    profile.d_max_source = SampleDamageProfile::DmaxSource::CHANNEL_B3_STRUCTURAL;
+                } else {
+                    profile.d_max_combined = raw_d_max_3prime;
+                    profile.d_max_source = SampleDamageProfile::DmaxSource::THREE_PRIME_ONLY;
+                }
             } else if (profile.mixture_converged && profile.mixture_d_reference > 0.01f) {
                 // No inversion - use mixture model d_reference (metaDMG proxy: E[δ | GC > 50%])
                 profile.d_max_combined = profile.mixture_d_reference;
@@ -2107,6 +2300,16 @@ void FrameSelector::merge_sample_profiles(SampleDamageProfile& dst, const Sample
     dst.convertible_tga_interior += src.convertible_tga_interior;
     dst.total_codons_interior += src.total_codons_interior;
 
+    // Merge Channel B₃' convertible codon counts
+    for (int i = 0; i < 15; ++i) {
+        dst.convertible_tgg_3prime[i]     += src.convertible_tgg_3prime[i];
+        dst.convertible_tag_ga_3prime[i]  += src.convertible_tag_ga_3prime[i];
+        dst.convertible_tga_ga_3prime[i]  += src.convertible_tga_ga_3prime[i];
+    }
+    dst.convertible_tgg_interior     += src.convertible_tgg_interior;
+    dst.convertible_tag_ga_interior  += src.convertible_tag_ga_interior;
+    dst.convertible_tga_ga_interior  += src.convertible_tga_ga_interior;
+
     // Merge Channel C oxidative codon counts (G→T transversions)
     for (int i = 0; i < 15; ++i) {
         dst.convertible_gag_5prime[i] += src.convertible_gag_5prime[i];
@@ -2311,6 +2514,23 @@ void FrameSelector::reset_sample_profile(SampleDamageProfile& profile) {
     profile.channel_b_valid = false;
     profile.damage_validated = false;
     profile.damage_artifact = false;
+
+    // Reset Channel B₃' convertible codon counts
+    profile.convertible_tgg_3prime.fill(0.0);
+    profile.convertible_tag_ga_3prime.fill(0.0);
+    profile.convertible_tga_ga_3prime.fill(0.0);
+    profile.convertible_tgg_interior    = 0.0;
+    profile.convertible_tag_ga_interior = 0.0;
+    profile.convertible_tga_ga_interior = 0.0;
+    profile.stop_conversion_rate_baseline_3prime = 0.0f;
+    profile.stop_decay_llr_3prime   = 0.0f;
+    profile.stop_amplitude_3prime   = 0.0f;
+    profile.channel_b3_valid        = false;
+    profile.d_max_from_channel_b3   = 0.0f;
+    profile.channel_b3_weight       = 0.0f;
+    profile.channel_b3_slope        = 0.0f;
+    profile.channel_b3_quantifiable = false;
+    profile.channel_b3_inverted     = false;
 
     // Joint probabilistic model
     profile.joint_delta_max = 0.0f;
