@@ -673,7 +673,8 @@ ColumnarIndexReader::ColumnarIndexReader(const std::string& path)
         impl_->close();
         return;
     }
-    if (impl_->header->version != EMI_VERSION) {
+    // Accept both v5 (32-bit string offsets) and v6 (64-bit string offsets)
+    if (impl_->header->version != EMI_VERSION && impl_->header->version != 5) {
         impl_->close();
         return;
     }
