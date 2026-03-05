@@ -763,6 +763,7 @@ struct GeneSummaryAccumulator {
     double n_modern_conf = 0.0;       // Gamma-weighted modern confident (damage-evidence reads)
     double sum_posterior = 0.0;       // Gamma-weighted posterior over damage-evidence reads
     double sum_fident = 0.0;          // Gamma-weighted identity over assigned reads
+    double sum_fident_sq = 0.0;       // Gamma-weighted identity^2 (for std)
     double sum_aln_len = 0.0;       // Sum of alignment lengths (for avg)
     double sum_aln_len_sq = 0.0;    // Sum of squared aln lengths (for std)
     std::vector<float> coverage;    // Per-position coverage depth (gamma-weighted)
@@ -775,7 +776,8 @@ struct GeneSummaryAccumulator {
                         float gamma = 1.0f) {
         ++n_reads;
         n_reads_eff += gamma;
-        sum_fident += gamma * fident;
+        sum_fident    += gamma * fident;
+        sum_fident_sq += gamma * fident * fident;
         sum_aln_len += gamma * aln_len_on_target;
         sum_aln_len_sq += gamma * aln_len_on_target * aln_len_on_target;
 
@@ -947,6 +949,13 @@ struct GeneSummaryAccumulator {
         return n_reads_eff > 0 ? static_cast<float>(sum_fident / n_reads_eff) : 0.0f;
     }
 
+    float std_fident() const {
+        if (n_reads_eff <= 1) return 0.0f;
+        double mean = sum_fident / n_reads_eff;
+        double var = (sum_fident_sq / n_reads_eff) - (mean * mean);
+        return static_cast<float>(std::sqrt(std::max(0.0, var)));
+    }
+
     // Ancient fraction based on effective counts
     float ancient_frac() const {
         double total = n_ancient_conf + n_ancient_likely + n_modern_conf;
@@ -965,10 +974,23 @@ struct FunctionalAccumulator {
     float n_modern = 0.0f;
     float n_undetermined = 0.0f;
     double sum_posterior = 0.0;
+    // Coverage stats (per-gene depth_mean aggregated across genes)
+    double sum_coverage = 0.0;
+    double sum_coverage_sq = 0.0;
+    // Identity and read-length stats (reads-weighted across all reads in group)
+    double sum_fident = 0.0;
+    double sum_fident_sq = 0.0;
+    double sum_aln_len = 0.0;
+    double sum_aln_len_sq = 0.0;
+    double sum_eff_reads = 0.0;  // denominator for reads-weighted stats
 
     void add_gene(uint32_t gene_reads, float gene_ancient, float gene_modern,
                   float gene_undetermined, float gene_mean_posterior,
-                  bool gene_is_damaged) {
+                  bool gene_is_damaged,
+                  float gene_depth_mean,
+                  double gene_sum_fident, double gene_sum_fident_sq,
+                  double gene_sum_aln_len, double gene_sum_aln_len_sq,
+                  double gene_eff_reads) {
         ++n_genes;
         if (gene_is_damaged) ++n_damaged_genes;
         n_reads += gene_reads;
@@ -976,6 +998,13 @@ struct FunctionalAccumulator {
         n_modern += gene_modern;
         n_undetermined += gene_undetermined;
         sum_posterior += gene_mean_posterior * gene_reads;
+        sum_coverage    += gene_depth_mean;
+        sum_coverage_sq += static_cast<double>(gene_depth_mean) * gene_depth_mean;
+        sum_fident      += gene_sum_fident;
+        sum_fident_sq   += gene_sum_fident_sq;
+        sum_aln_len     += gene_sum_aln_len;
+        sum_aln_len_sq  += gene_sum_aln_len_sq;
+        sum_eff_reads   += gene_eff_reads;
     }
 
     float ancient_frac() const {
@@ -989,6 +1018,39 @@ struct FunctionalAccumulator {
 
     float damaged_gene_frac() const {
         return n_genes > 0 ? static_cast<float>(n_damaged_genes) / static_cast<float>(n_genes) : 0.0f;
+    }
+
+    float coverage_mean() const {
+        return n_genes > 0 ? static_cast<float>(sum_coverage / n_genes) : 0.0f;
+    }
+
+    float coverage_stdev() const {
+        if (n_genes < 2) return 0.0f;
+        double mean = sum_coverage / n_genes;
+        double var = (sum_coverage_sq / n_genes) - (mean * mean);
+        return static_cast<float>(std::sqrt(std::max(0.0, var)));
+    }
+
+    float avg_identity() const {
+        return sum_eff_reads > 0 ? static_cast<float>(sum_fident / sum_eff_reads) : 0.0f;
+    }
+
+    float stdev_identity() const {
+        if (sum_eff_reads <= 1) return 0.0f;
+        double mean = sum_fident / sum_eff_reads;
+        double var = (sum_fident_sq / sum_eff_reads) - (mean * mean);
+        return static_cast<float>(std::sqrt(std::max(0.0, var)));
+    }
+
+    float avg_read_length() const {
+        return sum_eff_reads > 0 ? static_cast<float>(sum_aln_len / sum_eff_reads) : 0.0f;
+    }
+
+    float stdev_read_length() const {
+        if (sum_eff_reads <= 1) return 0.0f;
+        double mean = sum_aln_len / sum_eff_reads;
+        double var = (sum_aln_len_sq / sum_eff_reads) - (mean * mean);
+        return static_cast<float>(std::sqrt(std::max(0.0, var)));
     }
 };
 
@@ -3756,7 +3818,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 const float n_und = static_cast<float>(gene_acc.n_undetermined);
                 const float mean_post = gene_acc.avg_posterior();
                 const bool gene_damaged = (mean_post >= threshold);
-                fa.add_gene(static_cast<uint32_t>(std::round(eff)), n_anc, n_mod, n_und, mean_post, gene_damaged);
+                fa.add_gene(static_cast<uint32_t>(std::round(eff)), n_anc, n_mod, n_und, mean_post, gene_damaged,
+                            gene_acc.depth_mean(),
+                            gene_acc.sum_fident, gene_acc.sum_fident_sq,
+                            gene_acc.sum_aln_len, gene_acc.sum_aln_len_sq,
+                            gene_acc.n_reads_eff);
             } else if (verbose && func_acc.empty()) {
                 std::cerr << "  Warning: first gene_passes target not found in map: \""
                           << target_name << "\"\n";
@@ -3976,7 +4042,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         } else {
             ff_fs << "db\tfunction_id\tlevel\tn_genes\tn_reads\tn_ancient\tn_modern\tn_undetermined\t"
                      "ancient_frac\tci_low\tci_high\tmean_posterior\t"
-                     "n_damaged_genes\tdamaged_gene_frac\tdamage_enrichment\n";
+                     "n_damaged_genes\tdamaged_gene_frac\tdamage_enrichment\t"
+                     "coverage_mean\tcoverage_stdev\t"
+                     "avg_identity\tstdev_identity\t"
+                     "avg_read_length\tstdev_read_length\n";
             uint32_t global_genes = 0, global_damaged = 0;
             for (const auto& [fid, fa] : func_acc) {
                 global_genes   += fa.n_genes;
@@ -3999,7 +4068,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                       << fa.mean_posterior() << '\t'
                       << fa.n_damaged_genes << '\t'
                       << dam_frac << '\t'
-                      << enrich << '\n';
+                      << enrich << '\t'
+                      << std::setprecision(4) << fa.coverage_mean() << '\t' << fa.coverage_stdev() << '\t'
+                      << fa.avg_identity() << '\t' << fa.stdev_identity() << '\t'
+                      << std::setprecision(2) << fa.avg_read_length() << '\t' << fa.stdev_read_length() << '\n';
             }
             if (verbose) std::cerr << "Functional summary written to: " << functional_summary_file
                                    << " (" << func_acc.size() << " functions)\n";
