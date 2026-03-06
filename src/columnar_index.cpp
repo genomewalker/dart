@@ -98,6 +98,25 @@ inline void madvise_dontneed_range(const char* addr, size_t len) {
 #endif
 }
 
+// Helper: pread with retry loop for partial reads (common on NFS).
+inline bool pread_full(int fd, void* buf, size_t count, off_t offset) {
+    char* p = static_cast<char*>(buf);
+    size_t remaining = count;
+    while (remaining > 0) {
+        ssize_t n = pread(fd, p, remaining, offset);
+        if (n <= 0) return false;  // EOF or error
+        p += n;
+        offset += n;
+        remaining -= static_cast<size_t>(n);
+    }
+    return true;
+}
+
+template <typename T>
+inline bool pread_value(int fd, T& value, off_t offset) {
+    return pread_full(fd, &value, sizeof(T), offset);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -621,9 +640,9 @@ struct ColumnarIndexReader::Impl {
     size_t ref_names_file_off = 0;
     uint64_t ref_names_bytes = 0;
 
-    // Cached copy of header->num_refs, copied during construction before memory pressure.
-    // Use this instead of header->num_refs or num_ref_names in pread paths to avoid
-    // NFS mmap corruption where evicted pages return garbage when re-faulted.
+    // Cached copy of the on-disk ref-name count, read via pread() during construction.
+    // Use this instead of mmap-backed counts in pread paths to avoid NFS mmap
+    // corruption where evicted pages return garbage when re-faulted.
     uint32_t cached_num_refs = 0;
 
     // Cached ref_name offsets for on-demand pread (populated by ref_name_pread_single).
@@ -694,51 +713,104 @@ ColumnarIndexReader::ColumnarIndexReader(const std::string& path)
     impl_->row_groups = reinterpret_cast<const RowGroupMeta*>(
         base + impl_->header->row_group_dir_offset);
 
-    // String dictionaries (v5: 32-bit offsets, v6: 64-bit offsets)
-    const char* dict_ptr = base + impl_->header->string_dict_offset;
     impl_->use_64bit_string_dict = (impl_->header->flags & EMI_FLAG_64BIT_STRING_DICT) != 0;
 
+    // String dictionaries: derive all offsets from the header + on-disk scalar
+    // fields read via pread(), rather than walking mmap-backed pointers.
     uint64_t read_names_size = 0;
     uint64_t ref_names_size = 0;
+    const size_t offset_width = impl_->use_64bit_string_dict ? sizeof(uint64_t) : sizeof(uint32_t);
+    const size_t size_width = impl_->use_64bit_string_dict ? sizeof(uint64_t) : sizeof(uint32_t);
+    size_t dict_off = static_cast<size_t>(impl_->header->string_dict_offset);
+    auto advance_checked = [&](uint64_t delta) -> bool {
+        if (delta > impl_->file_size) return false;
+        if (dict_off > impl_->file_size - static_cast<size_t>(delta)) return false;
+        dict_off += static_cast<size_t>(delta);
+        return true;
+    };
 
-    impl_->num_read_names = *reinterpret_cast<const uint32_t*>(dict_ptr);
-    dict_ptr += sizeof(uint32_t);
-    impl_->read_name_offsets = dict_ptr;
-    if (impl_->use_64bit_string_dict) {
-        dict_ptr += impl_->num_read_names * sizeof(uint64_t);
-        read_names_size = *reinterpret_cast<const uint64_t*>(dict_ptr);
-        dict_ptr += sizeof(uint64_t);
-    } else {
-        dict_ptr += impl_->num_read_names * sizeof(uint32_t);
-        read_names_size = *reinterpret_cast<const uint32_t*>(dict_ptr);
-        dict_ptr += sizeof(uint32_t);
+    if (dict_off > impl_->file_size) {
+        impl_->close();
+        return;
     }
-    impl_->read_names = dict_ptr;
-    dict_ptr += read_names_size;
 
-    impl_->num_ref_names = *reinterpret_cast<const uint32_t*>(dict_ptr);
-    dict_ptr += sizeof(uint32_t);
-    impl_->ref_name_offsets = dict_ptr;
-    if (impl_->use_64bit_string_dict) {
-        dict_ptr += impl_->num_ref_names * sizeof(uint64_t);
-        ref_names_size = *reinterpret_cast<const uint64_t*>(dict_ptr);
-        dict_ptr += sizeof(uint64_t);
-    } else {
-        dict_ptr += impl_->num_ref_names * sizeof(uint32_t);
-        ref_names_size = *reinterpret_cast<const uint32_t*>(dict_ptr);
-        dict_ptr += sizeof(uint32_t);
+    if (!pread_value(impl_->fd, impl_->num_read_names, static_cast<off_t>(dict_off))) {
+        impl_->close();
+        return;
     }
-    impl_->ref_names = dict_ptr;
+    if (!advance_checked(sizeof(uint32_t))) {
+        impl_->close();
+        return;
+    }
+    impl_->read_name_offsets = base + dict_off;
+    if (!advance_checked(static_cast<uint64_t>(impl_->num_read_names) * offset_width)) {
+        impl_->close();
+        return;
+    }
+    if (impl_->use_64bit_string_dict) {
+        if (!pread_value(impl_->fd, read_names_size, static_cast<off_t>(dict_off))) {
+            impl_->close();
+            return;
+        }
+    } else {
+        uint32_t read_names_size32 = 0;
+        if (!pread_value(impl_->fd, read_names_size32, static_cast<off_t>(dict_off))) {
+            impl_->close();
+            return;
+        }
+        read_names_size = read_names_size32;
+    }
+    if (!advance_checked(size_width)) {
+        impl_->close();
+        return;
+    }
+    impl_->read_names = base + dict_off;
+    if (!advance_checked(read_names_size)) {
+        impl_->close();
+        return;
+    }
 
-    // Record file offsets for pread()-based access (immune to NFS page eviction).
-    impl_->ref_name_offsets_file_off = static_cast<size_t>(
-        static_cast<const char*>(impl_->ref_name_offsets) - base);
-    impl_->ref_names_file_off = static_cast<size_t>(impl_->ref_names - base);
+    if (!pread_value(impl_->fd, impl_->num_ref_names, static_cast<off_t>(dict_off))) {
+        impl_->close();
+        return;
+    }
+    if (!advance_checked(sizeof(uint32_t))) {
+        impl_->close();
+        return;
+    }
+    impl_->ref_name_offsets = base + dict_off;
+    impl_->ref_name_offsets_file_off = dict_off;
+    if (!advance_checked(static_cast<uint64_t>(impl_->num_ref_names) * offset_width)) {
+        impl_->close();
+        return;
+    }
+    if (impl_->use_64bit_string_dict) {
+        if (!pread_value(impl_->fd, ref_names_size, static_cast<off_t>(dict_off))) {
+            impl_->close();
+            return;
+        }
+    } else {
+        uint32_t ref_names_size32 = 0;
+        if (!pread_value(impl_->fd, ref_names_size32, static_cast<off_t>(dict_off))) {
+            impl_->close();
+            return;
+        }
+        ref_names_size = ref_names_size32;
+    }
+    if (!advance_checked(size_width)) {
+        impl_->close();
+        return;
+    }
+    impl_->ref_names = base + dict_off;
+    impl_->ref_names_file_off = dict_off;
     impl_->ref_names_bytes = ref_names_size;
+    if (!advance_checked(ref_names_size)) {
+        impl_->close();
+        return;
+    }
 
-    // Cache num_refs by value NOW, before memory pressure builds up.
-    // This avoids NFS mmap corruption where header pages return garbage later.
-    impl_->cached_num_refs = impl_->header->num_refs;
+    // Cache the ref-name count by value from the on-disk dictionary metadata.
+    impl_->cached_num_refs = impl_->num_ref_names;
 
     // CSR offsets
     impl_->csr_offsets = reinterpret_cast<const uint64_t*>(
@@ -832,33 +904,18 @@ std::string_view ColumnarIndexReader::ref_name(uint32_t idx) const {
     return {p, strlen(p)};
 }
 
-// Helper: pread with retry loop for partial reads (common on NFS).
-static bool pread_full(int fd, void* buf, size_t count, off_t offset) {
-    char* p = static_cast<char*>(buf);
-    size_t remaining = count;
-    while (remaining > 0) {
-        ssize_t n = pread(fd, p, remaining, offset);
-        if (n <= 0) return false;  // EOF or error
-        p += n;
-        offset += n;
-        remaining -= static_cast<size_t>(n);
-    }
-    return true;
-}
-
 // Read all ref names via pread() — bypasses the mmap page cache entirely.
 // On NFS + Linux 4.18 with MAP_PRIVATE, the kernel can evict pages at any time
 // under memory pressure; re-faulting those pages from NFS returns garbage.
 // pread() reads directly from the file descriptor without touching the mmap.
 //
 std::vector<std::string> ColumnarIndexReader::ref_names_pread() const {
-    // CRITICAL: Use cached_num_refs, NOT header->num_refs or num_ref_names.
-    // Both mmap-backed fields can return garbage under NFS memory pressure.
-    // cached_num_refs was copied by value during construction before pressure built up.
+    // CRITICAL: Use cached_num_refs, NOT mmap-backed ref counts.
+    // cached_num_refs was read from disk via pread() during construction.
     const uint32_t n = impl_->cached_num_refs;
     const bool use_64bit = impl_->use_64bit_string_dict;
 
-    // Use the ref_names_bytes stored during construction (read from mmap before pressure).
+    // Use the ref_names_bytes stored during construction via pread().
     const uint64_t ref_names_bytes = impl_->ref_names_bytes;
 
     // Debug output to diagnose OOM.
@@ -905,7 +962,7 @@ std::vector<std::string> ColumnarIndexReader::ref_names_pread() const {
 // Each subsequent call reads just one string (~20-100 bytes) via pread.
 // Use this during output phase to avoid OOM from allocating entire blob.
 std::string ColumnarIndexReader::ref_name_pread_single(uint32_t idx) const {
-    // Use cached_num_refs (copied at construction) to avoid NFS mmap corruption.
+    // Use cached_num_refs (read via pread() at construction) to avoid NFS mmap corruption.
     if (idx >= impl_->cached_num_refs) return {};
 
     // Cache offset array on first call (thread-safe via mutable + const method pattern).
