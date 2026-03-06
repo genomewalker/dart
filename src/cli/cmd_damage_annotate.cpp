@@ -3268,21 +3268,14 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         out = &file_out;
     }
 
-    // Cache all ref names via pread() — bypasses the mmap page cache entirely.
-    // On NFS + Linux 4.18 MAP_PRIVATE, the kernel evicts pages under memory pressure
-    // regardless of when we read them; re-faulting returns garbage. pread() reads
-    // directly from the file descriptor and is immune to page-cache state.
-    // Placed here (output phase) rather than after Pass 1 to reduce peak memory:
-    // streaming EM and annotation are done, so memory is lower.
-    std::vector<std::string> cached_ref_names = reader.ref_names_pread();
-    if (cached_ref_names.size() != reader.num_refs()) {
-        std::cerr << "[ERROR] Failed to load ref names via pread: got "
-                  << cached_ref_names.size() << ", expected " << reader.num_refs()
-                  << ". Falling back to mmap (may be unreliable on NFS).\n";
-        cached_ref_names.resize(reader.num_refs());
-        for (uint32_t i = 0; i < reader.num_refs(); ++i)
-            cached_ref_names[i] = std::string(reader.ref_name(i));
-    }
+    // Cache ref names to heap before output phase. NFS MAP_PRIVATE pages can be
+    // kernel-evicted under heavy memory pressure; re-faulting sometimes returns
+    // garbage. Materialise all names into owned strings on the heap to avoid.
+    // Placed here (output phase) after streaming EM + annotation to minimize
+    // peak memory (vs caching after Pass 1).
+    std::vector<std::string> cached_ref_names(reader.num_refs());
+    for (uint32_t i = 0; i < reader.num_refs(); ++i)
+        cached_ref_names[i] = std::string(reader.ref_name(i));
 
     // Output header with Bayesian decomposition columns
     *out << "query_id\ttarget_id\tevalue\tbits\tfident\talnlen\t"
