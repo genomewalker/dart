@@ -263,6 +263,9 @@ public:
     std::string_view ref_name(uint32_t idx) const;
     // NFS-safe: read all ref names via pread(), bypassing the mmap page cache.
     std::vector<std::string> ref_names_pread() const;
+    // NFS-safe single ref_name via pread. Caches offset array on first call (~40MB for 10M refs).
+    // Returns empty string on error. Use this for on-demand access during output to avoid OOM.
+    std::string ref_name_pread_single(uint32_t idx) const;
 
     // CSR access for per-read iteration
     uint64_t read_offset(uint32_t read_idx) const;
