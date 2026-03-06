@@ -843,7 +843,11 @@ static bool pread_full(int fd, void* buf, size_t count, off_t offset) {
 // pread() reads directly from the file descriptor without touching the mmap.
 //
 std::vector<std::string> ColumnarIndexReader::ref_names_pread() const {
-    const uint32_t n = impl_->num_ref_names;
+    // CRITICAL: Use header->num_refs, NOT impl_->num_ref_names.
+    // num_ref_names was read from a mmap location in the string dict section,
+    // which can get corrupted under NFS memory pressure.
+    // The header is in the first 128 bytes and stays reliably cached.
+    const uint32_t n = impl_->header->num_refs;
     const bool use_64bit = impl_->use_64bit_string_dict;
 
     // Use the ref_names_bytes stored during construction (read from mmap before pressure).
@@ -852,10 +856,10 @@ std::vector<std::string> ColumnarIndexReader::ref_names_pread() const {
 
     // Debug output to diagnose OOM.
     std::cerr << "[DEBUG] ref_names_pread: n=" << n
+              << " (header->num_refs=" << impl_->header->num_refs
+              << ", num_ref_names=" << impl_->num_ref_names << ")"
               << " ref_names_bytes=" << ref_names_bytes
-              << " use_64bit=" << use_64bit
-              << " ref_names_file_off=" << impl_->ref_names_file_off
-              << " ref_name_offsets_file_off=" << impl_->ref_name_offsets_file_off << "\n";
+              << " use_64bit=" << use_64bit << "\n";
 
     // Sanity check: ref names blob should be < 8 GB (generous limit).
     constexpr uint64_t MAX_REF_NAMES_BYTES = 8ULL * 1024 * 1024 * 1024;
