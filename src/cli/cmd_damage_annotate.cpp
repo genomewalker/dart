@@ -2264,6 +2264,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     std::atomic<bool> damage_em_active{false};
     std::unordered_map<uint32_t, dart::ProteinCoverageStats> coverage_stats_map;
 
+    // Cached ref_names (NFS-safe pread). Populated by streaming EM right after flush_pages,
+    // or lazily at output phase for non-streaming paths.
+    std::vector<std::string> cached_ref_names;
+
     // Auto-switch to streaming EM if estimated memory exceeds limit
     // Memory estimate: ~72 bytes per alignment at SQUAREM peak:
     //   Alignment struct (40B) + gamma (8B) + gamma_ancient (8B)
@@ -2504,6 +2508,21 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 #ifdef __linux__
         malloc_trim(0);
 #endif
+
+        // Cache ref_names NOW while memory is at its lowest (after flush_pages + malloc_trim).
+        // Doing this BEFORE annotation prevents OOM: annotation adds ~50GB of summaries,
+        // and ref_names_pread needs ~1GB peak. With 300GB limit, this order works.
+        if (verbose) {
+            std::cerr << "Caching ref_names via pread...\n";
+        }
+        cached_ref_names = reader.ref_names_pread();
+        if (cached_ref_names.empty() && reader.num_refs() > 0) {
+            std::cerr << "Error: ref_names_pread() returned empty vector\n";
+            return 1;
+        }
+        if (verbose) {
+            std::cerr << "Cached " << cached_ref_names.size() << " ref names\n";
+        }
 
     } else if (use_em && em_aln_count > 0) {
         if (verbose) {
@@ -3268,21 +3287,21 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         out = &file_out;
     }
 
-    // Cache all ref_names via pread (NFS-safe). This must happen AFTER streaming EM
-    // completes and flush_pages()+malloc_trim() frees memory, otherwise it OOMs.
-    // ref_names_pread() reads the entire offset array and string blob via pread,
-    // bypassing the mmap page cache which can return garbage on NFS under pressure.
-    // Cost: ~40MB offsets + ~300MB strings for 10M refs.
-    if (verbose) {
-        std::cerr << "Caching ref_names via pread...\n";
-    }
-    std::vector<std::string> cached_ref_names = reader.ref_names_pread();
-    if (cached_ref_names.empty() && reader.num_refs() > 0) {
-        std::cerr << "Error: ref_names_pread() returned empty vector\n";
-        return 1;
-    }
-    if (verbose) {
-        std::cerr << "Cached " << cached_ref_names.size() << " ref names\n";
+    // Cache all ref_names via pread (NFS-safe) if not already done.
+    // Streaming EM caches early (after flush_pages) when memory is lowest.
+    // Non-streaming paths cache here, at output phase.
+    if (cached_ref_names.empty()) {
+        if (verbose) {
+            std::cerr << "Caching ref_names via pread...\n";
+        }
+        cached_ref_names = reader.ref_names_pread();
+        if (cached_ref_names.empty() && reader.num_refs() > 0) {
+            std::cerr << "Error: ref_names_pread() returned empty vector\n";
+            return 1;
+        }
+        if (verbose) {
+            std::cerr << "Cached " << cached_ref_names.size() << " ref names\n";
+        }
     }
 
     // Output header with Bayesian decomposition columns
