@@ -908,23 +908,8 @@ std::string ColumnarIndexReader::ref_name_pread_single(uint32_t idx) const {
         const uint32_t n = impl_->num_ref_names;
         const bool use_64bit = impl_->use_64bit_string_dict;
 
-        // Re-read ref_names_bytes from file (4 or 8 bytes before ref_names data).
-        uint64_t ref_names_bytes = 0;
-        if (use_64bit) {
-            const off_t size_offset = static_cast<off_t>(impl_->ref_names_file_off) - sizeof(uint64_t);
-            if (pread(impl_->fd, &ref_names_bytes, sizeof(uint64_t), size_offset) != sizeof(uint64_t))
-                return {};
-        } else {
-            uint32_t ref_names_bytes_32 = 0;
-            const off_t size_offset = static_cast<off_t>(impl_->ref_names_file_off) - sizeof(uint32_t);
-            if (pread(impl_->fd, &ref_names_bytes_32, sizeof(uint32_t), size_offset) != sizeof(uint32_t))
-                return {};
-            ref_names_bytes = ref_names_bytes_32;
-        }
-        impl_->ref_names_bytes = ref_names_bytes;
-
         // Read offset array (~40MB for 10M refs).
-        impl_->cached_ref_offsets.resize(n + 1);  // +1 for sentinel
+        impl_->cached_ref_offsets.resize(n);
         if (use_64bit) {
             if (!pread_full(impl_->fd, impl_->cached_ref_offsets.data(), n * sizeof(uint64_t),
                             static_cast<off_t>(impl_->ref_name_offsets_file_off)))
@@ -937,25 +922,21 @@ std::string ColumnarIndexReader::ref_name_pread_single(uint32_t idx) const {
             for (uint32_t i = 0; i < n; ++i)
                 impl_->cached_ref_offsets[i] = off_buf_32[i];
         }
-        // Sentinel: end of last string = blob size
-        impl_->cached_ref_offsets[n] = ref_names_bytes;
         impl_->ref_offsets_cached = true;
     }
 
-    // Read just this one string.
+    // Read a chunk from the blob at the string's offset. Strings are null-terminated.
+    // Ref names are typically <100 chars; read 256 bytes and find null terminator.
     const uint64_t start = impl_->cached_ref_offsets[idx];
-    const uint64_t end = impl_->cached_ref_offsets[idx + 1];
-    if (end <= start) return {};  // Empty or invalid
+    char buf[256];
+    const ssize_t got = pread(impl_->fd, buf, sizeof(buf),
+                              static_cast<off_t>(impl_->ref_names_file_off + start));
+    if (got <= 0) return {};
 
-    // String length (excluding null terminator).
-    const size_t len = static_cast<size_t>(end - start - 1);  // -1 for null terminator
-    if (len > 65536) return {};  // Sanity check: ref names shouldn't be >64KB
-
-    std::string result(len, '\0');
-    if (pread(impl_->fd, result.data(), len,
-              static_cast<off_t>(impl_->ref_names_file_off + start)) != static_cast<ssize_t>(len))
-        return {};
-    return result;
+    // Find null terminator.
+    size_t len = 0;
+    while (len < static_cast<size_t>(got) && buf[len] != '\0') ++len;
+    return std::string(buf, len);
 }
 
 uint64_t ColumnarIndexReader::read_offset(uint32_t read_idx) const {
