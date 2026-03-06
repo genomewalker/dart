@@ -3268,12 +3268,22 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         out = &file_out;
     }
 
-    // On-demand ref_name cache using pread (NFS-safe). Rather than caching all
-    // 10M ref_names upfront (which can OOM or read garbage from evicted mmap pages),
-    // we fetch each ref_name via pread on first access and cache locally. The offset
-    // array (~40MB) is cached on first call; each string is then a single pread.
-    std::unordered_map<uint32_t, std::string> ref_name_cache;
-    ref_name_cache.reserve(std::min<size_t>(1000000, reader.num_refs()));
+    // Cache all ref_names via pread (NFS-safe). This must happen AFTER streaming EM
+    // completes and flush_pages()+malloc_trim() frees memory, otherwise it OOMs.
+    // ref_names_pread() reads the entire offset array and string blob via pread,
+    // bypassing the mmap page cache which can return garbage on NFS under pressure.
+    // Cost: ~40MB offsets + ~300MB strings for 10M refs.
+    if (verbose) {
+        std::cerr << "Caching ref_names via pread...\n";
+    }
+    std::vector<std::string> cached_ref_names = reader.ref_names_pread();
+    if (cached_ref_names.empty() && reader.num_refs() > 0) {
+        std::cerr << "Error: ref_names_pread() returned empty vector\n";
+        return 1;
+    }
+    if (verbose) {
+        std::cerr << "Cached " << cached_ref_names.size() << " ref names\n";
+    }
 
     // Output header with Bayesian decomposition columns
     *out << "query_id\ttarget_id\tevalue\tbits\tfident\talnlen\t"
@@ -3315,14 +3325,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         }
 
         // Reconstruct names at output time. Query name via mmap (safe for read names).
-        // Ref name via pread cache (NFS-safe: avoids corrupted mmap pages).
+        // Ref name from cached vector (NFS-safe pread).
         const std::string_view qname = reader.read_name(s.read_idx);
         const uint32_t ref_idx = best_hits[s.read_idx].ref_idx;
-        auto cache_it = ref_name_cache.find(ref_idx);
-        if (cache_it == ref_name_cache.end()) {
-            cache_it = ref_name_cache.emplace(ref_idx, reader.ref_name_pread_single(ref_idx)).first;
-        }
-        const std::string& tname = cache_it->second;
+        const std::string& tname = cached_ref_names[ref_idx];
 
         *out << qname << "\t" << tname << "\t"
              << std::scientific << std::setprecision(2) << s.evalue << "\t"
@@ -3683,12 +3689,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         auto pi_end = pi_cur;
         while (pi_end != protein_agg_inputs.cend() && pi_end->ref_idx == cur_ref) ++pi_end;
 
-        // Use pread cache for NFS-safe ref_name lookup.
-        auto tname_it = ref_name_cache.find(cur_ref);
-        if (tname_it == ref_name_cache.end()) {
-            tname_it = ref_name_cache.emplace(cur_ref, reader.ref_name_pread_single(cur_ref)).first;
-        }
-        const std::string& target_name = tname_it->second;
+        // Use cached ref_names vector (NFS-safe pread).
+        const std::string& target_name = cached_ref_names[cur_ref];
 
         // --- Gene accumulator ---
         GeneSummaryAccumulator gene_acc;
