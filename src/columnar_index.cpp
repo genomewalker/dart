@@ -620,7 +620,8 @@ struct ColumnarIndexReader::Impl {
     size_t file_size = 0;
     int fd = -1;
 
-    const EMIHeader* header = nullptr;
+    EMIHeader header_storage{};
+    const EMIHeader* header = &header_storage;
     const RowGroupMeta* row_groups = nullptr;
     const uint64_t* csr_offsets = nullptr;
     const RowGroupReadIndex* row_group_read_index = nullptr;
@@ -682,6 +683,26 @@ ColumnarIndexReader::ColumnarIndexReader(const std::string& path)
         return;
     }
     impl_->file_size = static_cast<size_t>(st.st_size);
+    if (impl_->file_size < sizeof(EMIHeader)) {
+        impl_->close();
+        return;
+    }
+
+    if (!pread_full(impl_->fd, &impl_->header_storage, sizeof(impl_->header_storage), 0)) {
+        impl_->close();
+        return;
+    }
+
+    // Parse header from owned storage populated via pread().
+    if (impl_->header->magic != EMI_MAGIC) {
+        impl_->close();
+        return;
+    }
+    // Accept both v5 (32-bit string offsets) and v6 (64-bit string offsets)
+    if (impl_->header->version != EMI_VERSION && impl_->header->version != 5) {
+        impl_->close();
+        return;
+    }
 
     impl_->data = mmap(nullptr, impl_->file_size, PROT_READ, MAP_PRIVATE, impl_->fd, 0);
     if (impl_->data == MAP_FAILED) {
@@ -694,18 +715,6 @@ ColumnarIndexReader::ColumnarIndexReader(const std::string& path)
     // Switched to MADV_RANDOM in flush_pages() before streaming_em to prevent
     // speculative readahead from accumulating 100+ GB during 100 EM iterations.
     madvise(impl_->data, impl_->file_size, MADV_SEQUENTIAL);
-
-    // Parse header
-    impl_->header = static_cast<const EMIHeader*>(impl_->data);
-    if (impl_->header->magic != EMI_MAGIC) {
-        impl_->close();
-        return;
-    }
-    // Accept both v5 (32-bit string offsets) and v6 (64-bit string offsets)
-    if (impl_->header->version != EMI_VERSION && impl_->header->version != 5) {
-        impl_->close();
-        return;
-    }
 
     const char* base = static_cast<const char*>(impl_->data);
 
