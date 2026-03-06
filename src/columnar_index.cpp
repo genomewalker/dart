@@ -621,6 +621,11 @@ struct ColumnarIndexReader::Impl {
     size_t ref_names_file_off = 0;
     uint64_t ref_names_bytes = 0;
 
+    // Cached copy of header->num_refs, copied during construction before memory pressure.
+    // Use this instead of header->num_refs or num_ref_names in pread paths to avoid
+    // NFS mmap corruption where evicted pages return garbage when re-faulted.
+    uint32_t cached_num_refs = 0;
+
     // Cached ref_name offsets for on-demand pread (populated by ref_name_pread_single).
     mutable std::vector<uint64_t> cached_ref_offsets;
     mutable bool ref_offsets_cached = false;
@@ -730,6 +735,10 @@ ColumnarIndexReader::ColumnarIndexReader(const std::string& path)
         static_cast<const char*>(impl_->ref_name_offsets) - base);
     impl_->ref_names_file_off = static_cast<size_t>(impl_->ref_names - base);
     impl_->ref_names_bytes = ref_names_size;
+
+    // Cache num_refs by value NOW, before memory pressure builds up.
+    // This avoids NFS mmap corruption where header pages return garbage later.
+    impl_->cached_num_refs = impl_->header->num_refs;
 
     // CSR offsets
     impl_->csr_offsets = reinterpret_cast<const uint64_t*>(
@@ -843,21 +852,19 @@ static bool pread_full(int fd, void* buf, size_t count, off_t offset) {
 // pread() reads directly from the file descriptor without touching the mmap.
 //
 std::vector<std::string> ColumnarIndexReader::ref_names_pread() const {
-    // CRITICAL: Use header->num_refs, NOT impl_->num_ref_names.
-    // num_ref_names was read from a mmap location in the string dict section,
-    // which can get corrupted under NFS memory pressure.
-    // The header is in the first 128 bytes and stays reliably cached.
-    const uint32_t n = impl_->header->num_refs;
+    // CRITICAL: Use cached_num_refs, NOT header->num_refs or num_ref_names.
+    // Both mmap-backed fields can return garbage under NFS memory pressure.
+    // cached_num_refs was copied by value during construction before pressure built up.
+    const uint32_t n = impl_->cached_num_refs;
     const bool use_64bit = impl_->use_64bit_string_dict;
 
     // Use the ref_names_bytes stored during construction (read from mmap before pressure).
-    // The file offset was also computed from mmap pointers at construction time.
     const uint64_t ref_names_bytes = impl_->ref_names_bytes;
 
     // Debug output to diagnose OOM.
     std::cerr << "[DEBUG] ref_names_pread: n=" << n
-              << " (header->num_refs=" << impl_->header->num_refs
-              << ", num_ref_names=" << impl_->num_ref_names << ")"
+              << " (cached, header=" << impl_->header->num_refs
+              << ", dict=" << impl_->num_ref_names << ")"
               << " ref_names_bytes=" << ref_names_bytes
               << " use_64bit=" << use_64bit << "\n";
 
@@ -898,11 +905,12 @@ std::vector<std::string> ColumnarIndexReader::ref_names_pread() const {
 // Each subsequent call reads just one string (~20-100 bytes) via pread.
 // Use this during output phase to avoid OOM from allocating entire blob.
 std::string ColumnarIndexReader::ref_name_pread_single(uint32_t idx) const {
-    if (idx >= impl_->num_ref_names) return {};
+    // Use cached_num_refs (copied at construction) to avoid NFS mmap corruption.
+    if (idx >= impl_->cached_num_refs) return {};
 
     // Cache offset array on first call (thread-safe via mutable + const method pattern).
     if (!impl_->ref_offsets_cached) {
-        const uint32_t n = impl_->num_ref_names;
+        const uint32_t n = impl_->cached_num_refs;
         const bool use_64bit = impl_->use_64bit_string_dict;
 
         // Read offset array (~40MB for 10M refs).
