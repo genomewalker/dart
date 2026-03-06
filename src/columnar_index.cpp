@@ -621,6 +621,10 @@ struct ColumnarIndexReader::Impl {
     size_t ref_names_file_off = 0;
     uint64_t ref_names_bytes = 0;
 
+    // Cached ref_name offsets for on-demand pread (populated by ref_name_pread_single).
+    mutable std::vector<uint64_t> cached_ref_offsets;
+    mutable bool ref_offsets_cached = false;
+
     // Filters
     std::vector<FilterPredicate> filters;
 
@@ -890,6 +894,67 @@ std::vector<std::string> ColumnarIndexReader::ref_names_pread() const {
     std::vector<std::string> result(n);
     for (uint32_t i = 0; i < n; ++i)
         result[i] = blob.data() + off_buf[i];
+    return result;
+}
+
+// On-demand single ref_name via pread. Caches offset array on first call (~40MB for 10M refs).
+// Each subsequent call reads just one string (~20-100 bytes) via pread.
+// Use this during output phase to avoid OOM from allocating entire blob.
+std::string ColumnarIndexReader::ref_name_pread_single(uint32_t idx) const {
+    if (idx >= impl_->num_ref_names) return {};
+
+    // Cache offset array on first call (thread-safe via mutable + const method pattern).
+    if (!impl_->ref_offsets_cached) {
+        const uint32_t n = impl_->num_ref_names;
+        const bool use_64bit = impl_->use_64bit_string_dict;
+
+        // Re-read ref_names_bytes from file (4 or 8 bytes before ref_names data).
+        uint64_t ref_names_bytes = 0;
+        if (use_64bit) {
+            const off_t size_offset = static_cast<off_t>(impl_->ref_names_file_off) - sizeof(uint64_t);
+            if (pread(impl_->fd, &ref_names_bytes, sizeof(uint64_t), size_offset) != sizeof(uint64_t))
+                return {};
+        } else {
+            uint32_t ref_names_bytes_32 = 0;
+            const off_t size_offset = static_cast<off_t>(impl_->ref_names_file_off) - sizeof(uint32_t);
+            if (pread(impl_->fd, &ref_names_bytes_32, sizeof(uint32_t), size_offset) != sizeof(uint32_t))
+                return {};
+            ref_names_bytes = ref_names_bytes_32;
+        }
+        impl_->ref_names_bytes = ref_names_bytes;
+
+        // Read offset array (~40MB for 10M refs).
+        impl_->cached_ref_offsets.resize(n + 1);  // +1 for sentinel
+        if (use_64bit) {
+            if (!pread_full(impl_->fd, impl_->cached_ref_offsets.data(), n * sizeof(uint64_t),
+                            static_cast<off_t>(impl_->ref_name_offsets_file_off)))
+                return {};
+        } else {
+            std::vector<uint32_t> off_buf_32(n);
+            if (!pread_full(impl_->fd, off_buf_32.data(), n * sizeof(uint32_t),
+                            static_cast<off_t>(impl_->ref_name_offsets_file_off)))
+                return {};
+            for (uint32_t i = 0; i < n; ++i)
+                impl_->cached_ref_offsets[i] = off_buf_32[i];
+        }
+        // Sentinel: end of last string = blob size
+        impl_->cached_ref_offsets[n] = ref_names_bytes;
+        impl_->ref_offsets_cached = true;
+    }
+
+    // Read just this one string.
+    const uint64_t start = impl_->cached_ref_offsets[idx];
+    const uint64_t end = impl_->cached_ref_offsets[idx + 1];
+    if (end <= start) return {};  // Empty or invalid
+
+    // String length (excluding null terminator).
+    const size_t len = static_cast<size_t>(end - start - 1);  // -1 for null terminator
+    if (len > 65536) return {};  // Sanity check: ref names shouldn't be >64KB
+
+    std::string result(len, '\0');
+    if (pread(impl_->fd, result.data(), len,
+              static_cast<off_t>(impl_->ref_names_file_off + start)) != static_cast<ssize_t>(len))
+        return {};
     return result;
 }
 
