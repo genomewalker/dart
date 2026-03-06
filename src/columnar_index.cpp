@@ -842,27 +842,20 @@ static bool pread_full(int fd, void* buf, size_t count, off_t offset) {
 // under memory pressure; re-faulting those pages from NFS returns garbage.
 // pread() reads directly from the file descriptor without touching the mmap.
 //
-// CRITICAL: Re-read ref_names_bytes from file via pread, not from impl_->ref_names_bytes.
-// The mmap page holding that value may have been evicted and corrupted during the
-// long damage index warmup phase.
 std::vector<std::string> ColumnarIndexReader::ref_names_pread() const {
     const uint32_t n = impl_->num_ref_names;
     const bool use_64bit = impl_->use_64bit_string_dict;
 
-    // Re-read ref_names_bytes from file (4 or 8 bytes before ref_names data).
-    // This bypasses potentially corrupted mmap pages.
-    uint64_t ref_names_bytes = 0;
-    if (use_64bit) {
-        const off_t size_offset = static_cast<off_t>(impl_->ref_names_file_off) - sizeof(uint64_t);
-        if (pread(impl_->fd, &ref_names_bytes, sizeof(uint64_t), size_offset) != sizeof(uint64_t))
-            return {};
-    } else {
-        uint32_t ref_names_bytes_32 = 0;
-        const off_t size_offset = static_cast<off_t>(impl_->ref_names_file_off) - sizeof(uint32_t);
-        if (pread(impl_->fd, &ref_names_bytes_32, sizeof(uint32_t), size_offset) != sizeof(uint32_t))
-            return {};
-        ref_names_bytes = ref_names_bytes_32;
-    }
+    // Use the ref_names_bytes stored during construction (read from mmap before pressure).
+    // The file offset was also computed from mmap pointers at construction time.
+    const uint64_t ref_names_bytes = impl_->ref_names_bytes;
+
+    // Debug output to diagnose OOM.
+    std::cerr << "[DEBUG] ref_names_pread: n=" << n
+              << " ref_names_bytes=" << ref_names_bytes
+              << " use_64bit=" << use_64bit
+              << " ref_names_file_off=" << impl_->ref_names_file_off
+              << " ref_name_offsets_file_off=" << impl_->ref_name_offsets_file_off << "\n";
 
     // Sanity check: ref names blob should be < 8 GB (generous limit).
     constexpr uint64_t MAX_REF_NAMES_BYTES = 8ULL * 1024 * 1024 * 1024;
