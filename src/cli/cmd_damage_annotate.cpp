@@ -2497,6 +2497,14 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             }
         }
 
+        // Release EMI mmap pages after 100+ streaming EM iterations.
+        // Without this, ~100 GB of NFS pages stay resident and push later
+        // allocations (ref_names cache, output buffers) past the memory limit.
+        reader.flush_pages();
+#ifdef __linux__
+        malloc_trim(0);
+#endif
+
     } else if (use_em && em_aln_count > 0) {
         if (verbose) {
             std::cerr << "\nEM reassignment:\n";
