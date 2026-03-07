@@ -783,13 +783,6 @@ ColumnarIndexReader::ColumnarIndexReader(const std::string& path)
         impl_->close();
         return;
     }
-    // DEBUG: trace string dict parsing
-    std::cerr << "[DEBUG-CTOR] string_dict_offset=" << impl_->header->string_dict_offset
-              << " num_read_names=" << impl_->num_read_names
-              << " read_names_size=" << read_names_size
-              << " num_ref_names=" << impl_->num_ref_names
-              << " dict_off_at_ref_count=" << (dict_off - sizeof(uint32_t))
-              << " header->num_refs=" << impl_->header->num_refs << "\n";
     if (!advance_checked(sizeof(uint32_t))) {
         impl_->close();
         return;
@@ -933,13 +926,6 @@ std::vector<std::string> ColumnarIndexReader::ref_names_pread() const {
 
     // Use the ref_names_bytes stored during construction via pread().
     const uint64_t ref_names_bytes = impl_->ref_names_bytes;
-
-    // Debug output to diagnose OOM.
-    std::cerr << "[DEBUG] ref_names_pread: n=" << n
-              << " (cached, header=" << impl_->header->num_refs
-              << ", dict=" << impl_->num_ref_names << ")"
-              << " ref_names_bytes=" << ref_names_bytes
-              << " use_64bit=" << use_64bit << "\n";
 
     // Sanity check: ref names blob should be < 8 GB (generous limit).
     constexpr uint64_t MAX_REF_NAMES_BYTES = 8ULL * 1024 * 1024 * 1024;
