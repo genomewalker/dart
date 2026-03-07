@@ -783,6 +783,13 @@ ColumnarIndexReader::ColumnarIndexReader(const std::string& path)
         impl_->close();
         return;
     }
+    // DEBUG: trace string dict parsing
+    std::cerr << "[DEBUG-CTOR] string_dict_offset=" << impl_->header->string_dict_offset
+              << " num_read_names=" << impl_->num_read_names
+              << " read_names_size=" << read_names_size
+              << " num_ref_names=" << impl_->num_ref_names
+              << " dict_off_at_ref_count=" << (dict_off - sizeof(uint32_t))
+              << " header->num_refs=" << impl_->header->num_refs << "\n";
     if (!advance_checked(sizeof(uint32_t))) {
         impl_->close();
         return;
