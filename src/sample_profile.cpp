@@ -527,15 +527,11 @@ void FrameSelector::update_sample_profile(
         }
     }
 
-    // CHANNEL D: G→T / C→A transversion tracking (oxidative damage)
-    // Track G and T counts at each position for G→T rate calculation
-    // Also track asymmetry: G→T vs T→G (real oxidation shows G→T > T→G)
-    // Count G and T at 5' end positions for G→T tracking
+    // CHANNEL D: G→T tracking for 8-oxoG model fit GT(p) = A*exp(-mu*p) + B
     for (size_t i = 0; i < std::min(size_t(15), len); ++i) {
         char base = fast_upper(seq[i]);
-        if (base == 'G') {
-            profile.g_count_5prime[i]++;
-        }
+        if      (base == 'G') profile.g_count_5prime[i]++;
+        else if (base == 'T') profile.t_from_g_5prime[i]++;
     }
 
     // Purine tracking done via a_freq/g_freq arrays; enrichment computed in finalize_sample_profile()
@@ -1358,10 +1354,68 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         }
     }
 
-    // Channel D: G→T asymmetry inferred from Channel C (no reference available)
+    // Channel D: GT exponential-background fit GT(p) = A*exp(-mu*p) + B
+    // B = uniform background (8-oxoG); A = terminal artifact.
+    // s_gt = B - A/(A+C)_interior: Chargaff contrast (valid for SS; ~0 for DS).
+    // Replaces codon-based Channel C detection with model-based detection.
     {
-        if (profile.channel_c_valid) {
-            profile.ox_gt_asymmetry = profile.ox_uniformity_ratio;
+        // Baselines from middle-third (already normalised to fractions)
+        float tg = profile.baseline_t_freq + profile.baseline_g_freq;
+        float ac = profile.baseline_a_freq + profile.baseline_c_freq;
+        if (tg > 0) profile.ox_gt_baseline = profile.baseline_t_freq / tg;
+        if (ac > 0) profile.ox_ca_baseline = profile.baseline_a_freq / ac;
+        if (tg > 0 && ac > 0)
+            profile.ox_gt_asymmetry = profile.ox_gt_baseline - profile.ox_ca_baseline;
+
+        // Per-position GT rate and weighted OLS fit
+        float y[15] = {}, w[15] = {};
+        float total_w = 0;
+        for (int p = 0; p < 15; ++p) {
+            double tot = profile.t_from_g_5prime[p] + profile.g_count_5prime[p];
+            if (tot > 10.0) {
+                w[p] = (float)tot;
+                y[p] = (float)(profile.t_from_g_5prime[p] / tot);
+            }
+            total_w += w[p];
+        }
+
+        if (total_w >= 200.0f) {
+            static constexpr float mu_grid[] = {0.05f,0.1f,0.2f,0.3f,0.5f,0.7f,1.0f,1.5f,2.0f,3.0f};
+            float best_sse = 1e30f, best_A = 0.0f, best_mu = 0.3f, best_B = 0.0f;
+            for (float mu : mu_grid) {
+                float sx2=0,sx=0,sxy=0,sy=0,sw=0;
+                for (int p = 0; p < 15; ++p) {
+                    if (w[p] == 0) continue;
+                    float x = std::exp(-mu * p);
+                    sx2+=w[p]*x*x; sx+=w[p]*x; sxy+=w[p]*x*y[p]; sy+=w[p]*y[p]; sw+=w[p];
+                }
+                float det = sx2*sw - sx*sx;
+                if (std::abs(det) < 1e-12f) continue;
+                float A = std::max(0.0f, (sxy*sw - sy*sx) / det);
+                float B = std::max(0.0f, std::min(0.5f, (sx2*sy - sx*sxy) / det));
+                float sse = 0;
+                for (int p = 0; p < 15; ++p) {
+                    if (w[p] == 0) continue;
+                    float r = y[p] - A*std::exp(-mu*p) - B;
+                    sse += w[p]*r*r;
+                }
+                if (sse < best_sse) { best_sse=sse; best_A=A; best_mu=mu; best_B=B; }
+            }
+            profile.g_bg_fitted   = best_B;
+            profile.g_term_fitted  = best_A;
+            profile.g_decay_fitted = best_mu;
+            if (profile.ox_ca_baseline > 0.0f)
+                profile.s_gt = best_B - profile.ox_ca_baseline;
+
+            const bool is_ss_lib = (profile.library_type ==
+                                    dart::SampleDamageProfile::LibraryType::SINGLE_STRANDED);
+            float threshold = is_ss_lib ? 0.004f : 0.006f;
+            if (total_w >= 500.0f && profile.s_gt > threshold && best_A >= 0.0f) {
+                profile.ox_damage_detected = true;
+                profile.ox_d_max = std::max(0.0f, profile.s_gt);
+            } else {
+                profile.ox_damage_detected = false;
+            }
         }
     }
 
@@ -2320,8 +2374,9 @@ void FrameSelector::merge_sample_profiles(SampleDamageProfile& dst, const Sample
         dst.convertible_taa_ox_5prime[i] += src.convertible_taa_ox_5prime[i];
         dst.convertible_gga_5prime[i] += src.convertible_gga_5prime[i];
         dst.convertible_tga_ox_5prime[i] += src.convertible_tga_ox_5prime[i];
-        // Channel D: G count for asymmetry tracking
-        dst.g_count_5prime[i] += src.g_count_5prime[i];
+        // Channel D: G and T counts for GT exponential-background fit
+        dst.g_count_5prime[i]  += src.g_count_5prime[i];
+        dst.t_from_g_5prime[i] += src.t_from_g_5prime[i];
     }
     dst.convertible_gag_interior += src.convertible_gag_interior;
     dst.convertible_tag_ox_interior += src.convertible_tag_ox_interior;
