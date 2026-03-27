@@ -145,11 +145,14 @@ private:
     size_t file_size_ = 0;          // Total file size
     int fd_ = -1;                   // File descriptor
 
-    // Pointers into mmap'd region
+    // Pointers into mmap'd or decompressed region
     const AgdHeader* header_ = nullptr;
     const AgdBucket* buckets_ = nullptr;
-    const AgdRecord* records_ = nullptr;
-    const uint32_t* chain_ = nullptr;  // Next pointers for hash collision chains
+    mutable const AgdRecord* records_ = nullptr;
+    mutable const uint32_t* chain_ = nullptr;
+
+    // v4: ZSTD-decompressed records+chain block (heap-allocated, set by warmup_cache)
+    mutable std::vector<char> decompressed_block_;
 
     void close();
 };
