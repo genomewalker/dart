@@ -101,8 +101,9 @@ enum class Codec : uint8_t {
     NONE = 0,
     LZ4 = 1,
     ZSTD = 2,
-    DELTA = 3,     // Delta encoding for sorted/sequential values
-    DICT = 4,      // Dictionary encoding
+    DELTA = 3,       // Delta encoding for sorted/sequential values
+    DICT = 4,        // Dictionary encoding
+    DELTA_ZSTD = 5,  // Delta-encoded u32 values, then ZSTD compressed
 };
 
 // Compression level (0 = fastest, higher = better compression)

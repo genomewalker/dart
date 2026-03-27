@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <zstd.h>
 
 namespace dart {
 
@@ -61,9 +62,6 @@ void DamageIndexWriter::add_record(std::string_view read_id, const Gene& gene,
 
     // Extract terminal codons based on frame and strand
     extract_terminal_codons(dna_sequence, gene.frame, !gene.is_forward, rec);
-
-    // Pack raw nucleotides for synonymous damage detection
-    pack_terminal_nucleotides(dna_sequence, !gene.is_forward, rec);
 
     records_.push_back(rec);
 }
@@ -268,27 +266,35 @@ void DamageIndexWriter::finalize() {
         }
     }
 
+    // ZSTD-compress records+chain into one block
+    const size_t records_bytes = records_.size() * sizeof(AgdRecord);
+    const size_t chain_bytes   = next_chain.size() * sizeof(uint32_t);
+    const size_t raw_bytes     = records_bytes + chain_bytes;
+
+    std::vector<char> raw_block(raw_bytes);
+    std::memcpy(raw_block.data(), records_.data(), records_bytes);
+    std::memcpy(raw_block.data() + records_bytes, next_chain.data(), chain_bytes);
+
+    const size_t max_compressed = ZSTD_compressBound(raw_bytes);
+    std::vector<char> compressed_block(max_compressed);
+    const size_t compressed_size = ZSTD_compress(
+        compressed_block.data(), max_compressed, raw_block.data(), raw_bytes, 3);
+    if (ZSTD_isError(compressed_size)) {
+        throw std::runtime_error("AGD ZSTD compression failed");
+    }
+    compressed_block.resize(compressed_size);
+    header_.records_compressed_size = compressed_size;
+
     // Write file
     std::ofstream out(path_, std::ios::binary);
     if (!out) {
         throw std::runtime_error("Failed to open output file: " + path_);
     }
 
-    // Write header
     out.write(reinterpret_cast<const char*>(&header_), sizeof(header_));
-
-    // Write hash table buckets
     out.write(reinterpret_cast<const char*>(buckets.data()),
               buckets.size() * sizeof(AgdBucket));
-
-    // Write records
-    out.write(reinterpret_cast<const char*>(records_.data()),
-              records_.size() * sizeof(AgdRecord));
-
-    // Write chain pointers (as a separate section after records)
-    // This allows the record struct to stay at 32 bytes
-    out.write(reinterpret_cast<const char*>(next_chain.data()),
-              next_chain.size() * sizeof(uint32_t));
+    out.write(compressed_block.data(), static_cast<std::streamsize>(compressed_size));
 
     if (!out) {
         throw std::runtime_error("Failed to write output file: " + path_);
