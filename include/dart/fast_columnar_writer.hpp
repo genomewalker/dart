@@ -905,6 +905,20 @@ inline std::vector<char> decompress_zstd(const void* src, size_t src_size, size_
     }
     return dst;
 }
+
+// Delta-encode a sorted u32 array then ZSTD compress.
+// Returns empty vector if compressed size >= raw size.
+inline std::vector<char> compress_delta_zstd(const uint32_t* vals, size_t n, int level = 3) {
+    std::vector<uint32_t> deltas(n);
+    if (n > 0) {
+        deltas[0] = vals[0];
+        for (size_t i = 1; i < n; ++i) deltas[i] = vals[i] - vals[i - 1];
+    }
+    const size_t raw_bytes = n * sizeof(uint32_t);
+    auto compressed = compress_zstd(deltas.data(), raw_bytes, level);
+    if (compressed.size() >= raw_bytes) return {};
+    return compressed;
+}
 #endif
 
 }  // namespace dart (compression utilities)
@@ -1652,6 +1666,30 @@ public:
                 auto& chunk = row_groups[rg].columns[static_cast<size_t>(col)];
                 chunk.offset = out.tellp();
                 chunk.uncompressed_size = static_cast<uint32_t>(elem_size * rg_rows);
+#ifdef HAVE_ZSTD
+                if (config.compress && chunk.uncompressed_size > 0) {
+                    if (col == ColumnID::READ_IDX) {
+                        auto compressed = compress_delta_zstd(
+                            static_cast<const uint32_t*>(chunk_data), rg_rows,
+                            config.compression_level);
+                        if (!compressed.empty()) {
+                            chunk.compressed_size = static_cast<uint32_t>(compressed.size());
+                            chunk.codec = Codec::DELTA_ZSTD;
+                            out.write(compressed.data(), static_cast<std::streamsize>(compressed.size()));
+                            return;
+                        }
+                    } else {
+                        auto compressed = compress_zstd(chunk_data, chunk.uncompressed_size,
+                                                        config.compression_level);
+                        if (compressed.size() < chunk.uncompressed_size) {
+                            chunk.compressed_size = static_cast<uint32_t>(compressed.size());
+                            chunk.codec = Codec::ZSTD;
+                            out.write(compressed.data(), static_cast<std::streamsize>(compressed.size()));
+                            return;
+                        }
+                    }
+                }
+#endif
                 chunk.compressed_size = chunk.uncompressed_size;
                 chunk.codec = Codec::NONE;
                 out.write(static_cast<const char*>(chunk_data), chunk.uncompressed_size);
@@ -2169,6 +2207,30 @@ public:
                 auto& chunk = rg_meta.columns[static_cast<size_t>(col)];
                 chunk.offset            = out.tellp();
                 chunk.uncompressed_size = static_cast<uint32_t>(elem_size * rg_rows);
+#ifdef HAVE_ZSTD
+                if (config.compress && chunk.uncompressed_size > 0) {
+                    if (col == ColumnID::READ_IDX) {
+                        auto compressed = compress_delta_zstd(
+                            static_cast<const uint32_t*>(data), rg_rows,
+                            config.compression_level);
+                        if (!compressed.empty()) {
+                            chunk.compressed_size = static_cast<uint32_t>(compressed.size());
+                            chunk.codec = Codec::DELTA_ZSTD;
+                            out.write(compressed.data(), static_cast<std::streamsize>(compressed.size()));
+                            return;
+                        }
+                    } else {
+                        auto compressed = compress_zstd(data, chunk.uncompressed_size,
+                                                        config.compression_level);
+                        if (compressed.size() < chunk.uncompressed_size) {
+                            chunk.compressed_size = static_cast<uint32_t>(compressed.size());
+                            chunk.codec = Codec::ZSTD;
+                            out.write(compressed.data(), static_cast<std::streamsize>(compressed.size()));
+                            return;
+                        }
+                    }
+                }
+#endif
                 chunk.compressed_size   = chunk.uncompressed_size;
                 chunk.codec             = Codec::NONE;
                 out.write(static_cast<const char*>(data), chunk.uncompressed_size);

@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <zstd.h>
 
 namespace dart {
 
@@ -63,18 +64,30 @@ DamageIndexReader::DamageIndexReader(const std::string& path, bool prefetch) {
     buckets_ = reinterpret_cast<const AgdBucket*>(base + offset);
     offset += header_->num_buckets * sizeof(AgdBucket);
 
-    records_ = reinterpret_cast<const AgdRecord*>(base + offset);
-    offset += header_->num_records * sizeof(AgdRecord);
+    if (header_->version >= 4 && header_->records_compressed_size > 0) {
+        // v4: records+chain block is ZSTD-compressed; defer decompression to warmup_cache()
+        const size_t expected_size = sizeof(AgdHeader) +
+                                     header_->num_buckets * sizeof(AgdBucket) +
+                                     header_->records_compressed_size;
+        if (file_size_ < expected_size) {
+            close();
+            throw std::runtime_error("Damage index file truncated (v4): " + path);
+        }
+        // records_ and chain_ will be set by warmup_cache()
+    } else {
+        // v2/v3: uncompressed records+chain directly in mmap
+        records_ = reinterpret_cast<const AgdRecord*>(base + offset);
+        offset += header_->num_records * sizeof(AgdRecord);
+        chain_ = reinterpret_cast<const uint32_t*>(base + offset);
 
-    chain_ = reinterpret_cast<const uint32_t*>(base + offset);  // collision chain
-
-    size_t expected_size = sizeof(AgdHeader) +
-                           header_->num_buckets * sizeof(AgdBucket) +
-                           header_->num_records * sizeof(AgdRecord) +
-                           header_->num_records * sizeof(uint32_t);
-    if (file_size_ < expected_size) {
-        close();
-        throw std::runtime_error("Damage index file truncated: " + path);
+        const size_t expected_size = sizeof(AgdHeader) +
+                                     header_->num_buckets * sizeof(AgdBucket) +
+                                     header_->num_records * sizeof(AgdRecord) +
+                                     header_->num_records * sizeof(uint32_t);
+        if (file_size_ < expected_size) {
+            close();
+            throw std::runtime_error("Damage index file truncated: " + path);
+        }
     }
 }
 
@@ -89,7 +102,8 @@ DamageIndexReader::DamageIndexReader(DamageIndexReader&& other) noexcept
     , header_(other.header_)
     , buckets_(other.buckets_)
     , records_(other.records_)
-    , chain_(other.chain_) {
+    , chain_(other.chain_)
+    , decompressed_block_(std::move(other.decompressed_block_)) {
     other.data_ = nullptr;
     other.fd_ = -1;
 }
@@ -104,6 +118,7 @@ DamageIndexReader& DamageIndexReader::operator=(DamageIndexReader&& other) noexc
         buckets_ = other.buckets_;
         records_ = other.records_;
         chain_ = other.chain_;
+        decompressed_block_ = std::move(other.decompressed_block_);
         other.data_ = nullptr;
         other.fd_ = -1;
     }
@@ -163,11 +178,44 @@ const AgdRecord* DamageIndexReader::get_record(size_t idx) const {
 size_t DamageIndexReader::warmup_cache() const {
     if (!is_valid() || file_size_ == 0) return 0;
 
-    // Use pread() with large blocks to get full NFS bandwidth (matches dd throughput).
-    // The mmap page-touch approach sends one NFS RPC per 4KB page and is 5-10x slower
-    // on NFS than reading with 64MB blocks. pread() populates the OS page cache exactly
-    // as mmap accesses would, so subsequent random lookups via the mmap'd pointer hit
-    // cached pages instead of incurring blocking NFS page faults.
+    // v4: ZSTD-compressed records+chain block — read and decompress into heap buffer.
+    if (header_->version >= 4 && header_->records_compressed_size > 0 &&
+        decompressed_block_.empty()) {
+        const size_t compressed_off = sizeof(AgdHeader) +
+                                      header_->num_buckets * sizeof(AgdBucket);
+        const size_t compressed_sz  = static_cast<size_t>(header_->records_compressed_size);
+        const size_t expected_uncompressed = header_->num_records * sizeof(AgdRecord) +
+                                             header_->num_records * sizeof(uint32_t);
+
+        std::vector<char> compressed(compressed_sz);
+        if (fd_ >= 0) {
+            size_t total_read = 0;
+            while (total_read < compressed_sz) {
+                ssize_t r = pread(fd_, compressed.data() + total_read,
+                                  compressed_sz - total_read,
+                                  static_cast<off_t>(compressed_off + total_read));
+                if (r <= 0) throw std::runtime_error("AGD v4: pread of compressed block failed");
+                total_read += static_cast<size_t>(r);
+            }
+        } else {
+            const char* base = reinterpret_cast<const char*>(data_);
+            std::memcpy(compressed.data(), base + compressed_off, compressed_sz);
+        }
+
+        decompressed_block_.resize(expected_uncompressed);
+        size_t got = ZSTD_decompress(decompressed_block_.data(), expected_uncompressed,
+                                     compressed.data(), compressed_sz);
+        if (ZSTD_isError(got) || got != expected_uncompressed) {
+            throw std::runtime_error("AGD v4: ZSTD decompression failed");
+        }
+
+        records_ = reinterpret_cast<const AgdRecord*>(decompressed_block_.data());
+        chain_   = reinterpret_cast<const uint32_t*>(
+                       decompressed_block_.data() + header_->num_records * sizeof(AgdRecord));
+        return compressed_sz;
+    }
+
+    // v2/v3: pread into page cache for fast NFS sequential prefetch.
     if (fd_ >= 0) {
         constexpr size_t BLOCK = 64 * 1024 * 1024;
         std::vector<char> buf(BLOCK);
@@ -180,7 +228,7 @@ size_t DamageIndexReader::warmup_cache() const {
         return total;
     }
 
-    // Fallback: mmap page-touch (no fd available, e.g. after explicit close)
+    // Fallback: mmap page-touch
     const char* ptr = reinterpret_cast<const char*>(data_);
     const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) return 0;

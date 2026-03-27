@@ -22,7 +22,7 @@ namespace dart {
 
 // Magic bytes: "AGD\x01" (AGP Damage index, version 1)
 constexpr uint32_t AGD_MAGIC = 0x01444741;  // Little-endian "AGD\x01"
-constexpr uint32_t AGD_VERSION = 3;
+constexpr uint32_t AGD_VERSION = 4;
 
 /**
  * @brief File header (64 bytes, fixed size).
@@ -41,9 +41,11 @@ struct AgdHeader {
     uint8_t damage_validated;    // offset 33, 1 byte (v3+: 0 or 1)
     uint8_t damage_artifact;     // offset 34, 1 byte (v3+: 0 or 1)
     uint8_t channel_b_valid;     // offset 35, 1 byte (v3+: 0 or 1)
-    float stop_decay_llr;        // offset 36, 4 bytes (v3+: Channel B LLR)
-    float terminal_shift;        // offset 40, 4 bytes (v3+: terminal T/(T+C) shift)
-    uint8_t _reserved[20];       // offset 44, 20 bytes (pad to 64)
+    float stop_decay_llr;              // offset 36, 4 bytes (v3+: Channel B LLR)
+    float terminal_shift;              // offset 40, 4 bytes (v3+: terminal T/(T+C) shift)
+    uint8_t _reserved1[4];             // offset 44, 4 bytes (alignment pad)
+    uint64_t records_compressed_size;  // offset 48, 8 bytes (v4+: ZSTD size of records+chain; 0 = uncompressed)
+    uint8_t _reserved[8];              // offset 56, 8 bytes (pad to 64)
 };
 static_assert(sizeof(AgdHeader) == 64, "AgdHeader must be 64 bytes");
 
