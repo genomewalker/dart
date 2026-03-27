@@ -61,6 +61,24 @@ inline void decompress_chunk_to_buffer(const ColumnChunk& chunk,
 #else
             throw std::runtime_error("EMI chunk uses ZSTD but binary was built without ZSTD support");
 #endif
+        case Codec::DELTA_ZSTD:
+#ifdef HAVE_ZSTD
+        {
+            size_t got = ZSTD_decompress(out.data(),
+                                         static_cast<size_t>(chunk.uncompressed_size),
+                                         src,
+                                         static_cast<size_t>(chunk.compressed_size));
+            if (ZSTD_isError(got) || got != static_cast<size_t>(chunk.uncompressed_size)) {
+                throw std::runtime_error("EMI DELTA_ZSTD decompression failed");
+            }
+            auto* vals = reinterpret_cast<uint32_t*>(out.data());
+            const size_t n = chunk.uncompressed_size / sizeof(uint32_t);
+            for (size_t i = 1; i < n; ++i) vals[i] += vals[i - 1];
+            return;
+        }
+#else
+            throw std::runtime_error("EMI chunk uses DELTA_ZSTD but binary was built without ZSTD support");
+#endif
         default:
             throw std::runtime_error("Unsupported EMI compression codec");
     }
