@@ -1,0 +1,29 @@
+{
+  "version": "0.3.0-",
+  "input": "/vol/cloud/agp/data/derep/ed3a67f780.derep.non.fq.gz",
+  "domain": "gtdb",
+  "sequences": 263137179,
+  "damage": {
+    "detection_enabled": true,
+    "level": "high",
+    "d_max": 40.00,
+    "d_max_5prime": 45.12,
+    "d_max_3prime": 45.06,
+    "delta_s_5prime": 0.4512,
+    "delta_s_3prime": 0.4506,
+    "lambda_5prime": 0.439,
+    "lambda_3prime": 0.432,
+    "channel_b_valid": true,
+    "channel_b_llr": 4248053.50,
+    "damage_validated": true,
+    "position_0_artifact_5prime": false,
+    "terminal_shift_5prime": 0.2185,
+    "inverted_pattern_5prime": false,
+    "inverted_pattern_3prime": false,
+    "d_max_from_channel_b": 42.18,
+    "d_metamatch": 42.18,
+    "metamatch_high_damage_reads": 0,
+    "metamatch_high_damage_pct": 0.00,
+    "library_type": "double-stranded"
+  }
+}
