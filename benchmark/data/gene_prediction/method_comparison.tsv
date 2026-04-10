@@ -1,0 +1,4 @@
+method	label	n_reads	correct_hits	any_hits	recall	precision	avg_identity
+agp	DART	18300000	12372000	12727000	0.676	0.972	0.962
+blastx	MMseqs2 blastx	18300000	12535500	13021500	0.685	0.963	0.948
+fgs	FGS-rs	18300000	3495300	3667200	0.191	0.953	0.942
