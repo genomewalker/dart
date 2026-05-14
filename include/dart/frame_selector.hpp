@@ -2,7 +2,6 @@
 
 #include "types.hpp"
 #include "hexamer_tables.hpp"  // For Domain enum
-#include <dart/sample_damage_profile.hpp>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -15,9 +14,9 @@ namespace dart {
 class DamageModel;
 struct UnifiedDamageContext;
 
-// SampleDamageProfile, DamageValidationState, get_damage_validation_state(),
-// get_damage_suppression_factor(), JointDamageModel, MixtureDamageModel are
-// provided by <dart/sample_damage_profile.hpp> (libdart-damage).
+// SampleDamageProfile, DamageValidationState, JointDamageModel, MixtureDamageModel,
+// get_damage_validation_state(), get_damage_suppression_factor() are bridged from
+// libtaph into dart:: namespace via types.hpp.
 
 
 /**
