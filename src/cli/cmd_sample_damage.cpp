@@ -1,6 +1,7 @@
-// dart sample-damage: Quick sample-level damage profiling
+// dart profile: Reference-free ancient DNA damage profiling
 //
-// Usage: dart sample-damage <input.fq> [-o output.json] [-v]
+// Usage: dart profile <input.fq> [-o output.json] [-v]
+// Alias:  dart damage
 //
 // Runs Pass 1 only to compute sample-level damage profile.
 // Faster than full prediction when you only need damage metrics.
@@ -26,7 +27,7 @@
 namespace dart {
 namespace cli {
 
-int cmd_sample_damage(int argc, char* argv[]) {
+int cmd_profile(int argc, char* argv[]) {
     auto run_start = std::chrono::steady_clock::now();
     std::string input_file;
     std::string output_file;
@@ -47,8 +48,8 @@ int cmd_sample_damage(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             verbose = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            std::cout << "Usage: dart sample-damage <input.fq> [options]\n\n";
-            std::cout << "Quick sample-level damage profiling (Pass 1 only).\n\n";
+            std::cout << "Usage: dart profile <input.fq> [options]\n\n";
+            std::cout << "Reference-free ancient DNA damage profiling.\n\n";
             std::cout << "Options:\n";
             std::cout << "  -o, --output FILE       Output JSON file (default: stdout)\n";
             std::cout << "  -d, --domain DOMAIN     Domain for hexamer scoring (default: gtdb)\n";
@@ -60,14 +61,14 @@ int cmd_sample_damage(int argc, char* argv[]) {
             input_file = argv[i];
         } else {
             std::cerr << "Unknown option: " << argv[i] << "\n";
-            std::cerr << "Run 'dart sample-damage --help' for usage.\n";
+            std::cerr << "Run 'dart profile --help' for usage.\n";
             return 1;
         }
     }
 
     if (input_file.empty()) {
         std::cerr << "Error: No input file specified.\n";
-        std::cerr << "Run 'dart sample-damage --help' for usage.\n";
+        std::cerr << "Run 'dart profile --help' for usage.\n";
         return 1;
     }
 
@@ -96,7 +97,7 @@ int cmd_sample_damage(int argc, char* argv[]) {
     }
 
     if (verbose) {
-        std::cerr << "Sample damage profiling v" << DART_VERSION << "\n";
+        std::cerr << "dart profile v" << DART_VERSION << "\n";
         std::cerr << "Input: " << input_file << "\n";
         std::cerr << "Domain: " << domain_name(active_domain) << "\n";
         std::cerr << "Threads: " << num_threads << "\n\n";
@@ -404,14 +405,18 @@ int cmd_sample_damage(int argc, char* argv[]) {
 
 // Register subcommand
 namespace {
-    struct SampleDamageRegistrar {
-        SampleDamageRegistrar() {
+    struct ProfileRegistrar {
+        ProfileRegistrar() {
             SubcommandRegistry::instance().register_command(
-                "sample-damage",
-                "Quick sample-level damage profiling",
-                cmd_sample_damage, 10);
+                "profile",
+                "Reference-free ancient DNA damage profiling",
+                cmd_profile, 10);
+            SubcommandRegistry::instance().register_command(
+                "damage",
+                "Alias for 'profile'",
+                cmd_profile, 11);
         }
-    } sample_damage_registrar;
+    } profile_registrar;
 }
 
 }  // namespace cli

@@ -46,7 +46,7 @@ private:
 // Forward declarations of subcommand entry points
 int cmd_predict(int argc, char* argv[]);
 int cmd_validate(int argc, char* argv[]);
-int cmd_sample_damage(int argc, char* argv[]);
+int cmd_profile(int argc, char* argv[]);
 int cmd_damage_annotate(int argc, char* argv[]);
 int cmd_damage_profile(int argc, char* argv[]);
 int cmd_hits2emi(int argc, char* argv[]);
