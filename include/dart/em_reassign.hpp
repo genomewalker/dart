@@ -45,9 +45,24 @@ struct EMParams {
     bool normalize_by_length = false;  // Apply -0.5*log(ref_length) in E-step scores
                                        // Penalizes longer references in a proper objective
 
+    // Per-query bit-score normalization (MMseqs2-style):
+    // Divide each alignment's bit_score by the max bit_score for that read before applying
+    // lambda_b. This makes competition between hits purely relative (all scores in [0,1]),
+    // preventing high-complexity reads or long proteins from dominating.
+    // Default: false (raw bit scores, existing behavior).
+    bool normalize_scores_per_query = false;
+
     // Optional initial weights for warm-starting EM (e.g., from coverage-aware outer loop).
     // If non-empty, must have size == num_refs. EM initializes from these instead of uniform.
     std::vector<double> initial_weights;
+
+    // Per-reference coverage log-penalty, added directly to log(w_t) in every E-step.
+    // coverage_log_weights[t] = gamma_cov * log(coverage_weight_t), where coverage_weight_t
+    // is in [w_min, 1.0] (computed by the outer coverage loop from KL divergence).
+    // This brings coverage feedback inside the inner EM loop so every gamma computation
+    // is penalized for patchy references, rather than only influencing the warm-start.
+    // Empty (default) = disabled, no coverage penalty.
+    std::vector<float> coverage_log_weights;
 };
 
 // Per-alignment record: one read mapping to one reference
@@ -87,6 +102,15 @@ struct AlignmentData {
     }
 };
 
+inline double coverage_log_penalty(
+    const EMParams& params,
+    uint32_t ref_idx)
+{
+    if (params.coverage_log_weights.empty()) return 0.0;
+    if (ref_idx >= params.coverage_log_weights.size()) return 0.0;
+    return static_cast<double>(params.coverage_log_weights[ref_idx]);
+}
+
 inline double length_log_penalty(
     const AlignmentData& data,
     const EMParams& params,
@@ -125,7 +149,60 @@ struct EMIterationDiagnostics {
     double alpha = 1.0;
     double step_min = 0.0;
     double step_max = 0.0;
+
+    // Weight-distribution telemetry
+    double effective_refs = 0.0;   // exp(H(w)) — effective number of references
+    double hhi = 0.0;              // Σw² — Herfindahl-Hirschman concentration
+    double top1_mass = 0.0;        // weight of single largest reference
+    double top5_mass = 0.0;        // combined weight of top-5 references
+    uint32_t n_active_refs = 0;    // references with weight > min_weight
 };
+
+// Compute weight-distribution telemetry from a normalised weight vector.
+// min_weight is the floor used in EMParams (used to define "active").
+inline void fill_weight_diagnostics(
+    EMIterationDiagnostics& diag,
+    const double* weights,
+    uint32_t T,
+    double min_weight)
+{
+    if (T == 0) return;
+
+    double hhi = 0.0;
+    double entropy = 0.0;
+    double top1 = 0.0;
+    uint32_t n_active = 0;
+
+    // Partial buffer for top-5 (insertion sort on 5 elements)
+    constexpr int K = 5;
+    double top_k[K] = {};
+
+    for (uint32_t t = 0; t < T; ++t) {
+        const double w = weights[t];
+        hhi += w * w;
+        if (w > min_weight) {
+            ++n_active;
+            if (w > 0.0) entropy -= w * std::log(w);
+        }
+        if (w > top1) top1 = w;
+
+        // Maintain top-K via insertion into sorted small buffer
+        if (w > top_k[K - 1]) {
+            top_k[K - 1] = w;
+            for (int i = K - 2; i >= 0 && top_k[i] < top_k[i + 1]; --i)
+                std::swap(top_k[i], top_k[i + 1]);
+        }
+    }
+
+    double top5 = 0.0;
+    for (int i = 0; i < K; ++i) top5 += top_k[i];
+
+    diag.effective_refs = std::exp(entropy);
+    diag.hhi            = hhi;
+    diag.top1_mass      = top1;
+    diag.top5_mass      = top5;
+    diag.n_active_refs  = n_active;
+}
 
 using EMProgressCallback = std::function<void(const EMIterationDiagnostics&)>;
 
@@ -167,6 +244,16 @@ inline double e_step(
         const uint32_t deg = end - start;
         if (deg == 0) continue;
 
+        // Per-query score normalization: divide by max bit_score so all scores are in [0,1].
+        // For unique mappers the scale is always 1.0 (self is max).
+        double score_scale = 1.0;
+        if (params.normalize_scores_per_query && deg > 1) {
+            float max_bs = data.alignments[start].bit_score;
+            for (uint32_t j = 1; j < deg; ++j)
+                max_bs = std::max(max_bs, data.alignments[start + j].bit_score);
+            if (max_bs > 0.0f) score_scale = 1.0 / static_cast<double>(max_bs);
+        }
+
         log_scores.resize(deg);
 
         // Compute unnormalized log-responsibilities
@@ -174,7 +261,8 @@ inline double e_step(
             const auto& aln = data.alignments[start + j];
             log_scores[j] = std::log(std::max(weights[aln.ref_idx], params.min_weight))
                            + length_log_penalty(data, params, aln.ref_idx)
-                           + params.lambda_b * static_cast<double>(aln.bit_score);
+                           + coverage_log_penalty(params, aln.ref_idx)
+                           + params.lambda_b * static_cast<double>(aln.bit_score) * score_scale;
         }
 
         // Normalize via log-sum-exp
@@ -350,6 +438,14 @@ inline double e_step_damage(
         const uint32_t deg = end - start;
         if (deg == 0) continue;
 
+        double score_scale = 1.0;
+        if (params.normalize_scores_per_query && deg > 1) {
+            float max_bs = data.alignments[start].bit_score;
+            for (uint32_t j = 1; j < deg; ++j)
+                max_bs = std::max(max_bs, data.alignments[start + j].bit_score);
+            if (max_bs > 0.0f) score_scale = 1.0 / static_cast<double>(max_bs);
+        }
+
         // For damage-aware: 2*deg entries (ancient/modern for each alignment)
         log_scores.resize(2 * deg);
 
@@ -357,7 +453,8 @@ inline double e_step_damage(
             const auto& aln = data.alignments[start + j];
             double log_w = std::log(std::max(weights[aln.ref_idx], params.min_weight));
             log_w += length_log_penalty(data, params, aln.ref_idx);
-            double score_contrib = params.lambda_b * static_cast<double>(aln.bit_score);
+            log_w += coverage_log_penalty(params, aln.ref_idx);
+            double score_contrib = params.lambda_b * static_cast<double>(aln.bit_score) * score_scale;
 
             if (params.use_alignment_damage_likelihood) {
                 // Principled model:
@@ -645,6 +742,18 @@ std::vector<std::pair<uint32_t, float>> reassign_reads(
     const AlignmentData& data,
     const EMState& state,
     double gamma_threshold = 0.01);
+
+// Post-EM abundance filtering via the largest-gap heuristic (MMseqs2-style).
+//
+// Sorts non-zero reference weights, finds the largest multiplicative jump in the
+// sorted distribution, and returns indices of references ABOVE the cutoff.
+// Useful for removing spurious low-abundance hits without requiring a fixed threshold.
+//
+// min_refs_to_filter: skip filtering if fewer than this many refs have weight > 0.
+// Returns the set of reference indices that survive the filter (unsorted).
+std::vector<uint32_t> largest_gap_filter(
+    const std::vector<double>& weights,
+    uint32_t min_refs_to_filter = 20);
 
 // Forward declaration for columnar index
 class ColumnarIndexReader;
