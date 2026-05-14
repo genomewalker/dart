@@ -104,27 +104,16 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(librapidarchive)
 
-# libdart-damage: shared damage type definitions
-# Use headers-only (INTERFACE) — dart/sample_profile.cpp provides the full implementation;
-# libdart-damage/damage_estimation.cpp is partial and would cause duplicate symbols.
+# libtaph: reference-free ancient DNA damage estimation and library-type classification
+set(TAPH_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
-    libdart_damage
-    GIT_REPOSITORY https://github.com/genomewalker/libdart-damage.git
-    GIT_TAG        main
+    libtaph
+    GIT_REPOSITORY https://github.com/genomewalker/libtaph.git
+    GIT_TAG        v1.0.0
     GIT_SHALLOW    TRUE
     UPDATE_DISCONNECTED TRUE
 )
-# Use Populate (not MakeAvailable) to download headers only — we don't want
-# the library's damage_estimation.cpp compiled (it's a partial implementation
-# and would cause duplicate symbols with dart's sample_profile.cpp).
-FetchContent_GetProperties(libdart_damage)
-if(NOT libdart_damage_POPULATED)
-    FetchContent_Populate(libdart_damage)
-endif()
-
-add_library(dart-damage-headers INTERFACE)
-target_include_directories(dart-damage-headers INTERFACE
-    $<BUILD_INTERFACE:${libdart_damage_SOURCE_DIR}/include>)
+FetchContent_MakeAvailable(libtaph)
 
 # Find zlib for compressed file support
 find_package(ZLIB REQUIRED)
@@ -194,7 +183,7 @@ set(DART_SUBCOMMAND_SOURCES
 
 # Main executable with subcommands
 add_executable(dart ${DART_CORE_SOURCES} ${DART_SUBCOMMAND_SOURCES})
-target_link_libraries(dart ${ZLIB_LIBRARIES} PkgConfig::ZSTD rapidgzip::rapidgzip dart-damage-headers)
+target_link_libraries(dart ${ZLIB_LIBRARIES} PkgConfig::ZSTD rapidgzip::rapidgzip taph)
 target_compile_definitions(dart PRIVATE HAVE_RAPIDGZIP)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(dart OpenMP::OpenMP_CXX)
@@ -202,7 +191,7 @@ endif()
 
 # Legacy standalone validation tool (for backwards compatibility)
 add_executable(dart-validate-standalone src/validate.cpp ${DART_CORE_SOURCES})
-target_link_libraries(dart-validate-standalone ${ZLIB_LIBRARIES} PkgConfig::ZSTD dart-damage-headers)
+target_link_libraries(dart-validate-standalone ${ZLIB_LIBRARIES} PkgConfig::ZSTD taph)
 target_compile_definitions(dart-validate-standalone PRIVATE DART_STANDALONE_VALIDATE)
 
 # Error analysis tool
@@ -215,7 +204,7 @@ target_link_libraries(dart-benchmark-damage ${ZLIB_LIBRARIES})
 
 # Streaming EM comparison test
 add_executable(test-streaming-em tests/test_streaming_em.cpp ${DART_CORE_SOURCES})
-target_link_libraries(test-streaming-em ${ZLIB_LIBRARIES} PkgConfig::ZSTD dart-damage-headers)
+target_link_libraries(test-streaming-em ${ZLIB_LIBRARIES} PkgConfig::ZSTD taph)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(test-streaming-em OpenMP::OpenMP_CXX)
 endif()
@@ -254,7 +243,7 @@ if(BUILD_TESTING)
         tests/test_formal_model.cpp
         ${DART_CORE_SOURCES}
     )
-    target_link_libraries(dart-formal-model-tests ${ZLIB_LIBRARIES} PkgConfig::ZSTD dart-damage-headers)
+    target_link_libraries(dart-formal-model-tests ${ZLIB_LIBRARIES} PkgConfig::ZSTD taph)
     if(OpenMP_CXX_FOUND)
         target_link_libraries(dart-formal-model-tests OpenMP::OpenMP_CXX)
     endif()
