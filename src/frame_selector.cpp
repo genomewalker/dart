@@ -20,6 +20,7 @@
 #include "dart/damage_aa_table.hpp"
 #include "dart/damage_model.hpp"
 #include "dart/damage_context_tables.hpp"
+#include "dart/wrong_frame_null.hpp"
 #include <cmath>
 #include <algorithm>
 
@@ -409,6 +410,16 @@ static char infer_damaged_stop_aa(char c0, char c1, char c2,
     return 'X';
 }
 
+// Hexamer log-prior for an ancestor codon in context, matching codon_scores units.
+// log(freq * 4096 + 1e-10): positive for common dicodons, negative for rare ones.
+// Used to score repaired ancestor codons at damage-induced stops.
+static float log_hex_prior(const char* prev3, const char anc3[3]) {
+    char hex[7] = { prev3[0], prev3[1], prev3[2], anc3[0], anc3[1], anc3[2], '\0' };
+    uint32_t code = encode_hexamer(hex);
+    if (code == UINT32_MAX) return -6.0f;
+    return std::log(GTDB_HEXAMER_FREQ[code] * 4096.0f + 1e-10f);
+}
+
 // Generate search-optimized protein by extending past damage-convertible stops.
 // This improves MMseqs2 alignment sensitivity for ancient DNA.
 static std::string generate_search_protein(
@@ -685,6 +696,11 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
         return -std::log(p_stop * kEr + (1.0f - p_stop) * kEt + 1e-30f);
     };
 
+    // Contrastive LLR: log P(hex|coding) - log P(hex|+1/+2 shifted coding null).
+    // Positive for hexamers that distinguish true coding frame from wrong frames.
+    static constexpr float kLLRWeight = 0.5f;
+    const auto& wf_llr = dart::get_wrong_frame_llr();
+
     std::vector<ORFFragment> fwd_fragments;
     std::vector<ORFFragment> rev_fragments;
     fwd_fragments.reserve(18);
@@ -779,12 +795,39 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                         current_corrected_nt += c2;
                         orf_rescued_stops++;
                         orf_rescued_stop_cost += stop_logaddexp_cost(p_stop);
-                        // Do NOT add the stop's marginal score to orf_hexamer_score.
-                        // The stop codon scores ~1.2 nats below typical coding codons even
-                        // under the damage model, contaminating avg_hexamer. The rescue cost
-                        // already accounts for the uncertainty; excluding the stop from the
-                        // hexamer average avoids double-penalizing the correct frame.
-                        // (orf_coding_codons not incremented: rescued stop excluded from avg)
+
+                        // Score the inferred ancestral codon's dicodon context.
+                        // Restores the coding signal the correct frame loses at each damage stop
+                        // instead of contributing 0 to avg_hexamer.
+                        float repair_score = 0.0f;
+                        if (prev != nullptr) {
+                            if (c1 == 'A' && c2 == 'A') {        // TAA←CAA
+                                const char anc[] = {'C','A','A'};
+                                repair_score = log_hex_prior(prev, anc);
+                            } else if (c1 == 'A' && c2 == 'G') { // TAG←CAG
+                                const char anc[] = {'C','A','G'};
+                                repair_score = log_hex_prior(prev, anc);
+                            } else {                              // TGA←CGA or TGG (weighted)
+                                const bool ct_is_5p = is_forward;
+                                const bool ga_is_5p = !is_forward;
+                                float p_ct = std::max(compute_position_damage_prob(
+                                    codon_nt_start,     oriented.length(),
+                                    sample_profile, ct_is_5p, is_forward), 1e-6f);
+                                float p_ga = std::max(compute_position_damage_prob(
+                                    codon_nt_start + 2, oriented.length(),
+                                    sample_profile, ga_is_5p, is_forward), 1e-6f);
+                                const char cga[] = {'C','G','A'};
+                                const char tgg[] = {'T','G','G'};
+                                float s_cga  = std::log(p_ct) + log_hex_prior(prev, cga);
+                                float s_tgg  = std::log(p_ga) + log_hex_prior(prev, tgg);
+                                float log_Z  = std::log(p_ct + p_ga);
+                                float mx     = std::max(s_cga, s_tgg);
+                                repair_score = mx + std::log(std::exp(s_cga - mx)
+                                                           + std::exp(s_tgg - mx)) - log_Z;
+                            }
+                        }
+                        orf_hexamer_score += repair_score;
+                        orf_coding_codons++;
                     } else {
                         // Real stop (or rescue cap): emit current ORF then start new one.
                         // Cap frame_stop_cost at 3× kTrueStopCost to prevent one early stop
@@ -860,7 +903,18 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                     current_protein += observed_aa;
                     current_search_protein += observed_aa;
                     current_observed += observed_aa;
-                    orf_hexamer_score += codon_score;
+                    // Add contrastive LLR: log P(hex|coding) - log P(hex|wrong-frame null).
+                    // Lookup uses the dicodon hexamer spanning the previous and current codon.
+                    float llr_bonus = 0.0f;
+                    if (c > 0) {
+                        size_t hex_nt = frame + (c - 1) * 3;
+                        if (hex_nt + 6 <= oriented.size()) {
+                            uint32_t hcode = encode_hexamer(oriented.data() + hex_nt);
+                            if (hcode != UINT32_MAX)
+                                llr_bonus = wf_llr[hcode];
+                        }
+                    }
+                    orf_hexamer_score += codon_score + kLLRWeight * llr_bonus;
                     orf_coding_codons++;
                 }
             }
