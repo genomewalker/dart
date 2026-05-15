@@ -309,6 +309,7 @@ public:
         size_t real_stops;            // Real (non-damage) internal stops in this frame
         float damage_evidence;        // Sum of p_damage_stop for convertible stops
         float score;                  // Ranking score (coding signal - stop penalties)
+        float strand_disc = 0.0f;    // Accumulated strand-discriminant evidence (not added to score here)
     };
 
     /**
