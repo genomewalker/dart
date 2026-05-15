@@ -787,9 +787,10 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
 
                     // Rescue: continue ORF through this stop when plausibly damage-induced.
                     // Threshold 0.10 (raised from 0.05) balances sensitivity vs. false rescue.
+                    bool codon_is_convertible = is_damage_convertible_stop(c0, c1, c2);
                     bool can_rescue = (p_stop > 0.10f && orf_rescued_stops < 2 &&
                                        codon_nt_start + 2 < oriented.length() &&
-                                       is_damage_convertible_stop(c0, c1, c2));
+                                       codon_is_convertible);
 
                     if (can_rescue) {
                         const char* prev = (codon_nt_start >= 3) ? (oriented.data() + codon_nt_start - 3) : nullptr;
@@ -844,6 +845,13 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                         frame_real_stops++;
                         frame_stop_cost = std::min(frame_stop_cost + stop_logaddexp_cost(p_stop),
                                                    3.0f * kTrueStopCost);
+                        // Sub-threshold soft strand evidence: a convertible stop with p_stop
+                        // below rescue threshold still favours this strand vs RC decoys.
+                        // Accumulates into orf_strand_disc before this ORF is emitted.
+                        if (codon_is_convertible) {
+                            float soft_ev = kDiscWeight * std::max(0.0f, std::log(p_stop) - kLogStopPrior);
+                            orf_strand_disc += soft_ev;
+                        }
 
                         size_t orf_nt_start = frame + orf_start * 3;
                         float avg_hexamer_score = current_protein.length() > 0 ?
@@ -1123,17 +1131,20 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
         }
     }
 
-    // Contrastive strand discriminant: boost best forward fragment's score at the
-    // cross-strand comparison step — but ONLY when the fwd/RC gap is small enough
-    // that the discriminant can resolve the tie. When hexamer scores are already
-    // decisive (|gap| >> 0.5), don't touch them.
+    // Two-part cross-strand post-processing:
     //
-    // Targets Oracle C finding: median gap on stop-read losers = 0.072 nats,
-    // 90th pct = 0.5 nats. A capped bonus of up to kDiscCap resolves these without
-    // affecting reads where the correct frame already wins by hexamer alone.
+    // Part A — logsumexp strand pooling: add log(Σ exp(score - max)) per strand to
+    // the best ORF on that strand. Real genes look vaguely coding in all 3 frames of
+    // the true strand; RC decoys typically have only one strong frame. This is a
+    // small but genuinely RC-asymmetric signal (~0–1.1 nats, max = log(3)).
+    //
+    // Part B — rescued-stop strand discriminant: when a forward frame has rescued-stop
+    // evidence, add log(p_stop) - log(3/64) nats as a bonus (pre-computed as
+    // strand_disc). kDiscMargin widened to 3.0 so the discriminant fires across the
+    // full range of realistic RC leads (not just ties).
     {
-        static constexpr float kDiscMargin = 0.5f;   // only act within this score gap
-        static constexpr float kDiscCap    = 3.0f;  // maximum bonus nats (~2 rescued stops)
+        static constexpr float kDiscMargin = 3.0f;
+        static constexpr float kDiscCap    = 3.0f;
 
         ORFFragment* best_fwd = nullptr;
         ORFFragment* best_rc  = nullptr;
@@ -1144,10 +1155,26 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                 if (!best_rc  || orf.score > best_rc->score)  best_rc  = &orf;
             }
         }
-        // Only fire when fwd is losing or tied and has rescued-stop evidence
+
+        // Part A: logsumexp pooling
+        if (best_fwd && best_rc) {
+            float fwd_max = best_fwd->score;
+            float rc_max  = best_rc->score;
+            float fwd_sum = 0.0f, rc_sum = 0.0f;
+            for (const auto& orf : result) {
+                if (orf.is_forward) fwd_sum += std::exp(orf.score - fwd_max);
+                else                rc_sum  += std::exp(orf.score - rc_max);
+            }
+            best_fwd->score += std::log(fwd_sum);
+            best_rc->score  += std::log(rc_sum);
+        }
+
+        // Part B: rescued-stop discriminant (fires if fwd behind by < kDiscMargin).
+        // Uses best_fwd->strand_disc — the evidence must belong to the ORF being boosted,
+        // not aggregated from other forward ORFs (that would boost the wrong ORF).
         if (best_fwd && best_rc && best_fwd->strand_disc > 0.0f) {
             float gap = best_rc->score - best_fwd->score;
-            if (gap > -kDiscMargin) {  // fwd is behind by less than margin (or ahead)
+            if (gap > -kDiscMargin) {
                 float bonus = std::min(best_fwd->strand_disc, kDiscCap);
                 best_fwd->score += bonus;
             }
