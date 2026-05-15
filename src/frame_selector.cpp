@@ -666,11 +666,21 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
 
     // Per-stop Bayesian logaddexp cost constants.
     // stop_cost(p) = -log(p * exp(-kRescued) + (1-p) * exp(-kTrue))
-    // p→1: stop_cost → kRescued (mild); p→0: stop_cost → kTrue (harsh)
-    static const float kRescuedStopCost = 0.3f;
+    // p→1: stop_cost → kRescued (nearly zero); p→0: stop_cost → kTrue (harsh)
+    static const float kRescuedStopCost = 0.15f;
     static const float kTrueStopCost    = 3.0f;
-    static const float kEr = std::exp(-kRescuedStopCost);   // ≈ 0.741
-    static const float kEt = std::exp(-kTrueStopCost);      // ≈ 0.050
+    static const float kEr = std::exp(-kRescuedStopCost);
+    static const float kEt = std::exp(-kTrueStopCost);
+
+    // p_stop: multiplicative combination with floor at 40% of sample signal.
+    // Pure p_sample * p_read_dmg suppresses p_stop too aggressively when p_read_dmg < 0.5;
+    // the floor prevents rescue from collapsing even when the per-read signal is uncertain.
+    auto combine_p_stop = [&](float p_sample) -> float {
+        float p_mult  = p_sample * p_read_dmg;
+        float p_floor = 0.4f * p_sample;
+        return std::clamp(std::max(p_mult, p_floor), 0.0f, 0.95f);
+    };
+
     auto stop_logaddexp_cost = [&](float p_stop) -> float {
         return -std::log(p_stop * kEr + (1.0f - p_stop) * kEt + 1e-30f);
     };
@@ -728,6 +738,7 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
             size_t orf_aa_corrections = 0;
             float orf_damage_evidence = 0.0f;
             float orf_hexamer_score = 0.0f;
+            size_t orf_coding_codons = 0;  // codons contributing to avg_hexamer (excludes rescued stops)
 
             for (size_t c = 0; c < num_codons; ++c) {
                 char observed_aa = buf.protein_buffer[h][c];
@@ -745,9 +756,10 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                     // empirical-rate-preferred, multi-path combined.
                     float p_stop_sample = compute_stop_damage_probability(
                         codon_ptr, codon_nt_start, oriented.length(), sample_profile, is_forward);
-                    // Scale by per-read damage prior: damaged reads get full sample-level p_stop;
-                    // modern/contaminant reads get suppressed rescue probability.
-                    float p_stop = p_stop_sample * p_read_dmg;
+                    // Combine sample-level and per-read priors in logit space (not multiplicative).
+                    // Multiplicative form p_sample * p_read is a conjunction that suppresses rescue
+                    // too aggressively (e.g. p_sample=0.68, p_read=0.5 → p=0.34 → cost=1.26 nats).
+                    float p_stop = combine_p_stop(p_stop_sample);
 
                     // Rescue: continue ORF through this stop when plausibly damage-induced.
                     // Threshold 0.10 (raised from 0.05) balances sensitivity vs. false rescue.
@@ -767,7 +779,12 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                         current_corrected_nt += c2;
                         orf_rescued_stops++;
                         orf_rescued_stop_cost += stop_logaddexp_cost(p_stop);
-                        orf_hexamer_score += codon_score;
+                        // Do NOT add the stop's marginal score to orf_hexamer_score.
+                        // The stop codon scores ~1.2 nats below typical coding codons even
+                        // under the damage model, contaminating avg_hexamer. The rescue cost
+                        // already accounts for the uncertainty; excluding the stop from the
+                        // hexamer average avoids double-penalizing the correct frame.
+                        // (orf_coding_codons not incremented: rescued stop excluded from avg)
                     } else {
                         // Real stop (or rescue cap): emit current ORF then start new one.
                         // Cap frame_stop_cost at 3× kTrueStopCost to prevent one early stop
@@ -803,7 +820,9 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                             orf.rescued_stops = orf_rescued_stops;
                             orf.real_stops = frame_real_stops;
                             orf.damage_evidence = orf_damage_evidence;
-                            float avg_hexamer = orf.length > 0 ? orf_hexamer_score / static_cast<float>(orf.length) : 0.0f;
+                            // Use orf_coding_codons (excludes rescued stops) as the denominator
+                            // so damage-induced stops don't contaminate avg_hexamer.
+                            float avg_hexamer = orf_coding_codons > 0 ? orf_hexamer_score / static_cast<float>(orf_coding_codons) : 0.0f;
                             float length_bonus = std::log(static_cast<float>(orf.length) + 1.0f);
                             // Score: hexamer signal + length bonus
                             //        − logaddexp cost of rescued stops in this ORF (mild)
@@ -826,6 +845,7 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                         orf_aa_corrections = 0;
                         orf_damage_evidence = 0.0f;
                         orf_hexamer_score = 0.0f;
+                        orf_coding_codons = 0;
                     }
                 } else {
                     // Non-stop codon
@@ -841,14 +861,15 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                     current_search_protein += observed_aa;
                     current_observed += observed_aa;
                     orf_hexamer_score += codon_score;
+                    orf_coding_codons++;
                 }
             }
 
             // Emit final ORF if long enough
             // For final ORF, there's no stop to extend past (ended at sequence end)
             size_t final_orf_nt_start = frame + orf_start * 3;
-            float final_avg_hexamer = current_protein.length() > 0 ?
-                orf_hexamer_score / static_cast<float>(current_protein.length()) : 0.0f;
+            float final_avg_hexamer = orf_coding_codons > 0 ?
+                orf_hexamer_score / static_cast<float>(orf_coding_codons) : 0.0f;
             std::string final_search_protein = generate_search_protein(
                 current_search_protein, oriented, frame, final_orf_nt_start, num_codons, d_max, &sample_profile, is_forward, final_avg_hexamer);
             size_t final_effective_length = std::max(current_protein.length(), final_search_protein.length());
@@ -873,7 +894,7 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                 orf.rescued_stops = orf_rescued_stops;
                 orf.real_stops = frame_real_stops;
                 orf.damage_evidence = orf_damage_evidence;
-                float avg_hexamer = orf.length > 0 ? orf_hexamer_score / static_cast<float>(orf.length) : 0.0f;
+                float avg_hexamer = orf_coding_codons > 0 ? orf_hexamer_score / static_cast<float>(orf_coding_codons) : 0.0f;
                 float length_bonus = std::log(static_cast<float>(orf.length) + 1.0f);
                 orf.score = avg_hexamer + length_bonus
                             - orf_rescued_stop_cost
