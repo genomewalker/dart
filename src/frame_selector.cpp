@@ -26,6 +26,13 @@
 
 namespace dart {
 
+// Strand-discriminant weight: boost the best forward fragment's score when comparing
+// against the best RC fragment. Applied ONLY at cross-strand comparison, not during
+// within-strand ORF competition (which would inflate wrong-frame scores).
+// log(3/64) = log(0.0469) = -3.0565 nats (prior probability of random stop codon)
+static constexpr float kDiscWeight   = 1.0f;
+static constexpr float kLogStopPrior = -3.0565f;
+
 // Convert codon scorer result to FrameScore
 static FrameScore codon_to_frame_score(const codon::FrameStrandResult& cr) {
     FrameScore fs;
@@ -754,6 +761,7 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
             size_t orf_aa_corrections = 0;
             float orf_damage_evidence = 0.0f;
             float orf_hexamer_score = 0.0f;
+            float orf_strand_disc = 0.0f;  // accumulated strand-discriminant evidence from rescued stops
             size_t orf_coding_codons = 0;  // codons contributing to avg_hexamer (excludes rescued stops)
 
             for (size_t c = 0; c < num_codons; ++c) {
@@ -795,6 +803,7 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                         current_corrected_nt += c2;
                         orf_rescued_stops++;
                         orf_rescued_stop_cost += stop_logaddexp_cost(p_stop);
+                        orf_strand_disc += kDiscWeight * (std::log(p_stop) - kLogStopPrior);
 
                         // Score the inferred ancestral codon's dicodon context.
                         // Restores the coding signal the correct frame loses at each damage stop
@@ -873,6 +882,7 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                             orf.score = avg_hexamer + length_bonus
                                         - orf_rescued_stop_cost
                                         - frame_stop_cost;
+                            orf.strand_disc = orf_strand_disc;
                             strand_fragments.push_back(std::move(orf));
                         }
 
@@ -885,6 +895,7 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                         orf_passed_stops = 0;
                         orf_rescued_stops = 0;
                         orf_rescued_stop_cost = 0.0f;
+                        orf_strand_disc = 0.0f;
                         orf_aa_corrections = 0;
                         orf_damage_evidence = 0.0f;
                         orf_hexamer_score = 0.0f;
@@ -953,6 +964,7 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                 orf.score = avg_hexamer + length_bonus
                             - orf_rescued_stop_cost
                             - frame_stop_cost;
+                orf.strand_disc = orf_strand_disc;
                 strand_fragments.push_back(std::move(orf));
             }
         }
@@ -1107,6 +1119,37 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
             if (!frame_represented[fi]) {
                 result.push_back(orf);
                 frame_represented[fi] = true;
+            }
+        }
+    }
+
+    // Contrastive strand discriminant: boost best forward fragment's score at the
+    // cross-strand comparison step — but ONLY when the fwd/RC gap is small enough
+    // that the discriminant can resolve the tie. When hexamer scores are already
+    // decisive (|gap| >> 0.5), don't touch them.
+    //
+    // Targets Oracle C finding: median gap on stop-read losers = 0.072 nats,
+    // 90th pct = 0.5 nats. A capped bonus of up to kDiscCap resolves these without
+    // affecting reads where the correct frame already wins by hexamer alone.
+    {
+        static constexpr float kDiscMargin = 0.5f;   // only act within this score gap
+        static constexpr float kDiscCap    = 3.0f;  // maximum bonus nats (~2 rescued stops)
+
+        ORFFragment* best_fwd = nullptr;
+        ORFFragment* best_rc  = nullptr;
+        for (auto& orf : result) {
+            if (orf.is_forward) {
+                if (!best_fwd || orf.score > best_fwd->score) best_fwd = &orf;
+            } else {
+                if (!best_rc  || orf.score > best_rc->score)  best_rc  = &orf;
+            }
+        }
+        // Only fire when fwd is losing or tied and has rescued-stop evidence
+        if (best_fwd && best_rc && best_fwd->strand_disc > 0.0f) {
+            float gap = best_rc->score - best_fwd->score;
+            if (gap > -kDiscMargin) {  // fwd is behind by less than margin (or ahead)
+                float bonus = std::min(best_fwd->strand_disc, kDiscCap);
+                best_fwd->score += bonus;
             }
         }
     }
