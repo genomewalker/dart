@@ -1146,6 +1146,18 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
         static constexpr float kDiscMargin = 3.0f;
         static constexpr float kDiscCap    = 3.0f;
 
+        // Within-strand pre-boost: apply a small fraction of strand_disc to each
+        // rescued-stop ORF before finding best_fwd. Fixes the case where the
+        // rescued-stop ORF is split by a later real stop — the downstream clean
+        // segment becomes best_fwd with strand_disc=0 and Part B silently no-ops.
+        // kWithinBoostFrac keeps this small so it doesn't distort within-strand
+        // ranking for reads where the clean companion is genuinely better.
+        static constexpr float kWithinBoostFrac = 0.25f;
+        for (auto& orf : result) {
+            if (orf.is_forward && orf.strand_disc > 0.0f)
+                orf.score += kWithinBoostFrac * std::min(orf.strand_disc, kDiscCap);
+        }
+
         ORFFragment* best_fwd = nullptr;
         ORFFragment* best_rc  = nullptr;
         for (auto& orf : result) {
