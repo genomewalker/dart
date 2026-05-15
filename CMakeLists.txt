@@ -186,6 +186,7 @@ set(DART_SUBCOMMAND_SOURCES
     src/cli/cmd_damage_profile.cpp    # cmd_damage_profile
     src/cli/cmd_hits2emi.cpp          # hits2emi (TSV to columnar)
     src/cli/cmd_simulate.cpp          # simulate (synthetic damage reads)
+    src/cli/cmd_eval.cpp              # eval (benchmark accuracy vs truth TSV)
 )
 
 # Main executable with subcommands
