@@ -50,6 +50,7 @@ int cmd_profile(int argc, char* argv[]);
 int cmd_damage_annotate(int argc, char* argv[]);
 int cmd_damage_profile(int argc, char* argv[]);
 int cmd_hits2emi(int argc, char* argv[]);
+int cmd_simulate(int argc, char* argv[]);
 
 }  // namespace cli
 }  // namespace dart
