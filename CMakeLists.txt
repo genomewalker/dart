@@ -106,14 +106,20 @@ FetchContent_MakeAvailable(librapidarchive)
 
 # libtaph: reference-free ancient DNA damage estimation and library-type classification
 set(TAPH_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(
-    libtaph
-    GIT_REPOSITORY https://github.com/genomewalker/libtaph.git
-    GIT_TAG        v1.0.0
-    GIT_SHALLOW    TRUE
-    UPDATE_DISCONNECTED TRUE
-)
-FetchContent_MakeAvailable(libtaph)
+set(LIBTAPH_LOCAL_PATH "$ENV{REPOS}/libtaph" CACHE PATH "Local libtaph checkout (overrides GitHub)")
+if(EXISTS "${LIBTAPH_LOCAL_PATH}/CMakeLists.txt")
+    message(STATUS "Using local libtaph: ${LIBTAPH_LOCAL_PATH}")
+    add_subdirectory("${LIBTAPH_LOCAL_PATH}" "${CMAKE_BINARY_DIR}/libtaph-local" EXCLUDE_FROM_ALL)
+else()
+    FetchContent_Declare(
+        libtaph
+        GIT_REPOSITORY https://github.com/genomewalker/libtaph.git
+        GIT_TAG        v1.0.0
+        GIT_SHALLOW    TRUE
+        UPDATE_DISCONNECTED TRUE
+    )
+    FetchContent_MakeAvailable(libtaph)
+endif()
 
 # Find zlib for compressed file support
 find_package(ZLIB REQUIRED)

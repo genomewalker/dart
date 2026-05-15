@@ -2705,6 +2705,28 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             }
         }
 
+        // Post-EM abundance filter: drop spurious low-abundance references via
+        // the largest-gap heuristic. Zero out gammas for dropped refs so they
+        // cannot be the argmax in reassign_reads or influence downstream stats.
+        {
+            const auto survivors = dart::largest_gap_filter(em_state.weights);
+            if (survivors.size() < em_state.weights.size()) {
+                std::vector<bool> keep(em_state.weights.size(), false);
+                for (uint32_t t : survivors) keep[t] = true;
+                for (size_t i = 0; i < aln_data.alignments.size(); ++i) {
+                    if (!keep[aln_data.alignments[i].ref_idx]) {
+                        em_state.gamma[i] = 0.0;
+                        if (!em_state.gamma_ancient.empty())
+                            em_state.gamma_ancient[i] = 0.0;
+                    }
+                }
+                if (verbose) {
+                    std::cerr << "  Largest-gap filter: kept " << survivors.size()
+                              << "/" << em_state.weights.size() << " references\n";
+                }
+            }
+        }
+
         // Extract best assignments and build per-read lookup
         auto best = dart::reassign_reads(aln_data, em_state, 0.0);
 

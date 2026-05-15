@@ -3,8 +3,10 @@
 // Usage: dart profile <input.fq> [-o output.json] [-v]
 // Alias:  dart damage
 //
-// Runs Pass 1 only to compute sample-level damage profile.
-// Faster than full prediction when you only need damage metrics.
+// Mirrors fqdup's profiling pipeline:
+//   Pre-scan  – first 100k reads, adapter detection via libtaph
+//   Pass 1    – full scan with adapter clipping, parallel aggregation
+//   Pass 2    – optional damage-weighted re-scan for d_metamatch
 
 #include "subcommand.hpp"
 #include "args.hpp"
@@ -13,6 +15,9 @@
 #include "dart/hexamer_tables.hpp"
 #include "dart/log_utils.hpp"
 #include "dart/version.h"
+#include <taph/profile_json.hpp>
+#include <taph/damage_profiler.hpp>
+#include <taph/frame_selector_decl.hpp>
 #include <iostream>
 #include <fstream>
 #include <cstring>
@@ -26,6 +31,23 @@
 
 namespace dart {
 namespace cli {
+
+// Build a BatchFn backed by a single SequenceReader (reads once through the file).
+static taph::BatchFn make_batch_fn(const std::string& path, int min_len = 30) {
+    auto reader = std::make_shared<SequenceReader>(path);
+    return [reader, min_len](std::vector<std::string>& out, size_t max) -> bool {
+        SequenceRecord rec;
+        size_t added = 0;
+        while (added < max && reader->read_next(rec)) {
+            std::string seq = SequenceUtils::clean(rec.sequence);
+            if ((int)seq.size() >= min_len) {
+                out.push_back(std::move(seq));
+                ++added;
+            }
+        }
+        return added > 0;
+    };
+}
 
 int cmd_profile(int argc, char* argv[]) {
     auto run_start = std::chrono::steady_clock::now();
@@ -81,11 +103,9 @@ int cmd_profile(int argc, char* argv[]) {
     num_threads = 1;
 #endif
 
-    // Set domain
     Domain active_domain = parse_domain(domain_str);
     set_active_domain(active_domain);
 
-    // Parse library type
     SampleDamageProfile::LibraryType forced_library = SampleDamageProfile::LibraryType::UNKNOWN;
     if (library_type_str == "ds") {
         forced_library = SampleDamageProfile::LibraryType::DOUBLE_STRANDED;
@@ -103,7 +123,35 @@ int cmd_profile(int argc, char* argv[]) {
         std::cerr << "Threads: " << num_threads << "\n\n";
     }
 
-    // Run Pass 1: damage detection
+    // =========================================================================
+    // PRE-SCAN: adapter detection (first 100k reads, single-threaded)
+    // =========================================================================
+    taph::AdapterStubs stubs;
+    try {
+        if (verbose) std::cerr << "Pre-scan: detecting adapters...\r" << std::flush;
+        auto prescan = taph::run_prescan(
+            make_batch_fn(input_file),
+            forced_library, 30, 100000);
+        stubs = std::move(prescan.stubs);
+        if (verbose) {
+            if (stubs.adapter_clipped) {
+                std::cerr << "Pre-scan: adapter detected (5': " << stubs.stubs5[0]
+                          << (stubs.adapter3_clipped ? ", 3': " + stubs.stubs3[0] : "") << ")\n";
+            } else {
+                std::cerr << "Pre-scan: no adapter detected          \n";
+            }
+        }
+    } catch (const std::exception& e) {
+        if (verbose) std::cerr << "Pre-scan warning: " << e.what() << "\n";
+    }
+
+    // Encode stub hexamer codes for fast per-read lookup
+    auto stub5_codes = taph::encode_stub_codes(stubs.stubs5);
+    auto stub3_codes = taph::encode_stub_codes(stubs.stubs3);
+
+    // =========================================================================
+    // PASS 1: full scan with adapter clipping
+    // =========================================================================
     auto pass1_start = std::chrono::steady_clock::now();
     SampleDamageProfile profile;
     profile.forced_library_type = forced_library;
@@ -115,11 +163,9 @@ int cmd_profile(int argc, char* argv[]) {
         std::vector<SequenceRecord> batch;
         batch.reserve(BATCH_SIZE);
 
-        // Thread-local profiles for parallel aggregation
         std::vector<SampleDamageProfile> thread_profiles(num_threads);
 
         while (true) {
-            // Read a batch
             batch.clear();
             SequenceRecord record;
             while (batch.size() < BATCH_SIZE && reader.read_next(record)) {
@@ -127,7 +173,6 @@ int cmd_profile(int argc, char* argv[]) {
             }
             if (batch.empty()) break;
 
-            // Process batch in parallel
             #pragma omp parallel for schedule(static)
             for (size_t i = 0; i < batch.size(); ++i) {
                 int tid = 0;
@@ -135,76 +180,60 @@ int cmd_profile(int argc, char* argv[]) {
                 tid = omp_get_thread_num();
                 #endif
                 std::string seq = SequenceUtils::clean(batch[i].sequence);
-                if (seq.length() >= 30) {
-                    FrameSelector::update_sample_profile(thread_profiles[tid], seq);
+                if (stubs.adapter_clipped || stubs.adapter3_clipped) {
+                    seq = taph::clip_adapters(seq, stub5_codes, stub3_codes, 30);
+                }
+                if (seq.size() >= 30) {
+                    taph::FrameSelector::update_sample_profile(thread_profiles[tid], seq);
                 }
             }
 
             total_reads += batch.size();
-
             if (verbose && total_reads % 100000 == 0) {
                 std::cerr << "Processed " << total_reads << " sequences...\r" << std::flush;
             }
         }
 
-        if (verbose) {
-            std::cerr << "Processed " << total_reads << " sequences.    \n";
-        }
+        if (verbose) std::cerr << "Processed " << total_reads << " sequences.    \n";
 
-        // Merge thread-local profiles
         for (int t = 0; t < num_threads; ++t) {
-            FrameSelector::merge_sample_profiles(profile, thread_profiles[t]);
+            taph::FrameSelector::merge_sample_profiles(profile, thread_profiles[t]);
         }
+        taph::FrameSelector::finalize_sample_profile(profile);
 
-        // Finalize profile (compute decay rates, d_max, etc.)
-        FrameSelector::finalize_sample_profile(profile);
+        // Post-clip hex enrichment (matches fqdup's compute_hex_enriched_5prime call)
+        stubs.top_enriched     = taph::compute_hex_enriched_5prime(profile);
+        stubs.flag_hex_artifact = !stubs.top_enriched.empty()
+                                   && stubs.top_enriched[0].log2fc > 1.5f
+                                   && !stubs.top_enriched[0].damage_consistent;
+
         if (verbose) {
             auto pass1_end = std::chrono::steady_clock::now();
             std::cerr << "Pass 1 runtime: "
                       << dart::log_utils::format_elapsed(pass1_start, pass1_end) << "\n";
         }
-
     } catch (const std::exception& e) {
         std::cerr << "Error reading input: " << e.what() << "\n";
         return 1;
     }
 
     // =========================================================================
-    // PASS 2: Damage-weighted profile for d_metamatch
-    //
-    // Re-read the file and weight each read's contribution by P(damaged).
-    // This mimics metaDMG's selection bias: reads showing clear damage patterns
-    // are likely ancient and would align to references.
-    //
-    // Only run if Pass 2 would meaningfully improve the estimate:
-    // 1. Damage was validated in Pass 1 (otherwise d_metamatch = 0 anyway)
-    // 2. d_max > 5% (meaningful damage to filter by)
-    // 3. At least one of:
-    //    a) Inverted pattern detected (Channel A unreliable)
-    //    b) Position-0 artifact (contamination likely)
-    //    c) Large gap between d_max and Channel B (selection bias issue)
+    // PASS 2: damage-weighted re-scan for d_metamatch (optional)
     // =========================================================================
     SampleDamageProfile weighted_profile;
     weighted_profile.forced_library_type = forced_library;
     float d_metamatch_filtered = 0.0f;
     size_t n_high_damage_reads = 0;
 
-    // Check if Pass 2 would add value
-    // Pass 2 only helps for HIGH-damage samples (>15%) where damaged reads
-    // are distinguishable from undamaged. For low-damage, weighting dilutes signal.
     bool needs_pass2 = false;
     if (profile.damage_validated && profile.d_max_combined > 0.15f) {
-        // For high-damage samples, run Pass 2 if there are reliability issues
         if (profile.inverted_pattern_5prime || profile.inverted_pattern_3prime) {
-            needs_pass2 = true;  // Channel A unreliable
+            needs_pass2 = true;
         } else if (profile.position_0_artifact_5prime) {
-            needs_pass2 = true;  // Contamination likely
+            needs_pass2 = true;
         } else {
-            // Run if there's a meaningful gap between d_max and Channel B
             float gap = std::abs(profile.d_max_from_channel_b - profile.d_max_combined);
-            if (gap > 0.05f) {  // >5% absolute difference
-                needs_pass2 = true;
-            }
+            if (gap > 0.05f) needs_pass2 = true;
         }
     }
 
@@ -212,13 +241,12 @@ int cmd_profile(int argc, char* argv[]) {
         auto pass2_start = std::chrono::steady_clock::now();
         if (verbose) {
             std::cerr << "\nPass 2: Computing damage-weighted profile...\n";
-            if (profile.inverted_pattern_5prime || profile.inverted_pattern_3prime) {
+            if (profile.inverted_pattern_5prime || profile.inverted_pattern_3prime)
                 std::cerr << "  Reason: inverted pattern detected\n";
-            } else if (profile.position_0_artifact_5prime) {
+            else if (profile.position_0_artifact_5prime)
                 std::cerr << "  Reason: position-0 artifact detected\n";
-            } else {
+            else
                 std::cerr << "  Reason: gap between d_max and Channel B > 5%\n";
-            }
         }
 
         try {
@@ -246,21 +274,16 @@ int cmd_profile(int argc, char* argv[]) {
                     tid = omp_get_thread_num();
                     #endif
                     std::string seq = SequenceUtils::clean(batch[i].sequence);
-                    if (seq.length() >= 30) {
-                        // Compute per-read damage probability using Pass 1 profile
+                    if (stubs.adapter_clipped || stubs.adapter3_clipped) {
+                        seq = taph::clip_adapters(seq, stub5_codes, stub3_codes, 30);
+                    }
+                    if (seq.size() >= 30) {
                         float p_damaged = FrameSelector::compute_per_read_damage_prior(seq, profile);
-
-                        // Use soft weighting: contribution proportional to P(damaged)
-                        // This gives ancient-looking reads higher influence
                         if (p_damaged > 0.01f) {
-                            FrameSelector::update_sample_profile_weighted(
+                            taph::FrameSelector::update_sample_profile_weighted(
                                 thread_profiles2[tid], seq, p_damaged);
                         }
-
-                        // Count high-confidence damaged reads
-                        if (p_damaged > 0.6f) {
-                            thread_high_counts[tid]++;
-                        }
+                        if (p_damaged > 0.6f) thread_high_counts[tid]++;
                     }
                 }
 
@@ -270,16 +293,11 @@ int cmd_profile(int argc, char* argv[]) {
                 }
             }
 
-            // Merge thread-local profiles
             for (int t = 0; t < num_threads; ++t) {
-                FrameSelector::merge_sample_profiles(weighted_profile, thread_profiles2[t]);
+                taph::FrameSelector::merge_sample_profiles(weighted_profile, thread_profiles2[t]);
                 n_high_damage_reads += thread_high_counts[t];
             }
-
-            // Finalize weighted profile
-            FrameSelector::finalize_sample_profile(weighted_profile);
-
-            // Use weighted profile's d_max as d_metamatch
+            taph::FrameSelector::finalize_sample_profile(weighted_profile);
             d_metamatch_filtered = weighted_profile.d_max_combined;
 
             if (verbose) {
@@ -293,25 +311,21 @@ int cmd_profile(int argc, char* argv[]) {
                 std::cerr << "Pass 2 runtime: "
                           << dart::log_utils::format_elapsed(pass2_start, pass2_end) << "\n";
             }
-
         } catch (const std::exception& e) {
-            if (verbose) {
-                std::cerr << "Warning: Pass 2 failed: " << e.what() << "\n";
-            }
-            // Fall back to Pass 1 d_metamatch
+            if (verbose) std::cerr << "Warning: Pass 2 failed: " << e.what() << "\n";
             d_metamatch_filtered = profile.d_metamatch;
         }
 
-        // Update profile's d_metamatch with the filtered estimate
         profile.d_metamatch = d_metamatch_filtered;
     } else if (verbose && profile.damage_validated && profile.d_max_combined > 0.05f) {
-        // Explain why Pass 2 was skipped
         std::cerr << "\nPass 2 skipped: d_max and Channel B are within 5%\n";
         std::cerr << "Using Channel B-anchored d_metamatch: " << std::fixed
                   << std::setprecision(1) << (profile.d_metamatch * 100.0f) << "%\n";
     }
 
-    // Determine damage level string
+    // =========================================================================
+    // OUTPUT
+    // =========================================================================
     auto damage_level_str = [](float d_max) -> const char* {
         if (d_max >= 0.10f) return "high";
         if (d_max >= 0.05f) return "moderate";
@@ -319,7 +333,6 @@ int cmd_profile(int argc, char* argv[]) {
         return "undetectable";
     };
 
-    // Output JSON
     std::ostream* out = &std::cout;
     std::ofstream file_out;
     if (!output_file.empty()) {
@@ -333,62 +346,29 @@ int cmd_profile(int argc, char* argv[]) {
 
     float d_max = profile.d_max_combined;
 
-    *out << "{\n";
-    *out << "  \"version\": \"" << DART_VERSION << "\",\n";
-    *out << "  \"input\": \"" << input_file << "\",\n";
-    *out << "  \"domain\": \"" << domain_str << "\",\n";
-    *out << "  \"sequences\": " << total_reads << ",\n";
-    *out << "  \"damage\": {\n";
-    *out << "    \"detection_enabled\": true,\n";
-    *out << "    \"level\": \"" << damage_level_str(d_max) << "\",\n";
-    *out << "    \"d_max\": " << std::fixed << std::setprecision(2) << (d_max * 100.0f) << ",\n";
-    *out << "    \"d_max_5prime\": " << std::fixed << std::setprecision(2) << (profile.d_max_5prime * 100.0f) << ",\n";
-    *out << "    \"d_max_3prime\": " << std::fixed << std::setprecision(2) << (profile.d_max_3prime * 100.0f) << ",\n";
-    *out << "    \"delta_s_5prime\": " << std::fixed << std::setprecision(4) << profile.delta_s_5prime << ",\n";
-    *out << "    \"delta_s_3prime\": " << std::fixed << std::setprecision(4) << profile.delta_s_3prime << ",\n";
-    *out << "    \"lambda_5prime\": " << std::fixed << std::setprecision(3) << profile.lambda_5prime << ",\n";
-    *out << "    \"lambda_3prime\": " << std::fixed << std::setprecision(3) << profile.lambda_3prime << ",\n";
-    *out << "    \"channel_b_valid\": " << (profile.channel_b_valid ? "true" : "false") << ",\n";
-    *out << "    \"channel_b_llr\": " << std::fixed << std::setprecision(2) << profile.stop_decay_llr_5prime << ",\n";
-    *out << "    \"channel_b3_valid\": " << (profile.channel_b3_valid ? "true" : "false") << ",\n";
-    *out << "    \"channel_b3_llr\": " << std::fixed << std::setprecision(2) << profile.stop_decay_llr_3prime << ",\n";
-    *out << "    \"d_max_from_channel_b3\": " << std::fixed << std::setprecision(2) << (profile.d_max_from_channel_b3 * 100.0f) << ",\n";
-    *out << "    \"damage_validated\": " << (profile.damage_validated ? "true" : "false") << ",\n";
-    *out << "    \"position_0_artifact_5prime\": " << (profile.position_0_artifact_5prime ? "true" : "false") << ",\n";
-    *out << "    \"terminal_shift_5prime\": " << std::fixed << std::setprecision(4) << profile.terminal_shift_5prime << ",\n";
-    *out << "    \"inverted_pattern_5prime\": " << (profile.inverted_pattern_5prime ? "true" : "false") << ",\n";
-    *out << "    \"inverted_pattern_3prime\": " << (profile.inverted_pattern_3prime ? "true" : "false") << ",\n";
-    *out << "    \"d_max_from_channel_b\": " << std::fixed << std::setprecision(2) << (profile.d_max_from_channel_b * 100.0f) << ",\n";
-    *out << "    \"d_metamatch\": " << std::fixed << std::setprecision(2) << (profile.d_metamatch * 100.0f) << ",\n";
-    *out << "    \"metamatch_high_damage_reads\": " << n_high_damage_reads << ",\n";
-    *out << "    \"metamatch_high_damage_pct\": " << std::fixed << std::setprecision(2)
-         << (total_reads > 0 ? 100.0f * n_high_damage_reads / total_reads : 0.0f) << ",\n";
-
-    // Channel C: Oxidative damage (G→T transversions)
-    *out << "    \"channel_c_valid\": " << (profile.channel_c_valid ? "true" : "false") << ",\n";
-    *out << "    \"ox_stop_rate_terminal\": " << std::fixed << std::setprecision(4) << profile.ox_stop_rate_terminal << ",\n";
-    *out << "    \"ox_stop_rate_interior\": " << std::fixed << std::setprecision(4) << profile.ox_stop_rate_interior << ",\n";
-    *out << "    \"ox_uniformity_ratio\": " << std::fixed << std::setprecision(3) << profile.ox_uniformity_ratio << ",\n";
-    *out << "    \"ox_d_max\": " << std::fixed << std::setprecision(2) << (profile.ox_d_max * 100.0f) << ",\n";
-    *out << "    \"ox_damage_detected\": " << (profile.ox_damage_detected ? "true" : "false") << ",\n";
-    *out << "    \"ox_is_artifact\": " << (profile.ox_is_artifact ? "true" : "false") << ",\n";
-
-    // Channel E: Depurination
-    *out << "    \"purine_enrichment_5prime\": " << std::fixed << std::setprecision(4) << profile.purine_enrichment_5prime << ",\n";
-    *out << "    \"depurination_detected\": " << (profile.depurination_detected ? "true" : "false") << ",\n";
-
-    *out << "    \"library_type\": \"" << profile.library_type_str() << "\"\n";
-    *out << "  }\n";
-    *out << "}\n";
+    taph::ProfileJsonInput pji;
+    pji.sample_name          = input_file;
+    pji.version              = std::string("dart/") + DART_VERSION;
+    pji.n_reads              = static_cast<uint64_t>(total_reads);
+    pji.adapter_stubs_5prime = stubs.stubs5;
+    pji.adapter_stubs_3prime = stubs.stubs3;
+    pji.top_hex_enriched     = stubs.top_enriched;
+    pji.adapter_clipped      = stubs.adapter_clipped;
+    pji.adapter3_clipped     = stubs.adapter3_clipped;
+    pji.flag_hex_artifact    = stubs.flag_hex_artifact;
+    taph::profile_to_json(profile, *out, pji);
 
     if (verbose) {
         std::cerr << "\nDamage profile:\n";
         std::cerr << "  Level: " << damage_level_str(d_max) << "\n";
         std::cerr << "  D_max: " << std::fixed << std::setprecision(1) << (d_max * 100.0f) << "%\n";
-        std::cerr << "  Channel B LLR:  " << std::fixed << std::setprecision(1) << profile.stop_decay_llr_5prime << " (5' C→T stop conversion)\n";
-        std::cerr << "  Channel B3 LLR: " << std::fixed << std::setprecision(1) << profile.stop_decay_llr_3prime << " (3' G→A stop conversion)\n";
+        std::cerr << "  Channel B LLR:  " << std::fixed << std::setprecision(1)
+                  << profile.stop_decay_llr_5prime << " (5' C→T stop conversion)\n";
+        std::cerr << "  Channel B3 LLR: " << std::fixed << std::setprecision(1)
+                  << profile.stop_decay_llr_3prime << " (3' G→A stop conversion)\n";
         if (profile.channel_c_valid) {
-            std::cerr << "  Channel C: ox_d_max=" << std::fixed << std::setprecision(1) << (profile.ox_d_max * 100.0f)
+            std::cerr << "  Channel C: ox_d_max=" << std::fixed << std::setprecision(1)
+                      << (profile.ox_d_max * 100.0f)
                       << "% uniformity=" << std::setprecision(2) << profile.ox_uniformity_ratio
                       << (profile.ox_damage_detected ? " DETECTED" : "") << " (G→T oxidation)\n";
         }
