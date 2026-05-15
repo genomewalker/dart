@@ -428,7 +428,8 @@ public:
         const char* codon,
         size_t codon_nt_start,
         size_t seq_len,
-        const SampleDamageProfile& sample_profile);
+        const SampleDamageProfile& sample_profile,
+        bool is_forward = true);
 
     /**
      * Per-read damage evidence from Bayesian log-odds scoring
