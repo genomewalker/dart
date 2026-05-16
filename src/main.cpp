@@ -478,7 +478,8 @@ int cmd_predict(int argc, char* argv[]) {
                     seq, sample_profile,
                     opts.orf_min_aa,
                     opts.adaptive_orf,
-                    per_read_damage_prior);
+                    per_read_damage_prior,
+                    id);
 
                 float damage_pct = opts.use_damage
                     ? dart::FrameSelector::compute_damage_percentage(seq, sample_profile)
