@@ -653,7 +653,8 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
     const SampleDamageProfile& sample_profile,
     size_t min_aa,
     bool adaptive,
-    float per_read_damage) {
+    float per_read_damage,
+    const std::string& read_id) {
 
     // =========================================================================
     // UNIFIED DAMAGE-AWARE ORF ENUMERATION
@@ -717,6 +718,15 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
     auto dmg = make_codon_damage_params(&sample_profile);
     auto all_scores = codon::score_all_hypotheses(seq, dmg, codon::ScoringWeights(), true);
     auto& buf = codon::get_thread_buffers();
+
+    // Look up full-read frame likelihood for a (forward, frame) pair.
+    // all_scores is sorted by posterior so we match by stored frame/forward fields.
+    auto frame_full_score = [&all_scores](bool forward, int frame) -> float {
+        for (const auto& r : all_scores)
+            if (r.forward == forward && r.frame == frame)
+                return r.log_likelihood;
+        return 0.0f;
+    };
 
     // STOP RESCUE STRATEGY:
     // AA-level correction (guessing Q, R, W) was disabled due to ~2% precision.
@@ -786,9 +796,37 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                     float p_stop = combine_p_stop(p_stop_sample);
 
                     // Rescue: continue ORF through this stop when plausibly damage-induced.
-                    // Threshold 0.10 (raised from 0.05) balances sensitivity vs. false rescue.
+                    //
+                    // Key design decisions:
+                    //
+                    // 1. THRESHOLD uses p_stop_sample (sample-level, before per-read downscaling).
+                    //    At low damage (d_max=5%), combined p_stop ≈ 0.4 × d_max = 0.02, far below
+                    //    the old threshold of 0.10. Using p_stop_sample directly rescues terminal
+                    //    convertible stops at all damage levels where the sample model detects damage.
+                    //    Threshold 0.03 rescues positions where sample probability ≥ 3% (d_max ≥ 3%).
+                    //
+                    // 2. COST uses kRescuedStopCost (0.15 nats) regardless of p_stop.
+                    //    The logaddexp cost at low p_stop (≈2.7 nats) would wipe out the correct
+                    //    frame's avg_hexamer advantage and cause it to lose to clean wrong frames.
+                    //    kRescuedStopCost reflects the committed rescue decision.
+                    //    False rescues in wrong frames are self-correcting: codons after the rescue
+                    //    position in the wrong frame have poor hexamer scores, reducing avg_hexamer.
+                    //
+                    // 3. CAP scales with damage. rescue_cap=2 at low damage limits false rescues.
                     bool codon_is_convertible = is_damage_convertible_stop(c0, c1, c2);
-                    bool can_rescue = (p_stop > 0.10f && orf_rescued_stops < 2 &&
+                    size_t rescue_cap = (d_max > 0.20f) ? 4 : 2;
+                    // Threshold on p_stop_sample (before per-read downscaling) avoids
+                    // false rescues in undamaged samples where combined p_stop ≈ 0.4×d_max
+                    // would be suppressed to near-zero by low p_read_dmg.
+                    // Threshold 0.05: excludes "none" background noise (d_max ≈ 3%)
+                    // while allowing rescue at "low" damage (d_max ≈ 5-10%).
+                    // Gate on d_max_combined > 0: this is 0 when Channel B invalidates
+                    // the Channel A signal (compositional T enrichment, not real damage).
+                    // For "none"-damage samples, d_max_combined = 0 even when d_max_5prime
+                    // is elevated by AT-rich compositional bias → correct exclusion.
+                    const bool damage_validated = (sample_profile.d_max_combined > 0.0f);
+                    bool can_rescue = (damage_validated &&
+                                       p_stop_sample > 0.05f && orf_rescued_stops < rescue_cap &&
                                        codon_nt_start + 2 < oriented.length() &&
                                        codon_is_convertible);
 
@@ -803,8 +841,11 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                         current_corrected_nt += c1;
                         current_corrected_nt += c2;
                         orf_rescued_stops++;
-                        orf_rescued_stop_cost += stop_logaddexp_cost(p_stop);
-                        orf_strand_disc += kDiscWeight * (std::log(p_stop) - kLogStopPrior);
+                        // Cost: capped at 1.0 nat so correct rescued frame still beats clean wrong
+                        // frames (avg_hexamer advantage ≈ 2 nats/frame). At high damage, the
+                        // natural logaddexp cost drops below 1.0 and is used directly.
+                        orf_rescued_stop_cost += std::min(stop_logaddexp_cost(p_stop_sample), 1.0f);
+                        orf_strand_disc += kDiscWeight * (std::log(p_stop_sample) - kLogStopPrior);
 
                         // Score the inferred ancestral codon's dicodon context.
                         // Restores the coding signal the correct frame loses at each damage stop
@@ -973,17 +1014,40 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                             - orf_rescued_stop_cost
                             - frame_stop_cost;
                 orf.strand_disc = orf_strand_disc;
+                orf.full_read_score = frame_full_score(is_forward, frame);
                 strand_fragments.push_back(std::move(orf));
             }
         }
     }
 
-    // Sort by score (coding signal - stop penalties + damage-aware rescue bonus)
+
+
     auto by_score = [](const ORFFragment& a, const ORFFragment& b) {
         return a.score > b.score;
     };
     std::sort(fwd_fragments.begin(), fwd_fragments.end(), by_score);
     std::sort(rev_fragments.begin(), rev_fragments.end(), by_score);
+
+    // Debug: for reads with any rescued stop, print per-fragment scores and strand_disc values.
+    // DART_DEBUG_STOPS=1 enables. Output format (tab-separated):
+    // STOP_DBG <read_id> <strand><frame>:<score>:<rescued>:<strand_disc>:<len> ...
+    static const bool dbg_stops = (std::getenv("DART_DEBUG_STOPS") != nullptr);
+    if (dbg_stops) {
+        bool any_rescued = false;
+        for (const auto& o : fwd_fragments) if (o.rescued_stops > 0) { any_rescued = true; break; }
+        if (!any_rescued)
+            for (const auto& o : rev_fragments) if (o.rescued_stops > 0) { any_rescued = true; break; }
+        if (any_rescued) {
+            std::fprintf(stderr, "STOP_DBG\t%s", read_id.c_str());
+            for (const auto& o : fwd_fragments)
+                std::fprintf(stderr, "\tf%d:%.3f:%zu:%.3f:%zu",
+                    o.frame, o.score, o.rescued_stops, o.strand_disc, o.length);
+            for (const auto& o : rev_fragments)
+                std::fprintf(stderr, "\tr%d:%.3f:%zu:%.3f:%zu",
+                    o.frame, o.score, o.rescued_stops, o.strand_disc, o.length);
+            std::fprintf(stderr, "\n");
+        }
+    }
 
     // =========================================================================
     // SELECTION MODES:
@@ -1135,28 +1199,17 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
     //
     // Part A — logsumexp strand pooling: add log(Σ exp(score - max)) per strand to
     // the best ORF on that strand. Real genes look vaguely coding in all 3 frames of
-    // the true strand; RC decoys typically have only one strong frame. This is a
-    // small but genuinely RC-asymmetric signal (~0–1.1 nats, max = log(3)).
+    // the true strand; RC decoys typically have only one strong frame (~0–1.1 nats bonus).
+    // Applied unconditionally — independent of damage level.
     //
-    // Part B — rescued-stop strand discriminant: when a forward frame has rescued-stop
-    // evidence, add log(p_stop) - log(3/64) nats as a bonus (pre-computed as
-    // strand_disc). kDiscMargin widened to 3.0 so the discriminant fires across the
-    // full range of realistic RC leads (not just ties).
+    // Part B — rescued-stop strand discriminant: when the best forward ORF has rescued-
+    // stop evidence (strand_disc > 0), add a bonus if the RC lead is within kDiscMargin.
+    // Only fires when damage is validated by the joint model (damage_validated=true) to
+    // avoid boosting wrong-frame rescued stops in undamaged or low-damage samples where
+    // the rescue threshold barely fires and produces spurious strand_disc evidence.
     {
         static constexpr float kDiscMargin = 3.0f;
         static constexpr float kDiscCap    = 3.0f;
-
-        // Within-strand pre-boost: apply a small fraction of strand_disc to each
-        // rescued-stop ORF before finding best_fwd. Fixes the case where the
-        // rescued-stop ORF is split by a later real stop — the downstream clean
-        // segment becomes best_fwd with strand_disc=0 and Part B silently no-ops.
-        // kWithinBoostFrac keeps this small so it doesn't distort within-strand
-        // ranking for reads where the clean companion is genuinely better.
-        static constexpr float kWithinBoostFrac = 0.25f;
-        for (auto& orf : result) {
-            if (orf.is_forward && orf.strand_disc > 0.0f)
-                orf.score += kWithinBoostFrac * std::min(orf.strand_disc, kDiscCap);
-        }
 
         ORFFragment* best_fwd = nullptr;
         ORFFragment* best_rc  = nullptr;
@@ -1168,7 +1221,7 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
             }
         }
 
-        // Part A: logsumexp pooling
+        // Part A: logsumexp pooling (always)
         if (best_fwd && best_rc) {
             float fwd_max = best_fwd->score;
             float rc_max  = best_rc->score;
@@ -1181,10 +1234,9 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
             best_rc->score  += std::log(rc_sum);
         }
 
-        // Part B: rescued-stop discriminant (fires if fwd behind by < kDiscMargin).
-        // Uses best_fwd->strand_disc — the evidence must belong to the ORF being boosted,
-        // not aggregated from other forward ORFs (that would boost the wrong ORF).
-        if (best_fwd && best_rc && best_fwd->strand_disc > 0.0f) {
+        // Part B: rescued-stop discriminant (only when damage is validated)
+        if (sample_profile.damage_validated &&
+                best_fwd && best_rc && best_fwd->strand_disc > 0.0f) {
             float gap = best_rc->score - best_fwd->score;
             if (gap > -kDiscMargin) {
                 float bonus = std::min(best_fwd->strand_disc, kDiscCap);
@@ -1193,7 +1245,6 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
         }
     }
 
-    // Final sort by score
     std::sort(result.begin(), result.end(), by_score);
 
     return result;

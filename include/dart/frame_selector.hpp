@@ -309,6 +309,7 @@ public:
         size_t real_stops;            // Real (non-damage) internal stops in this frame
         float damage_evidence;        // Sum of p_damage_stop for convertible stops
         float score;                  // Ranking score (coding signal - stop penalties)
+        float full_read_score = 0.0f; // Full-read frame likelihood from unified_codon_scorer (primary selector)
         float strand_disc = 0.0f;    // Accumulated strand-discriminant evidence (not added to score here)
     };
 
@@ -391,7 +392,8 @@ public:
         const SampleDamageProfile& sample_profile,
         size_t min_aa = 10,
         bool adaptive = false,
-        float per_read_damage = -1.0f);
+        float per_read_damage = -1.0f,
+        const std::string& read_id = "");
 
     /**
      * Compute per-read damage prior using Bayesian posterior on terminal bases.
