@@ -90,6 +90,7 @@ struct ThreadOutputBuffer {
     std::ostringstream gff;
     std::ostringstream fasta_nt;
     std::ostringstream fasta_aa;
+    std::ostringstream fasta_aa_corrected;
     std::ostringstream fasta_aa_masked;
     std::vector<std::tuple<std::string, Gene, std::string>> damage_records;
     size_t gene_count = 0;
@@ -101,6 +102,8 @@ struct ThreadOutputBuffer {
         fasta_nt.clear();
         fasta_aa.str("");
         fasta_aa.clear();
+        fasta_aa_corrected.str("");
+        fasta_aa_corrected.clear();
         fasta_aa_masked.str("");
         fasta_aa_masked.clear();
         damage_records.clear();
@@ -147,6 +150,17 @@ struct ThreadOutputBuffer {
                  << " stop_fix=" << gene.stop_restorations
                  << " corr_score=" << gene.orf_rank
                  << "\n" << gene.protein << "\n";
+    }
+
+    // Format FASTA entry for Bayesian-corrected protein (ancestor AAs at damage stops)
+    void write_fasta_aa_corrected(const std::string& seq_id, const Gene& gene, int gene_num) {
+        const std::string& prot = gene.corrected_protein.empty() ? gene.protein : gene.corrected_protein;
+        fasta_aa_corrected << ">" << seq_id << "_" << (gene.is_forward ? "+" : "-") << "_" << gene.frame
+                           << " " << (gene.start + 1) << ".." << gene.end
+                           << " length=" << prot.length() << "aa"
+                           << " stop_fix=" << gene.stop_restorations
+                           << " corr_score=" << gene.orf_rank
+                           << "\n" << prot << "\n";
     }
 
     // Format FASTA entry for search protein (X-masked)
@@ -211,11 +225,13 @@ int cmd_predict(int argc, char* argv[]) {
         // Direct file streams for parallel output buffering
         OutputFile fasta_nt_file;
         OutputFile fasta_aa_file;
+        OutputFile fasta_aa_corrected_file;
         OutputFile fasta_aa_masked_file;
 
         // Flags to check if outputs are enabled
         bool write_fasta_nt = !opts.fasta_nt.empty();
         bool write_fasta_aa = !opts.fasta_aa.empty();
+        bool write_fasta_aa_corrected = !opts.fasta_aa_corrected.empty();
         bool write_fasta_aa_masked = !opts.fasta_aa_masked.empty();
 
         // Keep corrected writer for backward compatibility (not optimized)
@@ -234,6 +250,12 @@ int cmd_predict(int argc, char* argv[]) {
             fasta_aa_file.open(opts.fasta_aa);
             if (!fasta_aa_file) {
                 throw std::runtime_error("Cannot open FASTA AA file: " + opts.fasta_aa);
+            }
+        }
+        if (write_fasta_aa_corrected) {
+            fasta_aa_corrected_file.open(opts.fasta_aa_corrected);
+            if (!fasta_aa_corrected_file) {
+                throw std::runtime_error("Cannot open FASTA AA corrected file: " + opts.fasta_aa_corrected);
             }
         }
         if (write_fasta_aa_masked) {
@@ -559,6 +581,7 @@ int cmd_predict(int argc, char* argv[]) {
                     buf.write_gff(id, gene, gene_num);
                     if (write_fasta_nt) buf.write_fasta_nt(id, gene, gene_num);
                     if (write_fasta_aa) buf.write_fasta_aa(id, gene, gene_num);
+                    if (write_fasta_aa_corrected) buf.write_fasta_aa_corrected(id, gene, gene_num);
                     if (write_fasta_aa_masked) buf.write_fasta_aa_masked(id, gene, gene_num);
                     if (damage_index_writer) {
                         buf.damage_records.emplace_back(id, gene, gene.sequence);
@@ -579,6 +602,9 @@ int cmd_predict(int argc, char* argv[]) {
                 }
                 if (write_fasta_aa) {
                     fasta_aa_file << buf.fasta_aa.str();
+                }
+                if (write_fasta_aa_corrected) {
+                    fasta_aa_corrected_file << buf.fasta_aa_corrected.str();
                 }
                 if (write_fasta_aa_masked) {
                     fasta_aa_masked_file << buf.fasta_aa_masked.str();

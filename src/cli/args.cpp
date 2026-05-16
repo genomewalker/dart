@@ -101,6 +101,8 @@ Options parse_args(int argc, char* argv[]) {
             opts.fasta_nt = require_value(arg);
         } else if (arg == "--fasta-nt-corrected") {
             opts.fasta_nt_corrected = require_value(arg);
+        } else if (arg == "--fasta-aa-corrected") {
+            opts.fasta_aa_corrected = require_value(arg);
         } else if (arg == "--fasta-aa") {
             opts.fasta_aa = require_value(arg);
         } else if (arg == "--fasta-aa-masked") {
