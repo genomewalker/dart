@@ -308,7 +308,8 @@ public:
         size_t rescued_stops;         // Damage stops X-masked in search_protein (continued through)
         size_t real_stops;            // Real (non-damage) internal stops in this frame
         float damage_evidence;        // Sum of p_damage_stop for convertible stops
-        float score;                  // Ranking score (coding signal - stop penalties)
+        float score;                  // Emit score: avg_hexamer (no LLR) + length - costs
+        float rank_score = 0.0f;     // Rank score: score + LLR contrastive bonus (used for final ordering)
         float full_read_score = 0.0f; // Full-read frame likelihood from unified_codon_scorer (primary selector)
         float strand_disc = 0.0f;    // Accumulated strand-discriminant evidence (not added to score here)
     };

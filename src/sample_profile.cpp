@@ -1376,7 +1376,7 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         // Use stricter threshold if deamination is present (correlated damage)
         // Deamination enriches ALL terminal damage, including G→T via adjacent effects
         float threshold = 0.02f;  // 2% excess required (was 0.5%)
-        if (profile.d_max_combined > 5.0f || profile.damage_validated) {
+        if (profile.d_max_combined > 0.05f || profile.damage_validated) {
             threshold = 0.05f;  // 5% excess if deamination present
         }
 

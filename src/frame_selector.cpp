@@ -394,7 +394,6 @@ static char infer_damaged_stop_aa(char c0, char c1, char c2,
         // Log-posterior: log p_damage + upstream hexamer + downstream hexamer
         float s_cga = std::log(p_ct);
         float s_tgg = std::log(p_ga);
-
         if (prev_codon != nullptr) {
             s_cga += log_hex_prior(prev_codon, cga);
             s_tgg += log_hex_prior(prev_codon, tgg);
@@ -417,7 +416,9 @@ static float log_hex_prior(const char* prev3, const char anc3[3]) {
     char hex[7] = { prev3[0], prev3[1], prev3[2], anc3[0], anc3[1], anc3[2], '\0' };
     uint32_t code = encode_hexamer(hex);
     if (code == UINT32_MAX) return -6.0f;
-    return std::log(GTDB_HEXAMER_FREQ[code] * 4096.0f + 1e-10f);
+    // KT-smoothed: add 0.5 pseudocount in scaled (×4096) frequency space.
+    // Raises floor for rare dicodons like CGA from log(0.33)≈−1.1 to log(0.83)≈−0.19.
+    return std::log(GTDB_HEXAMER_FREQ[code] * 4096.0f + 0.5f);
 }
 
 // Generate search-optimized protein by extending past damage-convertible stops.
@@ -698,7 +699,7 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
 
     // Contrastive LLR: log P(hex|coding) - log P(hex|+1/+2 shifted coding null).
     // Positive for hexamers that distinguish true coding frame from wrong frames.
-    static constexpr float kLLRWeight = 0.5f;
+    static constexpr float kLLRWeight   = 0.5f;
     const auto& wf_llr = dart::get_wrong_frame_llr();
 
     std::vector<ORFFragment> fwd_fragments;
@@ -762,7 +763,8 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
             float  orf_rescued_stop_cost = 0.0f; // logaddexp cost of rescued stops in current ORF
             size_t orf_aa_corrections = 0;
             float orf_damage_evidence = 0.0f;
-            float orf_hexamer_score = 0.0f;
+            float orf_hexamer_score = 0.0f;       // emit: codon_score + repair_score (no LLR)
+            float orf_rank_hexamer_score = 0.0f;  // rank: emit + kLLRWeight * wf_llr bonus
             float orf_strand_disc = 0.0f;  // accumulated strand-discriminant evidence from rescued stops
             size_t orf_coding_codons = 0;  // codons contributing to avg_hexamer (excludes rescued stops)
 
@@ -848,9 +850,11 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                             if (c1 == 'A' && c2 == 'A') {        // TAA←CAA
                                 const char anc[] = {'C','A','A'};
                                 repair_score = log_hex_prior(prev, anc);
+                                if (next != nullptr) repair_score += log_hex_prior(anc, next);
                             } else if (c1 == 'A' && c2 == 'G') { // TAG←CAG
                                 const char anc[] = {'C','A','G'};
                                 repair_score = log_hex_prior(prev, anc);
+                                if (next != nullptr) repair_score += log_hex_prior(anc, next);
                             } else {                              // TGA←CGA or TGG (weighted)
                                 float p_ct = std::max(compute_position_damage_prob(
                                     codon_nt_start,     oriented.length(),
@@ -880,6 +884,7 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                             }
                         }
                         orf_hexamer_score += repair_score;
+                        orf_rank_hexamer_score += repair_score;
                         orf_coding_codons++;
                     } else {
                         // Real stop (or rescue cap): emit current ORF then start new one.
@@ -926,13 +931,11 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                             // Use orf_coding_codons (excludes rescued stops) as the denominator
                             // so damage-induced stops don't contaminate avg_hexamer.
                             float avg_hexamer = orf_coding_codons > 0 ? orf_hexamer_score / static_cast<float>(orf_coding_codons) : 0.0f;
+                            float avg_rank_hexamer = orf_coding_codons > 0 ? orf_rank_hexamer_score / static_cast<float>(orf_coding_codons) : 0.0f;
                             float length_bonus = std::log(static_cast<float>(orf.length) + 1.0f);
-                            // Score: hexamer signal + length bonus
-                            //        − logaddexp cost of rescued stops in this ORF (mild)
-                            //        − accumulated logaddexp cost of real stops in this frame
-                            orf.score = avg_hexamer + length_bonus
-                                        - orf_rescued_stop_cost
-                                        - frame_stop_cost;
+                            float costs = orf_rescued_stop_cost + frame_stop_cost;
+                            orf.score = avg_hexamer + length_bonus - costs;
+                            orf.rank_score = avg_rank_hexamer + length_bonus - costs;
                             orf.strand_disc = orf_strand_disc;
                             strand_fragments.push_back(std::move(orf));
                         }
@@ -950,6 +953,7 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                         orf_aa_corrections = 0;
                         orf_damage_evidence = 0.0f;
                         orf_hexamer_score = 0.0f;
+                        orf_rank_hexamer_score = 0.0f;
                         orf_coding_codons = 0;
                     }
                 } else {
@@ -977,6 +981,7 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                         }
                     }
                     orf_hexamer_score += codon_score + kLLRWeight * llr_bonus;
+                    orf_rank_hexamer_score += codon_score + kLLRWeight * llr_bonus;
                     orf_coding_codons++;
                 }
             }
@@ -1011,10 +1016,11 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                 orf.real_stops = frame_real_stops;
                 orf.damage_evidence = orf_damage_evidence;
                 float avg_hexamer = orf_coding_codons > 0 ? orf_hexamer_score / static_cast<float>(orf_coding_codons) : 0.0f;
+                float avg_rank_hexamer = orf_coding_codons > 0 ? orf_rank_hexamer_score / static_cast<float>(orf_coding_codons) : 0.0f;
                 float length_bonus = std::log(static_cast<float>(orf.length) + 1.0f);
-                orf.score = avg_hexamer + length_bonus
-                            - orf_rescued_stop_cost
-                            - frame_stop_cost;
+                float costs = orf_rescued_stop_cost + frame_stop_cost;
+                orf.score = avg_hexamer + length_bonus - costs;
+                orf.rank_score = avg_rank_hexamer + length_bonus - costs;
                 orf.strand_disc = orf_strand_disc;
                 orf.full_read_score = frame_full_score(is_forward, frame);
                 strand_fragments.push_back(std::move(orf));
@@ -1024,11 +1030,14 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
 
 
 
-    auto by_score = [](const ORFFragment& a, const ORFFragment& b) {
-        return a.score > b.score;
+    // Sort by rank_score: selects best within-frame ORF by contrastive quality.
+    // The adaptive margin check still uses .score (emit, without LLR) so that
+    // the LLR influences ranking but not output-set membership.
+    auto by_rank = [](const ORFFragment& a, const ORFFragment& b) {
+        return a.rank_score > b.rank_score;
     };
-    std::sort(fwd_fragments.begin(), fwd_fragments.end(), by_score);
-    std::sort(rev_fragments.begin(), rev_fragments.end(), by_score);
+    std::sort(fwd_fragments.begin(), fwd_fragments.end(), by_rank);
+    std::sort(rev_fragments.begin(), rev_fragments.end(), by_rank);
 
     // Debug: for reads with any rescued stop, print per-fragment scores and strand_disc values.
     // DART_DEBUG_STOPS=1 enables. Output format (tab-separated):
@@ -1232,8 +1241,10 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                 if (orf.is_forward) fwd_sum += std::exp(orf.score - fwd_max);
                 else                rc_sum  += std::exp(orf.score - rc_max);
             }
-            best_fwd->score += std::log(fwd_sum);
-            best_rc->score  += std::log(rc_sum);
+            float fwd_lse = std::log(fwd_sum);
+            float rc_lse  = std::log(rc_sum);
+            best_fwd->score += fwd_lse;  best_fwd->rank_score += fwd_lse;
+            best_rc->score  += rc_lse;   best_rc->rank_score  += rc_lse;
         }
 
         // Part B: rescued-stop discriminant (only when damage is validated)
@@ -1243,11 +1254,15 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
             if (gap > -kDiscMargin) {
                 float bonus = std::min(best_fwd->strand_disc, kDiscCap);
                 best_fwd->score += bonus;
+                best_fwd->rank_score += bonus;
             }
         }
     }
 
-    std::sort(result.begin(), result.end(), by_score);
+    std::sort(result.begin(), result.end(),
+              [](const ORFFragment& a, const ORFFragment& b) {
+                  return a.rank_score > b.rank_score;
+              });
 
     return result;
 }

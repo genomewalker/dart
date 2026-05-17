@@ -545,10 +545,12 @@ int cmd_predict(int argc, char* argv[]) {
                     gene.is_fragment = true;
                     gene.frame = orf.frame;
 
+                    // Use rank_score (emit + LLR contrastive bonus) so GFF score field
+                    // and FASTA corr_score=0 both reflect the same ranking criterion.
                     float normalized_score = orf.length > 0
-                        ? orf.score / static_cast<float>(orf.length)
+                        ? orf.rank_score / static_cast<float>(orf.length)
                         : 0.0f;
-                    gene.frame_score = orf.score;
+                    gene.frame_score = orf.rank_score;
                     gene.coding_prob = std::max(0.0f, std::min(1.0f, normalized_score / 1.5f + 0.5f));
                     gene.score = gene.coding_prob;
 
