@@ -158,8 +158,13 @@ static std::unordered_map<std::string, std::string> load_proteins(const char* pa
 }
 
 struct TranslationCounts {
-    long aa_total = 0, aa_correct = 0;        // all correctly-framed reads
-    long stop_aa_total = 0, stop_aa_correct = 0; // at damage-induced stop positions
+    long aa_total = 0, aa_correct = 0;
+    // Per stop-type: discriminated by original AA at stop position
+    // Q = unambiguous (TAA←CAA or TAG←CAG)
+    // R = TGA←CGA (C→T), W = TGA←TGG (G→A)
+    long q_total = 0, q_correct = 0;
+    long r_total = 0, r_correct = 0;
+    long w_total = 0, w_correct = 0;
 };
 
 static TranslationCounts score_translation(
@@ -182,8 +187,11 @@ static TranslationCounts score_translation(
             tc.aa_total++;
             if (pred[i] == orig[i]) tc.aa_correct++;
             if (i < 64 && (t.stop_positions >> i) & 1u) {
-                tc.stop_aa_total++;
-                if (pred[i] == orig[i]) tc.stop_aa_correct++;
+                bool ok = (pred[i] == orig[i]);
+                char aa = (i < orig.size()) ? orig[i] : 0;
+                if (aa == 'Q') { tc.q_total++; if (ok) tc.q_correct++; }
+                else if (aa == 'R') { tc.r_total++; if (ok) tc.r_correct++; }
+                else if (aa == 'W') { tc.w_total++; if (ok) tc.w_correct++; }
             }
         }
     }
@@ -322,9 +330,17 @@ int cmd_eval(int argc, char* argv[]) {
     if (proteins_corrected_path) {
         auto proteins_corr = load_proteins(proteins_corrected_path);
         TranslationCounts tc = score_translation(truth, preds, proteins_corr);
-        double trl_s = tc.stop_aa_total ? 100.0*tc.stop_aa_correct/tc.stop_aa_total : 0;
+        long stop_total = tc.q_total + tc.r_total + tc.w_total;
+        long stop_correct = tc.q_correct + tc.r_correct + tc.w_correct;
+        double trl_s = stop_total ? 100.0*stop_correct/stop_total : 0;
+        double trl_q = tc.q_total ? 100.0*tc.q_correct/tc.q_total : 0;
+        double trl_r = tc.r_total ? 100.0*tc.r_correct/tc.r_total : 0;
+        double trl_w = tc.w_total ? 100.0*tc.w_correct/tc.w_total : 0;
         printf("trl_s: %.2f%%  ancestor AA accuracy at damage-induced stop positions  (n_stops=%ld)\n",
-               trl_s, tc.stop_aa_total);
+               trl_s, stop_total);
+        printf("  trl_Q: %.2f%%  TAA←CAA / TAG←CAG  (n=%ld)\n", trl_q, tc.q_total);
+        printf("  trl_R: %.2f%%  TGA←CGA  (n=%ld)\n", trl_r, tc.r_total);
+        printf("  trl_W: %.2f%%  TGA←TGG  (n=%ld)\n", trl_w, tc.w_total);
     }
     return 0;
 }

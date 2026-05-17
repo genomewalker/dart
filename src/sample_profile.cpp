@@ -1066,6 +1066,55 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
                 profile.stop_decay_llr_5prime = -std::abs(profile.stop_decay_llr_5prime);
             }
 
+            // Per-stop-type LLRs (same model, type-specific counts)
+            {
+                profile.n_convertible_caa = profile.convertible_caa_interior + profile.convertible_taa_interior;
+                profile.n_convertible_cag = profile.convertible_cag_interior + profile.convertible_tag_interior;
+                profile.n_convertible_cga = profile.convertible_cga_interior + profile.convertible_tga_interior;
+                profile.channel_b_valid_tga = (profile.n_convertible_cga >= 50.0);
+
+                const std::array<double,15>* pre_arr[3]  = { &profile.convertible_caa_5prime,
+                                                              &profile.convertible_cag_5prime,
+                                                              &profile.convertible_cga_5prime };
+                const std::array<double,15>* stop_arr[3] = { &profile.convertible_taa_5prime,
+                                                              &profile.convertible_tag_5prime,
+                                                              &profile.convertible_tga_5prime };
+                float* llr_out[3] = { &profile.stop_decay_llr_taa_5prime,
+                                      &profile.stop_decay_llr_tag_5prime,
+                                      &profile.stop_decay_llr_tga_5prime };
+                for (int t = 0; t < 3; ++t) {
+                    double t_pre_int = 0, t_stop_int = 0;
+                    for (int p = 5; p < 15; ++p) {
+                        t_pre_int  += (*pre_arr[t])[p];
+                        t_stop_int += (*stop_arr[t])[p];
+                    }
+                    double t_base = (t_pre_int + t_stop_int > 10)
+                        ? t_stop_int / (t_pre_int + t_stop_int)
+                        : static_cast<double>(local_baseline);
+                    double t_sum_e = 0, t_sum_w = 0;
+                    for (int i = 0; i < 5; ++i) {
+                        double t_n = (*pre_arr[t])[i] + (*stop_arr[t])[i];
+                        if (t_n > 10) {
+                            double w = std::exp(-lambda_b * i);
+                            t_sum_e += t_n * ((*stop_arr[t])[i] / t_n - t_base) / w;
+                            t_sum_w += t_n;
+                        }
+                    }
+                    double t_amp = (t_sum_w > 0) ? t_sum_e / t_sum_w : 0.0;
+                    double t_lle = 0, t_llc = 0;
+                    for (int p = 0; p < 10; ++p) {
+                        double t_n = (*pre_arr[t])[p] + (*stop_arr[t])[p];
+                        if (t_n < 20) continue;
+                        double t_k = (*stop_arr[t])[p];
+                        double t_pe = std::clamp(t_base + t_amp * std::exp(-lambda_b * p), 0.001, 0.999);
+                        double t_pc = std::clamp(t_base, 0.001, 0.999);
+                        t_lle += binomial_ll(t_k, t_n, t_pe);
+                        t_llc += binomial_ll(t_k, t_n, t_pc);
+                    }
+                    *llr_out[t] = static_cast<float>(t_amp < 0 ? -(t_lle - t_llc) : (t_lle - t_llc));
+                }
+            }
+
             // CHANNEL B STRUCTURAL QUANTIFICATION
             // Compute d_max directly from stop codon conversion rate at position 0.
             // Formula: d_max_B = stops_excess / convertible_original
@@ -2568,7 +2617,14 @@ void FrameSelector::reset_sample_profile(SampleDamageProfile& profile) {
     profile.stop_conversion_rate_baseline = 0.0f;
     profile.stop_decay_llr_5prime = 0.0f;
     profile.stop_amplitude_5prime = 0.0f;
+    profile.stop_decay_llr_taa_5prime = 0.0f;
+    profile.stop_decay_llr_tag_5prime = 0.0f;
+    profile.stop_decay_llr_tga_5prime = 0.0f;
+    profile.n_convertible_caa = 0.0;
+    profile.n_convertible_cag = 0.0;
+    profile.n_convertible_cga = 0.0;
     profile.channel_b_valid = false;
+    profile.channel_b_valid_tga = false;
     profile.damage_validated = false;
     profile.damage_artifact = false;
 
