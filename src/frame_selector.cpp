@@ -353,67 +353,60 @@ static bool is_damage_convertible_stop(char c0, char c1, char c2) {
            (c0 == 'T' && c1 == 'G' && c2 == 'A');    // TGA ← CGA or TGG
 }
 
-// Infer the original amino acid from a damage-convertible stop codon
-// Returns the most likely pre-damage AA based on codon, position, and hexamer context
-// - TAA: Q (CAA→TAA via C→T)
-// - TAG: Q (CAG→TAG via C→T)
-// - TGA: R or W based on position + hexamer context
-//
-// For TGA disambiguation, we use hexamer frequencies to compare:
-// - [prev_codon + CGA] → R (Arginine)
-// - [prev_codon + TGG] → W (Tryptophan)
-// The higher scoring hexamer indicates the more likely original codon.
+static float log_hex_prior(const char* prev3, const char anc3[3]);  // defined below
+
+// Infer the original amino acid from a damage-convertible stop codon.
+// TAA/TAG are unambiguous (C→T at pos 1). TGA is disambiguated via a
+// log-posterior combining damage position probabilities + bidirectional
+// hexamer context from both the upstream and downstream codons.
 static char infer_damaged_stop_aa(char c0, char c1, char c2,
                                    size_t codon_pos, size_t seq_len,
                                    bool is_forward,
-                                   const char* prev_codon = nullptr) {
-    // TAA and TAG are unambiguous: both from C→T at position 1
-    if (c0 == 'T' && c1 == 'A' && c2 == 'A') return 'Q';  // CAA→TAA
-    if (c0 == 'T' && c1 == 'A' && c2 == 'G') return 'Q';  // CAG→TAG
+                                   const char* prev_codon = nullptr,
+                                   const char* next_codon = nullptr,
+                                   const SampleDamageProfile* sample_profile = nullptr) {
+    if (c0 == 'T' && c1 == 'A' && c2 == 'A') return 'Q';  // CAA→TAA (unambiguous)
+    if (c0 == 'T' && c1 == 'A' && c2 == 'G') return 'Q';  // CAG→TAG (unambiguous)
 
-    // TGA is ambiguous: could be CGA→TGA (R) or TGG→TGA (W)
+    // TGA: CGA→TGA (C→T at pos 1, restores R) or TGG→TGA (G→A at pos 3, restores W)
     if (c0 == 'T' && c1 == 'G' && c2 == 'A') {
-        // Calculate distance from terminals
-        size_t dist_5prime = is_forward ? codon_pos : (seq_len - codon_pos - 3);
-        size_t dist_3prime = is_forward ? (seq_len - codon_pos - 3) : codon_pos;
-
-        // Damage zone is ~15-20 nt from terminus
-        constexpr size_t DAMAGE_ZONE = 20;
-
-        // Clear cases: only one terminal in damage zone
-        if (dist_5prime < DAMAGE_ZONE && dist_3prime >= DAMAGE_ZONE) {
-            return 'R';  // 5' terminal: C→T damage → CGA→TGA
-        } else if (dist_3prime < DAMAGE_ZONE && dist_5prime >= DAMAGE_ZONE) {
-            return 'W';  // 3' terminal: G→A damage → TGG→TGA
+        // Damage channel probabilities at each mutated position
+        float p_ct, p_ga;
+        if (sample_profile != nullptr) {
+            p_ct = std::max(compute_position_damage_prob(
+                codon_pos,     seq_len, *sample_profile, is_forward,  is_forward), 1e-6f);
+            p_ga = std::max(compute_position_damage_prob(
+                codon_pos + 2, seq_len, *sample_profile, !is_forward, is_forward), 1e-6f);
+            if (!sample_profile->channel_b_valid_tga)
+                p_ct = 1e-6f;  // Insufficient CGA exposure; default to TGG→TGA
+        } else {
+            // Fallback: exponential decay from each terminus
+            size_t d5 = is_forward ? codon_pos : (seq_len > codon_pos + 3 ? seq_len - codon_pos - 3 : 0);
+            size_t d3 = is_forward ? (seq_len > codon_pos + 3 ? seq_len - codon_pos - 3 : 0) : codon_pos;
+            constexpr float kLam = 0.08f;
+            p_ct = std::exp(-kLam * static_cast<float>(d5));
+            p_ga = std::exp(-kLam * static_cast<float>(d3));
         }
 
-        // Ambiguous case: use hexamer context if available
+        const char cga[] = {'C','G','A'};
+        const char tgg[] = {'T','G','G'};
+
+        // Log-posterior: log p_damage + upstream hexamer + downstream hexamer
+        float s_cga = std::log(p_ct);
+        float s_tgg = std::log(p_ga);
+
         if (prev_codon != nullptr) {
-            // Construct hexamers: [prev_codon + hypothetical_original_codon]
-            char hex_cga[7] = {prev_codon[0], prev_codon[1], prev_codon[2], 'C', 'G', 'A', '\0'};
-            char hex_tgg[7] = {prev_codon[0], prev_codon[1], prev_codon[2], 'T', 'G', 'G', '\0'};
-
-            // Look up hexamer frequencies
-            uint32_t code_cga = encode_hexamer(hex_cga);
-            uint32_t code_tgg = encode_hexamer(hex_tgg);
-
-            if (code_cga != UINT32_MAX && code_tgg != UINT32_MAX) {
-                float freq_cga = GTDB_HEXAMER_FREQ[code_cga];
-                float freq_tgg = GTDB_HEXAMER_FREQ[code_tgg];
-
-                // Return the amino acid corresponding to higher frequency hexamer
-                if (freq_tgg > freq_cga * 1.5f) {
-                    return 'W';  // TGG significantly more common in this context
-                }
-                // Otherwise default to R (CGA is generally more common than TGG)
-            }
+            s_cga += log_hex_prior(prev_codon, cga);
+            s_tgg += log_hex_prior(prev_codon, tgg);
+        }
+        if (next_codon != nullptr) {
+            s_cga += log_hex_prior(cga, next_codon);
+            s_tgg += log_hex_prior(tgg, next_codon);
         }
 
-        // Default to R (Arginine) - more common in coding sequences
-        return 'R';
+        return (s_cga >= s_tgg) ? 'R' : 'W';
     }
 
-    // Fallback (shouldn't reach here if is_damage_convertible_stop was true)
     return 'X';
 }
 
@@ -469,11 +462,10 @@ static std::string generate_search_protein(
                            (c0 == 'T' && c1 == 'G' && c2 == 'A');
 
             if (is_stop && is_damage_convertible_stop(c0, c1, c2)) {
-                // Extend with inferred original AA instead of truncating
-                // Pass previous codon for hexamer-based TGA disambiguation
                 const char* prev = (codon_nt >= 3) ? (oriented_seq.data() + codon_nt - 3) : nullptr;
+                const char* next = (codon_nt + 5 < oriented_seq.length()) ? (oriented_seq.data() + codon_nt + 3) : nullptr;
                 char inferred = infer_damaged_stop_aa(c0, c1, c2, codon_nt,
-                                                       oriented_seq.length(), is_forward, prev);
+                                                       oriented_seq.length(), is_forward, prev, next);
                 search_protein += inferred;
                 extensions++;
                 current_codon++;
@@ -832,8 +824,9 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
 
                     if (can_rescue) {
                         const char* prev = (codon_nt_start >= 3) ? (oriented.data() + codon_nt_start - 3) : nullptr;
+                        const char* next = (codon_nt_start + 5 < oriented.length()) ? (oriented.data() + codon_nt_start + 3) : nullptr;
                         char inferred = infer_damaged_stop_aa(c0, c1, c2, codon_nt_start,
-                                                               oriented.length(), is_forward, prev);
+                                                               oriented.length(), is_forward, prev, next, &sample_profile);
                         current_protein += '*';
                         current_search_protein += inferred;
                         current_observed += inferred;
@@ -859,20 +852,29 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                                 const char anc[] = {'C','A','G'};
                                 repair_score = log_hex_prior(prev, anc);
                             } else {                              // TGA←CGA or TGG (weighted)
-                                const bool ct_is_5p = is_forward;
-                                const bool ga_is_5p = !is_forward;
                                 float p_ct = std::max(compute_position_damage_prob(
                                     codon_nt_start,     oriented.length(),
-                                    sample_profile, ct_is_5p, is_forward), 1e-6f);
+                                    sample_profile, is_forward,  is_forward), 1e-6f);
                                 float p_ga = std::max(compute_position_damage_prob(
                                     codon_nt_start + 2, oriented.length(),
-                                    sample_profile, ga_is_5p, is_forward), 1e-6f);
+                                    sample_profile, !is_forward, is_forward), 1e-6f);
+                                // Suppress CGA→TGA path when Channel B has insufficient CGA exposure
+                                if (!sample_profile.channel_b_valid_tga)
+                                    p_ct = 1e-6f;
                                 const char cga[] = {'C','G','A'};
                                 const char tgg[] = {'T','G','G'};
-                                float s_cga  = std::log(p_ct) + log_hex_prior(prev, cga);
-                                float s_tgg  = std::log(p_ga) + log_hex_prior(prev, tgg);
-                                float log_Z  = std::log(p_ct + p_ga);
-                                float mx     = std::max(s_cga, s_tgg);
+                                float s_cga = std::log(p_ct);
+                                float s_tgg = std::log(p_ga);
+                                if (prev != nullptr) {
+                                    s_cga += log_hex_prior(prev, cga);
+                                    s_tgg += log_hex_prior(prev, tgg);
+                                }
+                                if (next != nullptr) {
+                                    s_cga += log_hex_prior(cga, next);
+                                    s_tgg += log_hex_prior(tgg, next);
+                                }
+                                float log_Z = std::log(p_ct + p_ga);
+                                float mx    = std::max(s_cga, s_tgg);
                                 repair_score = mx + std::log(std::exp(s_cga - mx)
                                                            + std::exp(s_tgg - mx)) - log_Z;
                             }

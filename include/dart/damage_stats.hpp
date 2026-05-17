@@ -597,6 +597,15 @@ struct SampleDamageResult {
     double channel_b_lrt = 0.0;     // LRT from stop codon channel
     bool damage_validated = false;  // Both channels agree
 
+    // Per-stop-type Channel B (split by deamination parent)
+    float stop_decay_llr_taa_5prime = 0.0f;
+    float stop_decay_llr_tag_5prime = 0.0f;
+    float stop_decay_llr_tga_5prime = 0.0f;
+    double n_convertible_caa = 0.0;
+    double n_convertible_cag = 0.0;
+    double n_convertible_cga = 0.0;
+    bool channel_b_valid_tga = false;  // CGA exposure >= 50
+
     // Summary
     size_t n_reads = 0;
     size_t n_positions = 0;
