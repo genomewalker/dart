@@ -321,15 +321,28 @@ See [Output Formats](https://github.com/genomewalker/dart/wiki/Output-Formats) o
 
 ### Gene prediction
 
-Benchmarked on 18.3 million synthetic ancient DNA reads from the KapK community (10 samples). A prediction is correct if it matches any reference protein at ≥90% sequence identity.
+Benchmarked on 18.3 million synthetic ancient DNA reads from the KapK community (10 samples, v1.0.4). A prediction is correct if it matches any reference protein at ≥90% sequence identity.
 
 | Method | Recall | Precision | Avg Identity |
 |--------|--------|-----------|--------------|
-| DART | 67.6% | **97.2%** | **96.2%** |
+| DART v1.0.4 | 67.6% | **97.2%** | **96.2%** |
 | MMseqs2 blastx [Steinegger & Söding 2017] | **68.5%** | 96.3% | 94.8% |
 | FGS-rs [Van der Jeugt et al. 2022] | 19.1% | 95.3% | 94.2% |
 
 DART and BLASTX have equivalent functional recall (~68%), both far exceeding FGS-rs (19%), which treats damage-induced stop codons as real stops. DART produces 1.4% higher identity hits than BLASTX and runs ~1.5× faster (~35,000 reads/s, 8 threads).
+
+#### v1.1.0 frame selection improvements
+
+v1.1.0 improves internal frame selection accuracy substantially through a contrastive wrong-frame null model (log-likelihood ratio scoring), RC-strand null model for reverse-complement frames, and repaired-codon ancestor scoring at damage-induced stops. Benchmarked on 10 million simulated reads at four damage levels (no/low/medium/high):
+
+| Damage level | Top-1 accuracy | vs v1.0.4 | Recall | vs v1.0.4 | Stop-read recall | vs v1.0.4 |
+|---|---|---|---|---|---|---|
+| None | 45.7% | +11.1% | 93.8% | +9.2% | 68.8% | +19.6% |
+| Low | 47.9% | +15.1% | 93.8% | +9.3% | 69.1% | +20.1% |
+| Medium | 52.1% | +18.3% | 93.3% | +7.8% | 69.1% | +15.1% |
+| High | 51.4% | +12.5% | 92.7% | +8.1% | 70.7% | +16.9% |
+
+MMseqs2 functional recall on the KapK-12-1-34 sample (4.4M reads, single sample): v1.1.0 = **62.6%** vs v1.0.4-adaptive = 63.0% (−0.4%), precision unchanged (92.7%). The marginal functional recall difference reflects fewer output candidates per read (3.5 vs 3.9) while the internal frame accuracy is +11–18% higher — correctly-ranked frames are less often diluted by wrong-frame candidates.
 
 <p align="center">
 <img src="docs/benchmark_comparison.png" width="700" alt="Method comparison: DART, BLASTX, FGS-rs">
