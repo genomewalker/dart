@@ -114,7 +114,7 @@ else()
     FetchContent_Declare(
         libtaph
         GIT_REPOSITORY https://github.com/genomewalker/libtaph.git
-        GIT_TAG        v1.0.0
+        GIT_TAG        v1.1.0
         GIT_SHALLOW    TRUE
         UPDATE_DISCONNECTED TRUE
     )
