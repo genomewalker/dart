@@ -85,4 +85,24 @@ inline const std::array<float, 4096>& get_wrong_frame_llr() {
     return llr;
 }
 
+// RC-strand null: for a hexamer h observed in an RC-oriented frame, the underlying
+// coding sequence had hexamer rc(h). So the contrastive score is wf_llr[rc(h)].
+// rc_complement(h): reverse the 6 bases and complement each (A↔T=0↔3, C↔G=1↔2).
+inline int rc_complement_code(int h) {
+    int b0 = (h >> 10) & 3, b1 = (h >> 8) & 3, b2 = (h >> 6) & 3;
+    int b3 = (h >>  4) & 3, b4 = (h >> 2) & 3, b5 =  h       & 3;
+    return encode6(3-b5, 3-b4, 3-b3, 3-b2, 3-b1, 3-b0);
+}
+
+inline const std::array<float, 4096>& get_rc_frame_llr() {
+    static const std::array<float, 4096> rc_llr = []() {
+        const auto& fwd = get_wrong_frame_llr();
+        std::array<float, 4096> r{};
+        for (int h = 0; h < 4096; h++)
+            r[h] = fwd[rc_complement_code(h)];
+        return r;
+    }();
+    return rc_llr;
+}
+
 }  // namespace dart
