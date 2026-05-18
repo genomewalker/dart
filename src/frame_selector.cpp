@@ -697,10 +697,13 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
         return -std::log(p_stop * kEr + (1.0f - p_stop) * kEt + 1e-30f);
     };
 
-    // Contrastive LLR: log P(hex|coding) - log P(hex|+1/+2 shifted coding null).
-    // Positive for hexamers that distinguish true coding frame from wrong frames.
-    static constexpr float kLLRWeight   = 0.5f;
-    const auto& wf_llr = dart::get_wrong_frame_llr();
+    // Contrastive LLR: log P(hex|coding) - log P(hex|wrong-frame null).
+    // Forward frames: wf_llr_fwd[h] = log P(h|coding) - log P(h|+1/+2/RC null)
+    // RC frames:      wf_llr_rc[h]  = wf_llr_fwd[rc_complement(h)]
+    //   because hexamer h in an RC frame came from a coding position with hexamer rc(h).
+    static constexpr float kLLRWeight    = 0.5f;
+    const auto& wf_llr_fwd = dart::get_wrong_frame_llr();
+    const auto& wf_llr_rc  = dart::get_rc_frame_llr();
 
     std::vector<ORFFragment> fwd_fragments;
     std::vector<ORFFragment> rev_fragments;
@@ -737,6 +740,7 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
     for (bool is_forward : {true, false}) {
         const std::string& oriented = is_forward ? seq : reverse_complement_cached(seq);
         auto& strand_fragments = is_forward ? fwd_fragments : rev_fragments;
+        const auto& wf_llr = is_forward ? wf_llr_fwd : wf_llr_rc;
 
         for (int frame = 0; frame < 3; ++frame) {
             // Hypothesis index: fwd frames 0,1,2 -> h=0,1,2; rev frames 0,1,2 -> h=3,4,5
@@ -885,6 +889,7 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                         }
                         orf_hexamer_score += repair_score;
                         orf_rank_hexamer_score += repair_score;
+
                         orf_coding_codons++;
                     } else {
                         // Real stop (or rescue cap): emit current ORF then start new one.
@@ -980,8 +985,10 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                                 llr_bonus = wf_llr[hcode];
                         }
                     }
-                    orf_hexamer_score += codon_score + kLLRWeight * llr_bonus;
-                    orf_rank_hexamer_score += codon_score + kLLRWeight * llr_bonus;
+                    float codon_total = codon_score + kLLRWeight * llr_bonus;
+                    orf_hexamer_score += codon_total;
+                    orf_rank_hexamer_score += codon_total;
+
                     orf_coding_codons++;
                 }
             }
@@ -1025,14 +1032,11 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                 orf.full_read_score = frame_full_score(is_forward, frame);
                 strand_fragments.push_back(std::move(orf));
             }
+
         }
     }
 
-
-
-    // Sort by rank_score: selects best within-frame ORF by contrastive quality.
-    // The adaptive margin check still uses .score (emit, without LLR) so that
-    // the LLR influences ranking but not output-set membership.
+    // Sort by rank_score.
     auto by_rank = [](const ORFFragment& a, const ORFFragment& b) {
         return a.rank_score > b.rank_score;
     };
