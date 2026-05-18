@@ -2160,21 +2160,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                   << dart::log_utils::format_elapsed(pass1_start, pass1_end) << "\n";
     }
 
-    // Cache all ref names via pread() — bypasses the mmap page cache entirely.
-    // On NFS + Linux 4.18 MAP_PRIVATE, the kernel evicts pages under memory pressure
-    // regardless of when we read them; re-faulting returns garbage. pread() reads
-    // directly from the file descriptor and is immune to page-cache state.
-    std::vector<std::string> cached_ref_names = reader.ref_names_pread();
-    if (cached_ref_names.size() != reader.num_refs()) {
-        std::cerr << "[ERROR] Failed to load ref names via pread: got "
-                  << cached_ref_names.size() << ", expected " << reader.num_refs()
-                  << ". Falling back to mmap (may be unreliable on NFS).\n";
-        cached_ref_names.resize(reader.num_refs());
-        for (uint32_t i = 0; i < reader.num_refs(); ++i)
-            cached_ref_names[i] = std::string(reader.ref_name(i));
-    }
-
-
     // Release NFS pages accumulated during Pass 1 before the annotation pass.
     // MADV_SEQUENTIAL readahead holds the entire 114 GB EMI resident even with
     // per-row-group DONTNEED; flush_pages() calls posix_fadvise+madvise DONTNEED
@@ -3294,12 +3279,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             damage_index->damage_artifact(), damage_index->channel_b_valid(),
             damage_index->stop_decay_llr(), damage_index->terminal_shift());
         score_params.damage_detectability = damage_detectability;
-        // Capture v4 env-damage header fields before releasing the index.
-        sample_ox_detected      = damage_index->ox_damage_detected();
-        sample_ox_rate_terminal = damage_index->ox_rate_terminal();
-        sample_depurination     = damage_index->depurination_detected();
-        sample_purine_enrich_5p = damage_index->purine_enrichment_5prime();
-        sample_purine_enrich_3p = damage_index->purine_enrichment_3prime();
+        // Env-damage channels (C/E) not yet implemented in AGD format; default to zero.
+        sample_ox_detected      = false;
+        sample_ox_rate_terminal = 0.0f;
+        sample_depurination     = false;
+        sample_purine_enrich_5p = 0.0f;
+        sample_purine_enrich_3p = 0.0f;
         // All per-read lookups are done; release the 31 GB index before Bayesian scoring.
         damage_index.reset();
 #ifdef __linux__

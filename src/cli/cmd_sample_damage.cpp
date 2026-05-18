@@ -15,7 +15,6 @@
 #include "dart/hexamer_tables.hpp"
 #include "dart/log_utils.hpp"
 #include "dart/version.h"
-#include <taph/profile_json.hpp>
 #include <taph/damage_profiler.hpp>
 #include <taph/frame_selector_decl.hpp>
 #include <iostream>
@@ -346,17 +345,38 @@ int cmd_profile(int argc, char* argv[]) {
 
     float d_max = profile.d_max_combined;
 
-    taph::ProfileJsonInput pji;
-    pji.sample_name          = input_file;
-    pji.version              = std::string("dart/") + DART_VERSION;
-    pji.n_reads              = static_cast<uint64_t>(total_reads);
-    pji.adapter_stubs_5prime = stubs.stubs5;
-    pji.adapter_stubs_3prime = stubs.stubs3;
-    pji.top_hex_enriched     = stubs.top_enriched;
-    pji.adapter_clipped      = stubs.adapter_clipped;
-    pji.adapter3_clipped     = stubs.adapter3_clipped;
-    pji.flag_hex_artifact    = stubs.flag_hex_artifact;
-    taph::profile_to_json(profile, *out, pji);
+    auto boolstr = [](bool b) { return b ? "true" : "false"; };
+    *out << "{\n";
+    *out << "  \"version\": \"" << DART_VERSION << "\",\n";
+    *out << "  \"input\": \"" << input_file << "\",\n";
+    *out << "  \"domain\": \"" << domain_str << "\",\n";
+    *out << "  \"sequences\": " << total_reads << ",\n";
+    *out << "  \"damage\": {\n";
+    *out << "    \"detection_enabled\": true,\n";
+    *out << "    \"level\": \"" << damage_level_str(d_max) << "\",\n";
+    *out << "    \"d_max\": " << std::fixed << std::setprecision(2) << (d_max * 100.0f) << ",\n";
+    *out << "    \"d_max_5prime\": " << std::fixed << std::setprecision(2) << (profile.d_max_5prime * 100.0f) << ",\n";
+    *out << "    \"d_max_3prime\": " << std::fixed << std::setprecision(2) << (profile.d_max_3prime * 100.0f) << ",\n";
+    *out << "    \"delta_s_5prime\": " << std::fixed << std::setprecision(4) << profile.delta_s_5prime << ",\n";
+    *out << "    \"delta_s_3prime\": " << std::fixed << std::setprecision(4) << profile.delta_s_3prime << ",\n";
+    *out << "    \"lambda_5prime\": " << std::fixed << std::setprecision(3) << profile.lambda_5prime << ",\n";
+    *out << "    \"lambda_3prime\": " << std::fixed << std::setprecision(3) << profile.lambda_3prime << ",\n";
+    *out << "    \"channel_b_valid\": " << boolstr(profile.channel_b_valid) << ",\n";
+    *out << "    \"channel_b_llr\": " << std::fixed << std::setprecision(2) << profile.stop_decay_llr_5prime << ",\n";
+    *out << "    \"channel_b3_llr\": " << std::fixed << std::setprecision(2) << profile.stop_decay_llr_3prime << ",\n";
+    *out << "    \"damage_validated\": " << boolstr(profile.damage_validated) << ",\n";
+    *out << "    \"position_0_artifact_5prime\": " << boolstr(profile.position_0_artifact_5prime) << ",\n";
+    *out << "    \"terminal_shift_5prime\": " << std::fixed << std::setprecision(4) << profile.terminal_shift_5prime << ",\n";
+    *out << "    \"inverted_pattern_5prime\": " << boolstr(profile.inverted_pattern_5prime) << ",\n";
+    *out << "    \"inverted_pattern_3prime\": " << boolstr(profile.inverted_pattern_3prime) << ",\n";
+    *out << "    \"d_max_from_channel_b\": " << std::fixed << std::setprecision(2) << (profile.d_max_from_channel_b * 100.0f) << ",\n";
+    *out << "    \"channel_c_valid\": " << boolstr(profile.channel_c_valid) << ",\n";
+    *out << "    \"ox_d_max\": " << std::fixed << std::setprecision(2) << (profile.ox_d_max * 100.0f) << ",\n";
+    *out << "    \"ox_damage_detected\": " << boolstr(profile.ox_damage_detected) << ",\n";
+    *out << "    \"depurination_detected\": " << boolstr(profile.depurination_detected) << ",\n";
+    *out << "    \"library_type\": \"" << profile.library_type_str() << "\"\n";
+    *out << "  }\n";
+    *out << "}\n";
 
     if (verbose) {
         std::cerr << "\nDamage profile:\n";
