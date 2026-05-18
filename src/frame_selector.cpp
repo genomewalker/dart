@@ -701,7 +701,7 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
     // Forward frames: wf_llr_fwd[h] = log P(h|coding) - log P(h|+1/+2/RC null)
     // RC frames:      wf_llr_rc[h]  = wf_llr_fwd[rc_complement(h)]
     //   because hexamer h in an RC frame came from a coding position with hexamer rc(h).
-    static constexpr float kLLRWeight    = 0.5f;
+    static constexpr float kLLRWeight    = 2.0f;
     const auto& wf_llr_fwd = dart::get_wrong_frame_llr();
     const auto& wf_llr_rc  = dart::get_rc_frame_llr();
 
