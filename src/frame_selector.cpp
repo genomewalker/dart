@@ -1109,7 +1109,7 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
         //
         // Target: ~2-3 ORFs/read average, ≥70% coverage
         // =====================================================================
-        constexpr float MARGIN_THRESHOLD = 2.0f;    // Score margin for ambiguity
+        constexpr float MARGIN_THRESHOLD = 4.0f;    // Score margin for ambiguity (scaled for kLLRWeight=2.0)
         constexpr float LOW_COMPLEXITY_ENTROPY = 1.5f;  // Shannon entropy threshold
 
         // Compute sequence complexity (Shannon entropy of dinucleotides)
