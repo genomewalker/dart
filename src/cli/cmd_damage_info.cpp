@@ -54,18 +54,7 @@ void print_human_readable(const dart::DamageIndexReader& reader, std::ostream& o
     os << "terminal_shift:         " << reader.terminal_shift() << "\n";
     os << "damage_informative:     " << (reader.damage_informative() ? "yes" : "no") << "\n\n";
 
-    os << "--- Channel C: Oxidation (8-oxoG, G→T) ---\n";
-    os << "ox_rate_terminal:       " << reader.ox_rate_terminal() << "\n";
-    os << "ox_rate_interior:       " << reader.ox_rate_interior() << "\n";
-    os << std::setprecision(2);
-    os << "ox_uniformity_ratio:    " << reader.ox_uniformity_ratio() << "\n";
-    os << "ox_damage_detected:     " << (reader.ox_damage_detected() ? "yes" : "no") << "\n\n";
-
-    os << "--- Channel D: Depurination ---\n";
-    os << std::setprecision(4);
-    os << "purine_enrichment_5':   " << reader.purine_enrichment_5prime() << "\n";
-    os << "purine_enrichment_3':   " << reader.purine_enrichment_3prime() << "\n";
-    os << "depurination_detected:  " << (reader.depurination_detected() ? "yes" : "no") << "\n";
+    os << "--- Channel C/D: not encoded in this AGD version ---\n";
 }
 
 void print_json(const dart::DamageIndexReader& reader, std::ostream& os) {
@@ -90,16 +79,13 @@ void print_json(const dart::DamageIndexReader& reader, std::ostream& os) {
     os << "    \"terminal_shift\": " << reader.terminal_shift() << ",\n";
     os << "    \"damage_informative\": " << (reader.damage_informative() ? "true" : "false") << ",\n";
 
-    os << "    \"ox_rate_terminal\": " << reader.ox_rate_terminal() << ",\n";
-    os << "    \"ox_rate_interior\": " << reader.ox_rate_interior() << ",\n";
-    os << std::setprecision(2);
-    os << "    \"ox_uniformity_ratio\": " << reader.ox_uniformity_ratio() << ",\n";
-    os << "    \"ox_damage_detected\": " << (reader.ox_damage_detected() ? "true" : "false") << ",\n";
-
-    os << std::setprecision(4);
-    os << "    \"purine_enrichment_5prime\": " << reader.purine_enrichment_5prime() << ",\n";
-    os << "    \"purine_enrichment_3prime\": " << reader.purine_enrichment_3prime() << ",\n";
-    os << "    \"depurination_detected\": " << (reader.depurination_detected() ? "true" : "false") << "\n";
+    os << "    \"ox_rate_terminal\": 0,\n";
+    os << "    \"ox_rate_interior\": 0,\n";
+    os << "    \"ox_uniformity_ratio\": 0,\n";
+    os << "    \"ox_damage_detected\": false,\n";
+    os << "    \"purine_enrichment_5prime\": 0,\n";
+    os << "    \"purine_enrichment_3prime\": 0,\n";
+    os << "    \"depurination_detected\": false\n";
 
     os << "  }\n";
     os << "}\n";
