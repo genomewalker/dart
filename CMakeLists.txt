@@ -104,6 +104,23 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(librapidarchive)
 
+# libtaph: reference-free ancient DNA damage estimation and library-type classification
+set(TAPH_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(LIBTAPH_LOCAL_PATH "$ENV{REPOS}/libtaph" CACHE PATH "Local libtaph checkout (overrides GitHub)")
+if(EXISTS "${LIBTAPH_LOCAL_PATH}/CMakeLists.txt")
+    message(STATUS "Using local libtaph: ${LIBTAPH_LOCAL_PATH}")
+    add_subdirectory("${LIBTAPH_LOCAL_PATH}" "${CMAKE_BINARY_DIR}/libtaph-local" EXCLUDE_FROM_ALL)
+else()
+    FetchContent_Declare(
+        libtaph
+        GIT_REPOSITORY https://github.com/genomewalker/libtaph.git
+        GIT_TAG        v1.0.0
+        GIT_SHALLOW    TRUE
+        UPDATE_DISCONNECTED TRUE
+    )
+    FetchContent_MakeAvailable(libtaph)
+endif()
+
 # Find zlib for compressed file support
 find_package(ZLIB REQUIRED)
 
@@ -165,13 +182,16 @@ set(DART_SUBCOMMAND_SOURCES
     src/validate.cpp                  # cmd_validate
     src/cli/cmd_sample_damage.cpp     # cmd_sample_damage
     src/cli/cmd_damage_annotate.cpp   # cmd_damage_annotate
+    src/cli/cmd_damage_info.cpp       # cmd_damage_info
     src/cli/cmd_damage_profile.cpp    # cmd_damage_profile
     src/cli/cmd_hits2emi.cpp          # hits2emi (TSV to columnar)
+    src/cli/cmd_simulate.cpp          # simulate (synthetic damage reads)
+    src/cli/cmd_eval.cpp              # eval (benchmark accuracy vs truth TSV)
 )
 
 # Main executable with subcommands
 add_executable(dart ${DART_CORE_SOURCES} ${DART_SUBCOMMAND_SOURCES})
-target_link_libraries(dart ${ZLIB_LIBRARIES} PkgConfig::ZSTD rapidgzip::rapidgzip)
+target_link_libraries(dart ${ZLIB_LIBRARIES} PkgConfig::ZSTD rapidgzip::rapidgzip taph)
 target_compile_definitions(dart PRIVATE HAVE_RAPIDGZIP)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(dart OpenMP::OpenMP_CXX)
@@ -179,7 +199,7 @@ endif()
 
 # Legacy standalone validation tool (for backwards compatibility)
 add_executable(dart-validate-standalone src/validate.cpp ${DART_CORE_SOURCES})
-target_link_libraries(dart-validate-standalone ${ZLIB_LIBRARIES} PkgConfig::ZSTD)
+target_link_libraries(dart-validate-standalone ${ZLIB_LIBRARIES} PkgConfig::ZSTD taph)
 target_compile_definitions(dart-validate-standalone PRIVATE DART_STANDALONE_VALIDATE)
 
 # Error analysis tool
@@ -192,7 +212,7 @@ target_link_libraries(dart-benchmark-damage ${ZLIB_LIBRARIES})
 
 # Streaming EM comparison test
 add_executable(test-streaming-em tests/test_streaming_em.cpp ${DART_CORE_SOURCES})
-target_link_libraries(test-streaming-em ${ZLIB_LIBRARIES} PkgConfig::ZSTD)
+target_link_libraries(test-streaming-em ${ZLIB_LIBRARIES} PkgConfig::ZSTD taph)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(test-streaming-em OpenMP::OpenMP_CXX)
 endif()
@@ -231,7 +251,7 @@ if(BUILD_TESTING)
         tests/test_formal_model.cpp
         ${DART_CORE_SOURCES}
     )
-    target_link_libraries(dart-formal-model-tests ${ZLIB_LIBRARIES} PkgConfig::ZSTD)
+    target_link_libraries(dart-formal-model-tests ${ZLIB_LIBRARIES} PkgConfig::ZSTD taph)
     if(OpenMP_CXX_FOUND)
         target_link_libraries(dart-formal-model-tests OpenMP::OpenMP_CXX)
     endif()

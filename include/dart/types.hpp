@@ -6,8 +6,24 @@
 #include <array>
 #include <cmath>
 #include <cctype>
+#include <taph/sample_damage_profile.hpp>
+#include <taph/joint_damage_model.hpp>
+#include <taph/mixture_damage_model.hpp>
 
 namespace dart {
+
+// Bridge libtaph damage types into dart namespace so all dart:: code resolves them.
+using taph::SampleDamageProfile;
+using taph::DamageValidationState;
+using taph::JointDamageModel;
+using taph::JointDamageResult;
+using taph::JointDamageSuffStats;
+using taph::MixtureDamageModel;
+using taph::SuperRead;
+using taph::get_damage_validation_state;
+using taph::get_damage_suppression_factor;
+static constexpr int N_GC_BINS   = taph::N_GC_BINS;
+static constexpr int N_POSITIONS = taph::N_POSITIONS;
 
 // Basic sequence types
 using Sequence = std::string;

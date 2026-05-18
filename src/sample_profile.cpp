@@ -373,6 +373,80 @@ void FrameSelector::update_sample_profile(
         }
     }
 
+    // CHANNEL B₃': G→A convertible stop codon tracking at 3' end
+    // TGG (Trp) converts to TAG (b1 G→A) or TGA (b2 G→A) near the 3' terminus.
+    // Position p = distance of codon's last base from the 3' end (p=0: most terminal codon).
+    if (len >= 18) {
+        for (int frame = 0; frame < 3; ++frame) {
+            for (size_t k = 0; ; ++k) {
+                if (len < static_cast<size_t>(3 + frame) + 3 * k) break;
+                size_t codon_start = len - static_cast<size_t>(3 + frame) - 3 * k;
+                size_t p = static_cast<size_t>(frame) + 3 * k;
+                if (p >= 15) break;
+
+                char b0 = fast_upper(seq[codon_start]);
+                char b1 = fast_upper(seq[codon_start + 1]);
+                char b2 = fast_upper(seq[codon_start + 2]);
+
+                if ((b0 != 'A' && b0 != 'C' && b0 != 'G' && b0 != 'T') ||
+                    (b1 != 'A' && b1 != 'C' && b1 != 'G' && b1 != 'T') ||
+                    (b2 != 'A' && b2 != 'C' && b2 != 'G' && b2 != 'T')) {
+                    continue;
+                }
+
+                if (b0 == 'T') {
+                    if (b1 == 'G') {
+                        if (b2 == 'G') {
+                            // TGG (Trp): pre-image for both G→A conversions
+                            profile.convertible_tgg_3prime[p]++;
+                        } else if (b2 == 'A') {
+                            // TGA: potential TGG→TGA via b2 G→A
+                            profile.convertible_tga_ga_3prime[p]++;
+                        }
+                    } else if (b1 == 'A' && b2 == 'G') {
+                        // TAG: potential TGG→TAG via b1 G→A
+                        profile.convertible_tag_ga_3prime[p]++;
+                    }
+                }
+            }
+        }
+
+        constexpr size_t INTERIOR_MIN_LEN_B3 = 63;
+        if (len >= INTERIOR_MIN_LEN_B3) {
+            for (int frame = 0; frame < 3; ++frame) {
+                for (size_t k = 0; ; ++k) {
+                    size_t codon_start = frame + 3 * k;
+                    if (codon_start < 30 || codon_start + 3 > len - 30) {
+                        if (codon_start + 3 > len - 30) break;
+                        continue;
+                    }
+
+                    char b0 = fast_upper(seq[codon_start]);
+                    char b1 = fast_upper(seq[codon_start + 1]);
+                    char b2 = fast_upper(seq[codon_start + 2]);
+
+                    if ((b0 != 'A' && b0 != 'C' && b0 != 'G' && b0 != 'T') ||
+                        (b1 != 'A' && b1 != 'C' && b1 != 'G' && b1 != 'T') ||
+                        (b2 != 'A' && b2 != 'C' && b2 != 'G' && b2 != 'T')) {
+                        continue;
+                    }
+
+                    if (b0 == 'T') {
+                        if (b1 == 'G') {
+                            if (b2 == 'G') {
+                                profile.convertible_tgg_interior++;
+                            } else if (b2 == 'A') {
+                                profile.convertible_tga_ga_interior++;
+                            }
+                        } else if (b1 == 'A' && b2 == 'G') {
+                            profile.convertible_tag_ga_interior++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // CHANNEL C: Oxidative stop codon tracking (G→T transversions)
     // Track GAG→TAG, GAA→TAA, GGA→TGA pairs by nucleotide position
     // Unlike deamination, oxidative damage is UNIFORM across read length
@@ -453,15 +527,11 @@ void FrameSelector::update_sample_profile(
         }
     }
 
-    // CHANNEL D: G→T / C→A transversion tracking (oxidative damage)
-    // Track G and T counts at each position for G→T rate calculation
-    // Also track asymmetry: G→T vs T→G (real oxidation shows G→T > T→G)
-    // Count G and T at 5' end positions for G→T tracking
+    // CHANNEL D: G→T tracking for 8-oxoG model fit GT(p) = A*exp(-mu*p) + B
     for (size_t i = 0; i < std::min(size_t(15), len); ++i) {
         char base = fast_upper(seq[i]);
-        if (base == 'G') {
-            profile.g_count_5prime[i]++;
-        }
+        if      (base == 'G') profile.g_count_5prime[i]++;
+        else if (base == 'T') profile.t_from_g_5prime[i]++;
     }
 
     // Purine tracking done via a_freq/g_freq arrays; enrichment computed in finalize_sample_profile()
@@ -996,6 +1066,55 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
                 profile.stop_decay_llr_5prime = -std::abs(profile.stop_decay_llr_5prime);
             }
 
+            // Per-stop-type LLRs (same model, type-specific counts)
+            {
+                profile.n_convertible_caa = profile.convertible_caa_interior + profile.convertible_taa_interior;
+                profile.n_convertible_cag = profile.convertible_cag_interior + profile.convertible_tag_interior;
+                profile.n_convertible_cga = profile.convertible_cga_interior + profile.convertible_tga_interior;
+                profile.channel_b_valid_tga = (profile.n_convertible_cga >= 50.0);
+
+                const std::array<double,15>* pre_arr[3]  = { &profile.convertible_caa_5prime,
+                                                              &profile.convertible_cag_5prime,
+                                                              &profile.convertible_cga_5prime };
+                const std::array<double,15>* stop_arr[3] = { &profile.convertible_taa_5prime,
+                                                              &profile.convertible_tag_5prime,
+                                                              &profile.convertible_tga_5prime };
+                float* llr_out[3] = { &profile.stop_decay_llr_taa_5prime,
+                                      &profile.stop_decay_llr_tag_5prime,
+                                      &profile.stop_decay_llr_tga_5prime };
+                for (int t = 0; t < 3; ++t) {
+                    double t_pre_int = 0, t_stop_int = 0;
+                    for (int p = 5; p < 15; ++p) {
+                        t_pre_int  += (*pre_arr[t])[p];
+                        t_stop_int += (*stop_arr[t])[p];
+                    }
+                    double t_base = (t_pre_int + t_stop_int > 10)
+                        ? t_stop_int / (t_pre_int + t_stop_int)
+                        : static_cast<double>(local_baseline);
+                    double t_sum_e = 0, t_sum_w = 0;
+                    for (int i = 0; i < 5; ++i) {
+                        double t_n = (*pre_arr[t])[i] + (*stop_arr[t])[i];
+                        if (t_n > 10) {
+                            double w = std::exp(-lambda_b * i);
+                            t_sum_e += t_n * ((*stop_arr[t])[i] / t_n - t_base) / w;
+                            t_sum_w += t_n;
+                        }
+                    }
+                    double t_amp = (t_sum_w > 0) ? t_sum_e / t_sum_w : 0.0;
+                    double t_lle = 0, t_llc = 0;
+                    for (int p = 0; p < 10; ++p) {
+                        double t_n = (*pre_arr[t])[p] + (*stop_arr[t])[p];
+                        if (t_n < 20) continue;
+                        double t_k = (*stop_arr[t])[p];
+                        double t_pe = std::clamp(t_base + t_amp * std::exp(-lambda_b * p), 0.001, 0.999);
+                        double t_pc = std::clamp(t_base, 0.001, 0.999);
+                        t_lle += binomial_ll(t_k, t_n, t_pe);
+                        t_llc += binomial_ll(t_k, t_n, t_pc);
+                    }
+                    *llr_out[t] = static_cast<float>(t_amp < 0 ? -(t_lle - t_llc) : (t_lle - t_llc));
+                }
+            }
+
             // CHANNEL B STRUCTURAL QUANTIFICATION
             // Compute d_max directly from stop codon conversion rate at position 0.
             // Formula: d_max_B = stops_excess / convertible_original
@@ -1081,6 +1200,119 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         }
     }
 
+    // CHANNEL B₃': G→A stop codon conversion at 3' end
+    // Analogous to 5' Channel B but for SS libraries where the damage signal is at the 3' end.
+    // TGG (Trp) → TAG (b1 G→A) or TGA (b2 G→A). Positive LLR = real terminal G→A damage.
+    {
+        double total_pre_3 = profile.convertible_tgg_interior;
+        double total_stop_3 = profile.convertible_tag_ga_interior + profile.convertible_tga_ga_interior;
+        double total_conv_3 = total_pre_3 + total_stop_3;
+
+        if (total_conv_3 > 100) {
+            profile.stop_conversion_rate_baseline_3prime = static_cast<float>(total_stop_3 / total_conv_3);
+            profile.channel_b3_valid = true;
+        }
+
+        std::array<double, 15> stop_rate_3 = {};
+        std::array<double, 15> stop_exp_3 = {};
+        for (int p = 0; p < 15; ++p) {
+            double pre = profile.convertible_tgg_3prime[p];
+            double stp = profile.convertible_tag_ga_3prime[p] + profile.convertible_tga_ga_3prime[p];
+            stop_exp_3[p] = pre + stp;
+            stop_rate_3[p] = (stop_exp_3[p] > 10)
+                ? stp / stop_exp_3[p]
+                : profile.stop_conversion_rate_baseline_3prime;
+        }
+
+        // Local baseline from positions 5-14 (past the damage zone)
+        double lp3 = 0.0, ls3 = 0.0;
+        for (int p = 5; p < 15; ++p) {
+            lp3 += profile.convertible_tgg_3prime[p];
+            ls3 += profile.convertible_tag_ga_3prime[p] + profile.convertible_tga_ga_3prime[p];
+        }
+        float local_base3 = (lp3 + ls3 > 100)
+            ? static_cast<float>(ls3 / (lp3 + ls3))
+            : profile.stop_conversion_rate_baseline_3prime;
+
+        if (profile.channel_b3_valid) {
+            float baseline3 = local_base3;
+            float lambda3   = fit_lambda_3p;
+
+            // Amplitude estimate from positions 0-4
+            double sum_exc3 = 0.0, sum_w3 = 0.0;
+            for (int i = 0; i < 5; ++i) {
+                if (stop_exp_3[i] > 50) {
+                    double wt = std::exp(-lambda3 * i);
+                    sum_exc3 += stop_exp_3[i] * (stop_rate_3[i] - baseline3) / wt;
+                    sum_w3   += stop_exp_3[i];
+                }
+            }
+            float amp3 = (sum_w3 > 0) ? static_cast<float>(sum_exc3 / sum_w3) : 0.0f;
+            profile.stop_amplitude_3prime = std::max(0.0f, amp3);
+
+            // LLR: exponential model vs constant
+            double ll_exp3 = 0.0, ll_cst3 = 0.0;
+            for (int p = 0; p < 10; ++p) {
+                if (stop_exp_3[p] < 50) continue;
+                double n = stop_exp_3[p];
+                double k = profile.convertible_tag_ga_3prime[p] + profile.convertible_tga_ga_3prime[p];
+                double pe = std::clamp(static_cast<double>(baseline3) + static_cast<double>(amp3) * std::exp(-static_cast<double>(lambda3) * p), 0.001, 0.999);
+                double pc = std::clamp(static_cast<double>(baseline3), 0.001, 0.999);
+                ll_exp3 += binomial_ll(k, n, pe);
+                ll_cst3 += binomial_ll(k, n, pc);
+            }
+            profile.stop_decay_llr_3prime = static_cast<float>(ll_exp3 - ll_cst3);
+            if (amp3 < 0) profile.stop_decay_llr_3prime = -std::abs(profile.stop_decay_llr_3prime);
+
+            // WLS quantification of d_max from 3' stop conversions
+            {
+                const double lambda = std::clamp(static_cast<double>(fit_lambda_3p), 0.1, 0.5);
+                double S_w = 0, S_x = 0, S_xx = 0, S_y = 0, S_xy = 0, tot_exp = 0;
+                for (int p = 0; p < 15; ++p) {
+                    double stops_p = profile.convertible_tag_ga_3prime[p] + profile.convertible_tga_ga_3prime[p];
+                    double exp_p   = stops_p + profile.convertible_tgg_3prime[p];
+                    if (exp_p < 100) continue;
+                    double x_p = std::exp(-lambda * p);
+                    double y_p = stops_p / exp_p;
+                    S_w  += exp_p;       S_x  += exp_p * x_p;
+                    S_xx += exp_p * x_p * x_p;
+                    S_y  += exp_p * y_p; S_xy += exp_p * x_p * y_p;
+                    tot_exp += exp_p;
+                }
+                double denom = S_w * S_xx - S_x * S_x;
+                if (tot_exp > 1000 && std::abs(denom) > 1e-10) {
+                    double c = (S_w * S_xy - S_x * S_y) / denom;
+                    double a = (S_y  - c * S_x) / S_w;
+                    profile.channel_b3_slope = static_cast<float>(c);
+                    if (c > 0) {
+                        double b0v = std::clamp(a, 0.01, 0.99);
+                        profile.d_max_from_channel_b3  = static_cast<float>(std::clamp(c / (1.0 - b0v), 0.0, 1.0));
+                        profile.channel_b3_weight      = static_cast<float>(S_w);
+                        profile.channel_b3_quantifiable = true;
+                        profile.channel_b3_inverted    = false;
+                    } else {
+                        profile.d_max_from_channel_b3  = 0.0f;
+                        profile.channel_b3_weight      = 0.0f;
+                        profile.channel_b3_quantifiable = false;
+                        profile.channel_b3_inverted    = true;
+                    }
+                } else {
+                    profile.d_max_from_channel_b3  = 0.0f;
+                    profile.channel_b3_weight      = 0.0f;
+                    profile.channel_b3_quantifiable = false;
+                    profile.channel_b3_slope       = 0.0f;
+                }
+            }
+
+            // Channel B₃' is a standalone structural signal (real G→A stop codon conversion).
+            // Validates damage regardless of library type — no channel A or library-type dependency.
+            if (profile.channel_b3_quantifiable && profile.stop_decay_llr_3prime > 0.0f) {
+                profile.damage_validated = true;
+                profile.damage_artifact  = false;
+            }
+        }
+    }
+
     // CHANNEL C: Oxidative stop codon analysis (G→T transversions)
     // Unlike deamination (terminal decay), oxidation is UNIFORM across reads
     // Real oxidation: terminal rate ≈ interior rate (uniformity ratio ≈ 1)
@@ -1144,7 +1376,7 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         // Use stricter threshold if deamination is present (correlated damage)
         // Deamination enriches ALL terminal damage, including G→T via adjacent effects
         float threshold = 0.02f;  // 2% excess required (was 0.5%)
-        if (profile.d_max_combined > 5.0f || profile.damage_validated) {
+        if (profile.d_max_combined > 0.05f || profile.damage_validated) {
             threshold = 0.05f;  // 5% excess if deamination present
         }
 
@@ -1153,7 +1385,7 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
 
         if (profile.channel_c_valid && elevated && uniform) {
             profile.ox_damage_detected = true;
-            profile.ox_d_max = std::max(0.0f, ox_stop_excess * 100.0f);  // Convert to percentage
+            profile.ox_d_max = std::max(0.0f, ox_stop_excess);  // fraction 0-1, consistent with other d_max fields
         }
 
         // Check for artifact pattern: terminal much higher than interior (like deamination)
@@ -1171,10 +1403,68 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
         }
     }
 
-    // Channel D: G→T asymmetry inferred from Channel C (no reference available)
+    // Channel D: GT exponential-background fit GT(p) = A*exp(-mu*p) + B
+    // B = uniform background (8-oxoG); A = terminal artifact.
+    // s_gt = B - A/(A+C)_interior: Chargaff contrast (valid for SS; ~0 for DS).
+    // Replaces codon-based Channel C detection with model-based detection.
     {
-        if (profile.channel_c_valid) {
-            profile.ox_gt_asymmetry = profile.ox_uniformity_ratio;
+        // Baselines from middle-third (already normalised to fractions)
+        float tg = profile.baseline_t_freq + profile.baseline_g_freq;
+        float ac = profile.baseline_a_freq + profile.baseline_c_freq;
+        if (tg > 0) profile.ox_gt_baseline = profile.baseline_t_freq / tg;
+        if (ac > 0) profile.ox_ca_baseline = profile.baseline_a_freq / ac;
+        if (tg > 0 && ac > 0)
+            profile.ox_gt_asymmetry = profile.ox_gt_baseline - profile.ox_ca_baseline;
+
+        // Per-position GT rate and weighted OLS fit
+        float y[15] = {}, w[15] = {};
+        float total_w = 0;
+        for (int p = 0; p < 15; ++p) {
+            double tot = profile.t_from_g_5prime[p] + profile.g_count_5prime[p];
+            if (tot > 10.0) {
+                w[p] = (float)tot;
+                y[p] = (float)(profile.t_from_g_5prime[p] / tot);
+            }
+            total_w += w[p];
+        }
+
+        if (total_w >= 200.0f) {
+            static constexpr float mu_grid[] = {0.05f,0.1f,0.2f,0.3f,0.5f,0.7f,1.0f,1.5f,2.0f,3.0f};
+            float best_sse = 1e30f, best_A = 0.0f, best_mu = 0.3f, best_B = 0.0f;
+            for (float mu : mu_grid) {
+                float sx2=0,sx=0,sxy=0,sy=0,sw=0;
+                for (int p = 0; p < 15; ++p) {
+                    if (w[p] == 0) continue;
+                    float x = std::exp(-mu * p);
+                    sx2+=w[p]*x*x; sx+=w[p]*x; sxy+=w[p]*x*y[p]; sy+=w[p]*y[p]; sw+=w[p];
+                }
+                float det = sx2*sw - sx*sx;
+                if (std::abs(det) < 1e-12f) continue;
+                float A = std::max(0.0f, (sxy*sw - sy*sx) / det);
+                float B = std::max(0.0f, std::min(0.5f, (sx2*sy - sx*sxy) / det));
+                float sse = 0;
+                for (int p = 0; p < 15; ++p) {
+                    if (w[p] == 0) continue;
+                    float r = y[p] - A*std::exp(-mu*p) - B;
+                    sse += w[p]*r*r;
+                }
+                if (sse < best_sse) { best_sse=sse; best_A=A; best_mu=mu; best_B=B; }
+            }
+            profile.g_bg_fitted   = best_B;
+            profile.g_term_fitted  = best_A;
+            profile.g_decay_fitted = best_mu;
+            if (profile.ox_ca_baseline > 0.0f)
+                profile.s_gt = best_B - profile.ox_ca_baseline;
+
+            const bool is_ss_lib = (profile.library_type ==
+                                    dart::SampleDamageProfile::LibraryType::SINGLE_STRANDED);
+            float threshold = is_ss_lib ? 0.004f : 0.006f;
+            if (total_w >= 500.0f && profile.s_gt > threshold && best_A >= 0.0f) {
+                profile.ox_damage_detected = true;
+                profile.ox_d_max = std::max(0.0f, profile.s_gt);
+            } else {
+                profile.ox_damage_detected = false;
+            }
         }
     }
 
@@ -1848,9 +2138,17 @@ void FrameSelector::finalize_sample_profile(SampleDamageProfile& profile) {
                 profile.d_max_combined = raw_d_max_5prime;
                 profile.d_max_source = SampleDamageProfile::DmaxSource::FIVE_PRIME_ONLY;
             } else if (profile.inverted_pattern_5prime && !profile.inverted_pattern_3prime) {
-                // 5' inverted but 3' valid - use 3' raw estimate
-                profile.d_max_combined = raw_d_max_3prime;
-                profile.d_max_source = SampleDamageProfile::DmaxSource::THREE_PRIME_ONLY;
+                // 5' inverted but 3' valid - prefer Channel B₃' (structural), fall back to raw 3'
+                if (profile.channel_b3_quantifiable && profile.d_max_from_channel_b3 > 0.01f) {
+                    // Channel A 3' may be flat/zero; override with B₃' structural estimate
+                    // so frame_selector gets the correct d_max_3p.
+                    profile.d_max_3prime  = profile.d_max_from_channel_b3;
+                    profile.d_max_combined = profile.d_max_from_channel_b3;
+                    profile.d_max_source = SampleDamageProfile::DmaxSource::CHANNEL_B3_STRUCTURAL;
+                } else {
+                    profile.d_max_combined = raw_d_max_3prime;
+                    profile.d_max_source = SampleDamageProfile::DmaxSource::THREE_PRIME_ONLY;
+                }
             } else if (profile.mixture_converged && profile.mixture_d_reference > 0.01f) {
                 // No inversion - use mixture model d_reference (metaDMG proxy: E[δ | GC > 50%])
                 profile.d_max_combined = profile.mixture_d_reference;
@@ -2107,6 +2405,16 @@ void FrameSelector::merge_sample_profiles(SampleDamageProfile& dst, const Sample
     dst.convertible_tga_interior += src.convertible_tga_interior;
     dst.total_codons_interior += src.total_codons_interior;
 
+    // Merge Channel B₃' convertible codon counts
+    for (int i = 0; i < 15; ++i) {
+        dst.convertible_tgg_3prime[i]     += src.convertible_tgg_3prime[i];
+        dst.convertible_tag_ga_3prime[i]  += src.convertible_tag_ga_3prime[i];
+        dst.convertible_tga_ga_3prime[i]  += src.convertible_tga_ga_3prime[i];
+    }
+    dst.convertible_tgg_interior     += src.convertible_tgg_interior;
+    dst.convertible_tag_ga_interior  += src.convertible_tag_ga_interior;
+    dst.convertible_tga_ga_interior  += src.convertible_tga_ga_interior;
+
     // Merge Channel C oxidative codon counts (G→T transversions)
     for (int i = 0; i < 15; ++i) {
         dst.convertible_gag_5prime[i] += src.convertible_gag_5prime[i];
@@ -2115,8 +2423,9 @@ void FrameSelector::merge_sample_profiles(SampleDamageProfile& dst, const Sample
         dst.convertible_taa_ox_5prime[i] += src.convertible_taa_ox_5prime[i];
         dst.convertible_gga_5prime[i] += src.convertible_gga_5prime[i];
         dst.convertible_tga_ox_5prime[i] += src.convertible_tga_ox_5prime[i];
-        // Channel D: G count for asymmetry tracking
-        dst.g_count_5prime[i] += src.g_count_5prime[i];
+        // Channel D: G and T counts for GT exponential-background fit
+        dst.g_count_5prime[i]  += src.g_count_5prime[i];
+        dst.t_from_g_5prime[i] += src.t_from_g_5prime[i];
     }
     dst.convertible_gag_interior += src.convertible_gag_interior;
     dst.convertible_tag_ox_interior += src.convertible_tag_ox_interior;
@@ -2308,9 +2617,33 @@ void FrameSelector::reset_sample_profile(SampleDamageProfile& profile) {
     profile.stop_conversion_rate_baseline = 0.0f;
     profile.stop_decay_llr_5prime = 0.0f;
     profile.stop_amplitude_5prime = 0.0f;
+    profile.stop_decay_llr_taa_5prime = 0.0f;
+    profile.stop_decay_llr_tag_5prime = 0.0f;
+    profile.stop_decay_llr_tga_5prime = 0.0f;
+    profile.n_convertible_caa = 0.0;
+    profile.n_convertible_cag = 0.0;
+    profile.n_convertible_cga = 0.0;
     profile.channel_b_valid = false;
+    profile.channel_b_valid_tga = false;
     profile.damage_validated = false;
     profile.damage_artifact = false;
+
+    // Reset Channel B₃' convertible codon counts
+    profile.convertible_tgg_3prime.fill(0.0);
+    profile.convertible_tag_ga_3prime.fill(0.0);
+    profile.convertible_tga_ga_3prime.fill(0.0);
+    profile.convertible_tgg_interior    = 0.0;
+    profile.convertible_tag_ga_interior = 0.0;
+    profile.convertible_tga_ga_interior = 0.0;
+    profile.stop_conversion_rate_baseline_3prime = 0.0f;
+    profile.stop_decay_llr_3prime   = 0.0f;
+    profile.stop_amplitude_3prime   = 0.0f;
+    profile.channel_b3_valid        = false;
+    profile.d_max_from_channel_b3   = 0.0f;
+    profile.channel_b3_weight       = 0.0f;
+    profile.channel_b3_slope        = 0.0f;
+    profile.channel_b3_quantifiable = false;
+    profile.channel_b3_inverted     = false;
 
     // Joint probabilistic model
     profile.joint_delta_max = 0.0f;

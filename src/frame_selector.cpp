@@ -20,10 +20,18 @@
 #include "dart/damage_aa_table.hpp"
 #include "dart/damage_model.hpp"
 #include "dart/damage_context_tables.hpp"
+#include "dart/wrong_frame_null.hpp"
 #include <cmath>
 #include <algorithm>
 
 namespace dart {
+
+// Strand-discriminant weight: boost the best forward fragment's score when comparing
+// against the best RC fragment. Applied ONLY at cross-strand comparison, not during
+// within-strand ORF competition (which would inflate wrong-frame scores).
+// log(3/64) = log(0.0469) = -3.0565 nats (prior probability of random stop codon)
+static constexpr float kDiscWeight   = 1.0f;
+static constexpr float kLogStopPrior = -3.0565f;
 
 // Convert codon scorer result to FrameScore
 static FrameScore codon_to_frame_score(const codon::FrameStrandResult& cr) {
@@ -51,6 +59,10 @@ static codon::DamageParams make_codon_damage_params(const SampleDamageProfile* s
         dmg.d_max_3p = sample->d_max_3prime;
         dmg.lambda_5p = sample->lambda_5prime;
         dmg.lambda_3p = sample->lambda_3prime;
+        // Channel C: oxidative G→T (GAA→TAA, GAG→TAG, GGA→TGA), uniform rate
+        if (sample->ox_damage_detected) {
+            dmg.d_max_gt = sample->ox_d_max;
+        }
     }
     return dmg;
 }
@@ -119,10 +131,23 @@ std::pair<FrameScore, FrameScore> FrameSelector::select_best_per_strand(
     // Use sample profile if available
     auto dmg = sample_profile ? make_codon_damage_params(sample_profile) : make_codon_damage_params(damage);
 
-    // If damage not validated by Channel B, disable damage model
-    if (sample_profile && !sample_profile->damage_validated) {
-        dmg.d_max_5p = 0.0f;
-        dmg.d_max_3p = 0.0f;
+    if (sample_profile) {
+        // Channel B/B₃': gate deamination — require Channel B validation before applying C→T/G→A model
+        if (!sample_profile->damage_validated) {
+            dmg.d_max_5p = 0.0f;
+            dmg.d_max_3p = 0.0f;
+        }
+
+        // Channel E (depurination): when Channel B₃' does NOT validate the 3' G→A signal,
+        // depurination-induced purine enrichment at 3' termini may be inflating d_max_3p.
+        // Suppress 3' correction to avoid rescuing false stops from a spurious G→A signal.
+        if (sample_profile->depurination_detected && sample_profile->stop_decay_llr_3prime <= 0.0f) {
+            dmg.d_max_3p = 0.0f;
+        }
+
+        // Channel C (oxidative): d_max_gt already set in make_codon_damage_params when
+        // ox_damage_detected; no further gating needed — oxidation is self-validated by
+        // its uniformity check (channel_c_valid + elevated + uniform in sample_profile.cpp).
     }
 
     auto [best_fwd, best_rev] = codon::select_best_per_strand(seq, dmg);
@@ -179,98 +204,146 @@ float calculate_damage_strand_preference(
 }
 
 // Damage probability at a nucleotide position using exponential decay model
+// Compute P(damage event at this position) in the original read.
+//
+// nt_pos is in ORIENTED (frame) coordinates — i.e. the read as presented to
+// the 6-frame translator (reverse-complemented for reverse frames).  We must
+// map it back to original-read coordinates before choosing the terminus:
+//
+//   Forward frame: dist_from_5p = nt_pos
+//   Reverse frame: dist_from_5p = seq_len - 1 - nt_pos  (RC flips 5'/3')
+//
+// Library type determines which damage events are allowed at which terminus:
+//   DS : C→T only at original 5′; G→A only at original 3′
+//   SS : C→T at both ends (use min distance); G→A never (SS shows C→T on
+//        both strands — the 3′ signal is C→T on the complement, already
+//        captured by the 3′ distance branch when is_5prime_damage=true)
+//   UNKNOWN: treated as DS
 static float compute_position_damage_prob(
-    size_t nt_pos,
+    size_t nt_pos,          // position in oriented (frame) coordinates
     size_t seq_len,
     const SampleDamageProfile& sample_profile,
-    bool is_5prime_damage) {  // true for C->T (5'), false for G->A (3')
+    bool is_5prime_damage,  // true = C→T channel; false = G→A channel
+    bool is_forward = true) // frame orientation
+{
+    using LT = SampleDamageProfile::LibraryType;
 
-    // Tri-state damage validation: VALIDATED=full, CONTRADICTED=suppress, UNVALIDATED=soft
+    // Tri-state validation gate
     const auto state = get_damage_validation_state(sample_profile);
-    if (state == DamageValidationState::CONTRADICTED) {
-        return 0.0f;
-    }
-    // For UNVALIDATED state with low d_max, also suppress
+    if (state == DamageValidationState::CONTRADICTED) return 0.0f;
     const float d_max_check = std::max(sample_profile.d_max_5prime, sample_profile.d_max_3prime);
-    if (d_max_check < 0.05f && state == DamageValidationState::UNVALIDATED) {
-        return 0.0f;
+    if (d_max_check < 0.05f && state == DamageValidationState::UNVALIDATED) return 0.0f;
+
+    // Map oriented position → original-read distances from each terminus
+    size_t dist_5p = is_forward ? nt_pos : (seq_len > nt_pos ? seq_len - 1 - nt_pos : 0);
+    size_t dist_3p = (seq_len > dist_5p) ? seq_len - 1 - dist_5p : 0;
+
+    // SS: C→T at both ends; G→A is not a SS damage event — return 0.
+    // Use end-specific empirical rates (damage_rate_5prime for 5' branch,
+    // damage_rate_3prime for 3' branch).
+    if (sample_profile.library_type == LT::SINGLE_STRANDED) {
+        if (!is_5prime_damage) return 0.0f;
+        bool use_5p = (dist_5p <= dist_3p);
+        size_t dist = use_5p ? dist_5p : dist_3p;
+        if (use_5p && dist == 0 && sample_profile.position_0_artifact_5prime) return 0.0f;
+        if (!use_5p && dist == 0 && sample_profile.position_0_artifact_3prime) return 0.0f;
+        float d_max  = use_5p ? sample_profile.d_max_5prime  : sample_profile.d_max_3prime;
+        float lambda = use_5p ? sample_profile.lambda_5prime : sample_profile.lambda_3prime;
+        const float* rate_arr = use_5p ? sample_profile.damage_rate_5prime.data()
+                                       : sample_profile.damage_rate_3prime.data();
+        if (d_max < 0.01f) return 0.0f;
+        float p = (dist < 15 && rate_arr[dist] > 0.001f)
+                  ? rate_arr[dist]
+                  : d_max * std::exp(-lambda * static_cast<float>(dist));
+        return std::clamp(p, 0.0f, 0.95f);
     }
 
-    float d_max, lambda;
+    // DS (and UNKNOWN): C→T at 5', G→A at 3' in original-read coordinates.
+    // is_5prime_damage must already encode the original-read event type
+    // (callers are responsible for flipping when translating from oriented coords).
     size_t dist;
+    float d_max, lambda;
+    const float* rate_arr;
 
     if (is_5prime_damage) {
-        // C->T damage: strongest at 5' end
-        d_max = sample_profile.d_max_5prime;
-        lambda = sample_profile.lambda_5prime;
-        dist = nt_pos;  // Distance from 5' end
+        dist     = dist_5p;
+        d_max    = sample_profile.d_max_5prime;
+        lambda   = sample_profile.lambda_5prime;
+        rate_arr = sample_profile.damage_rate_5prime.data();
+        if (dist == 0 && sample_profile.position_0_artifact_5prime) return 0.0f;
     } else {
-        // G->A damage: strongest at 3' end
-        d_max = sample_profile.d_max_3prime;
-        lambda = sample_profile.lambda_3prime;
-        dist = (seq_len > nt_pos) ? seq_len - 1 - nt_pos : 0;  // Distance from 3' end
+        dist     = dist_3p;
+        d_max    = sample_profile.d_max_3prime;
+        lambda   = sample_profile.lambda_3prime;
+        rate_arr = sample_profile.damage_rate_3prime.data();
+        if (dist == 0 && sample_profile.position_0_artifact_3prime) return 0.0f;
     }
 
-    // For single-stranded libraries, C->T can happen at both ends
-    if (sample_profile.library_type == SampleDamageProfile::LibraryType::SINGLE_STRANDED) {
-        // Use minimum distance to either terminal for C->T
-        if (is_5prime_damage) {
-            size_t dist_3p = (seq_len > nt_pos) ? seq_len - 1 - nt_pos : 0;
-            dist = std::min(dist, dist_3p);
-            d_max = std::max(sample_profile.d_max_5prime, sample_profile.d_max_3prime);
-        }
-    }
+    if (d_max < 0.01f) return 0.0f;
 
-    if (d_max < 0.01f) {
-        return 0.0f;
-    }
-
-    float p_damage = d_max * std::exp(-lambda * static_cast<float>(dist));
-    return std::clamp(p_damage, 0.0f, 1.0f);
+    // Prefer empirical per-position rate when it has meaningful signal (> 0.1%)
+    float p_damage = (dist < 15 && rate_arr[dist] > 0.001f)
+                     ? rate_arr[dist]
+                     : d_max * std::exp(-lambda * static_cast<float>(dist));
+    return std::clamp(p_damage, 0.0f, 0.95f);
 }
 
 float FrameSelector::compute_stop_damage_probability(
     const char* codon,
     size_t codon_nt_start,
     size_t seq_len,
-    const SampleDamageProfile& sample_profile) {
+    const SampleDamageProfile& sample_profile,
+    bool is_forward) {
+
+    // Delegate validation to compute_position_damage_prob (tri-state gate).
+    // No separate gate here — avoids inconsistent double-gating.
 
     char c0 = fast_upper(codon[0]);
     char c1 = fast_upper(codon[1]);
     char c2 = fast_upper(codon[2]);
 
-    // Check for C->T convertible stops (5' damage)
-    // TAA <- CAA (Gln), TAG <- CAG (Gln), TGA <- CGA (Arg)
-    bool is_ct_convertible = (c0 == 'T' && c1 == 'A' && c2 == 'A') ||  // TAA from CAA
-                             (c0 == 'T' && c1 == 'A' && c2 == 'G') ||  // TAG from CAG
-                             (c0 == 'T' && c1 == 'G' && c2 == 'A');    // TGA from CGA
+    // CRITICAL: translate oriented event types to original-read event types.
+    //
+    // In a reverse-complement frame the oriented sequence is revcomp(original).
+    // An oriented C→T (T at codon[0]) corresponds to G→A in the original read,
+    // which maps to the 3' end.  Likewise oriented G→A → original C→T at 5'.
+    //
+    // Therefore: for forward frames  → original event = oriented event
+    //            for reverse frames  → original C→T ↔ G→A (flip)
+    //
+    // We encode this as: "original is_5prime" = is_forward for oriented-CT events
+    //                                          = !is_forward for oriented-GA events
+    const bool ct_is_orig_5p = is_forward;   // oriented C→T → original C→T (fwd) or G→A (rev)
+    const bool ga_is_orig_5p = !is_forward;  // oriented G→A → original G→A (fwd) or C→T (rev)
 
-    // Check for G->A convertible stops (3' damage)
-    // TGA <- TGG (Trp) via G->A at position 3
-    // TAG <- TGG (Trp) via G->A at position 2 (less common pattern)
-    bool is_ga_convertible_pos3 = (c0 == 'T' && c1 == 'G' && c2 == 'A');  // TGA from TGG
-    bool is_ga_convertible_pos2 = (c0 == 'T' && c1 == 'A' && c2 == 'G');  // TAG from TGG
+    // C→T-convertible in oriented space: TAA←CAA, TAG←CAG, TGA←CGA
+    bool is_ct_conv = (c0 == 'T' && c1 == 'A' && c2 == 'A') ||
+                      (c0 == 'T' && c1 == 'A' && c2 == 'G') ||
+                      (c0 == 'T' && c1 == 'G' && c2 == 'A');
+    // G→A-convertible in oriented space: TGA←TGG (pos+2), TAG←TGG (pos+1)
+    bool is_ga_conv3 = (c0 == 'T' && c1 == 'G' && c2 == 'A');
+    bool is_ga_conv2 = (c0 == 'T' && c1 == 'A' && c2 == 'G');
 
-    float p_damage = 0.0f;
+    // Combine independent rescue paths: p = 1 - prod(1 - p_k)
+    float p_survive = 1.0f;
 
-    if (is_ct_convertible) {
-        // C->T at position 0 of codon
-        p_damage = compute_position_damage_prob(codon_nt_start, seq_len, sample_profile, true);
+    if (is_ct_conv) {
+        float p = compute_position_damage_prob(
+            codon_nt_start, seq_len, sample_profile, ct_is_orig_5p, is_forward);
+        p_survive *= (1.0f - p);
+    }
+    if (is_ga_conv3) {
+        float p = compute_position_damage_prob(
+            codon_nt_start + 2, seq_len, sample_profile, ga_is_orig_5p, is_forward);
+        p_survive *= (1.0f - p);
+    }
+    if (is_ga_conv2 && !is_ct_conv) {
+        float p = compute_position_damage_prob(
+            codon_nt_start + 1, seq_len, sample_profile, ga_is_orig_5p, is_forward);
+        p_survive *= (1.0f - p);
     }
 
-    if (is_ga_convertible_pos3) {
-        // G->A at position 2 of codon (TGG->TGA)
-        float p_ga = compute_position_damage_prob(codon_nt_start + 2, seq_len, sample_profile, false);
-        p_damage = std::max(p_damage, p_ga);
-    }
-
-    if (is_ga_convertible_pos2 && !is_ct_convertible) {
-        // G->A at position 1 of codon (TGG->TAG) - only if not already C->T convertible
-        float p_ga = compute_position_damage_prob(codon_nt_start + 1, seq_len, sample_profile, false);
-        p_damage = std::max(p_damage, p_ga);
-    }
-
-    return p_damage;
+    return std::min(1.0f - p_survive, 0.95f);
 }
 
 // Check if a stop codon could be from C→T damage
@@ -280,68 +353,72 @@ static bool is_damage_convertible_stop(char c0, char c1, char c2) {
            (c0 == 'T' && c1 == 'G' && c2 == 'A');    // TGA ← CGA or TGG
 }
 
-// Infer the original amino acid from a damage-convertible stop codon
-// Returns the most likely pre-damage AA based on codon, position, and hexamer context
-// - TAA: Q (CAA→TAA via C→T)
-// - TAG: Q (CAG→TAG via C→T)
-// - TGA: R or W based on position + hexamer context
-//
-// For TGA disambiguation, we use hexamer frequencies to compare:
-// - [prev_codon + CGA] → R (Arginine)
-// - [prev_codon + TGG] → W (Tryptophan)
-// The higher scoring hexamer indicates the more likely original codon.
+static float log_hex_prior(const char* prev3, const char anc3[3]);  // defined below
+
+// Infer the original amino acid from a damage-convertible stop codon.
+// TAA/TAG are unambiguous (C→T at pos 1). TGA is disambiguated via a
+// log-posterior combining damage position probabilities + bidirectional
+// hexamer context from both the upstream and downstream codons.
 static char infer_damaged_stop_aa(char c0, char c1, char c2,
                                    size_t codon_pos, size_t seq_len,
                                    bool is_forward,
-                                   const char* prev_codon = nullptr) {
-    // TAA and TAG are unambiguous: both from C→T at position 1
-    if (c0 == 'T' && c1 == 'A' && c2 == 'A') return 'Q';  // CAA→TAA
-    if (c0 == 'T' && c1 == 'A' && c2 == 'G') return 'Q';  // CAG→TAG
+                                   const char* prev_codon = nullptr,
+                                   const char* next_codon = nullptr,
+                                   const SampleDamageProfile* sample_profile = nullptr) {
+    if (c0 == 'T' && c1 == 'A' && c2 == 'A') return 'Q';  // CAA→TAA (unambiguous)
+    if (c0 == 'T' && c1 == 'A' && c2 == 'G') return 'Q';  // CAG→TAG (unambiguous)
 
-    // TGA is ambiguous: could be CGA→TGA (R) or TGG→TGA (W)
+    // TGA: CGA→TGA (C→T at pos 1, restores R) or TGG→TGA (G→A at pos 3, restores W)
     if (c0 == 'T' && c1 == 'G' && c2 == 'A') {
-        // Calculate distance from terminals
-        size_t dist_5prime = is_forward ? codon_pos : (seq_len - codon_pos - 3);
-        size_t dist_3prime = is_forward ? (seq_len - codon_pos - 3) : codon_pos;
-
-        // Damage zone is ~15-20 nt from terminus
-        constexpr size_t DAMAGE_ZONE = 20;
-
-        // Clear cases: only one terminal in damage zone
-        if (dist_5prime < DAMAGE_ZONE && dist_3prime >= DAMAGE_ZONE) {
-            return 'R';  // 5' terminal: C→T damage → CGA→TGA
-        } else if (dist_3prime < DAMAGE_ZONE && dist_5prime >= DAMAGE_ZONE) {
-            return 'W';  // 3' terminal: G→A damage → TGG→TGA
+        // Damage channel probabilities at each mutated position
+        float p_ct, p_ga;
+        if (sample_profile != nullptr) {
+            p_ct = std::max(compute_position_damage_prob(
+                codon_pos,     seq_len, *sample_profile, is_forward,  is_forward), 1e-6f);
+            p_ga = std::max(compute_position_damage_prob(
+                codon_pos + 2, seq_len, *sample_profile, !is_forward, is_forward), 1e-6f);
+            if (!sample_profile->channel_b_valid_tga)
+                p_ct = 1e-6f;  // Insufficient CGA exposure; default to TGG→TGA
+        } else {
+            // Fallback: exponential decay from each terminus
+            size_t d5 = is_forward ? codon_pos : (seq_len > codon_pos + 3 ? seq_len - codon_pos - 3 : 0);
+            size_t d3 = is_forward ? (seq_len > codon_pos + 3 ? seq_len - codon_pos - 3 : 0) : codon_pos;
+            constexpr float kLam = 0.08f;
+            p_ct = std::exp(-kLam * static_cast<float>(d5));
+            p_ga = std::exp(-kLam * static_cast<float>(d3));
         }
 
-        // Ambiguous case: use hexamer context if available
+        const char cga[] = {'C','G','A'};
+        const char tgg[] = {'T','G','G'};
+
+        // Log-posterior: log p_damage + upstream hexamer + downstream hexamer
+        float s_cga = std::log(p_ct);
+        float s_tgg = std::log(p_ga);
         if (prev_codon != nullptr) {
-            // Construct hexamers: [prev_codon + hypothetical_original_codon]
-            char hex_cga[7] = {prev_codon[0], prev_codon[1], prev_codon[2], 'C', 'G', 'A', '\0'};
-            char hex_tgg[7] = {prev_codon[0], prev_codon[1], prev_codon[2], 'T', 'G', 'G', '\0'};
-
-            // Look up hexamer frequencies
-            uint32_t code_cga = encode_hexamer(hex_cga);
-            uint32_t code_tgg = encode_hexamer(hex_tgg);
-
-            if (code_cga != UINT32_MAX && code_tgg != UINT32_MAX) {
-                float freq_cga = GTDB_HEXAMER_FREQ[code_cga];
-                float freq_tgg = GTDB_HEXAMER_FREQ[code_tgg];
-
-                // Return the amino acid corresponding to higher frequency hexamer
-                if (freq_tgg > freq_cga * 1.5f) {
-                    return 'W';  // TGG significantly more common in this context
-                }
-                // Otherwise default to R (CGA is generally more common than TGG)
-            }
+            s_cga += log_hex_prior(prev_codon, cga);
+            s_tgg += log_hex_prior(prev_codon, tgg);
+        }
+        if (next_codon != nullptr) {
+            s_cga += log_hex_prior(cga, next_codon);
+            s_tgg += log_hex_prior(tgg, next_codon);
         }
 
-        // Default to R (Arginine) - more common in coding sequences
-        return 'R';
+        return (s_cga >= s_tgg) ? 'R' : 'W';
     }
 
-    // Fallback (shouldn't reach here if is_damage_convertible_stop was true)
     return 'X';
+}
+
+// Hexamer log-prior for an ancestor codon in context, matching codon_scores units.
+// log(freq * 4096 + 1e-10): positive for common dicodons, negative for rare ones.
+// Used to score repaired ancestor codons at damage-induced stops.
+static float log_hex_prior(const char* prev3, const char anc3[3]) {
+    char hex[7] = { prev3[0], prev3[1], prev3[2], anc3[0], anc3[1], anc3[2], '\0' };
+    uint32_t code = encode_hexamer(hex);
+    if (code == UINT32_MAX) return -6.0f;
+    // KT-smoothed: add 0.5 pseudocount in scaled (×4096) frequency space.
+    // Raises floor for rare dicodons like CGA from log(0.33)≈−1.1 to log(0.83)≈−0.19.
+    return std::log(GTDB_HEXAMER_FREQ[code] * 4096.0f + 0.5f);
 }
 
 // Generate search-optimized protein by extending past damage-convertible stops.
@@ -386,11 +463,10 @@ static std::string generate_search_protein(
                            (c0 == 'T' && c1 == 'G' && c2 == 'A');
 
             if (is_stop && is_damage_convertible_stop(c0, c1, c2)) {
-                // Extend with inferred original AA instead of truncating
-                // Pass previous codon for hexamer-based TGA disambiguation
                 const char* prev = (codon_nt >= 3) ? (oriented_seq.data() + codon_nt - 3) : nullptr;
+                const char* next = (codon_nt + 5 < oriented_seq.length()) ? (oriented_seq.data() + codon_nt + 3) : nullptr;
                 char inferred = infer_damaged_stop_aa(c0, c1, c2, codon_nt,
-                                                       oriented_seq.length(), is_forward, prev);
+                                                       oriented_seq.length(), is_forward, prev, next);
                 search_protein += inferred;
                 extensions++;
                 current_codon++;
@@ -570,7 +646,8 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
     const SampleDamageProfile& sample_profile,
     size_t min_aa,
     bool adaptive,
-    float per_read_damage) {
+    float per_read_damage,
+    const std::string& read_id) {
 
     // =========================================================================
     // UNIFIED DAMAGE-AWARE ORF ENUMERATION
@@ -593,18 +670,40 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
     //    - Low per-read damage → standard stop penalty
     // =========================================================================
 
-    constexpr float BASE_STOP_PENALTY = 3.0f;  // Base penalty per real stop
-
     // Auto-compute per-read damage if not provided
     float p_read_dmg = per_read_damage;
     if (p_read_dmg < 0.0f) {
         p_read_dmg = compute_per_read_damage_prior(seq, sample_profile);
     }
 
-    // Adjust stop penalty based on per-read damage:
-    // High damage (p=1.0) → 50% penalty reduction (more lenient)
-    // Low damage (p=0.0) → full penalty
-    const float REAL_STOP_PENALTY = BASE_STOP_PENALTY * (1.0f - 0.5f * p_read_dmg);
+    // Per-stop Bayesian logaddexp cost constants.
+    // stop_cost(p) = -log(p * exp(-kRescued) + (1-p) * exp(-kTrue))
+    // p→1: stop_cost → kRescued (nearly zero); p→0: stop_cost → kTrue (harsh)
+    static const float kRescuedStopCost = 0.15f;
+    static const float kTrueStopCost    = 3.0f;
+    static const float kEr = std::exp(-kRescuedStopCost);
+    static const float kEt = std::exp(-kTrueStopCost);
+
+    // p_stop: multiplicative combination with floor at 40% of sample signal.
+    // Pure p_sample * p_read_dmg suppresses p_stop too aggressively when p_read_dmg < 0.5;
+    // the floor prevents rescue from collapsing even when the per-read signal is uncertain.
+    auto combine_p_stop = [&](float p_sample) -> float {
+        float p_mult  = p_sample * p_read_dmg;
+        float p_floor = 0.4f * p_sample;
+        return std::clamp(std::max(p_mult, p_floor), 0.0f, 0.95f);
+    };
+
+    auto stop_logaddexp_cost = [&](float p_stop) -> float {
+        return -std::log(p_stop * kEr + (1.0f - p_stop) * kEt + 1e-30f);
+    };
+
+    // Contrastive LLR: log P(hex|coding) - log P(hex|wrong-frame null).
+    // Forward frames: wf_llr_fwd[h] = log P(h|coding) - log P(h|+1/+2/RC null)
+    // RC frames:      wf_llr_rc[h]  = wf_llr_fwd[rc_complement(h)]
+    //   because hexamer h in an RC frame came from a coding position with hexamer rc(h).
+    static constexpr float kLLRWeight    = 2.0f;
+    const auto& wf_llr_fwd = dart::get_wrong_frame_llr();
+    const auto& wf_llr_rc  = dart::get_rc_frame_llr();
 
     std::vector<ORFFragment> fwd_fragments;
     std::vector<ORFFragment> rev_fragments;
@@ -615,6 +714,15 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
     auto dmg = make_codon_damage_params(&sample_profile);
     auto all_scores = codon::score_all_hypotheses(seq, dmg, codon::ScoringWeights(), true);
     auto& buf = codon::get_thread_buffers();
+
+    // Look up full-read frame likelihood for a (forward, frame) pair.
+    // all_scores is sorted by posterior so we match by stored frame/forward fields.
+    auto frame_full_score = [&all_scores](bool forward, int frame) -> float {
+        for (const auto& r : all_scores)
+            if (r.forward == forward && r.frame == frame)
+                return r.log_likelihood;
+        return 0.0f;
+    };
 
     // STOP RESCUE STRATEGY:
     // AA-level correction (guessing Q, R, W) was disabled due to ~2% precision.
@@ -632,6 +740,7 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
     for (bool is_forward : {true, false}) {
         const std::string& oriented = is_forward ? seq : reverse_complement_cached(seq);
         auto& strand_fragments = is_forward ? fwd_fragments : rev_fragments;
+        const auto& wf_llr = is_forward ? wf_llr_fwd : wf_llr_rc;
 
         for (int frame = 0; frame < 3; ++frame) {
             // Hypothesis index: fwd frames 0,1,2 -> h=0,1,2; rev frames 0,1,2 -> h=3,4,5
@@ -650,13 +759,18 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
             current_observed.reserve(num_codons);
             current_corrected_nt.reserve(num_codons * 3);
 
-            size_t orf_start = 0;          // Start codon index of current ORF
-            size_t frame_real_stops = 0;   // Total real stops in this frame (for scoring)
-            size_t orf_passed_stops = 0;   // Damage stops continued through in current ORF (legacy)
-            size_t orf_rescued_stops = 0;  // Damage stops X-masked in search_protein
-            size_t orf_aa_corrections = 0; // Non-stop AA corrections in current ORF
+            size_t orf_start = 0;
+            size_t frame_real_stops = 0;       // count for reporting
+            float  frame_stop_cost  = 0.0f;    // accumulated logaddexp cost of real stops in this frame
+            size_t orf_passed_stops = 0;
+            size_t orf_rescued_stops = 0;
+            float  orf_rescued_stop_cost = 0.0f; // logaddexp cost of rescued stops in current ORF
+            size_t orf_aa_corrections = 0;
             float orf_damage_evidence = 0.0f;
-            float orf_hexamer_score = 0.0f;
+            float orf_hexamer_score = 0.0f;       // emit: codon_score + repair_score (no LLR)
+            float orf_rank_hexamer_score = 0.0f;  // rank: emit + kLLRWeight * wf_llr bonus
+            float orf_strand_disc = 0.0f;  // accumulated strand-discriminant evidence from rescued stops
+            size_t orf_coding_codons = 0;  // codons contributing to avg_hexamer (excludes rescued stops)
 
             for (size_t c = 0; c < num_codons; ++c) {
                 char observed_aa = buf.protein_buffer[h][c];
@@ -670,21 +784,55 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                     char c1 = fast_upper(codon_ptr[1]);
                     char c2 = fast_upper(codon_ptr[2]);
 
-                    // Stop rescue: continue ORF through damage-convertible stops
-                    // protein keeps '*' (truthful), search_protein gets inferred original AA
-                    // Cap at 2 rescued stops per ORF to avoid noise accumulation
+                    // Per-stop Bayesian damage probability — orientation-aware, library-gated,
+                    // empirical-rate-preferred, multi-path combined.
+                    float p_stop_sample = compute_stop_damage_probability(
+                        codon_ptr, codon_nt_start, oriented.length(), sample_profile, is_forward);
+                    // Combine sample-level and per-read priors in logit space (not multiplicative).
+                    // Multiplicative form p_sample * p_read is a conjunction that suppresses rescue
+                    // too aggressively (e.g. p_sample=0.68, p_read=0.5 → p=0.34 → cost=1.26 nats).
+                    float p_stop = combine_p_stop(p_stop_sample);
+
+                    // Rescue: continue ORF through this stop when plausibly damage-induced.
                     //
-                    // Per-read damage integration: lower threshold for high-damage reads
-                    // d_max threshold: 0.05 (baseline) → 0.02 (high damage, p=1.0)
-                    const float x_mask_threshold = 0.05f - 0.03f * p_read_dmg;
-                    if (d_max >= x_mask_threshold && orf_rescued_stops < 2 &&
-                        codon_nt_start + 2 < oriented.length() &&
-                        is_damage_convertible_stop(c0, c1, c2)) {
-                        // Infer the original AA from the damage pattern
-                        // Pass previous codon for hexamer-based TGA disambiguation
+                    // Key design decisions:
+                    //
+                    // 1. THRESHOLD uses p_stop_sample (sample-level, before per-read downscaling).
+                    //    At low damage (d_max=5%), combined p_stop ≈ 0.4 × d_max = 0.02, far below
+                    //    the old threshold of 0.10. Using p_stop_sample directly rescues terminal
+                    //    convertible stops at all damage levels where the sample model detects damage.
+                    //    Threshold 0.03 rescues positions where sample probability ≥ 3% (d_max ≥ 3%).
+                    //
+                    // 2. COST uses kRescuedStopCost (0.15 nats) regardless of p_stop.
+                    //    The logaddexp cost at low p_stop (≈2.7 nats) would wipe out the correct
+                    //    frame's avg_hexamer advantage and cause it to lose to clean wrong frames.
+                    //    kRescuedStopCost reflects the committed rescue decision.
+                    //    False rescues in wrong frames are self-correcting: codons after the rescue
+                    //    position in the wrong frame have poor hexamer scores, reducing avg_hexamer.
+                    //
+                    // 3. CAP scales with damage. rescue_cap=2 at low damage limits false rescues.
+                    bool codon_is_convertible = is_damage_convertible_stop(c0, c1, c2);
+                    size_t rescue_cap = (d_max > 0.20f) ? 4 : 2;
+                    // Threshold on p_stop_sample (before per-read downscaling) avoids
+                    // false rescues in undamaged samples where combined p_stop ≈ 0.4×d_max
+                    // would be suppressed to near-zero by low p_read_dmg.
+                    // Threshold 0.05: excludes "none" background noise (d_max ≈ 3%)
+                    // while allowing rescue at "low" damage (d_max ≈ 5-10%).
+                    // Gate on d_max_combined > 0: this is 0 when Channel B invalidates
+                    // the Channel A signal (compositional T enrichment, not real damage).
+                    // For "none"-damage samples, d_max_combined = 0 even when d_max_5prime
+                    // is elevated by AT-rich compositional bias → correct exclusion.
+                    const bool damage_validated = (sample_profile.d_max_combined > 0.0f);
+                    bool can_rescue = (damage_validated &&
+                                       p_stop_sample > 0.05f && orf_rescued_stops < rescue_cap &&
+                                       codon_nt_start + 2 < oriented.length() &&
+                                       codon_is_convertible);
+
+                    if (can_rescue) {
                         const char* prev = (codon_nt_start >= 3) ? (oriented.data() + codon_nt_start - 3) : nullptr;
+                        const char* next = (codon_nt_start + 5 < oriented.length()) ? (oriented.data() + codon_nt_start + 3) : nullptr;
                         char inferred = infer_damaged_stop_aa(c0, c1, c2, codon_nt_start,
-                                                               oriented.length(), is_forward, prev);
+                                                               oriented.length(), is_forward, prev, next, &sample_profile);
                         current_protein += '*';
                         current_search_protein += inferred;
                         current_observed += inferred;
@@ -692,10 +840,71 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                         current_corrected_nt += c1;
                         current_corrected_nt += c2;
                         orf_rescued_stops++;
-                        orf_hexamer_score += codon_score;
+                        // Cost: capped at 1.0 nat so correct rescued frame still beats clean wrong
+                        // frames (avg_hexamer advantage ≈ 2 nats/frame). At high damage, the
+                        // natural logaddexp cost drops below 1.0 and is used directly.
+                        orf_rescued_stop_cost += std::min(stop_logaddexp_cost(p_stop_sample), 1.0f);
+                        orf_strand_disc += kDiscWeight * (std::log(p_stop_sample) - kLogStopPrior);
+
+                        // Score the inferred ancestral codon's dicodon context.
+                        // Restores the coding signal the correct frame loses at each damage stop
+                        // instead of contributing 0 to avg_hexamer.
+                        float repair_score = 0.0f;
+                        if (prev != nullptr) {
+                            if (c1 == 'A' && c2 == 'A') {        // TAA←CAA
+                                const char anc[] = {'C','A','A'};
+                                repair_score = log_hex_prior(prev, anc);
+                                if (next != nullptr) repair_score += log_hex_prior(anc, next);
+                            } else if (c1 == 'A' && c2 == 'G') { // TAG←CAG
+                                const char anc[] = {'C','A','G'};
+                                repair_score = log_hex_prior(prev, anc);
+                                if (next != nullptr) repair_score += log_hex_prior(anc, next);
+                            } else {                              // TGA←CGA or TGG (weighted)
+                                float p_ct = std::max(compute_position_damage_prob(
+                                    codon_nt_start,     oriented.length(),
+                                    sample_profile, is_forward,  is_forward), 1e-6f);
+                                float p_ga = std::max(compute_position_damage_prob(
+                                    codon_nt_start + 2, oriented.length(),
+                                    sample_profile, !is_forward, is_forward), 1e-6f);
+                                // Suppress CGA→TGA path when Channel B has insufficient CGA exposure
+                                if (!sample_profile.channel_b_valid_tga)
+                                    p_ct = 1e-6f;
+                                const char cga[] = {'C','G','A'};
+                                const char tgg[] = {'T','G','G'};
+                                float s_cga = std::log(p_ct);
+                                float s_tgg = std::log(p_ga);
+                                if (prev != nullptr) {
+                                    s_cga += log_hex_prior(prev, cga);
+                                    s_tgg += log_hex_prior(prev, tgg);
+                                }
+                                if (next != nullptr) {
+                                    s_cga += log_hex_prior(cga, next);
+                                    s_tgg += log_hex_prior(tgg, next);
+                                }
+                                float log_Z = std::log(p_ct + p_ga);
+                                float mx    = std::max(s_cga, s_tgg);
+                                repair_score = mx + std::log(std::exp(s_cga - mx)
+                                                           + std::exp(s_tgg - mx)) - log_Z;
+                            }
+                        }
+                        orf_hexamer_score += repair_score;
+                        orf_rank_hexamer_score += repair_score;
+
+                        orf_coding_codons++;
                     } else {
-                        // Real stop (or rescue cap reached): emit current ORF and start new one
+                        // Real stop (or rescue cap): emit current ORF then start new one.
+                        // Cap frame_stop_cost at 3× kTrueStopCost to prevent one early stop
+                        // from poisoning all downstream ORF scores in this frame.
                         frame_real_stops++;
+                        frame_stop_cost = std::min(frame_stop_cost + stop_logaddexp_cost(p_stop),
+                                                   3.0f * kTrueStopCost);
+                        // Sub-threshold soft strand evidence: a convertible stop with p_stop
+                        // below rescue threshold still favours this strand vs RC decoys.
+                        // Accumulates into orf_strand_disc before this ORF is emitted.
+                        if (codon_is_convertible) {
+                            float soft_ev = kDiscWeight * std::max(0.0f, std::log(p_stop) - kLogStopPrior);
+                            orf_strand_disc += soft_ev;
+                        }
 
                         size_t orf_nt_start = frame + orf_start * 3;
                         float avg_hexamer_score = current_protein.length() > 0 ?
@@ -724,17 +933,19 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                             orf.rescued_stops = orf_rescued_stops;
                             orf.real_stops = frame_real_stops;
                             orf.damage_evidence = orf_damage_evidence;
-                            float avg_hexamer = orf.length > 0 ? orf_hexamer_score / static_cast<float>(orf.length) : 0.0f;
+                            // Use orf_coding_codons (excludes rescued stops) as the denominator
+                            // so damage-induced stops don't contaminate avg_hexamer.
+                            float avg_hexamer = orf_coding_codons > 0 ? orf_hexamer_score / static_cast<float>(orf_coding_codons) : 0.0f;
+                            float avg_rank_hexamer = orf_coding_codons > 0 ? orf_rank_hexamer_score / static_cast<float>(orf_coding_codons) : 0.0f;
                             float length_bonus = std::log(static_cast<float>(orf.length) + 1.0f);
-                            // Rescued stop bonus: reward X-masked stops on high-damage reads
-                            // High damage (p=1.0) → +0.5 per rescued stop
-                            // Low damage (p=0.0) → no bonus
-                            float rescue_bonus = p_read_dmg * 0.5f * static_cast<float>(orf_rescued_stops);
-                            orf.score = avg_hexamer + length_bonus + rescue_bonus - REAL_STOP_PENALTY * frame_real_stops;
+                            float costs = orf_rescued_stop_cost + frame_stop_cost;
+                            orf.score = avg_hexamer + length_bonus - costs;
+                            orf.rank_score = avg_rank_hexamer + length_bonus - costs;
+                            orf.strand_disc = orf_strand_disc;
                             strand_fragments.push_back(std::move(orf));
                         }
 
-                        // Reset for next ORF
+                        // Reset for next ORF (frame_stop_cost is NOT reset — penalises later ORFs)
                         current_protein.clear();
                         current_search_protein.clear();
                         current_observed.clear();
@@ -742,9 +953,13 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                         orf_start = c + 1;
                         orf_passed_stops = 0;
                         orf_rescued_stops = 0;
+                        orf_rescued_stop_cost = 0.0f;
+                        orf_strand_disc = 0.0f;
                         orf_aa_corrections = 0;
                         orf_damage_evidence = 0.0f;
                         orf_hexamer_score = 0.0f;
+                        orf_rank_hexamer_score = 0.0f;
+                        orf_coding_codons = 0;
                     }
                 } else {
                     // Non-stop codon
@@ -759,15 +974,30 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                     current_protein += observed_aa;
                     current_search_protein += observed_aa;
                     current_observed += observed_aa;
-                    orf_hexamer_score += codon_score;
+                    // Add contrastive LLR: log P(hex|coding) - log P(hex|wrong-frame null).
+                    // Lookup uses the dicodon hexamer spanning the previous and current codon.
+                    float llr_bonus = 0.0f;
+                    if (c > 0) {
+                        size_t hex_nt = frame + (c - 1) * 3;
+                        if (hex_nt + 6 <= oriented.size()) {
+                            uint32_t hcode = encode_hexamer(oriented.data() + hex_nt);
+                            if (hcode != UINT32_MAX)
+                                llr_bonus = wf_llr[hcode];
+                        }
+                    }
+                    float codon_total = codon_score + kLLRWeight * llr_bonus;
+                    orf_hexamer_score += codon_total;
+                    orf_rank_hexamer_score += codon_total;
+
+                    orf_coding_codons++;
                 }
             }
 
             // Emit final ORF if long enough
             // For final ORF, there's no stop to extend past (ended at sequence end)
             size_t final_orf_nt_start = frame + orf_start * 3;
-            float final_avg_hexamer = current_protein.length() > 0 ?
-                orf_hexamer_score / static_cast<float>(current_protein.length()) : 0.0f;
+            float final_avg_hexamer = orf_coding_codons > 0 ?
+                orf_hexamer_score / static_cast<float>(orf_coding_codons) : 0.0f;
             std::string final_search_protein = generate_search_protein(
                 current_search_protein, oriented, frame, final_orf_nt_start, num_codons, d_max, &sample_profile, is_forward, final_avg_hexamer);
             size_t final_effective_length = std::max(current_protein.length(), final_search_protein.length());
@@ -792,21 +1022,47 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                 orf.rescued_stops = orf_rescued_stops;
                 orf.real_stops = frame_real_stops;
                 orf.damage_evidence = orf_damage_evidence;
-                float avg_hexamer = orf.length > 0 ? orf_hexamer_score / static_cast<float>(orf.length) : 0.0f;
+                float avg_hexamer = orf_coding_codons > 0 ? orf_hexamer_score / static_cast<float>(orf_coding_codons) : 0.0f;
+                float avg_rank_hexamer = orf_coding_codons > 0 ? orf_rank_hexamer_score / static_cast<float>(orf_coding_codons) : 0.0f;
                 float length_bonus = std::log(static_cast<float>(orf.length) + 1.0f);
-                float rescue_bonus = p_read_dmg * 0.5f * static_cast<float>(orf_rescued_stops);
-                orf.score = avg_hexamer + length_bonus + rescue_bonus - REAL_STOP_PENALTY * frame_real_stops;
+                float costs = orf_rescued_stop_cost + frame_stop_cost;
+                orf.score = avg_hexamer + length_bonus - costs;
+                orf.rank_score = avg_rank_hexamer + length_bonus - costs;
+                orf.strand_disc = orf_strand_disc;
+                orf.full_read_score = frame_full_score(is_forward, frame);
                 strand_fragments.push_back(std::move(orf));
             }
+
         }
     }
 
-    // Sort by score (coding signal - stop penalties + damage-aware rescue bonus)
-    auto by_score = [](const ORFFragment& a, const ORFFragment& b) {
-        return a.score > b.score;
+    // Sort by rank_score.
+    auto by_rank = [](const ORFFragment& a, const ORFFragment& b) {
+        return a.rank_score > b.rank_score;
     };
-    std::sort(fwd_fragments.begin(), fwd_fragments.end(), by_score);
-    std::sort(rev_fragments.begin(), rev_fragments.end(), by_score);
+    std::sort(fwd_fragments.begin(), fwd_fragments.end(), by_rank);
+    std::sort(rev_fragments.begin(), rev_fragments.end(), by_rank);
+
+    // Debug: for reads with any rescued stop, print per-fragment scores and strand_disc values.
+    // DART_DEBUG_STOPS=1 enables. Output format (tab-separated):
+    // STOP_DBG <read_id> <strand><frame>:<score>:<rescued>:<strand_disc>:<len> ...
+    static const bool dbg_stops = (std::getenv("DART_DEBUG_STOPS") != nullptr);
+    if (dbg_stops) {
+        bool any_rescued = false;
+        for (const auto& o : fwd_fragments) if (o.rescued_stops > 0) { any_rescued = true; break; }
+        if (!any_rescued)
+            for (const auto& o : rev_fragments) if (o.rescued_stops > 0) { any_rescued = true; break; }
+        if (any_rescued) {
+            std::fprintf(stderr, "STOP_DBG\t%s", read_id.c_str());
+            for (const auto& o : fwd_fragments)
+                std::fprintf(stderr, "\tf%d:%.3f:%zu:%.3f:%zu",
+                    o.frame, o.score, o.rescued_stops, o.strand_disc, o.length);
+            for (const auto& o : rev_fragments)
+                std::fprintf(stderr, "\tr%d:%.3f:%zu:%.3f:%zu",
+                    o.frame, o.score, o.rescued_stops, o.strand_disc, o.length);
+            std::fprintf(stderr, "\n");
+        }
+    }
 
     // =========================================================================
     // SELECTION MODES:
@@ -853,7 +1109,7 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
         //
         // Target: ~2-3 ORFs/read average, ≥70% coverage
         // =====================================================================
-        constexpr float MARGIN_THRESHOLD = 2.0f;    // Score margin for ambiguity
+        constexpr float MARGIN_THRESHOLD = 4.0f;    // Score margin for ambiguity (scaled for kLLRWeight=2.0)
         constexpr float LOW_COMPLEXITY_ENTROPY = 1.5f;  // Shannon entropy threshold
 
         // Compute sequence complexity (Shannon entropy of dinucleotides)
@@ -954,8 +1210,63 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
         }
     }
 
-    // Final sort by score
-    std::sort(result.begin(), result.end(), by_score);
+    // Two-part cross-strand post-processing:
+    //
+    // Part A — logsumexp strand pooling: add log(Σ exp(score - max)) per strand to
+    // the best ORF on that strand. Real genes look vaguely coding in all 3 frames of
+    // the true strand; RC decoys typically have only one strong frame (~0–1.1 nats bonus).
+    // Applied unconditionally — independent of damage level.
+    //
+    // Part B — rescued-stop strand discriminant: when the best forward ORF has rescued-
+    // stop evidence (strand_disc > 0), add a bonus if the RC lead is within kDiscMargin.
+    // Only fires when damage is validated by the joint model (damage_validated=true) to
+    // avoid boosting wrong-frame rescued stops in undamaged or low-damage samples where
+    // the rescue threshold barely fires and produces spurious strand_disc evidence.
+    {
+        static constexpr float kDiscMargin = 3.0f;
+        static constexpr float kDiscCap    = 3.0f;
+
+        ORFFragment* best_fwd = nullptr;
+        ORFFragment* best_rc  = nullptr;
+        for (auto& orf : result) {
+            if (orf.is_forward) {
+                if (!best_fwd || orf.score > best_fwd->score) best_fwd = &orf;
+            } else {
+                if (!best_rc  || orf.score > best_rc->score)  best_rc  = &orf;
+            }
+        }
+
+        // Part A: logsumexp pooling (always)
+        if (best_fwd && best_rc) {
+            float fwd_max = best_fwd->score;
+            float rc_max  = best_rc->score;
+            float fwd_sum = 0.0f, rc_sum = 0.0f;
+            for (const auto& orf : result) {
+                if (orf.is_forward) fwd_sum += std::exp(orf.score - fwd_max);
+                else                rc_sum  += std::exp(orf.score - rc_max);
+            }
+            float fwd_lse = std::log(fwd_sum);
+            float rc_lse  = std::log(rc_sum);
+            best_fwd->score += fwd_lse;  best_fwd->rank_score += fwd_lse;
+            best_rc->score  += rc_lse;   best_rc->rank_score  += rc_lse;
+        }
+
+        // Part B: rescued-stop discriminant (only when damage is validated)
+        if (sample_profile.damage_validated &&
+                best_fwd && best_rc && best_fwd->strand_disc > 0.0f) {
+            float gap = best_rc->score - best_fwd->score;
+            if (gap > -kDiscMargin) {
+                float bonus = std::min(best_fwd->strand_disc, kDiscCap);
+                best_fwd->score += bonus;
+                best_fwd->rank_score += bonus;
+            }
+        }
+    }
+
+    std::sort(result.begin(), result.end(),
+              [](const ORFFragment& a, const ORFFragment& b) {
+                  return a.rank_score > b.rank_score;
+              });
 
     return result;
 }
@@ -1171,17 +1482,19 @@ float FrameSelector::infer_per_read_aa_damage(
 
             float p_j = 0.0f;
             if (ct_convertible) {
-                p_j = compute_position_damage_prob(nt_pos, seq_len, profile, true);
+                p_j = compute_position_damage_prob(nt_pos, seq_len, profile, true, orf.is_forward);
             }
             if (ga_convertible) {
-                float p_ga = compute_position_damage_prob(nt_pos + 2, seq_len, profile, false);
+                float p_ga = compute_position_damage_prob(nt_pos + 2, seq_len, profile, false, orf.is_forward);
                 p_j = std::max(p_j, p_ga);
             }
 
             if (p_j < 0.001f) continue;
 
-            size_t dist_5 = nt_pos;
-            size_t dist_3 = (seq_len > nt_pos) ? seq_len - 1 - nt_pos : 0;
+            // Distance in original-read coordinates for weight decay
+            size_t dist_5p_orig = orf.is_forward ? nt_pos : (seq_len > nt_pos ? seq_len - 1 - nt_pos : 0);
+            size_t dist_5 = dist_5p_orig;
+            size_t dist_3 = (seq_len > dist_5p_orig) ? seq_len - 1 - dist_5p_orig : 0;
             size_t min_dist = std::min(dist_5, dist_3);
             float w_j = std::exp(-0.3f * static_cast<float>(min_dist / 3));
 
@@ -1207,7 +1520,7 @@ float FrameSelector::infer_per_read_aa_damage(
                                       (c0 == 'C' && c1 == 'A' && c2 == 'G') ||
                                       (c0 == 'C' && c1 == 'G' && c2 == 'A');
                     if (is_prestop) {
-                        float p_j = compute_position_damage_prob(nt_pos, seq_len, profile, true);
+                        float p_j = compute_position_damage_prob(nt_pos, seq_len, profile, true, orf.is_forward);
                         if (p_j > 0.001f) {
                             logbf_prestop += std::log(1.0f - p_j);
                             ++n_prestops;
@@ -1216,7 +1529,7 @@ float FrameSelector::infer_per_read_aa_damage(
                 }
                 if (check_3p) {
                     if (c0 == 'T' && c1 == 'G' && c2 == 'G') {
-                        float p_j = compute_position_damage_prob(nt_pos + 2, seq_len, profile, false);
+                        float p_j = compute_position_damage_prob(nt_pos + 2, seq_len, profile, false, orf.is_forward);
                         if (p_j > 0.001f) {
                             logbf_prestop += std::log(1.0f - p_j);
                             ++n_prestops;
