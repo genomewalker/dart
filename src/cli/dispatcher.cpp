@@ -2,7 +2,8 @@
 //
 // Usage:
 //   dart predict <input.fq> [options]     Gene prediction (main function)
-//   dart sample-damage <input.fq>         Quick sample-level damage check
+//   dart profile <input.fq>               Reference-free damage profiling
+//   dart damage <input.fq>               Alias for 'profile'
 //   dart damage-annotate --emi <hits.emi> Post-mapping damage annotation
 //   dart validate <pred.gff> <ref.gff>    Validate predictions
 

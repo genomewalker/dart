@@ -121,9 +121,19 @@ static double e_step_parallel(
             if (deg == 1) {
                 gamma[start] = 1.0;
                 ll_local += std::log(std::max(weights[data.alignments[start].ref_idx], params.min_weight))
-                    + length_log_penalty(data, params, data.alignments[start].ref_idx)
-                    + params.lambda_b * static_cast<double>(data.alignments[start].bit_score);
+                            + length_log_penalty(data, params, data.alignments[start].ref_idx)
+                            + coverage_log_penalty(params, data.alignments[start].ref_idx)
+                            + params.lambda_b * static_cast<double>(data.alignments[start].bit_score);
                 continue;
+            }
+
+            // Per-query score normalization: scale all bit scores by 1/max so scores ∈ [0,1].
+            double score_scale = 1.0;
+            if (params.normalize_scores_per_query) {
+                float max_bs = data.alignments[start].bit_score;
+                for (uint32_t j = 1; j < deg; ++j)
+                    max_bs = std::max(max_bs, data.alignments[start + j].bit_score);
+                if (max_bs > 0.0f) score_scale = 1.0 / static_cast<double>(max_bs);
             }
 
             log_scores.resize(deg);
@@ -132,7 +142,8 @@ static double e_step_parallel(
                 const auto& aln = data.alignments[start + j];
                 log_scores[j] = std::log(std::max(weights[aln.ref_idx], params.min_weight))
                                + length_log_penalty(data, params, aln.ref_idx)
-                               + params.lambda_b * static_cast<double>(aln.bit_score);
+                               + coverage_log_penalty(params, aln.ref_idx)
+                               + params.lambda_b * static_cast<double>(aln.bit_score) * score_scale;
             }
 
             double lse = log_sum_exp(log_scores.data(), deg);
@@ -158,9 +169,18 @@ static double e_step_parallel(
         if (deg == 1) {
             gamma[start] = 1.0;
             ll += std::log(std::max(weights[data.alignments[start].ref_idx], params.min_weight))
-                + length_log_penalty(data, params, data.alignments[start].ref_idx)
-                + params.lambda_b * static_cast<double>(data.alignments[start].bit_score);
+                  + length_log_penalty(data, params, data.alignments[start].ref_idx)
+                  + coverage_log_penalty(params, data.alignments[start].ref_idx)
+                  + params.lambda_b * static_cast<double>(data.alignments[start].bit_score);
             continue;
+        }
+
+        double score_scale = 1.0;
+        if (params.normalize_scores_per_query) {
+            float max_bs = data.alignments[start].bit_score;
+            for (uint32_t j = 1; j < deg; ++j)
+                max_bs = std::max(max_bs, data.alignments[start + j].bit_score);
+            if (max_bs > 0.0f) score_scale = 1.0 / static_cast<double>(max_bs);
         }
 
         log_scores.resize(deg);
@@ -168,7 +188,8 @@ static double e_step_parallel(
             const auto& aln = data.alignments[start + j];
             log_scores[j] = std::log(std::max(weights[aln.ref_idx], params.min_weight))
                            + length_log_penalty(data, params, aln.ref_idx)
-                           + params.lambda_b * static_cast<double>(aln.bit_score);
+                           + coverage_log_penalty(params, aln.ref_idx)
+                           + params.lambda_b * static_cast<double>(aln.bit_score) * score_scale;
         }
         double lse = log_sum_exp(log_scores.data(), deg);
         ll += lse;
@@ -215,13 +236,22 @@ static double e_step_damage_parallel(
             const uint32_t deg = end - start;
             if (deg == 0) continue;
 
+            double score_scale = 1.0;
+            if (params.normalize_scores_per_query && deg > 1) {
+                float max_bs = data.alignments[start].bit_score;
+                for (uint32_t j = 1; j < deg; ++j)
+                    max_bs = std::max(max_bs, data.alignments[start + j].bit_score);
+                if (max_bs > 0.0f) score_scale = 1.0 / static_cast<double>(max_bs);
+            }
+
             log_scores.resize(2 * deg);
 
             for (uint32_t j = 0; j < deg; ++j) {
                 const auto& aln = data.alignments[start + j];
                 double log_w = std::log(std::max(weights[aln.ref_idx], params.min_weight));
                 log_w += length_log_penalty(data, params, aln.ref_idx);
-                double score_contrib = params.lambda_b * static_cast<double>(aln.bit_score);
+                log_w += coverage_log_penalty(params, aln.ref_idx);
+                double score_contrib = params.lambda_b * static_cast<double>(aln.bit_score) * score_scale;
 
                 if (params.use_alignment_damage_likelihood) {
                     const double p_read = std::clamp(static_cast<double>(aln.damage_score), eps, 1.0 - eps);
@@ -229,10 +259,8 @@ static double e_step_damage_parallel(
                     log_scores[2 * j + 1] = log_w + score_contrib + std::log(1.0 - p_read) + aln.damage_ll_m;
                 } else {
                     double ds = std::clamp(static_cast<double>(aln.damage_score), eps, 1.0 - eps);
-                    double log_p_ds_ancient = std::log(ds);
-                    double log_p_ds_modern = std::log(1.0 - ds);
-                    log_scores[2 * j]     = log_w + score_contrib + log_pi_a + log_p_ds_ancient;
-                    log_scores[2 * j + 1] = log_w + score_contrib + log_pi_m + log_p_ds_modern;
+                    log_scores[2 * j]     = log_w + score_contrib + log_pi_a + std::log(ds);
+                    log_scores[2 * j + 1] = log_w + score_contrib + log_pi_m + std::log(1.0 - ds);
                 }
             }
 
@@ -261,22 +289,28 @@ static double e_step_damage_parallel(
         const uint32_t deg = end - start;
         if (deg == 0) continue;
 
+        double score_scale = 1.0;
+        if (params.normalize_scores_per_query && deg > 1) {
+            float max_bs = data.alignments[start].bit_score;
+            for (uint32_t j = 1; j < deg; ++j)
+                max_bs = std::max(max_bs, data.alignments[start + j].bit_score);
+            if (max_bs > 0.0f) score_scale = 1.0 / static_cast<double>(max_bs);
+        }
+
         log_scores.resize(2 * deg);
         for (uint32_t j = 0; j < deg; ++j) {
             const auto& aln = data.alignments[start + j];
             double log_w = std::log(std::max(weights[aln.ref_idx], params.min_weight));
             log_w += length_log_penalty(data, params, aln.ref_idx);
-            double score_contrib = params.lambda_b * static_cast<double>(aln.bit_score);
+            double score_contrib = params.lambda_b * static_cast<double>(aln.bit_score) * score_scale;
             if (params.use_alignment_damage_likelihood) {
                 const double p_read = std::clamp(static_cast<double>(aln.damage_score), eps, 1.0 - eps);
                 log_scores[2 * j]     = log_w + score_contrib + std::log(p_read) + aln.damage_ll_a;
                 log_scores[2 * j + 1] = log_w + score_contrib + std::log(1.0 - p_read) + aln.damage_ll_m;
             } else {
                 double ds = std::clamp(static_cast<double>(aln.damage_score), eps, 1.0 - eps);
-                double log_p_ds_ancient = std::log(ds);
-                double log_p_ds_modern = std::log(1.0 - ds);
-                log_scores[2 * j]     = log_w + score_contrib + log_pi_a + log_p_ds_ancient;
-                log_scores[2 * j + 1] = log_w + score_contrib + log_pi_m + log_p_ds_modern;
+                log_scores[2 * j]     = log_w + score_contrib + log_pi_a + std::log(ds);
+                log_scores[2 * j + 1] = log_w + score_contrib + log_pi_m + std::log(1.0 - ds);
             }
         }
 
@@ -553,6 +587,7 @@ EMState squarem_em(
             diag.alpha = alpha_used;
             diag.step_min = step_min;
             diag.step_max = step_max;
+            fill_weight_diagnostics(diag, state.weights.data(), T, params.min_weight);
             progress_cb(diag);
         }
         if (iter > 0 &&
@@ -616,6 +651,61 @@ std::vector<std::pair<uint32_t, float>> reassign_reads(
     }
 
     return result;
+}
+
+// ---------------------------------------------------------------------------
+// Largest-gap abundance filter (MMseqs2-style)
+// ---------------------------------------------------------------------------
+
+std::vector<uint32_t> largest_gap_filter(
+    const std::vector<double>& weights,
+    uint32_t min_refs_to_filter)
+{
+    const uint32_t T = static_cast<uint32_t>(weights.size());
+
+    // Collect (weight, original_index) for non-negligible references
+    std::vector<std::pair<double, uint32_t>> nonzero;
+    nonzero.reserve(T);
+    for (uint32_t t = 0; t < T; ++t) {
+        if (weights[t] > 0.0) nonzero.push_back({weights[t], t});
+    }
+
+    // If too few refs to reliably detect a gap, return all non-zero
+    if (nonzero.size() < min_refs_to_filter) {
+        std::vector<uint32_t> all;
+        all.reserve(nonzero.size());
+        for (auto& p : nonzero) all.push_back(p.second);
+        return all;
+    }
+
+    // Sort ascending by weight
+    std::sort(nonzero.begin(), nonzero.end());
+
+    // Find the largest multiplicative gap between consecutive sorted weights.
+    // We use log-ratio (= log(w[i+1]/w[i])) to find the gap robustly across
+    // orders of magnitude without being dominated by tiny absolute differences.
+    const size_t n = nonzero.size();
+    size_t gap_pos = 0;           // index AFTER which the gap occurs (cutoff = keep > gap_pos)
+    double max_log_ratio = -1.0;
+
+    for (size_t i = 0; i + 1 < n; ++i) {
+        const double lo = nonzero[i].first;
+        const double hi = nonzero[i + 1].first;
+        if (lo <= 0.0) continue;
+        const double log_ratio = std::log(hi / lo);
+        if (log_ratio > max_log_ratio) {
+            max_log_ratio = log_ratio;
+            gap_pos = i;
+        }
+    }
+
+    // Keep everything above the gap (indices gap_pos+1 .. n-1)
+    std::vector<uint32_t> survivors;
+    survivors.reserve(n - gap_pos - 1);
+    for (size_t i = gap_pos + 1; i < n; ++i) {
+        survivors.push_back(nonzero[i].second);
+    }
+    return survivors;
 }
 
 } // namespace dart
@@ -1037,10 +1127,11 @@ StreamingEMResult streaming_em(
         // Progress callback
         if (progress_cb) {
             EMIterationDiagnostics diag;
-            diag.iteration = iter;
+            diag.iteration = iter + 1;
             diag.log_likelihood = total_ll;
             diag.objective = total_obj;
             diag.rel_change = std::abs(total_obj - prev_obj) / (std::abs(prev_obj) + 1e-15);
+            fill_weight_diagnostics(diag, result.weights.data(), T, params.min_weight);
             progress_cb(diag);
         }
 

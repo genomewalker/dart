@@ -28,7 +28,8 @@ constexpr uint32_t AGD_VERSION = 4;
  * @brief File header (64 bytes, fixed size).
  *
  * v3 adds damage informativeness fields (offsets 33-43) from the reserved area.
- * v2 files are still readable via version-gated accessors in DamageIndexReader.
+ * v4 adds environmental damage channels C/D (offsets 44-49).
+ * v2/v3 files are still readable via version-gated accessors in DamageIndexReader.
  */
 struct AgdHeader {
     uint32_t magic;              // offset 0, 4 bytes

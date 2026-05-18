@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <iomanip>
 #include <iostream>
 #include <unordered_map>
 #include <vector>
@@ -456,11 +457,32 @@ StreamingEMResult coverage_em_outer_loop(
         }
 
         // 1. Run inner EM
-        result = streaming_em(reader, inner_params);
+        EMIterationDiagnostics last_diag;
+        EMProgressCallback progress_cb;
+        if (verbose) {
+            progress_cb = [&last_diag](const EMIterationDiagnostics& d) {
+                last_diag = d;
+                std::cerr << "[em] iter=" << d.iteration
+                          << " LL=" << std::fixed << std::setprecision(1) << d.log_likelihood
+                          << " eff_refs=" << std::setprecision(1) << d.effective_refs
+                          << " top1=" << std::setprecision(3) << d.top1_mass
+                          << " hhi=" << std::setprecision(4) << d.hhi
+                          << " active=" << d.n_active_refs
+                          << (d.squarem_active ? " [SQ]" : "")
+                          << "\n";
+            };
+        }
+        result = streaming_em(reader, inner_params, progress_cb);
 
         if (verbose) {
-            std::cerr << "[coverage-em]   inner EM: " << result.iterations << " iters"
-                      << ", LL=" << result.log_likelihood << std::endl;
+            std::cerr << "[coverage-em]   EM: " << result.iterations << " iter"
+                      << " | LL=" << std::fixed << std::setprecision(1) << result.log_likelihood
+                      << " | eff_refs=" << std::setprecision(1) << last_diag.effective_refs
+                      << " | top1=" << std::setprecision(3) << last_diag.top1_mass
+                      << " | top5=" << std::setprecision(3) << last_diag.top5_mass
+                      << " | hhi=" << std::setprecision(4) << last_diag.hhi
+                      << " | active=" << last_diag.n_active_refs
+                      << "\n";
         }
 
         // 2-3. Recompute coverage stats from current EM solution.
@@ -525,7 +547,19 @@ StreamingEMResult coverage_em_outer_loop(
         }
 
         // 6. Update inner_params for next iteration or final refit.
+        // Populate coverage_log_weights so inner E-step penalizes patchy proteins
+        // directly at every gamma computation, not only via the warm-start weights.
         inner_params.initial_weights = std::move(new_weights);
+        inner_params.coverage_log_weights.resize(T, 0.0f);
+        for (uint32_t j = 0; j < T; ++j) {
+            auto it = out_stats.find(j);
+            if (it != out_stats.end() && it->second.coverage_weight < 1.0f) {
+                inner_params.coverage_log_weights[j] =
+                    static_cast<float>(std::log(static_cast<double>(it->second.coverage_weight)));
+            } else {
+                inner_params.coverage_log_weights[j] = 0.0f;
+            }
+        }
         have_updated_weights = true;
         if (converged) break;
     }
@@ -739,8 +773,20 @@ EMState coverage_em_squarem(
                       << "), skipping outer-loop convergence check\n";
         }
 
-        // 6. Warm-start SQUAREM for the next outer iteration
+        // 6. Warm-start SQUAREM for the next outer iteration.
+        // Also populate coverage_log_weights so the inner E-step penalizes patchy
+        // proteins at every gamma computation, not only via the warm-start weights.
         inner_params.initial_weights = std::move(new_weights);
+        inner_params.coverage_log_weights.resize(T, 0.0f);
+        for (uint32_t j = 0; j < T; ++j) {
+            auto it = out_stats.find(j);
+            if (it != out_stats.end() && it->second.coverage_weight < 1.0f) {
+                inner_params.coverage_log_weights[j] =
+                    std::log(static_cast<double>(it->second.coverage_weight));
+            } else {
+                inner_params.coverage_log_weights[j] = 0.0f;
+            }
+        }
         have_updated_weights = true;
         if (converged) break;
     }

@@ -62,7 +62,7 @@ void test_defaults() {
     assert(opts.damage_only == false);
     assert(opts.domain_name == "gtdb");
     assert(opts.orf_min_aa == 10);
-    assert(opts.adaptive_orf == false);
+    assert(opts.adaptive_orf == true);
     assert(opts.forced_library_type == dart::cli::LibraryType::UNKNOWN);
     std::cout << "PASSED\n";
 }
@@ -75,13 +75,13 @@ void test_boolean_flags() {
            .add("--no-damage")
            .add("--no-aggregate")
            .add("--damage-only")
-           .add("--adaptive")
+           .add("--no-adaptive")
            .add("--verbose");
     auto opts = dart::cli::parse_args(builder.argc(), builder.argv());
     assert(opts.use_damage == false);
     assert(opts.aggregate_damage == false);
     assert(opts.damage_only == true);
-    assert(opts.adaptive_orf == true);
+    assert(opts.adaptive_orf == false);
     assert(opts.verbose == true);
     std::cout << "PASSED\n";
 }

@@ -23,6 +23,7 @@ struct Options {
     std::string fasta_nt;
     std::string fasta_nt_corrected;  // Damage-corrected nucleotide output
     std::string fasta_aa;            // Protein output (observed, stops as *)
+    std::string fasta_aa_corrected;  // Protein output (Bayesian-corrected ancestor AAs at damage stops)
     std::string fasta_aa_masked;     // Search-optimized: terminal damage stops masked as X
     std::string summary_file;        // Summary statistics output file (JSON format)
     std::string damage_index;        // Binary damage index (.agd) for post-mapping annotation
@@ -41,7 +42,7 @@ struct Options {
 
     // ORF enumeration parameters
     size_t orf_min_aa = 10;          // Minimum ORF length in amino acids
-    bool adaptive_orf = false;       // Adaptive mode: output ORFs within score threshold
+    bool adaptive_orf = true;        // Adaptive mode: output ORFs within score threshold
 };
 
 // Exception used by parse_args to signal an early/controlled CLI exit.
