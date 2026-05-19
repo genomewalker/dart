@@ -1,6 +1,7 @@
 #include "dart/sequence_io.hpp"
 #include "dart/gz_reader_base.hpp"
 #include "dart/codon_tables.hpp"
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <algorithm>
@@ -441,6 +442,8 @@ SequenceWriter::SequenceWriter(const std::string& filename, bool compress)
         std::cerr << "Warning: pigz not found, writing uncompressed to " << out_filename << "\n";
     }
 
+    if (auto p = std::filesystem::path(out_filename).parent_path(); !p.empty())
+        std::filesystem::create_directories(p);
     impl_->file_.open(out_filename);
     if (!impl_->file_) {
         throw std::runtime_error("Failed to open sequence output file: " + out_filename);
@@ -564,6 +567,8 @@ GeneWriter::GeneWriter(const std::string& filename)
         std::cerr << "Warning: pigz not found, writing uncompressed to " << out_filename << "\n";
     }
 
+    if (auto p = std::filesystem::path(out_filename).parent_path(); !p.empty())
+        std::filesystem::create_directories(p);
     impl_->file_.open(out_filename);
     if (!impl_->file_) {
         throw std::runtime_error("Failed to open file: " + out_filename);
@@ -887,6 +892,8 @@ FastaWriter::FastaWriter(const std::string& filename)
         std::cerr << "Warning: pigz not found, writing uncompressed to " << out_filename << "\n";
     }
 
+    if (auto p = std::filesystem::path(out_filename).parent_path(); !p.empty())
+        std::filesystem::create_directories(p);
     impl_->file_.open(out_filename);
     if (!impl_->file_) {
         throw std::runtime_error("Failed to open FASTA file: " + out_filename);
@@ -1149,6 +1156,8 @@ public:
 
 StatsWriter::StatsWriter(const std::string& filename)
     : impl_(std::make_unique<Impl>()) {
+    if (auto p = std::filesystem::path(filename).parent_path(); !p.empty())
+        std::filesystem::create_directories(p);
     impl_->file_.open(filename);
     if (!impl_->file_) {
         throw std::runtime_error("Failed to open stats file: " + filename);
