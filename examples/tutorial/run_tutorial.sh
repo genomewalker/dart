@@ -9,7 +9,8 @@
 #
 # Prerequisites:
 #   - agp built: cmake --build build -j8 && cp build/dart /usr/local/bin/
-#   - mmseqs2 installed: conda install -c bioconda mmseqs2 (includes VTML20.out)
+#   - mmseqs2 installed: conda install -c bioconda mmseqs2
+#     (VTML20.out substitution matrix is bundled in examples/tutorial/data/)
 #
 # Runtime: ~5 s (predict) + ~10 s (MMseqs2 against tutorial DB) + <1 s (annotate)
 #
@@ -67,6 +68,8 @@ echo "Step 2/4: MMseqs2 search against reference proteins..."
     --min-seq-id 0.86 \
     -c 0.65 \
     --cov-mode 2 \
+    --sub-mat "$TUTORIAL_DIR/data/VTML20.out" \
+    --seed-sub-mat "$TUTORIAL_DIR/data/VTML20.out" \
     -s 2 -k 6 \
     --spaced-kmer-pattern 11011101 \
     --format-output "query,target,fident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits,qlen,tlen,qaln,taln" \
