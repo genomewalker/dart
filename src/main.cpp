@@ -310,7 +310,7 @@ int cmd_predict(int argc, char* argv[]) {
                     #endif
                     std::string seq = dart::SequenceUtils::clean(batch[i].sequence);
                     if (seq.length() >= opts.min_length) {
-                        dart::FrameSelector::update_sample_profile(thread_profiles[tid], seq);
+                        taph::FrameSelector::update_sample_profile(thread_profiles[tid], seq);
 
                         if (seq.length() >= 60 && seq.length() <= 200) {
                             size_t slot = em_training_count.fetch_add(1, std::memory_order_relaxed);
@@ -329,13 +329,13 @@ int cmd_predict(int argc, char* argv[]) {
 
             // Merge thread profiles
             for (int t = 0; t < num_threads; ++t) {
-                dart::FrameSelector::merge_sample_profiles(sample_profile, thread_profiles[t]);
+                taph::FrameSelector::merge_sample_profiles(sample_profile, thread_profiles[t]);
             }
 
             size_t kept_training = std::min(em_training_count.load(std::memory_order_relaxed), EM_MAX_SEQS);
             em_training_seqs.resize(kept_training);
 
-            dart::FrameSelector::finalize_sample_profile(sample_profile);
+            taph::FrameSelector::finalize_sample_profile(sample_profile);
 
             // =========================================================================
             // Pass 1.5: Compute d_metamatch for high-damage samples
@@ -381,7 +381,7 @@ int cmd_predict(int argc, char* argv[]) {
                             if (seq.length() >= 30) {
                                 float p_damaged = dart::FrameSelector::compute_per_read_damage_prior(seq, sample_profile);
                                 if (p_damaged > 0.01f) {
-                                    dart::FrameSelector::update_sample_profile_weighted(
+                                    taph::FrameSelector::update_sample_profile_weighted(
                                         thread_profiles2[tid], seq, p_damaged);
                                 }
                             }
@@ -390,9 +390,9 @@ int cmd_predict(int argc, char* argv[]) {
 
                     dart::SampleDamageProfile weighted_profile;
                     for (int t = 0; t < num_threads; ++t) {
-                        dart::FrameSelector::merge_sample_profiles(weighted_profile, thread_profiles2[t]);
+                        taph::FrameSelector::merge_sample_profiles(weighted_profile, thread_profiles2[t]);
                     }
-                    dart::FrameSelector::finalize_sample_profile(weighted_profile);
+                    taph::FrameSelector::finalize_sample_profile(weighted_profile);
 
                     // Update d_max_combined with d_metamatch for prediction
                     float d_metamatch = weighted_profile.d_max_combined;

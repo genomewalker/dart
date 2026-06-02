@@ -6,6 +6,7 @@
 #include <array>
 #include <cmath>
 #include <cctype>
+#include <taph/frame_selector_decl.hpp>
 #include <taph/sample_damage_profile.hpp>
 #include <taph/joint_damage_model.hpp>
 #include <taph/mixture_damage_model.hpp>

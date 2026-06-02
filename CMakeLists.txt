@@ -160,7 +160,6 @@ set(DART_CORE_SOURCES
     src/sequence_io.cpp
     src/codon_tables.cpp
     src/scoring.cpp
-    src/sample_profile.cpp
     src/damage_probability.cpp
     src/damage_scoring.cpp
     src/frame_selector.cpp
