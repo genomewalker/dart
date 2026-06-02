@@ -247,6 +247,16 @@ if(BUILD_TESTING)
     )
 
     add_executable(
+        dart-profile-regressions
+        tests/test_profile_regressions.cpp
+    )
+    add_test(
+        NAME profile_regressions
+        COMMAND dart-profile-regressions $<TARGET_FILE:dart>
+            ${CMAKE_SOURCE_DIR}/examples/tutorial/reads.fq.gz
+    )
+
+    add_executable(
         dart-formal-model-tests
         tests/test_formal_model.cpp
         ${DART_CORE_SOURCES}
