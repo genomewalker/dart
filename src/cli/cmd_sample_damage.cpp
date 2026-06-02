@@ -155,6 +155,7 @@ int cmd_profile(int argc, char* argv[]) {
     SampleDamageProfile profile;
     profile.forced_library_type = forced_library;
     size_t total_reads = 0;
+    taph::HexEndAsymmetry hex_asym{};
 
     try {
         SequenceReader reader(input_file);
@@ -205,6 +206,9 @@ int cmd_profile(int argc, char* argv[]) {
         stubs.flag_hex_artifact = !stubs.top_enriched.empty()
                                    && stubs.top_enriched[0].log2fc > 1.5f
                                    && !stubs.top_enriched[0].damage_consistent;
+        stubs.top_enriched_3prime = taph::compute_hex_enriched_3prime(profile);
+        hex_asym = taph::compute_hex_end_asymmetry(
+            profile, stubs.top_enriched, stubs.top_enriched_3prime);
 
         if (verbose) {
             auto pass1_end = std::chrono::steady_clock::now();
@@ -374,7 +378,23 @@ int cmd_profile(int argc, char* argv[]) {
     *out << "    \"ox_d_max\": " << std::fixed << std::setprecision(2) << (profile.ox_d_max * 100.0f) << ",\n";
     *out << "    \"ox_damage_detected\": " << boolstr(profile.ox_damage_detected) << ",\n";
     *out << "    \"depurination_detected\": " << boolstr(profile.depurination_detected) << ",\n";
-    *out << "    \"library_type\": \"" << profile.library_type_str() << "\"\n";
+    *out << "    \"library_type\": \"" << profile.library_type_str() << "\",\n";
+    *out << "    \"d5_profile_flat\": " << boolstr(profile.d5_profile_flat) << ",\n";
+    *out << "    \"d3_profile_flat\": " << boolstr(profile.d3_profile_flat) << ",\n";
+    *out << "    \"d5_blunting_suspected\": " << boolstr(profile.d5_blunting_suspected) << ",\n";
+    *out << std::fixed << std::setprecision(4);
+    *out << "    \"d5_max_rate_pos0_4\": " << profile.d5_max_rate_pos0_4 << ",\n";
+    *out << "    \"d3_max_rate_pos0_4\": " << profile.d3_max_rate_pos0_4 << ",\n";
+    // hex_end_asymmetry is unreliable when position-0 hexamers are corrupted by adapter ligation
+    if (!profile.position_0_artifact_5prime && !std::isnan(hex_asym.rc_excess_jsd)) {
+        *out << "    \"hex_end_asymmetry\": {\n";
+        *out << "      \"rc_excess_jsd\": " << hex_asym.rc_excess_jsd << ",\n";
+        *out << "      \"fwd_excess_jsd\": " << hex_asym.fwd_excess_jsd << ",\n";
+        *out << "      \"status\": \"" << hex_asym.status << "\"\n";
+        *out << "    }\n";
+    } else {
+        *out << "    \"hex_end_asymmetry\": null\n";
+    }
     *out << "  }\n";
     *out << "}\n";
 
@@ -396,6 +416,15 @@ int cmd_profile(int argc, char* argv[]) {
             std::cerr << "  Channel E: depurination detected (purine enrichment at 5' termini)\n";
         }
         std::cerr << "  Validated: " << (profile.damage_validated ? "yes" : "no") << "\n";
+        if (profile.d5_blunting_suspected) {
+            std::cerr << "  5' blunting suspected (flat 5', real 3' decay)\n";
+        } else if (profile.d5_profile_flat) {
+            std::cerr << "  5' profile flat (no detectable terminal signal)\n";
+        }
+        if (!std::isnan(hex_asym.rc_excess_jsd)) {
+            std::cerr << "  Hex end asymmetry: rc_jsd=" << std::fixed << std::setprecision(3)
+                      << hex_asym.rc_excess_jsd << " (" << hex_asym.status << ")\n";
+        }
         auto run_end = std::chrono::steady_clock::now();
         std::cerr << "  Runtime: " << dart::log_utils::format_elapsed(run_start, run_end) << "\n";
     }
