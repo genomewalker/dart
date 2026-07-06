@@ -12,6 +12,7 @@
 #include "dart/damage_index_reader.hpp"
 #include "dart/bayesian_damage_score.hpp"
 #include "dart/em_reassign.hpp"
+#include "dart/fast_tsv.hpp"
 #include "dart/theta_d_coordinator.hpp"
 #include "dart/coverage_em.hpp"
 #include "dart/columnar_index.hpp"
@@ -174,6 +175,8 @@ struct ProteinDamageSummary {
     float damage_fraction;
     float max_p_damage;         // Highest p_damage among terminal sites
     float p_damaged;            // Overall probability read is damaged
+    float prior_damaged = 0.5f; // Empirical prior P(read ancient) = EM pi; threaded so
+                                // recompute_summary_site_metrics reuses the same prior
     std::vector<DamageSite> sites;  // Cleared+shrunk in callback after aggregation
     // Channel D: Oxidative damage tracking (G→T at DNA level)
     // Gly→Cys (GGN→TGN) and Gly→Trp indicate G→T at codon position 1
@@ -230,12 +233,14 @@ struct ProteinAggInput {
     float posterior;      // Bayesian posterior (p_read + AA evidence); 0 if unavailable
     uint32_t gly_to_cys;  // Gly→Cys substitutions (oxidation signal)
     uint32_t gly_total;   // Total Gly positions in target (denominator)
+    bool em_ambiguous = false;  // EM confidence gate: exclude from damage/auth evidence
 };
 
 // Compact per-read assignment data sorted by ref_idx for streaming gene/protein output.
 // Replaces the gene_agg and protein_agg unordered_maps with a sort-then-stream pass.
 struct ReadRefEntry {
     uint32_t ref_idx;
+    uint32_t qstart_0;
     uint32_t tstart_0;
     float gamma;
     float fident;
@@ -245,10 +250,11 @@ struct ReadRefEntry {
     uint16_t tlen;
     uint8_t length_bin;
     bool has_damage_obs;
+    bool auth_keep;
     float posterior;
     uint8_t classification;  // dart::AncientClassification cast to uint8_t
     uint8_t pad[2];
-};  // 40 bytes
+};  // 44 bytes
 
 // Parse strand and frame from DART header suffix (e.g., readname_+_1 -> '+', 1)
 // Returns {strand, frame} where frame is 0, 1, or 2
@@ -297,7 +303,7 @@ static ProteinDamageSummary annotate_alignment(
     std::string_view qaln, std::string_view taln,
     size_t qstart, size_t tstart, size_t qlen,
     float evalue, float bits, float fident,
-    float d_max, float lambda)
+    float d_max, float lambda, float prior_ancient)
 {
     constexpr float Q_BASELINE = 0.005f;
     // Fix 1: AA_SCALE derived from codon usage analysis
@@ -440,7 +446,9 @@ static ProteinDamageSummary annotate_alignment(
     // that some interior damage still occurs.
     constexpr float SEQ_ERROR_RATE = 0.01f;        // P(damage-like mismatch | not damaged)
     constexpr float MIN_DAMAGE_RATE = 0.01f;       // Interior sites: LLR=0 (no evidence)
-    constexpr float PRIOR_DAMAGED = 0.5f;          // Prior P(read is damaged)
+    // Empirical prior from the Pass-1 EM ancient fraction (pi) instead of a fixed 0.5;
+    // a fixed 0.5 mis-scales p_damaged across libraries of different damage levels.
+    const float PRIOR_DAMAGED = std::clamp(prior_ancient, 0.02f, 0.98f);
 
     size_t ct = 0, ga = 0, hc = 0;
     float max_p_damage = 0.0f;
@@ -498,6 +506,7 @@ static ProteinDamageSummary annotate_alignment(
         : 0.0f;
     out.max_p_damage = max_p_damage;
     out.p_damaged = p_damaged;
+    out.prior_damaged = PRIOR_DAMAGED;
     out.sites = std::move(sites);
     out.aa_m_opportunities = aa_m_opportunities;
     out.aa_k_hits = aa_k_hits;
@@ -518,7 +527,7 @@ static void recompute_summary_site_metrics(ProteinDamageSummary& summary) {
     // Bayesian LLR parameters (must match compute_damage_summary)
     constexpr float SEQ_ERROR_RATE = 0.01f;
     constexpr float MIN_DAMAGE_RATE = 0.01f;       // Interior sites: LLR=0 (no evidence)
-    constexpr float PRIOR_DAMAGED = 0.5f;
+    const float PRIOR_DAMAGED = std::clamp(summary.prior_damaged, 0.02f, 0.98f);
 
     float llr_sum = 0.0f;
     summary.ct_sites = 0;
@@ -672,13 +681,65 @@ struct ProteinAggregate {
 
     // Mapping-pattern aggregates for spurious-hit filtering
     std::unordered_set<uint32_t> unique_starts;
+    std::unordered_set<uint64_t> unique_start_pairs;
     uint32_t min_start = UINT32_MAX;
     uint32_t max_start = 0;
+    std::vector<float> coverage; // Per-position coverage depth (gamma-weighted)
     double left_cov = 0.0;   // Alignment overlap in left terminal window
     double right_cov = 0.0;  // Alignment overlap in right terminal window
     double middle_cov = 0.0; // Alignment overlap in middle region
     double sum_aln_len = 0.0;
     double sum_aln_len_sq = 0.0;
+
+    void add_assignment(uint32_t qstart, uint32_t tstart, uint32_t aln_len_on_target,
+                        float gamma) {
+        ++n_reads;
+        n_reads_eff += gamma;
+
+        unique_starts.insert(tstart);
+        unique_start_pairs.insert((static_cast<uint64_t>(qstart) << 32) |
+                                  static_cast<uint64_t>(tstart));
+        if (tstart < min_start) min_start = tstart;
+        if (tstart > max_start) max_start = tstart;
+
+        if (tlen > 0 && coverage.empty()) {
+            coverage.assign(tlen, 0.0f);
+        }
+        if (!coverage.empty()) {
+            const size_t start = std::min(static_cast<size_t>(tstart), coverage.size());
+            const size_t end = std::min(start + static_cast<size_t>(aln_len_on_target),
+                                        coverage.size());
+            for (size_t p = start; p < end; ++p) {
+                coverage[p] += gamma;
+            }
+        }
+    }
+
+    float breadth() const {
+        if (coverage.empty()) return 0.0f;
+        uint32_t covered = 0;
+        for (float v : coverage) {
+            if (v > 0.0f) ++covered;
+        }
+        return static_cast<float>(covered) / static_cast<float>(coverage.size());
+    }
+
+    float depth_mean() const {
+        if (coverage.empty()) return 0.0f;
+        double total = 0.0;
+        for (float v : coverage) total += v;
+        return static_cast<float>(total / static_cast<double>(coverage.size()));
+    }
+
+    size_t n_distinct_starts() const {
+        return unique_start_pairs.size();
+    }
+
+    float start_dispersion() const {
+        if (n_reads == 0) return 0.0f;
+        return static_cast<float>(unique_start_pairs.size()) /
+               static_cast<float>(n_reads);
+    }
 
     float start_diversity() const {
         if (n_reads == 0 || tlen == 0) return 0.0f;
@@ -1222,6 +1283,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     float min_breadth = 0.10f;
     float min_depth = 0.5f;
     uint32_t min_reads = 3;
+    uint32_t min_distinct_starts = 2;
     float min_positional_score = 0.0f;
     float min_terminal_ratio = 0.0f;
     bool user_set_terminal_ratio = false;  // True when --min-terminal-ratio is explicitly provided
@@ -1235,6 +1297,15 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     double em_lambda_b = 3.0;
     double em_tol = 1e-4;
     double em_min_prob = 1e-6;       // absolute posterior threshold for keeping alignment
+    double em_min_margin = 0.5;      // auth evidence requires gamma_top1 - gamma_top2
+    double em_max_neff = 2.0;        // auth evidence requires exp(H(gamma)) <= cap
+
+    // Null/noise component (spurious short-peptide rejection). Off by default.
+    std::string em_null_model_file;  // load empirical decoy Gumbel (bin lo hi mu beta n)
+    double em_null_tau = 0.5;        // reject read when gamma_null > tau
+    double em_null_fdr = -1.0;       // target FDR knob (requires decoy pass; -1 = off)
+    std::string fit_null_from_file;  // decoy hits TSV to fit the null model from
+    std::string null_out_file;       // output sidecar for the fitted null model
 
     // Coverage-aware outer EM options
     bool use_coverage_em = false;
@@ -1326,6 +1397,20 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             em_tol = std::stod(argv[++i]);
         } else if (strcmp(argv[i], "--em-min-prob") == 0 && i + 1 < argc) {
             em_min_prob = std::stod(argv[++i]);
+        } else if (strcmp(argv[i], "--em-min-margin") == 0 && i + 1 < argc) {
+            em_min_margin = std::stod(argv[++i]);
+        } else if (strcmp(argv[i], "--em-max-neff") == 0 && i + 1 < argc) {
+            em_max_neff = std::stod(argv[++i]);
+        } else if (strcmp(argv[i], "--em-null-model") == 0 && i + 1 < argc) {
+            em_null_model_file = argv[++i];
+        } else if (strcmp(argv[i], "--em-null-tau") == 0 && i + 1 < argc) {
+            em_null_tau = std::stod(argv[++i]);
+        } else if (strcmp(argv[i], "--em-null-fdr") == 0 && i + 1 < argc) {
+            em_null_fdr = std::stod(argv[++i]);
+        } else if (strcmp(argv[i], "--fit-null-from") == 0 && i + 1 < argc) {
+            fit_null_from_file = argv[++i];
+        } else if (strcmp(argv[i], "--null-out") == 0 && i + 1 < argc) {
+            null_out_file = argv[++i];
         } else if (strcmp(argv[i], "--coverage-em") == 0) {
             use_coverage_em = true;
         } else if (strcmp(argv[i], "--no-coverage-em") == 0) {
@@ -1360,7 +1445,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--preset") == 0 && i + 1 < argc) {
             const char* preset = argv[++i];
             if (strcmp(preset, "loose") == 0) {
-                min_reads = 1; min_breadth = 0.0f; min_depth = 0.0f; min_damage_sites = 1;
+                min_reads = 1; min_breadth = 0.0f; min_depth = 0.0f;
+                min_distinct_starts = 0; min_damage_sites = 1;
             } else if (strcmp(preset, "strict") == 0) {
                 min_reads = 5; min_breadth = 0.20f; min_depth = 1.0f;
                 auto_calibrate_spurious = true; min_damage_sites = 5;
@@ -1381,6 +1467,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             min_depth = std::stof(argv[++i]);
         } else if (strcmp(argv[i], "--min-reads") == 0 && i + 1 < argc) {
             min_reads = static_cast<uint32_t>(std::stoul(argv[++i]));
+        } else if (strcmp(argv[i], "--min-distinct-starts") == 0 && i + 1 < argc) {
+            min_distinct_starts = static_cast<uint32_t>(std::stoul(argv[++i]));
         } else if (strcmp(argv[i], "--min-positional-score") == 0 && i + 1 < argc) {
             min_positional_score = std::stof(argv[++i]);
         } else if (strcmp(argv[i], "--min-terminal-ratio") == 0 && i + 1 < argc) {
@@ -1455,6 +1543,15 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cout << "  --em-lambda FLOAT Temperature parameter (default: 3.0)\n";
             std::cout << "  --em-tol FLOAT    Convergence tolerance (default: 1e-4)\n";
             std::cout << "  --em-min-prob FLOAT     Min EM posterior to keep (default: 1e-6)\n";
+            std::cout << "  --em-min-margin FLOAT   Min top1-top2 margin for damage/auth evidence (default: 0.5)\n";
+            std::cout << "  --em-max-neff FLOAT     Max effective refs/read for damage/auth evidence (default: 2.0)\n";
+            std::cout << "\nNull/noise component (spurious short-peptide rejection, opt-in):\n";
+            std::cout << "  --em-null-model FILE    Load empirical decoy Gumbel sidecar (bin lo hi mu beta n)\n";
+            std::cout << "                          Enables the null column; reads dominated by it are rejected\n";
+            std::cout << "  --em-null-tau FLOAT     Reject read when gamma_null > tau (default: 0.5)\n";
+            std::cout << "  --em-null-fdr FLOAT     Target FDR to solve tau (requires a decoy pass; default off)\n";
+            std::cout << "  --fit-null-from FILE    Fit the null from a 16-col decoy hits TSV, then exit\n";
+            std::cout << "  --null-out FILE         Output path for the fitted null sidecar (with --fit-null-from)\n";
             std::cout << "\nCoverage-aware EM (outer loop, opt-in):\n";
             std::cout << "  --coverage-em            Enable coverage-aware outer EM loop (default: off)\n";
             std::cout << "  --no-coverage-em         Explicitly disable coverage-aware outer EM (kept for scripts)\n";
@@ -1486,6 +1583,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cout << "  --min-positional-score FLOAT  Min read start diversity (default: 0)\n";
             std::cout << "                       Filters spurious matches where all reads hit same position\n";
             std::cout << "                       Score = sqrt(diversity * span), range 0-1\n";
+            std::cout << "  --min-distinct-starts INT  Min distinct query/target starts when n_reads>=3 (default: 2)\n";
             std::cout << "  --min-terminal-ratio FLOAT  Min terminal/middle coverage ratio (default: 0)\n";
             std::cout << "                       Filters matches with reads only in middle (spurious motif)\n";
             std::cout << "  --auto-calibrate-spurious   Auto-derive thresholds from data\n";
@@ -1506,6 +1604,59 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Fit-null mode: read a 16-col decoy hits TSV, fit the per-length-bin Gumbel
+    // to the per-query MAX (lambda_b * bit_score), write the sidecar, and exit.
+    // -----------------------------------------------------------------------
+    if (!fit_null_from_file.empty()) {
+        if (null_out_file.empty()) {
+            null_out_file = fit_null_from_file + ".null.tsv";
+        }
+        dart::MappedTSV tsv(fit_null_from_file.c_str());
+        if (!tsv.valid()) {
+            std::cerr << "Error: cannot open decoy hits TSV: " << fit_null_from_file << "\n";
+            return 1;
+        }
+        // Per query: track (max bit_score, aln_len at that max). Grouped by query id.
+        struct QMax { float bits; uint16_t aln_len; };
+        std::unordered_map<std::string, QMax> qmax;
+        std::mutex qmax_mutex;
+        dart::partitioned_parse_tsv(tsv, [&](const dart::TSVLine& line) {
+            if (line.n_fields < 12) return;
+            // Skip header rows (query...) defensively.
+            if (line.fields[0].size() >= 5 &&
+                std::strncmp(line.fields[0].data(), "query", 5) == 0) return;
+            const std::string q(line.fields[0]);
+            const uint32_t alnlen = dart::fast_stou(line.fields[3]);
+            const float bits = dart::fast_stof(line.fields[11]);
+            std::lock_guard<std::mutex> lk(qmax_mutex);
+            auto it = qmax.find(q);
+            if (it == qmax.end() || bits > it->second.bits) {
+                qmax[q] = {bits, static_cast<uint16_t>(std::min(alnlen, 65535u))};
+            }
+        }, /*skip_header=*/true, /*min_fields=*/12);
+
+        std::vector<std::vector<double>> per_bin(dart::kNumNullBins);
+        for (const auto& kv : qmax) {
+            const int b = dart::null_length_bin(kv.second.aln_len);
+            per_bin[b].push_back(static_cast<double>(em_lambda_b) *
+                                 static_cast<double>(kv.second.bits));
+        }
+        dart::NullModel model = dart::fit_null_model(per_bin, /*min_n=*/200);
+        if (!dart::write_null_model(null_out_file, model)) {
+            std::cerr << "Error: failed to write null model to " << null_out_file << "\n";
+            return 1;
+        }
+        std::cerr << "Fitted null model from " << qmax.size()
+                  << " decoy queries -> " << null_out_file << "\n";
+        for (int b = 0; b < dart::kNumNullBins; ++b) {
+            std::cerr << "  bin " << b << " [" << dart::kNullBinEdges[b] << ","
+                      << dart::kNullBinEdges[b + 1] << ") n=" << model.n[b]
+                      << " mu=" << model.mu[b] << " beta=" << model.beta[b] << "\n";
+        }
+        return 0;
+    }
+
     if (emi_file.empty()) {
         std::cerr << "Error: No EMI index specified (--emi).\n";
         std::cerr << "Run 'dart damage-annotate --help' for usage.\n";
@@ -1513,6 +1664,39 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
     if (em_min_prob < 0.0 || em_min_prob > 1.0) {
         std::cerr << "Error: --em-min-prob must be in [0,1]\n";
+        return 1;
+    }
+    if (em_min_margin < 0.0 || em_min_margin > 1.0) {
+        std::cerr << "Error: --em-min-margin must be in [0,1]\n";
+        return 1;
+    }
+    if (em_max_neff < 1.0) {
+        std::cerr << "Error: --em-max-neff must be >= 1\n";
+        return 1;
+    }
+    if (em_null_tau < 0.0 || em_null_tau > 1.0) {
+        std::cerr << "Error: --em-null-tau must be in [0,1]\n";
+        return 1;
+    }
+
+    // Load the empirical null model (Gumbel per length bin) if requested.
+    // use_em_null gates the whole null path; disabled → zero behavior change.
+    dart::NullModel em_null_model;
+    bool use_em_null = false;
+    if (!em_null_model_file.empty()) {
+        if (!dart::read_null_model(em_null_model_file, em_null_model)) {
+            std::cerr << "Error: cannot read --em-null-model " << em_null_model_file << "\n";
+            return 1;
+        }
+        use_em_null = em_null_model.valid();
+        if (use_em_null && verbose) {
+            std::cerr << "Loaded null model (" << em_null_model.mu.size()
+                      << " bins) from " << em_null_model_file
+                      << "; reject tau=" << em_null_tau << "\n";
+        }
+    }
+    if (em_null_fdr >= 0.0 && !use_em_null) {
+        std::cerr << "Error: --em-null-fdr requires --em-null-model (and a decoy pass to solve tau).\n";
         return 1;
     }
     if (coverage_em_bins < 1) {
@@ -2290,6 +2474,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         float em_threshold = 0.0f;      // Applied per-read keep threshold
         float em_margin = 0.0f;         // EM confidence margin: top1 - top2 responsibility
         float em_ref_neff = 1.0f;       // Effective number of references: 1 / sum_j gamma_j^2
+        float gamma_null = 0.0f;        // null-component responsibility (spurious-hit mass)
+        uint8_t em_reject_reason = 0;   // 0=keep, bit0=null_dominated, bit1=low_margin, bit2=high_neff
     };
     std::vector<EmReadResult> em_read_results(n_reads);
     // True when damage-aware EM was active and gamma_ancient was actually populated.
@@ -2586,9 +2772,23 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         em_params.tol = em_tol;
         em_params.use_squarem = true;
         em_params.normalize_by_length = true;
+        // Null/noise component: adds one mixture column scored by the decoy Gumbel.
+        // Absolute bit-score information is required, so per-query score normalization
+        // is forced off when the null is active (it would erase the null's signal).
+        if (use_em_null) {
+            em_params.use_null = true;
+            em_params.null_mu = em_null_model.mu;
+            em_params.null_beta = em_null_model.beta;
+            em_params.log_w_null = std::log(0.096);   // measured hit-FDR seed
+            em_params.alpha_null = 2.0;               // informative floor; can't collapse to 0
+            em_params.lambda_null = 1.0;
+            em_params.normalize_scores_per_query = false;
+        }
         if (verbose) {
             std::cerr << "  Min iters: " << em_params.min_iters << "\n";
             std::cerr << "  SQUAREM warmup iters: " << em_params.squarem_warmup_iters << "\n";
+            if (use_em_null)
+                std::cerr << "  Null component: on (w_null init=0.096, tau=" << em_null_tau << ")\n";
         }
         const double em_damage_mean =
             (em_damage_n > 0) ? (em_damage_sum / static_cast<double>(em_damage_n)) : 0.0;
@@ -2756,8 +2956,16 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             float top1 = 0.0f, top2 = 0.0f;
             double sum_sq = 0.0;
 
+            // Null responsibility for this read (0 when the null column is off).
+            const double gnull = (em_params.use_null && r < em_state.gamma_null.size())
+                ? em_state.gamma_null[r] : 0.0;
+            // Renormalize real responsibilities by 1/(1-gamma_null) so margin/neff are
+            // computed on the REAL simplex — avoids double-penalizing a read that already
+            // pays for its null mass. Guard the degenerate gamma_null ≈ 1 case.
+            const double real_norm = (gnull < 1.0 - 1e-9) ? (1.0 / (1.0 - gnull)) : 0.0;
+
             for (uint32_t j = start; j < end; ++j) {
-                const double g = em_state.gamma[j];
+                const double g = em_state.gamma[j] * real_norm;
                 sum_sq += g * g;
                 if (g > static_cast<double>(top1)) {
                     top2 = top1;
@@ -2789,14 +2997,23 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 em_keep = false;
             }
 
+            const float em_margin = std::max(0.0f, top1 - top2);
+            const float em_ref_neff = (sum_sq > 0.0) ? static_cast<float>(1.0 / sum_sq) : 0.0f;
+            uint8_t reason = 0;
+            if (em_params.use_null && gnull > em_null_tau) reason |= 0x1;  // null_dominated
+            if (em_margin < static_cast<float>(em_min_margin)) reason |= 0x2;  // low_margin
+            if (em_ref_neff > static_cast<float>(em_max_neff)) reason |= 0x4;  // high_neff
+
             em_read_results[r] = {
                 best_hit_gamma,
                 best_hit_gamma_ancient,
                 bitscore_best_matches_em,
                 em_keep,
                 keep_thr,
-                std::max(0.0f, top1 - top2),
-                (sum_sq > 0.0) ? static_cast<float>(1.0 / sum_sq) : 0.0f
+                em_margin,
+                em_ref_neff,
+                static_cast<float>(gnull),
+                reason
             };
         }
 
@@ -2957,7 +3174,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                         auto summary = annotate_alignment(
                             query_id, qaln_sv, taln_sv,
                             hit.qstart_0, hit.tstart_0, hit.qlen,
-                            hit.evalue, hit.bits, hit.fident, d_max, lambda);
+                            hit.evalue, hit.bits, hit.fident, d_max, lambda,
+                            em_state.pi);
 
                         per_read_aa_decay[ridx] = summary.aa_sum_exp_decay;
 
@@ -3411,7 +3629,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             "damage_informative\t"
             "ox_hits\tox_total\tox_fraction";
     if (use_em) {
-        *out << "\tgamma\tgamma_ancient\tbest_hit\tem_keep\tem_keep_threshold\tem_margin\tem_ref_neff";
+        *out << "\tgamma\tgamma_ancient\tbest_hit\tem_keep\tem_keep_threshold\tem_margin\tem_ref_neff\tem_ambiguous\tgamma_null\tem_reject_reason";
     }
     *out << "\n";
 
@@ -3503,9 +3721,14 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                      << "\t" << (em.em_keep ? 1 : 0)
                      << "\t" << std::fixed << std::setprecision(6) << em.em_threshold
                      << "\t" << std::fixed << std::setprecision(4) << em.em_margin
-                     << "\t" << std::fixed << std::setprecision(4) << em.em_ref_neff;
+                     << "\t" << std::fixed << std::setprecision(4) << em.em_ref_neff
+                     << "\t" << (((em.em_reject_reason != 0) ||
+                                  (em.em_margin < static_cast<float>(em_min_margin)) ||
+                                  (em.em_ref_neff > static_cast<float>(em_max_neff))) ? 1 : 0)
+                     << "\t" << std::scientific << std::setprecision(6) << em.gamma_null
+                     << "\t" << static_cast<int>(em.em_reject_reason);
             } else {
-                *out << "\t.\t.\t.\t.\t.\t.\t.";
+                *out << "\t.\t.\t.\t.\t.\t.\t.\t.\t.\t.";
             }
         }
         *out << "\n";
@@ -3532,6 +3755,18 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             c.posterior = s.posterior;
             c.gly_to_cys = s.gly_to_cys;
             c.gly_total = s.gly_total;
+            // EM confidence gate: a read is ambiguous when it is null-dominated
+            // (gamma_null > tau), has a weak top1-top2 margin, or too many effective
+            // references. Margin/neff are computed on real-only responsibilities (see
+            // em_read_results fill), so the null does not double-penalize. Ambiguous
+            // reads are excluded from the protein's damage/authentication evidence
+            // (below) but still contribute to abundance/coverage via read_ref_entries.
+            if (use_em && s.read_idx < em_read_results.size()) {
+                const auto& em = em_read_results[s.read_idx];
+                c.em_ambiguous = (em.em_reject_reason != 0) ||
+                                 (em.em_margin < static_cast<float>(em_min_margin)) ||
+                                 (em.em_ref_neff > static_cast<float>(em_max_neff));
+            }
             protein_agg_inputs.push_back(c);
         }
     }
@@ -3564,6 +3799,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 continue;
             ReadRefEntry e;
             e.ref_idx              = hit.ref_idx;
+            e.qstart_0             = static_cast<uint32_t>(hit.qstart_0);
             e.tstart_0             = static_cast<uint32_t>(hit.tstart_0);
             e.gamma                = use_em ? em_read_results[ridx].gamma : 1.0f;
             e.fident               = hit.fident;
@@ -3575,6 +3811,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             const int32_t si       = (ridx < summary_index_by_read.size())
                                      ? summary_index_by_read[ridx] : -1;
             e.has_damage_obs       = (si >= 0);
+            e.auth_keep            = true;
             if (si >= 0 && static_cast<size_t>(si) < summaries.size()) {
                 e.posterior        = summaries[static_cast<size_t>(si)].posterior;
                 e.classification   = summaries[static_cast<size_t>(si)].classification;
@@ -3846,8 +4083,18 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             pa.sum_bpa += it->gamma * bpa_v;
             pa.length_bin_counts[it->length_bin]++;
             pa.unique_starts.insert(it->tstart_0);
+            pa.unique_start_pairs.insert((static_cast<uint64_t>(it->qstart_0) << 32) |
+                                         static_cast<uint64_t>(it->tstart_0));
             if (it->tstart_0 < pa.min_start) pa.min_start = it->tstart_0;
             if (it->tstart_0 > pa.max_start) pa.max_start = it->tstart_0;
+            // Per-position gamma-weighted coverage (mirrors GeneSummaryAccumulator).
+            if (pa.tlen > 0 && pa.coverage.empty()) pa.coverage.assign(pa.tlen, 0.0f);
+            if (!pa.coverage.empty()) {
+                const size_t cs = std::min(static_cast<size_t>(it->tstart_0), pa.coverage.size());
+                const size_t ce = std::min(cs + static_cast<size_t>(it->aln_len_on_target),
+                                           pa.coverage.size());
+                for (size_t p = cs; p < ce; ++p) pa.coverage[p] += it->gamma;
+            }
             const size_t aln = it->aln_len_on_target;
             pa.sum_aln_len += it->gamma * static_cast<double>(aln);
             pa.sum_aln_len_sq += it->gamma * static_cast<double>(aln) * static_cast<double>(aln);
@@ -3876,6 +4123,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         uint32_t total_ox_total = 0;
         for (auto it = pi_cur; it != pi_end; ++it) {
             if (pa.tlen == 0 && it->tlen > 0) pa.tlen = it->tlen;
+            // EM-ambiguous reads are excluded from damage/authentication evidence.
+            if (it->em_ambiguous) continue;
             pa.n_damage_reads++;
             // Use posterior (p_read + AA evidence) when available; fall back to AA-only p_damaged
             const float p_eff = (it->posterior > 0.0f) ? it->posterior : it->p_damaged;
@@ -4037,7 +4286,14 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 if (!filter_fail_p.empty()) filter_fail_p.push_back(',');
                 filter_fail_p += t;
             };
+            const float prot_breadth = pa.breadth();
+            const float prot_depth   = (pa.tlen > 0) ? pa.depth_mean() : 0.0f;
             if (pa.n_reads < min_reads)          add_fp("min_reads");
+            if (prot_breadth < min_breadth)      add_fp("min_breadth");
+            if (prot_depth < min_depth)          add_fp("min_depth");
+            if (min_distinct_starts > 0 && pa.n_reads >= 3 &&
+                pa.unique_start_pairs.size() < min_distinct_starts)
+                add_fp("min_distinct_starts");
             if (pos_score < min_positional_score) add_fp("min_positional_score");
             if (term_ratio < min_terminal_ratio)  add_fp("min_terminal_ratio");
             protein_passes = filter_fail_p.empty();

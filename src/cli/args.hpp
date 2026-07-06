@@ -29,7 +29,7 @@ struct Options {
     std::string damage_index;        // Binary damage index (.agd) for post-mapping annotation
 
     // Taxonomic domain
-    std::string domain_name = "gtdb";  // Default to bacteria/archaea for ancient DNA
+    std::string domain_name = "meta";  // Default to mixed-community hexamer tables for ancient metagenomes
 
     // Basic options
     size_t min_length = 30;
