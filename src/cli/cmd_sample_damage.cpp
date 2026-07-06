@@ -374,9 +374,41 @@ int cmd_profile(int argc, char* argv[]) {
     *out << "    \"inverted_pattern_5prime\": " << boolstr(profile.inverted_pattern_5prime) << ",\n";
     *out << "    \"inverted_pattern_3prime\": " << boolstr(profile.inverted_pattern_3prime) << ",\n";
     *out << "    \"d_max_from_channel_b\": " << std::fixed << std::setprecision(2) << (profile.d_max_from_channel_b * 100.0f) << ",\n";
+    // Bulk length-stratified Briggs fit (libtaph, damage_estimation_finalize_preservation.cpp):
+    // read-weighted delta over identified length bins. Populated inside finalize_sample_profile(),
+    // which DART already calls -- unlike damaged_fraction_d5_fit, no extra wiring needed.
+    *out << "    \"bulk_attempted\": " << boolstr(profile.bulk_attempted) << ",\n";
+    *out << "    \"bulk_headline_delta\": " << std::fixed << std::setprecision(4) << profile.bulk_headline_delta << ",\n";
+    // Damaged-fraction IRLS estimator (libtaph): d_max fitted only from reads the
+    // per-read LLR scorer classifies as damaged, gated by the CT-vs-CA/CG specificity
+    // check (73d1bb7). Directly comparable to metaDMG's per-reference "damaged
+    // fraction" d_max, unlike d_max_combined which mixes damaged/non-damaged reads.
+    *out << "    \"damaged_fraction_valid\": " << boolstr(profile.damaged_fraction_valid) << ",\n";
+    *out << "    \"damaged_fraction_d5\": " << std::fixed << std::setprecision(2) << (profile.damaged_fraction_d5 * 100.0f) << ",\n";
+    *out << "    \"damaged_fraction_d5_fit\": " << std::fixed << std::setprecision(2) << (profile.damaged_fraction_d5_fit * 100.0f) << ",\n";
+    *out << "    \"damaged_fraction_pi\": " << std::fixed << std::setprecision(4) << profile.damaged_fraction_pi << ",\n";
+    *out << "    \"damaged_fraction_n\": " << profile.damaged_fraction_n << ",\n";
     *out << "    \"channel_c_valid\": " << boolstr(profile.channel_c_valid) << ",\n";
     *out << "    \"ox_d_max\": " << std::fixed << std::setprecision(2) << (profile.ox_d_max * 100.0f) << ",\n";
     *out << "    \"ox_damage_detected\": " << boolstr(profile.ox_damage_detected) << ",\n";
+    *out << "    \"ox_damage_detected_codon\": " << boolstr(profile.ox_damage_detected_codon) << ",\n";
+    *out << "    \"ox_damage_detected_model\": " << boolstr(profile.ox_damage_detected_model) << ",\n";
+    *out << "    \"oxidative_scission_delta_5prime\": " << std::fixed << std::setprecision(4) << profile.oxidative_scission_delta_5prime << ",\n";
+    {
+        // libtaph oxoG-16 context panel (s_oxog_16ctx), populated by finalize over
+        // contexts with >=500 covered events (cov = oxog16_t + oxog16_a_rc).
+        int n_cov = 0; float s_max = 0.0f; double s_sum = 0.0;
+        for (size_t i = 0; i < profile.s_oxog_16ctx.size(); ++i) {
+            if (profile.oxog16_t[i] + profile.oxog16_a_rc[i] >= 500) {
+                float v = profile.s_oxog_16ctx[i];
+                ++n_cov; s_sum += v; if (v > s_max) s_max = v;
+            }
+        }
+        *out << "    \"oxog16_n_covered\": " << n_cov << ",\n";
+        *out << "    \"oxog16_s_oxog_max\": " << std::fixed << std::setprecision(4) << s_max << ",\n";
+        *out << "    \"oxog16_s_oxog_mean\": " << std::fixed << std::setprecision(4)
+             << (n_cov ? s_sum / n_cov : 0.0) << ",\n";
+    }
     *out << "    \"depurination_detected\": " << boolstr(profile.depurination_detected) << ",\n";
     *out << "    \"library_type\": \"" << profile.library_type_str() << "\",\n";
     *out << "    \"d5_profile_flat\": " << boolstr(profile.d5_profile_flat) << ",\n";
@@ -410,7 +442,9 @@ int cmd_profile(int argc, char* argv[]) {
             std::cerr << "  Channel C: ox_d_max=" << std::fixed << std::setprecision(1)
                       << (profile.ox_d_max * 100.0f)
                       << "% uniformity=" << std::setprecision(2) << profile.ox_uniformity_ratio
-                      << (profile.ox_damage_detected ? " DETECTED" : "") << " (G→T oxidation)\n";
+                      << " [codon=" << (profile.ox_damage_detected_codon ? "Y" : "n")
+                      << " model=" << (profile.ox_damage_detected_model ? "Y" : "n") << "]"
+                      << (profile.ox_damage_detected_codon ? " DETECTED" : "") << " (G→T oxidation)\n";
         }
         if (profile.depurination_detected) {
             std::cerr << "  Channel E: depurination detected (purine enrichment at 5' termini)\n";

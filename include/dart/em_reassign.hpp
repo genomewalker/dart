@@ -18,6 +18,7 @@
 #include <functional>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace dart {
@@ -38,6 +39,8 @@ struct EMParams {
     double squarem_objfn_inc = 1.0;   // allowed objective decrease before fallback
     bool use_damage = true;      // incorporate damage evidence in responsibilities
     bool use_alignment_damage_likelihood = false;  // if true use ll_a/ll_m with per-read prior
+    double em_min_margin = 0.5;  // auth keep: require top1 - top2 responsibility >= this
+    double em_max_neff = 2.0;    // auth keep: require exp(entropy(gamma)) <= this
 
     // Dirichlet prior parameter (MAP): alpha=1 gives no prior effect.
     // alpha>1 shrinks toward uniform; alpha<1 promotes sparsity.
@@ -63,7 +66,60 @@ struct EMParams {
     // is penalized for patchy references, rather than only influencing the warm-start.
     // Empty (default) = disabled, no coverage penalty.
     std::vector<float> coverage_log_weights;
+
+    // ---------------------------------------------------------------------
+    // Null / noise component (spurious short-peptide rejection)
+    //
+    // Adds one extra "null" column to each read's E-step mixture. The null
+    // component scores a read by an empirical per-aligned-length-bin Gumbel
+    // fit from a reversed-sequence decoy search (NOT K-A / mmseqs E-values,
+    // which are invalid at 5-6 residues). Real-reference weights then sum to
+    // 1 - w_null, and a read dominated by the null is rejected downstream.
+    //
+    // All fields inert unless use_null == true → zero behavior change when off.
+    // null_mu / null_beta are indexed by null length bin (see kNullBinEdges).
+    // Missing/empty bins fall back to a pooled fit written by the fitter.
+    std::vector<float> null_mu;    // per-bin Gumbel location (on lambda_b*bit scale)
+    std::vector<float> null_beta;  // per-bin Gumbel scale
+    double log_w_null = std::log(0.096);  // log soft abundance weight of the null column
+    double alpha_null = 0.0;       // informative Dirichlet floor for the null coordinate (>1 = floor)
+    double lambda_null = 1.0;      // tempering on the null log-density
+    bool use_null = false;         // master switch; false → null column never added
 };
+
+// Aligned-length bins for the empirical null Gumbel. aln_len falls into bin b
+// when kNullBinEdges[b] <= aln_len < kNullBinEdges[b+1]; the final open bin
+// [25, inf) catches everything else. 6 bins → 7 edges (last = sentinel).
+inline constexpr int kNumNullBins = 6;
+inline constexpr uint16_t kNullBinEdges[kNumNullBins + 1] = {4, 7, 10, 13, 17, 25, 65535};
+
+// Map an alignment length to its null bin index [0, kNumNullBins). Lengths
+// below the first edge clamp to bin 0; lengths at/after the last edge → last bin.
+inline int null_length_bin(uint16_t aln_len) {
+    for (int b = kNumNullBins - 1; b >= 0; --b) {
+        if (aln_len >= kNullBinEdges[b]) return b;
+    }
+    return 0;
+}
+
+// log p_null(b | L) for a Gumbel(mu, beta): the density
+//   f(x) = (1/beta) exp(-(z + exp(-z))),  z = (x - mu)/beta
+// so log f = -z - exp(-z) - log(beta). Guarded against beta <= 0.
+inline double log_p_null_gumbel(double score, double mu, double beta) {
+    if (!(beta > 0.0)) return -std::numeric_limits<double>::infinity();
+    const double z = (score - mu) / beta;
+    const double ez = (z < 700.0) ? std::exp(-z) : std::numeric_limits<double>::infinity();
+    if (!std::isfinite(ez)) return -std::numeric_limits<double>::infinity();
+    return -z - ez - std::log(beta);
+}
+
+// Best null log-density over a read's alignments: max_j log p_null(b_j | L_j),
+// evaluated on the same tempered scale as the real scores (lambda_b * bit_score).
+// Returns -inf when the model is empty (caller should treat as null disabled).
+inline double read_null_log_density(
+    const EMParams& params,
+    const struct Alignment* alns,
+    uint32_t deg);
 
 // Per-alignment record: one read mapping to one reference
 struct Alignment {
@@ -127,11 +183,64 @@ inline double length_log_penalty(
     return 0.0;
 }
 
+// Best null log-density over a read's alignments (definition; declared above).
+// Uses lambda_b * bit_score as the score (same tempered scale as real hits) and
+// the per-bin Gumbel selected by null_length_bin(aln.aln_len). Falls back to the
+// last (pooled) bin when a bin has no fitted parameters.
+inline double read_null_log_density(
+    const EMParams& params,
+    const Alignment* alns,
+    uint32_t deg)
+{
+    if (params.null_mu.empty() || params.null_beta.empty()) {
+        return -std::numeric_limits<double>::infinity();
+    }
+    const int nbins = static_cast<int>(std::min(params.null_mu.size(), params.null_beta.size()));
+    double best = -std::numeric_limits<double>::infinity();
+    for (uint32_t j = 0; j < deg; ++j) {
+        const Alignment& a = alns[j];
+        int b = null_length_bin(a.aln_len);
+        if (b >= nbins) b = nbins - 1;
+        const double mu = static_cast<double>(params.null_mu[b]);
+        const double beta = static_cast<double>(params.null_beta[b]);
+        const double score = params.lambda_b * static_cast<double>(a.bit_score);
+        const double lp = log_p_null_gumbel(score, mu, beta);
+        if (lp > best) best = lp;
+    }
+    return best;
+}
+
+// -------------------------------------------------------------------------
+// Empirical null model I/O (decoy Gumbel per aligned-length bin)
+// -------------------------------------------------------------------------
+struct NullModel {
+    std::vector<float> mu;    // per-bin location (on lambda_b*bit scale)
+    std::vector<float> beta;  // per-bin scale
+    std::vector<uint32_t> n;  // per-bin decoy query count used for the fit
+    bool valid() const { return !mu.empty() && mu.size() == beta.size(); }
+};
+
+// Fit the empirical null from per-query MAX (lambda_b * bit_score) values,
+// grouped by aligned-length bin, via method-of-moments Gumbel:
+//   beta = sqrt(6)*sd/pi,  mu = mean - 0.5772*beta.
+// Inputs: per bin, a list of per-query max tempered scores. Bins with fewer
+// than min_n queries fall back to the pooled (all-query) fit.
+NullModel fit_null_model(
+    const std::vector<std::vector<double>>& per_bin_scores,
+    uint32_t min_n = 200);
+
+// Write/read the sidecar TSV: header + one row per bin
+//   bin lo hi mu beta n
+bool write_null_model(const std::string& path, const NullModel& m);
+bool read_null_model(const std::string& path, NullModel& m);
+
 // EM state vector
 struct EMState {
     std::vector<double> weights;           // w_t: reference abundance weights (sum = 1)
     std::vector<double> gamma;             // gamma_{rt}: P(ref_t | read_r), flat array [aln_idx]
     std::vector<double> gamma_ancient;     // P(ancient, ref_t | read_r) (damage extension)
+    std::vector<double> gamma_null;        // P(null | read_r), one per read (null extension)
+    double w_null = 0.0;                    // soft abundance weight of the null column
     double pi = 0.10;                      // global ancient fraction estimate
     double log_likelihood = -std::numeric_limits<double>::infinity();
     uint32_t iterations = 0;
@@ -254,7 +363,9 @@ inline double e_step(
             if (max_bs > 0.0f) score_scale = 1.0 / static_cast<double>(max_bs);
         }
 
-        log_scores.resize(deg);
+        // Optional null column appended after the deg real columns.
+        const bool null_on = params.use_null && !params.null_mu.empty();
+        log_scores.resize(null_on ? deg + 1 : deg);
 
         // Compute unnormalized log-responsibilities
         for (uint32_t j = 0; j < deg; ++j) {
@@ -264,9 +375,14 @@ inline double e_step(
                            + coverage_log_penalty(params, aln.ref_idx)
                            + params.lambda_b * static_cast<double>(aln.bit_score) * score_scale;
         }
+        if (null_on) {
+            const double lp = read_null_log_density(params, data.alignments.data() + start, deg);
+            log_scores[deg] = params.log_w_null + params.lambda_null * lp;
+        }
 
-        // Normalize via log-sum-exp
-        double lse = log_sum_exp(log_scores.data(), deg);
+        // Normalize via log-sum-exp (over real columns + optional null column)
+        const uint32_t n_cols = null_on ? deg + 1 : deg;
+        double lse = log_sum_exp(log_scores.data(), n_cols);
         ll += lse;
 
         for (uint32_t j = 0; j < deg; ++j) {

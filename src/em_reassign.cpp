@@ -15,7 +15,10 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -91,16 +94,110 @@ AlignmentData build_alignment_data(
 }
 
 // ---------------------------------------------------------------------------
+// Empirical null model: fit / write / read
+// ---------------------------------------------------------------------------
+
+// Method-of-moments Gumbel from a set of scores (needs n>=2 with sd>0).
+static bool fit_gumbel_mom(const std::vector<double>& xs, float& mu, float& beta) {
+    const size_t n = xs.size();
+    if (n < 2) return false;
+    double mean = 0.0;
+    for (double x : xs) mean += x;
+    mean /= static_cast<double>(n);
+    double var = 0.0;
+    for (double x : xs) { const double d = x - mean; var += d * d; }
+    var /= static_cast<double>(n - 1);  // sample variance
+    const double sd = std::sqrt(var);
+    if (!(sd > 0.0)) return false;
+    const double b = std::sqrt(6.0) * sd / M_PI;
+    beta = static_cast<float>(b);
+    mu = static_cast<float>(mean - 0.5772156649015329 * b);
+    return true;
+}
+
+NullModel fit_null_model(
+    const std::vector<std::vector<double>>& per_bin_scores,
+    uint32_t min_n)
+{
+    NullModel m;
+    const int nbins = static_cast<int>(per_bin_scores.size());
+    m.mu.assign(nbins, 0.0f);
+    m.beta.assign(nbins, 0.0f);
+    m.n.assign(nbins, 0u);
+
+    // Pooled fallback fit across every bin (used for sparse bins).
+    std::vector<double> pooled;
+    for (const auto& v : per_bin_scores) pooled.insert(pooled.end(), v.begin(), v.end());
+    float pooled_mu = 0.0f, pooled_beta = 0.0f;
+    const bool pooled_ok = fit_gumbel_mom(pooled, pooled_mu, pooled_beta);
+
+    for (int b = 0; b < nbins; ++b) {
+        m.n[b] = static_cast<uint32_t>(per_bin_scores[b].size());
+        float bmu = 0.0f, bbeta = 0.0f;
+        if (per_bin_scores[b].size() >= min_n && fit_gumbel_mom(per_bin_scores[b], bmu, bbeta)) {
+            m.mu[b] = bmu;
+            m.beta[b] = bbeta;
+        } else if (pooled_ok) {
+            m.mu[b] = pooled_mu;
+            m.beta[b] = pooled_beta;
+        }
+    }
+    return m;
+}
+
+bool write_null_model(const std::string& path, const NullModel& m) {
+    std::ofstream out(path);
+    if (!out) return false;
+    out << "bin\tlo\thi\tmu\tbeta\tn\n";
+    const int nbins = static_cast<int>(m.mu.size());
+    for (int b = 0; b < nbins && b < kNumNullBins; ++b) {
+        const uint16_t lo = kNullBinEdges[b];
+        const uint16_t hi = kNullBinEdges[b + 1];
+        out << b << '\t' << lo << '\t' << hi << '\t'
+            << m.mu[b] << '\t' << m.beta[b] << '\t'
+            << (b < static_cast<int>(m.n.size()) ? m.n[b] : 0u) << '\n';
+    }
+    return static_cast<bool>(out);
+}
+
+bool read_null_model(const std::string& path, NullModel& m) {
+    std::ifstream in(path);
+    if (!in) return false;
+    m.mu.clear(); m.beta.clear(); m.n.clear();
+    std::string line;
+    bool first = true;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        if (first) { first = false; if (line.rfind("bin", 0) == 0) continue; }
+        std::istringstream ss(line);
+        int bin; double lo, hi, mu, beta; long n = 0;
+        if (!(ss >> bin >> lo >> hi >> mu >> beta)) continue;
+        ss >> n;
+        m.mu.push_back(static_cast<float>(mu));
+        m.beta.push_back(static_cast<float>(beta));
+        m.n.push_back(static_cast<uint32_t>(std::max(0L, n)));
+    }
+    return m.valid();
+}
+
+// ---------------------------------------------------------------------------
 // Parallel E-step with OpenMP
 // ---------------------------------------------------------------------------
 
+// gamma_null (per-read, size num_reads) is optional. When non-null AND the null
+// model is active, each read's mixture gains one extra "null" column whose weight
+// is log_w_null_dyn (the current M-step estimate of log w_null). Real gammas are
+// renormalized over deg+1 columns; gamma_null[r] holds the null responsibility.
 static double e_step_parallel(
     const AlignmentData& data,
     const EMParams& params,
     const double* weights,
-    double* gamma)
+    double* gamma,
+    double* gamma_null = nullptr,
+    double log_w_null_dyn = 0.0)
 {
     double ll = 0.0;
+    const bool null_on = params.use_null && !params.null_mu.empty() && gamma_null != nullptr;
 #ifdef _OPENMP
     const int n_threads = std::max(1, omp_get_max_threads());
     std::vector<double> ll_partial(static_cast<size_t>(n_threads), 0.0);
@@ -117,8 +214,8 @@ static double e_step_parallel(
             const uint32_t deg = end - start;
             if (deg == 0) continue;
 
-            // Unique mappers: skip computation
-            if (deg == 1) {
+            // Unique mappers: skip computation (unless the null column competes).
+            if (deg == 1 && !null_on) {
                 gamma[start] = 1.0;
                 ll_local += std::log(std::max(weights[data.alignments[start].ref_idx], params.min_weight))
                             + length_log_penalty(data, params, data.alignments[start].ref_idx)
@@ -129,14 +226,15 @@ static double e_step_parallel(
 
             // Per-query score normalization: scale all bit scores by 1/max so scores ∈ [0,1].
             double score_scale = 1.0;
-            if (params.normalize_scores_per_query) {
+            if (params.normalize_scores_per_query && deg > 1) {
                 float max_bs = data.alignments[start].bit_score;
                 for (uint32_t j = 1; j < deg; ++j)
                     max_bs = std::max(max_bs, data.alignments[start + j].bit_score);
                 if (max_bs > 0.0f) score_scale = 1.0 / static_cast<double>(max_bs);
             }
 
-            log_scores.resize(deg);
+            const uint32_t n_cols = null_on ? deg + 1 : deg;
+            log_scores.resize(n_cols);
 
             for (uint32_t j = 0; j < deg; ++j) {
                 const auto& aln = data.alignments[start + j];
@@ -145,13 +243,21 @@ static double e_step_parallel(
                                + coverage_log_penalty(params, aln.ref_idx)
                                + params.lambda_b * static_cast<double>(aln.bit_score) * score_scale;
             }
+            if (null_on) {
+                const double lp = read_null_log_density(params, data.alignments.data() + start, deg);
+                log_scores[deg] = log_w_null_dyn + params.lambda_null * lp;
+            }
 
-            double lse = log_sum_exp(log_scores.data(), deg);
+            double lse = log_sum_exp(log_scores.data(), n_cols);
             ll_local += lse;
 
             for (uint32_t j = 0; j < deg; ++j) {
                 double diff = log_scores[j] - lse;
                 gamma[start + j] = (diff > -700.0) ? std::exp(diff) : 0.0;
+            }
+            if (null_on) {
+                double diff = log_scores[deg] - lse;
+                gamma_null[r] = (diff > -700.0) ? std::exp(diff) : 0.0;
             }
         }
 
@@ -166,7 +272,7 @@ static double e_step_parallel(
         const uint32_t deg = end - start;
         if (deg == 0) continue;
 
-        if (deg == 1) {
+        if (deg == 1 && !null_on) {
             gamma[start] = 1.0;
             ll += std::log(std::max(weights[data.alignments[start].ref_idx], params.min_weight))
                   + length_log_penalty(data, params, data.alignments[start].ref_idx)
@@ -176,14 +282,15 @@ static double e_step_parallel(
         }
 
         double score_scale = 1.0;
-        if (params.normalize_scores_per_query) {
+        if (params.normalize_scores_per_query && deg > 1) {
             float max_bs = data.alignments[start].bit_score;
             for (uint32_t j = 1; j < deg; ++j)
                 max_bs = std::max(max_bs, data.alignments[start + j].bit_score);
             if (max_bs > 0.0f) score_scale = 1.0 / static_cast<double>(max_bs);
         }
 
-        log_scores.resize(deg);
+        const uint32_t n_cols = null_on ? deg + 1 : deg;
+        log_scores.resize(n_cols);
         for (uint32_t j = 0; j < deg; ++j) {
             const auto& aln = data.alignments[start + j];
             log_scores[j] = std::log(std::max(weights[aln.ref_idx], params.min_weight))
@@ -191,11 +298,19 @@ static double e_step_parallel(
                            + coverage_log_penalty(params, aln.ref_idx)
                            + params.lambda_b * static_cast<double>(aln.bit_score) * score_scale;
         }
-        double lse = log_sum_exp(log_scores.data(), deg);
+        if (null_on) {
+            const double lp = read_null_log_density(params, data.alignments.data() + start, deg);
+            log_scores[deg] = log_w_null_dyn + params.lambda_null * lp;
+        }
+        double lse = log_sum_exp(log_scores.data(), n_cols);
         ll += lse;
         for (uint32_t j = 0; j < deg; ++j) {
             double diff = log_scores[j] - lse;
             gamma[start + j] = (diff > -700.0) ? std::exp(diff) : 0.0;
+        }
+        if (null_on) {
+            double diff = log_scores[deg] - lse;
+            gamma_null[r] = (diff > -700.0) ? std::exp(diff) : 0.0;
         }
     }
 #endif
@@ -207,19 +322,25 @@ static double e_step_parallel(
 // Parallel damage-aware E-step
 // ---------------------------------------------------------------------------
 
+// Damage-aware E-step. gamma_null (per-read, optional) adds one extra null column
+// at index 2*deg; when active it competes with the 2*deg ancient/modern columns
+// and gamma_null[r] receives the marginal null responsibility.
 static double e_step_damage_parallel(
     const AlignmentData& data,
     const EMParams& params,
     const double* weights,
     double pi_ancient,
     double* gamma,
-    double* gamma_ancient)
+    double* gamma_ancient,
+    double* gamma_null = nullptr,
+    double log_w_null_dyn = 0.0)
 {
     double ll = 0.0;
     const double eps = 1e-12;
     const double pi_a = std::clamp(pi_ancient, eps, 1.0 - eps);
     const double log_pi_a = std::log(pi_a);
     const double log_pi_m = std::log(1.0 - pi_a);
+    const bool null_on = params.use_null && !params.null_mu.empty() && gamma_null != nullptr;
 #ifdef _OPENMP
     const int n_threads = std::max(1, omp_get_max_threads());
     std::vector<double> ll_partial(static_cast<size_t>(n_threads), 0.0);
@@ -244,7 +365,8 @@ static double e_step_damage_parallel(
                 if (max_bs > 0.0f) score_scale = 1.0 / static_cast<double>(max_bs);
             }
 
-            log_scores.resize(2 * deg);
+            const uint32_t n_cols = null_on ? 2 * deg + 1 : 2 * deg;
+            log_scores.resize(n_cols);
 
             for (uint32_t j = 0; j < deg; ++j) {
                 const auto& aln = data.alignments[start + j];
@@ -263,8 +385,12 @@ static double e_step_damage_parallel(
                     log_scores[2 * j + 1] = log_w + score_contrib + log_pi_m + std::log(1.0 - ds);
                 }
             }
+            if (null_on) {
+                const double lp = read_null_log_density(params, data.alignments.data() + start, deg);
+                log_scores[2 * deg] = log_w_null_dyn + params.lambda_null * lp;
+            }
 
-            double lse = log_sum_exp(log_scores.data(), 2 * deg);
+            double lse = log_sum_exp(log_scores.data(), n_cols);
             ll_local += lse;
 
             for (uint32_t j = 0; j < deg; ++j) {
@@ -275,6 +401,10 @@ static double e_step_damage_parallel(
 
                 gamma[start + j] = g_a + g_m;
                 gamma_ancient[start + j] = g_a;
+            }
+            if (null_on) {
+                double diff = log_scores[2 * deg] - lse;
+                gamma_null[r] = (diff > -700.0) ? std::exp(diff) : 0.0;
             }
         }
 
@@ -297,7 +427,8 @@ static double e_step_damage_parallel(
             if (max_bs > 0.0f) score_scale = 1.0 / static_cast<double>(max_bs);
         }
 
-        log_scores.resize(2 * deg);
+        const uint32_t n_cols = null_on ? 2 * deg + 1 : 2 * deg;
+        log_scores.resize(n_cols);
         for (uint32_t j = 0; j < deg; ++j) {
             const auto& aln = data.alignments[start + j];
             double log_w = std::log(std::max(weights[aln.ref_idx], params.min_weight));
@@ -313,8 +444,12 @@ static double e_step_damage_parallel(
                 log_scores[2 * j + 1] = log_w + score_contrib + log_pi_m + std::log(1.0 - ds);
             }
         }
+        if (null_on) {
+            const double lp = read_null_log_density(params, data.alignments.data() + start, deg);
+            log_scores[2 * deg] = log_w_null_dyn + params.lambda_null * lp;
+        }
 
-        double lse = log_sum_exp(log_scores.data(), 2 * deg);
+        double lse = log_sum_exp(log_scores.data(), n_cols);
         ll += lse;
         for (uint32_t j = 0; j < deg; ++j) {
             double diff_a = log_scores[2 * j] - lse;
@@ -323,6 +458,10 @@ static double e_step_damage_parallel(
             double g_m = (diff_m > -700.0) ? std::exp(diff_m) : 0.0;
             gamma[start + j] = g_a + g_m;
             gamma_ancient[start + j] = g_a;
+        }
+        if (null_on) {
+            double diff = log_scores[2 * deg] - lse;
+            gamma_null[r] = (diff > -700.0) ? std::exp(diff) : 0.0;
         }
     }
 #endif
@@ -334,13 +473,19 @@ static double e_step_damage_parallel(
 // Parallel M-step with thread-local accumulators
 // ---------------------------------------------------------------------------
 
+// gamma_null (per-read, optional) contributes a null coordinate to the simplex:
+//   Σ_t w_t + w_null = 1,  w_null ∝ (alpha_null - 1) + Σ_r gamma_null_r.
+// When out_w_null is non-null it receives the normalized null weight.
 static void m_step_parallel(
     const AlignmentData& data,
     const EMParams& params,
     const double* gamma,
-    double* out_weights)
+    double* out_weights,
+    const double* gamma_null = nullptr,
+    double* out_w_null = nullptr)
 {
     const uint32_t T = data.num_refs;
+    const bool null_on = params.use_null && gamma_null != nullptr && out_w_null != nullptr;
 
 #ifdef _OPENMP
     const int n_threads = std::max(1, omp_get_max_threads());
@@ -377,11 +522,22 @@ static void m_step_parallel(
         sum += out_weights[t];
     }
 
+    // Null coordinate: informative Dirichlet floor (alpha_null) prevents the null
+    // from collapsing to 0 or absorbing all mass.
+    double w_null = 0.0;
+    if (null_on) {
+        double null_mass = params.alpha_null - 1.0;
+        for (uint32_t r = 0; r < data.num_reads; ++r) null_mass += gamma_null[r];
+        w_null = std::max(null_mass, params.min_weight);
+        sum += w_null;
+    }
+
     double inv_sum = 1.0 / sum;
 #pragma omp simd
     for (uint32_t t = 0; t < T; ++t) {
         out_weights[t] *= inv_sum;
     }
+    if (null_on) *out_w_null = w_null * inv_sum;
 }
 
 // ---------------------------------------------------------------------------
@@ -401,10 +557,20 @@ EMState squarem_em(
     const uint32_t T = data.num_refs;
     const size_t A = data.alignments.size();
 
+    // Null component: augment the weight simplex with one extra coordinate at
+    // index T holding w_null. All SQUAREM vector ops run over Tn = T+1 coords so
+    // the null participates in extrapolation and renormalization. When use_null is
+    // off, Tn == T and every code path is byte-identical to before.
+    const bool null_on = params.use_null && !params.null_mu.empty();
+    const uint32_t Tn = null_on ? T + 1 : T;
+
     EMState state;
     state.gamma.resize(A, 0.0);
     if (params.use_damage) {
         state.gamma_ancient.resize(A, 0.0);
+    }
+    if (null_on) {
+        state.gamma_null.assign(data.num_reads, 0.0);
     }
     if (T == 0) {
         state.log_likelihood = 0.0;
@@ -412,22 +578,49 @@ EMState squarem_em(
         return state;
     }
     if (!params.initial_weights.empty() && params.initial_weights.size() == T) {
-        state.weights = params.initial_weights;
+        state.weights.assign(Tn, 0.0);
         double sum = 0.0;
-        for (double w : state.weights) sum += w;
-        if (sum > 0.0) for (double& w : state.weights) w /= sum;
+        for (uint32_t t = 0; t < T; ++t) sum += params.initial_weights[t];
+        for (uint32_t t = 0; t < T; ++t)
+            state.weights[t] = (sum > 0.0) ? params.initial_weights[t] / sum : (1.0 / T);
     } else {
-        state.weights.assign(T, 1.0 / static_cast<double>(T));
+        state.weights.assign(Tn, 1.0 / static_cast<double>(T));
+    }
+    // Initialize w_null to the (renormalized) prior weight exp(log_w_null).
+    if (null_on) {
+        double w_null0 = std::clamp(std::exp(params.log_w_null), params.min_weight, 1.0 - 1e-6);
+        for (uint32_t t = 0; t < T; ++t) state.weights[t] *= (1.0 - w_null0);
+        state.weights[T] = w_null0;
     }
 
-    // SQUAREM scratch buffers
-    std::vector<double> w0(T), w1(T), w2(T), r_buf(T), v_buf(T);
-    std::vector<double> prev_weights(T);
+    // SQUAREM scratch buffers (sized Tn so the null coordinate is carried through)
+    std::vector<double> w0(Tn), w1(Tn), w2(Tn), r_buf(Tn), v_buf(Tn);
+    std::vector<double> prev_weights(Tn);
     std::vector<double> gamma_scratch(A);
     std::vector<double> gamma_ancient_scratch;
     if (params.use_damage) {
         gamma_ancient_scratch.resize(A, 0.0);
     }
+    // Per-read null responsibility scratch (only allocated when null is active).
+    std::vector<double> gamma_null_scratch;
+    if (null_on) gamma_null_scratch.assign(data.num_reads, 0.0);
+
+    // Convenience lambdas that dispatch E/M with the null coordinate wired in.
+    auto do_e_step = [&](const double* w, double* gamma, double* gamma_anc, double* gnull) {
+        const double log_w_null_dyn = null_on
+            ? std::log(std::max(w[T], params.min_weight)) : 0.0;
+        if (params.use_damage) {
+            return e_step_damage_parallel(data, params, w, state.pi, gamma, gamma_anc,
+                                          null_on ? gnull : nullptr, log_w_null_dyn);
+        }
+        return e_step_parallel(data, params, w, gamma,
+                               null_on ? gnull : nullptr, log_w_null_dyn);
+    };
+    auto do_m_step = [&](const double* gamma, double* out_w, const double* gnull) {
+        m_step_parallel(data, params, gamma, out_w,
+                        null_on ? gnull : nullptr,
+                        null_on ? out_w + T : nullptr);
+    };
 
     double prev_obj = -std::numeric_limits<double>::infinity();
     double step_min = params.squarem_step_min0;
@@ -450,52 +643,36 @@ EMState squarem_em(
             std::copy(state.weights.begin(), state.weights.end(), w0.begin());
 
             // First EM step: w0 -> w1
-            if (params.use_damage) {
-                e_step_damage_parallel(data, params, w0.data(), state.pi,
-                    gamma_scratch.data(), gamma_ancient_scratch.data());
-            } else {
-                e_step_parallel(data, params, w0.data(), gamma_scratch.data());
-            }
-            m_step_parallel(data, params, gamma_scratch.data(), w1.data());
+            do_e_step(w0.data(), gamma_scratch.data(), gamma_ancient_scratch.data(),
+                      gamma_null_scratch.data());
+            do_m_step(gamma_scratch.data(), w1.data(), gamma_null_scratch.data());
 
             // Second EM step: w1 -> w2
-            if (params.use_damage) {
-                e_step_damage_parallel(data, params, w1.data(), state.pi,
-                    gamma_scratch.data(), gamma_ancient_scratch.data());
-            } else {
-                e_step_parallel(data, params, w1.data(), gamma_scratch.data());
-            }
-            m_step_parallel(data, params, gamma_scratch.data(), w2.data());
+            do_e_step(w1.data(), gamma_scratch.data(), gamma_ancient_scratch.data(),
+                      gamma_null_scratch.data());
+            do_m_step(gamma_scratch.data(), w2.data(), gamma_null_scratch.data());
 
             // SQUAREM extrapolation with textbook step rules.
             double sr2 = 0.0, sv2 = 0.0, srv = 0.0;
             squarem_build_directions(
-                w0.data(), w1.data(), w2.data(), r_buf.data(), v_buf.data(), T, sr2, sv2, srv);
+                w0.data(), w1.data(), w2.data(), r_buf.data(), v_buf.data(), Tn, sr2, sv2, srv);
             double alpha = squarem_step_length(params.squarem_method, sr2, sv2, srv);
             alpha = std::clamp(alpha, step_min, step_max);
             alpha_used = alpha;
-            squarem_extrapolate(w0.data(), r_buf.data(), v_buf.data(), T, alpha, params.min_weight);
+            squarem_extrapolate(w0.data(), r_buf.data(), v_buf.data(), Tn, alpha, params.min_weight);
 
             // Stabilization step from canonical SQUAREM (Varadhan & Roland 2008).
             // Always applied after extrapolation to maintain monotonicity guarantee.
             {
-                if (params.use_damage) {
-                    e_step_damage_parallel(data, params, w0.data(), state.pi,
-                        gamma_scratch.data(), gamma_ancient_scratch.data());
-                } else {
-                    e_step_parallel(data, params, w0.data(), gamma_scratch.data());
-                }
-                m_step_parallel(data, params, gamma_scratch.data(), w1.data());
+                do_e_step(w0.data(), gamma_scratch.data(), gamma_ancient_scratch.data(),
+                          gamma_null_scratch.data());
+                do_m_step(gamma_scratch.data(), w1.data(), gamma_null_scratch.data());
                 std::copy(w1.begin(), w1.end(), w0.begin());
             }
 
             // Evaluate at accelerated point
-            if (params.use_damage) {
-                ll = e_step_damage_parallel(data, params, w0.data(), state.pi,
-                    state.gamma.data(), state.gamma_ancient.data());
-            } else {
-                ll = e_step_parallel(data, params, w0.data(), state.gamma.data());
-            }
+            ll = do_e_step(w0.data(), state.gamma.data(), state.gamma_ancient.data(),
+                           state.gamma_null.data());
             objective = em_objective_from_ll(params, w0.data(), T, ll);
 
             // Objective safeguard: revert to EM two-step point when acceleration is non-monotone.
@@ -506,12 +683,8 @@ EMState squarem_em(
             if (non_monotone) {
                 fallback_to_em = true;
                 std::copy(w2.begin(), w2.end(), state.weights.begin());
-                if (params.use_damage) {
-                    ll = e_step_damage_parallel(data, params, state.weights.data(), state.pi,
-                        state.gamma.data(), state.gamma_ancient.data());
-                } else {
-                    ll = e_step_parallel(data, params, state.weights.data(), state.gamma.data());
-                }
+                ll = do_e_step(state.weights.data(), state.gamma.data(),
+                               state.gamma_ancient.data(), state.gamma_null.data());
                 objective = em_objective_from_ll(params, state.weights.data(), T, ll);
 
                 const bool at_upper =
@@ -535,14 +708,10 @@ EMState squarem_em(
             }
         } else {
             // Plain EM
-            if (params.use_damage) {
-                ll = e_step_damage_parallel(data, params, state.weights.data(), state.pi,
-                    state.gamma.data(), state.gamma_ancient.data());
-            } else {
-                ll = e_step_parallel(data, params, state.weights.data(), state.gamma.data());
-            }
+            ll = do_e_step(state.weights.data(), state.gamma.data(),
+                           state.gamma_ancient.data(), state.gamma_null.data());
             objective = em_objective_from_ll(params, state.weights.data(), T, ll);
-            m_step_parallel(data, params, state.gamma.data(), state.weights.data());
+            do_m_step(state.gamma.data(), state.weights.data(), state.gamma_null.data());
         }
 
         // Update global ancient fraction from damage responsibilities
@@ -597,6 +766,13 @@ EMState squarem_em(
             break;
         }
         prev_obj = objective;
+    }
+
+    // Detach the null coordinate: expose it as state.w_null and shrink weights
+    // back to T so all downstream ref-indexed consumers see only real references.
+    if (null_on) {
+        state.w_null = state.weights[T];
+        state.weights.resize(T);
     }
 
     // Populate reference stats from final responsibilities

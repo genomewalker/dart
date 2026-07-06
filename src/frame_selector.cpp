@@ -59,8 +59,12 @@ static codon::DamageParams make_codon_damage_params(const SampleDamageProfile* s
         dmg.d_max_3p = sample->d_max_3prime;
         dmg.lambda_5p = sample->lambda_5prime;
         dmg.lambda_3p = sample->lambda_3prime;
-        // Channel C: oxidative G→T (GAA→TAA, GAG→TAG, GGA→TGA), uniform rate
-        if (sample->ox_damage_detected) {
+        // Channel C: oxidative G→T (GAA→TAA, GAG→TAG, GGA→TGA), uniform rate.
+        // ox_d_max is written by libtaph's codon-stop path (finalize_oxidation),
+        // which also sets ox_damage_detected_codon. The scalar ox_damage_detected
+        // now holds the independent GT model-fit verdict and can disagree, so gate
+        // the magnitude on the codon verdict that produced it to keep them coherent.
+        if (sample->ox_damage_detected_codon) {
             dmg.d_max_gt = sample->ox_d_max;
         }
     }

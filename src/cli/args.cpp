@@ -28,8 +28,9 @@ void print_usage(const char* program_name) {
     std::cout << "  --no-damage              Disable damage detection\n";
     std::cout << "  --no-aggregate           Disable two-pass damage aggregation\n";
     std::cout << "  --damage-only            Run damage detection only, skip gene prediction\n";
-    std::cout << "  --domain <name>          Taxonomic domain (default: gtdb)\n";
-    std::cout << "                           Options: gtdb, fungi, plant, protozoa, invertebrate, viral\n";
+    std::cout << "  --domain <name>          Taxonomic domain (default: meta)\n";
+    std::cout << "                           Options: meta, gtdb, fungi, plant, protozoa,\n";
+    std::cout << "                           invertebrate, mammal, vertebrate, viral\n";
     std::cout << "  --library-type <type>    Force library type: ds, ss, or auto (default)\n";
     std::cout << "\nORF Parameters:\n";
     std::cout << "  --orf-min-aa <int>       Minimum ORF length in amino acids (default: 10)\n";
