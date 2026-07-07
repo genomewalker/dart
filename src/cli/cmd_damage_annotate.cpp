@@ -3578,6 +3578,20 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     constexpr float PI0_FIXED = 0.10f;
     const float empirical_pi0 = PI0_FIXED;
 
+    // Self-calibrating protein-level NULL floor (π₀) for the Beta-Binomial damage
+    // test (fit_protein_damage): the mean per-read p_damaged in the sample's LOW tail
+    // -- the library's own non-ancient / technical baseline. This replaces the old
+    // θ≈0 null that pinned p_protein_damaged at 1.0. Clamped to a technical floor
+    // (~pi0_technical_floor.tsv) so a clean modern library still has a positive null,
+    // capped at 0.5; falls back to the floor when the low tail is empty.
+    constexpr float PI0_PROT_FLOOR = 0.02f;
+    float sample_pi0_null = (p_read_n_low > 0)
+        ? static_cast<float>(p_read_sum_low / static_cast<double>(p_read_n_low))
+        : PI0_PROT_FLOOR;
+    sample_pi0_null = std::clamp(sample_pi0_null, PI0_PROT_FLOOR, 0.5f);
+    if (verbose) std::cerr << "  Protein-null pi0 (self-calibrated): " << std::fixed
+                           << std::setprecision(4) << sample_pi0_null << "\n";
+
     // Auto-calibrate prior_ancient from mean p_read if requested
     // E[p_read] = weighted average of P(damaged|read) ≈ fraction of ancient reads in the sample.
     // Requires AGD index (has_p_read); falls back to default if insufficient data.
@@ -4500,7 +4514,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             const float frac_all= pa.n_reads > 0
                 ? static_cast<float>(pa.n_damaged) / static_cast<float>(pa.n_reads) : 0.0f;
 
-            ProteinDamageResult result = fit_protein_damage(pa.read_obs);
+            ProteinDamageResult result = fit_protein_damage(pa.read_obs, 0.5, 2.0, sample_pi0_null);
             const float p_prot  = static_cast<float>(result.p_damaged);
             const float d_mle   = static_cast<float>(result.delta_max);
             const float ci_lo2  = static_cast<float>(result.ci_lower);
@@ -4665,7 +4679,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             const float protein_mean_p  = pa.n_damage_reads > 0
                 ? (pa.sum_p_damaged / static_cast<float>(pa.n_damage_reads)) : 0.0f;
             ProteinDamageResult comb_result = protein_present
-                ? fit_protein_damage(pa.read_obs)
+                ? fit_protein_damage(pa.read_obs, 0.5, 2.0, sample_pi0_null)
                 : ProteinDamageResult{};
             const float protein_d_aa_c = protein_present ? [&]() {
                 const float obs = use_both_ends

@@ -401,13 +401,16 @@ inline double log_beta_binomial(double k, double n, double theta, double phi) {
 inline ProteinDamageResult fit_protein_damage(
     const std::vector<ReadDamageObs>& obs,
     double prior_theta = 0.5,
-    double prior_strength = 2.0)
+    double prior_strength = 2.0,
+    double null_theta = 0.05)
 {
     ProteinDamageResult result;
     result.n_reads = obs.size();
 
     if (obs.empty()) {
-        result.p_damaged = prior_theta;
+        // No reads carry damage evidence -> not a damage call (no data). Returning a
+        // 0.5 "prior" here produced a spurious spike at p_protein_damaged==0.5.
+        result.p_damaged = 0.0;
         return result;
     }
 
@@ -455,9 +458,16 @@ inline ProteinDamageResult fit_protein_damage(
     phi_init = std::clamp(phi_init, 2.0, 1000.0);  // Reasonable range
 
     // =========================================================================
-    // Null model: θ = 0 (no damage)
+    // Null model: θ = π₀, the per-sample TECHNICAL FLOOR (library's own non-damage
+    // substitution / p_damaged baseline), NOT θ = 0. Testing against θ≈0 made ANY
+    // nonzero soft count k_eff astronomically unlikely under H0 -> log BF saturated
+    // -> p_damaged pinned at 1.0 (the bimodal {0.5,1.0} spike). Against θ=π₀ the LRT
+    // asks "is this protein's damage rate ABOVE the sample floor" -> graded posterior.
+    // The test is one-sided: proteins whose MLE rate sits at/below the floor are
+    // forced to p_damaged=0 by the directional guard after the BF (see below).
     // =========================================================================
-    result.log_lik_m0 = log_beta_binomial(k_eff, n_eff, 1e-6, phi_init);
+    const double null_theta_eff = std::clamp(null_theta, 1e-4, 0.5);
+    result.log_lik_m0 = log_beta_binomial(k_eff, n_eff, null_theta_eff, phi_init);
 
     // =========================================================================
     // Damage model: θ > 0 with Newton-Raphson MLE
@@ -529,6 +539,15 @@ inline ProteinDamageResult fit_protein_damage(
     // P(H1|data) = BF10 / (1 + BF10)
     double bf = std::exp(std::clamp(log_bf, -100.0, 100.0));
     result.p_damaged = bf / (1.0 + bf);
+
+    // Directional: the damage test is one-sided (H1: θ > π₀). If the MLE damage rate
+    // sits at or below the sample floor there is no evidence for damage ABOVE the
+    // floor, whatever the Laplace/BF arithmetic says -> not a damage call.
+    if (result.delta_max <= null_theta_eff) {
+        result.p_damaged = 0.0;
+        result.likelihood_ratio = 0.0;
+        result.p_value = 1.0;
+    }
 
     // =========================================================================
     // Profile Likelihood Confidence Interval
