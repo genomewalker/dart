@@ -172,6 +172,7 @@ set(DART_CORE_SOURCES
     src/columnar_index.cpp
     src/coverage_em.cpp
     src/sequence_io_backend.cpp
+    src/dart_columnar.cpp              # .dcx columnar interchange writer (zstd only)
 )
 
 # Subcommand sources
@@ -267,6 +268,21 @@ if(BUILD_TESTING)
     add_test(
         NAME formal_model
         COMMAND dart-formal-model-tests
+    )
+
+    # .dcx writer round-trip (offset math, footer adler32, calib section, obs grain)
+    add_executable(
+        dart-dcx-roundtrip
+        tests/test_dcx_roundtrip.cpp
+        src/dart_columnar.cpp
+    )
+    target_link_libraries(dart-dcx-roundtrip PkgConfig::ZSTD)
+    # The round-trip checks (incl. the write_dcx call itself) live inside assert(),
+    # so keep asserts active even in Release (-DNDEBUG would strip the write).
+    target_compile_options(dart-dcx-roundtrip PRIVATE -UNDEBUG)
+    add_test(
+        NAME dcx_roundtrip
+        COMMAND dart-dcx-roundtrip
     )
 endif()
 
