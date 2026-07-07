@@ -161,8 +161,10 @@ struct DamageSite {
     float p_damage;        // positional damage probability
 };
 
-// One accepted (em_keep=1) read x target alignment staged for the .dcx --dcx
-// emit. Grain A scalars + the concatenated per-covered-position Grain B columns,
+// One best-hit read x target alignment staged for the .dcx --dcx emit (one row
+// per read = its argmax target; em_keep carried as a SOFT weight, not a filter,
+// so em_keep=0 rows are emitted too — the consumer weights, never WHEREs).
+// Grain A scalars + the concatenated per-covered-position Grain B columns,
 // built by walking qaln/taln inside the annotate scan (the only place the aln
 // strings are live). posterior is patched in after the Bayesian output loop
 // computes it; the record is then sorted by (target_ord, tstart) and appended
@@ -178,6 +180,7 @@ struct DcxReadRec {
     float gamma = 0, gamma_ancient = 0, em_margin = 0, em_ref_neff = 0;
     float posterior = 0;                 // filled post-scoring
     uint8_t strand = 0;
+    uint8_t em_keep = 0;                  // real EM keep bit (SOFT weight, not a filter)
     std::vector<uint8_t> presence;       // ceil(span/8), bit k => covered
     std::vector<uint8_t> ref_aa, obs_aa, dcls;   // Grain B, covered positions
     std::vector<float>   p_damage;
@@ -3285,72 +3288,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                                 }
                             }
 
-                            // Stage the .dcx grain-A/B record for accepted (em_keep=1)
-                            // alignments. Walk qaln/taln here — the only place they are
-                            // live — emitting every covered target position; p_damage /
-                            // dist / damage_class come from summary.sites (already
-                            // distance-filtered, so they match the --sites TSV) at
-                            // mismatch positions, 0/None elsewhere. posterior is patched
-                            // in after the scoring loop below computes it.
-                            if (emit_dcx && ridx < em_read_results.size() &&
-                                em_read_results[ridx].em_keep) {
-                                std::unordered_map<size_t, const DamageSite*> site_by_pos;
-                                site_by_pos.reserve(summary.sites.size() * 2);
-                                for (const auto& site : summary.sites)
-                                    site_by_pos.emplace(site.target_pos, &site);
-
-                                DcxReadRec rec;
-                                rec.read_idx = ridx;
-                                rec.query_id = query_id;
-                                rec.target_id = target_id;
-                                rec.tstart = hit.tstart_0;
-                                rec.strand = (query_id.find("_-_") != std::string::npos) ? 1 : 0;
-                                const auto& em = em_read_results[ridx];
-                                rec.gamma = em.gamma;
-                                rec.gamma_ancient = em.gamma_ancient;
-                                rec.em_margin = em.em_margin;
-                                rec.em_ref_neff = em.em_ref_neff;
-
-                                std::vector<uint8_t> cover;
-                                uint32_t tpos = hit.tstart_0;
-                                const size_t naln = std::min(qaln_sv.size(), taln_sv.size());
-                                for (size_t k = 0; k < naln; ++k) {
-                                    const char tc = taln_sv[k], qc = qaln_sv[k];
-                                    if (tc == '-') continue;   // query insertion: no target pos
-                                    const bool covered = (qc != '-');
-                                    cover.push_back(covered ? 1 : 0);
-                                    if (covered) {
-                                        rec.ref_aa.push_back(uint8_t(tc));
-                                        rec.obs_aa.push_back(uint8_t(qc));
-                                        float pd = 0.0f; uint16_t d5 = 0, d3 = 0;
-                                        uint8_t dc = uint8_t(dcx::DamageClass::None);
-                                        auto sit = site_by_pos.find(tpos);
-                                        if (sit != site_by_pos.end()) {
-                                            const DamageSite* s = sit->second;
-                                            pd = s->p_damage;
-                                            d5 = uint16_t(std::min<size_t>(s->dist_5prime, 65535));
-                                            d3 = uint16_t(std::min<size_t>(s->dist_3prime, 65535));
-                                            dc = (s->damage_class == 'C')
-                                                ? uint8_t(dcx::DamageClass::CT)
-                                                : uint8_t(dcx::DamageClass::GA);
-                                        }
-                                        rec.p_damage.push_back(pd);
-                                        rec.dist5.push_back(d5);
-                                        rec.dist3.push_back(d3);
-                                        rec.dcls.push_back(dc);
-                                    }
-                                    ++tpos;
-                                }
-                                rec.span = uint32_t(cover.size());
-                                if (rec.span > 0) {
-                                    rec.presence.assign((rec.span + 7) / 8, 0);
-                                    for (uint32_t k = 0; k < rec.span; ++k)
-                                        if (cover[k])
-                                            rec.presence[k >> 3] |= uint8_t(1u << (k & 7));  // LSB-first
-                                    local_dcx.push_back(std::move(rec));
-                                }
-                            }
-
                             // Aggregate sites into compact scalars (replaces sites loop in
                             // ProteinAggInput and protein aggregate building).
                             constexpr size_t TERM_COD = 3;  // codons from terminus
@@ -3361,7 +3298,82 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                                 else if (site.damage_class == 'G' && site.dist_3prime / 3 < TERM_COD)
                                     ++summary.terminal_3;
                             }
+                        }
 
+                        // Stage the .dcx grain-A/B record for EVERY best-hit alignment —
+                        // INCLUDING zero-substitution (clean) reads AND em_keep=0 reads.
+                        // em_keep is a SOFT weight (fusion decision D / M5), not a filter:
+                        // the emit must not hard-gate on it or the producer contradicts the
+                        // consumer (saav_observation carries em_keep as a no-WHERE column).
+                        // Two bugs were fixed here: (1) this block was nested inside the
+                        // total_mismatches>0 guard, dropping every clean read; (2) it was
+                        // gated on em_keep, dropping every em_keep=0 read (99.8% of best
+                        // hits) and starving the per-opportunity denominator. The real
+                        // em_keep bit is carried in rec.em_keep. Walk qaln/taln here — the
+                        // only place they are live — emitting every covered target position;
+                        // p_damage / dist / damage_class come from summary.sites (distance-
+                        // filtered for mismatched reads, empty for clean) so grain-B matches
+                        // the --sites TSV. posterior is patched in after scoring below.
+                        if (emit_dcx && ridx < em_read_results.size()) {
+                            std::unordered_map<size_t, const DamageSite*> site_by_pos;
+                            site_by_pos.reserve(summary.sites.size() * 2);
+                            for (const auto& site : summary.sites)
+                                site_by_pos.emplace(site.target_pos, &site);
+
+                            DcxReadRec rec;
+                            rec.read_idx = ridx;
+                            rec.query_id = query_id;
+                            rec.target_id = target_id;
+                            rec.tstart = hit.tstart_0;
+                            rec.strand = (query_id.find("_-_") != std::string::npos) ? 1 : 0;
+                            const auto& em = em_read_results[ridx];
+                            rec.gamma = em.gamma;
+                            rec.gamma_ancient = em.gamma_ancient;
+                            rec.em_margin = em.em_margin;
+                            rec.em_ref_neff = em.em_ref_neff;
+                            rec.em_keep = em.em_keep ? 1 : 0;
+
+                            std::vector<uint8_t> cover;
+                            uint32_t tpos = hit.tstart_0;
+                            const size_t naln = std::min(qaln_sv.size(), taln_sv.size());
+                            for (size_t k = 0; k < naln; ++k) {
+                                const char tc = taln_sv[k], qc = qaln_sv[k];
+                                if (tc == '-') continue;   // query insertion: no target pos
+                                const bool covered = (qc != '-');
+                                cover.push_back(covered ? 1 : 0);
+                                if (covered) {
+                                    rec.ref_aa.push_back(uint8_t(tc));
+                                    rec.obs_aa.push_back(uint8_t(qc));
+                                    float pd = 0.0f; uint16_t d5 = 0, d3 = 0;
+                                    uint8_t dc = uint8_t(dcx::DamageClass::None);
+                                    auto sit = site_by_pos.find(tpos);
+                                    if (sit != site_by_pos.end()) {
+                                        const DamageSite* s = sit->second;
+                                        pd = s->p_damage;
+                                        d5 = uint16_t(std::min<size_t>(s->dist_5prime, 65535));
+                                        d3 = uint16_t(std::min<size_t>(s->dist_3prime, 65535));
+                                        dc = (s->damage_class == 'C')
+                                            ? uint8_t(dcx::DamageClass::CT)
+                                            : uint8_t(dcx::DamageClass::GA);
+                                    }
+                                    rec.p_damage.push_back(pd);
+                                    rec.dist5.push_back(d5);
+                                    rec.dist3.push_back(d3);
+                                    rec.dcls.push_back(dc);
+                                }
+                                ++tpos;
+                            }
+                            rec.span = uint32_t(cover.size());
+                            if (rec.span > 0) {
+                                rec.presence.assign((rec.span + 7) / 8, 0);
+                                for (uint32_t k = 0; k < rec.span; ++k)
+                                    if (cover[k])
+                                        rec.presence[k >> 3] |= uint8_t(1u << (k & 7));  // LSB-first
+                                local_dcx.push_back(std::move(rec));
+                            }
+                        }
+
+                        if (summary.total_mismatches > 0) {
                             // Return sites heap to allocator immediately (~10 GB for 40M reads).
                             summary.sites.clear();
                             summary.sites.shrink_to_fit();
@@ -3901,7 +3913,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             B.span.push_back(rec.span);
             B.gamma.push_back(rec.gamma);
             B.posterior.push_back(rec.posterior);
-            B.em_keep.push_back(1);                 // staged only for em_keep=1
+            B.em_keep.push_back(rec.em_keep);       // real EM keep bit (soft weight)
             B.strand.push_back(rec.strand);
             B.gamma_ancient.push_back(rec.gamma_ancient);
             B.em_margin.push_back(rec.em_margin);
@@ -3918,6 +3930,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         dcx::DcxWriteOptions opt;
         opt.col_flags = B.col_flags;
         opt.sample_flags = 0;   // grain-B target_pos is 0-based (DART convention)
+        // Test-only: force a small block cap so a modest input spans >1 .dcx block,
+        // exercising the writer's block loop and the reader's cross-block walk.
+        if (const char* cap = std::getenv("DART_DCX_BLOCK_CAP")) {
+            unsigned long v = std::strtoul(cap, nullptr, 10);
+            if (v > 0) opt.block_raw_cap = uint32_t(v);
+        }
         opt.calib_model = "dart-positional/1";
         // library_label: explicit --library-label, else the .dcx output basename.
         if (!library_label.empty()) {
