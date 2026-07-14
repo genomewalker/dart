@@ -106,19 +106,49 @@ FetchContent_MakeAvailable(librapidarchive)
 
 # libtaph: reference-free ancient DNA damage estimation and library-type classification
 set(TAPH_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+# The damage estimates in every DART artifact come from libtaph, so the libtaph revision IS a build
+# input. Pin it and prove the pin, or the numbers are not reproducible.
+#
+# 14b95f1 is verified green: 6/6 ctest and the oracle's route assertions all pass at this exact
+# commit (SLURM 20140502, built from a worktree checked out at it). It is the first revision whose
+# build inputs are fully reachable from a commit -- protein_damage.hpp / damage_summary.hpp were
+# loose scratch files until 0b590e8.
+#
+# It is UNPUSHED (local main is ahead of origin), so the FetchContent path below CANNOT resolve it.
+# That is exactly why the else() branch is fatal rather than a fallback: silently building against
+# GitHub v1.2.1 would emit different numbers under the same version string. Fail loud, never drift.
+set(LIBTAPH_PINNED_SHA "14b95f1fc18d660121d26c400c6fb4c2c18538db")
 set(LIBTAPH_LOCAL_PATH "$ENV{REPOS}/libtaph" CACHE PATH "Local libtaph checkout (overrides GitHub)")
 if(EXISTS "${LIBTAPH_LOCAL_PATH}/CMakeLists.txt")
-    message(STATUS "Using local libtaph: ${LIBTAPH_LOCAL_PATH}")
+    execute_process(
+        COMMAND git -C "${LIBTAPH_LOCAL_PATH}" rev-parse HEAD
+        OUTPUT_VARIABLE LIBTAPH_HEAD_SHA OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    execute_process(
+        COMMAND git -C "${LIBTAPH_LOCAL_PATH}" status --porcelain
+        OUTPUT_VARIABLE LIBTAPH_DIRTY OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(NOT LIBTAPH_HEAD_SHA STREQUAL LIBTAPH_PINNED_SHA)
+        message(FATAL_ERROR
+            "libtaph at ${LIBTAPH_LOCAL_PATH} is not the pinned revision.\n"
+            "  pinned: ${LIBTAPH_PINNED_SHA}\n"
+            "  HEAD:   ${LIBTAPH_HEAD_SHA}\n"
+            "Damage numbers depend on this. Check it out, or update LIBTAPH_PINNED_SHA deliberately "
+            "and re-run the damage validation.")
+    endif()
+    if(LIBTAPH_DIRTY)
+        message(FATAL_ERROR
+            "libtaph at ${LIBTAPH_LOCAL_PATH} is at the pinned SHA but the tree is DIRTY.\n"
+            "${LIBTAPH_DIRTY}\n"
+            "A dirty tree means the built code is not the pinned code, and the SHA stamped into "
+            "DART's artifacts would be a lie. Commit or stash first.")
+    endif()
+    message(STATUS "Using local libtaph, pinned + clean: ${LIBTAPH_PINNED_SHA}")
     add_subdirectory("${LIBTAPH_LOCAL_PATH}" "${CMAKE_BINARY_DIR}/libtaph-local" EXCLUDE_FROM_ALL)
 else()
-    FetchContent_Declare(
-        libtaph
-        GIT_REPOSITORY https://github.com/genomewalker/libtaph.git
-        GIT_TAG        v1.2.1
-        GIT_SHALLOW    TRUE
-        UPDATE_DISCONNECTED TRUE
-    )
-    FetchContent_MakeAvailable(libtaph)
+    message(FATAL_ERROR
+        "No libtaph checkout at ${LIBTAPH_LOCAL_PATH}, and the pinned revision "
+        "${LIBTAPH_PINNED_SHA} is not on any remote -- FetchContent cannot reach it.\n"
+        "Falling back to a published tag here would silently build DIFFERENT damage estimates. "
+        "Set LIBTAPH_LOCAL_PATH to a checkout at the pinned SHA.")
 endif()
 
 # Find zlib for compressed file support
