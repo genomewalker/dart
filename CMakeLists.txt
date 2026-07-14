@@ -34,6 +34,13 @@ endif()
 
 message(STATUS "DART Version: ${DART_VERSION}")
 
+# The pinned libtaph revision. Declared HERE, above configure_file, so it can be stamped into
+# version.h -- the guard that enforces it lives further down, where libtaph is added. A DART artifact
+# has to be able to say which damage estimator produced it; the guard below makes this SHA true (it
+# hard-fails unless the checkout is at exactly this revision AND clean), so stamping it is not a
+# guess.
+set(LIBTAPH_PINNED_SHA "14b95f1fc18d660121d26c400c6fb4c2c18538db")
+
 # Generate version header
 configure_file(
     ${CMAKE_SOURCE_DIR}/cmake/version.h.in
@@ -117,7 +124,6 @@ set(TAPH_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 # It is UNPUSHED (local main is ahead of origin), so the FetchContent path below CANNOT resolve it.
 # That is exactly why the else() branch is fatal rather than a fallback: silently building against
 # GitHub v1.2.1 would emit different numbers under the same version string. Fail loud, never drift.
-set(LIBTAPH_PINNED_SHA "14b95f1fc18d660121d26c400c6fb4c2c18538db")
 set(LIBTAPH_LOCAL_PATH "$ENV{REPOS}/libtaph" CACHE PATH "Local libtaph checkout (overrides GitHub)")
 if(EXISTS "${LIBTAPH_LOCAL_PATH}/CMakeLists.txt")
     execute_process(

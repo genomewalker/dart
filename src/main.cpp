@@ -644,6 +644,7 @@ int cmd_predict(int argc, char* argv[]) {
             std::ofstream summary(opts.summary_file);
             summary << "{\n";
             summary << "  \"version\": \"" << DART_VERSION << "\",\n";
+            summary << "  \"libtaph\": \"" << DART_LIBTAPH_SHA << "\",\n";
             summary << "  \"input\": \"" << opts.input_file << "\",\n";
             summary << "  \"sequences\": " << total_seqs.load() << ",\n";
             summary << "  \"genes\": " << total_genes.load() << ",\n";
