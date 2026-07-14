@@ -352,6 +352,7 @@ int cmd_profile(int argc, char* argv[]) {
     auto boolstr = [](bool b) { return b ? "true" : "false"; };
     *out << "{\n";
     *out << "  \"version\": \"" << DART_VERSION << "\",\n";
+    *out << "  \"libtaph\": \"" << DART_LIBTAPH_SHA << "\",\n";
     *out << "  \"input\": \"" << input_file << "\",\n";
     *out << "  \"domain\": \"" << domain_str << "\",\n";
     *out << "  \"sequences\": " << total_reads << ",\n";

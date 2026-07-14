@@ -9,6 +9,7 @@ namespace cli {
 
 void print_version() {
     std::cout << "dart " << DART_VERSION << "\n";
+    std::cout << "libtaph " << DART_LIBTAPH_SHA << "\n";
 }
 
 void print_usage(const char* program_name) {

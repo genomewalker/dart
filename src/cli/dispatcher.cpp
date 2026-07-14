@@ -31,6 +31,7 @@ int main(int argc, char* argv[]) {
 
     if (strcmp(first_arg, "--version") == 0 || strcmp(first_arg, "-V") == 0) {
         std::cout << "dart " << DART_VERSION << "\n";
+        std::cout << "libtaph " << DART_LIBTAPH_SHA << "\n";
         return 0;
     }
 
