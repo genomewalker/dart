@@ -8,10 +8,14 @@
 #include "dart/codon_tables.hpp"
 #include "dart/unified_codon_scorer.hpp"
 #include "dart/damage_index_writer.hpp"
+#include "dart/libtaph_damage.hpp"
+#include "taph/damage_summary.hpp"
+#include "taph/damage_profiler.hpp"
 #include "dart/log_utils.hpp"
 #include "dart/version.h"
 #include <iostream>
 #include <fstream>
+#include <optional>
 #include <chrono>
 #include <iomanip>
 #include <mutex>
@@ -211,6 +215,35 @@ int cmd_predict(int argc, char* argv[]) {
         }
         std::cerr << "\n";
 
+        // Library damage profile (single-engine sidecar). Fail fast: DART's self-profiling
+        // diverges from fqdup on deduplicated input. On identical reads the damage FIT
+        // agrees (LV7008956662: d_cooc 0.449 vs 0.447, pi 0.272 vs 0.251, d_5p 0.122 vs
+        // 0.112 within noise) but the confidence STATE lands LOW_ABUNDANCE where fqdup
+        // DETECTs — the divergence is in the eligibility-count / strand-symmetry inputs to
+        // the shared libtaph state gate, not the fit or a collapsed denominator. The exact
+        // gate input is not yet root-caused, so the canonical fqdup-fit DamageSummary is
+        // required unless self-profiling is explicitly opted into for standalone use.
+        std::optional<taph::DamageSummary> library_summary;
+        if (!opts.library_profile.empty()) {
+            library_summary = taph::read_damage_summary(opts.library_profile);
+            if (!library_summary) {
+                std::cerr << "[FATAL] --library-profile could not be read/parsed: "
+                          << opts.library_profile << "\n";
+                return 1;
+            }
+            std::cerr << "[library-profile] loaded " << opts.library_profile
+                      << " (pi.state=" << static_cast<int>(library_summary->pi_state)
+                      << " pi.point=" << library_summary->pi_point
+                      << " d_max_cooc=" << library_summary->d_max_cooc_point
+                      << " d_max_5p=" << library_summary->d_max_5prime << ")\n";
+        } else if (opts.use_damage && !opts.allow_self_profile) {
+            std::cerr << "[FATAL] predict requires --library-profile: DART self-profiling is "
+                         "disabled\n        because it is unreliable on deduplicated libraries. "
+                         "Pass --allow-self-profile\n        to use the tracked self-profile "
+                         "fallback for standalone use.\n";
+            return 1;
+        }
+
         // Initialize damage model
         dart::DamageModel damage_model;
 
@@ -272,139 +305,135 @@ int cmd_predict(int argc, char* argv[]) {
         // Adaptive damage calibrator
         dart::AdaptiveDamageCalibrator calibrator;
 
+        // Adapter pre-scan (single-engine libtaph): DART must clip adapter stubs before
+        // profiling AND before per-read authentication, exactly as fqdup does, or terminal
+        // remnants corrupt the 5'/3' deamination counts (LV7008956662: un-clipped d_5p 0.122
+        // -> LOW_ABUNDANCE; clipped 0.112 -> DETECTED, matching fqdup to the digit). Hoisted
+        // OUT of the aggregate block and run whenever damage is used, so the --no-aggregate
+        // path (Pass 2 per-read scoring) clips read termini too. Reuses shared taph primitives.
+        taph::AdapterStubs adapter_stubs;
+        std::vector<uint32_t> stub5_codes, stub3_codes;
+        bool clip_reads = false;
+        // §8.1: damage is profiled on prof_in (the merged pre-dedup reads when
+        // --profile-input is set), NOT -i (the dedup set, which lands LOW_ABUNDANCE).
+        // ORF prediction always runs on -i. Adapter stubs are detected on the same
+        // reads we profile (fqdup-faithful), then applied to -i in Pass 2.
+        const std::string prof_in = opts.profile_input.empty() ? opts.input_file
+                                                               : opts.profile_input;
+        if (opts.use_damage) {
+            auto scan_reader = std::make_shared<dart::SequenceReader>(prof_in);
+            taph::BatchFn scan_fn =
+                [scan_reader](std::vector<std::string>& out, size_t max) -> bool {
+                    dart::SequenceRecord rec;
+                    size_t added = 0;
+                    while (added < max && scan_reader->read_next(rec)) {
+                        std::string s = dart::SequenceUtils::clean(rec.sequence);
+                        if ((int)s.size() >= 30) { out.push_back(std::move(s)); ++added; }
+                    }
+                    return added > 0;
+                };
+            try {
+                auto prescan = taph::run_prescan(
+                    scan_fn, to_sample_library_type(opts.forced_library_type), 30,
+                    opts.profile_sample);   // 0 = scan all (§8.1)
+                adapter_stubs = std::move(prescan.stubs);
+                stub5_codes = taph::encode_stub_codes(adapter_stubs.stubs5);
+                stub3_codes = taph::encode_stub_codes(adapter_stubs.stubs3);
+                if (adapter_stubs.adapter_clipped || adapter_stubs.adapter3_clipped) {
+                    std::cerr << "  Adapter pre-scan: clipping stubs (5': "
+                              << (adapter_stubs.stubs5.empty() ? "-" : adapter_stubs.stubs5[0])
+                              << ", 3': "
+                              << (adapter_stubs.stubs3.empty() ? "-" : adapter_stubs.stubs3[0])
+                              << ")\n";
+                }
+            } catch (const std::exception& e) {
+                // FAIL-CLOSED: a thrown prescan means the adapter state is UNKNOWN. Silently
+                // scoring raw termini would re-poison the terminal deamination counts feeding
+                // authentication (the exact bug the clip fix removes), so abort rather than
+                // authenticate on unclipped reads. Explicit override for non-authentication or
+                // known-adapterless input: env DART_ALLOW_UNCLIPPED_AUTH=1.
+                const char* allow = std::getenv("DART_ALLOW_UNCLIPPED_AUTH");
+                if (allow && std::string(allow) == "1") {
+                    std::cerr << "  Adapter pre-scan failed (" << e.what()
+                              << "); DART_ALLOW_UNCLIPPED_AUTH=1 set — proceeding UNCLIPPED.\n";
+                } else {
+                    throw std::runtime_error(
+                        std::string("Adapter pre-scan failed on an authentication run: ") + e.what() +
+                        " — refusing to score raw termini. Set DART_ALLOW_UNCLIPPED_AUTH=1 to override.");
+                }
+            }
+            clip_reads = adapter_stubs.adapter_clipped || adapter_stubs.adapter3_clipped;
+        }
+
         // Pass 1: Damage detection
         if (opts.aggregate_damage && opts.use_damage) {
             auto pass1_start = std::chrono::high_resolution_clock::now();
             std::cerr << "[Pass 1] Scanning for damage patterns...\n";
 
-            dart::SequenceReader first_pass(opts.input_file);
-            const size_t BATCH_SIZE = 50000;
-            std::vector<dart::SequenceRecord> batch;
-            batch.reserve(BATCH_SIZE);
-            size_t count = 0;
+            taph::ProfileConfig cfg;
+            cfg.threads              = num_threads;
+            cfg.forced_lib           = to_sample_library_type(opts.forced_library_type);
+            cfg.min_read_len         = static_cast<int>(opts.min_length);
+            cfg.short_fragment_floor = 30;                  // dart does not lower the floor
+            cfg.prescan_reads        = opts.profile_sample; // 0 = all
+            cfg.precomputed_stubs    = clip_reads ? &adapter_stubs : nullptr;
 
-            // Thread-local profiles
-            std::vector<dart::SampleDamageProfile> thread_profiles(num_threads);
-            for (auto& tp : thread_profiles) {
-                tp.forced_library_type = to_sample_library_type(opts.forced_library_type);
-            }
+            // Reader factory: a fresh reader at the head of prof_in per call, cleaned
+            // exactly like Pass 2 so the profiled bytes match the scored bytes. The
+            // clip + length gate now live inside profile_reads (single engine).
+            auto make_reader = [&]() -> taph::BatchFn {
+                auto rdr = std::make_shared<dart::SequenceReader>(prof_in);
+                return [rdr](std::vector<std::string>& out, size_t max) -> bool {
+                    dart::SequenceRecord rec;
+                    size_t added = 0;
+                    while (added < max && rdr->read_next(rec)) {
+                        out.push_back(dart::SequenceUtils::clean(rec.sequence));
+                        ++added;
+                    }
+                    return added > 0;
+                };
+            };
 
-            // EM training sequences
+            // Side channel: capture 60..200 bp clipped reads for the periodic-codon EM
+            // model (feeds Pass-2 gene prediction, NOT the damage gate). Per-thread
+            // buffers, flattened in tid order after the pass — no locks.
             const size_t EM_MAX_SEQS = 50000;
-            std::vector<std::string> em_training_seqs(EM_MAX_SEQS);
-            std::atomic<size_t> em_training_count{0};
+            std::vector<std::vector<std::string>> em_by_thread(std::max(1, num_threads));
+            taph::PerReadHook em_hook =
+                [&](int tid, const std::string& seq, int /*L*/) {
+                    if (seq.size() >= 60 && seq.size() <= 200 &&
+                        em_by_thread[tid].size() < EM_MAX_SEQS)
+                        em_by_thread[tid].push_back(seq);
+                };
 
-            while (true) {
-                batch.clear();
-                dart::SequenceRecord record;
-                while (batch.size() < BATCH_SIZE && first_pass.read_next(record)) {
-                    batch.push_back(std::move(record));
-                }
-                if (batch.empty()) break;
+            taph::ProfileResult pres = taph::profile_reads(make_reader, cfg, em_hook);
+            sample_profile = std::move(pres.profile);
 
-                #pragma omp parallel for schedule(static)
-                for (size_t i = 0; i < batch.size(); ++i) {
-                    int tid = 0;
-                    #ifdef _OPENMP
-                    tid = omp_get_thread_num();
-                    #endif
-                    std::string seq = dart::SequenceUtils::clean(batch[i].sequence);
-                    if (seq.length() >= opts.min_length) {
-                        taph::FrameSelector::update_sample_profile(thread_profiles[tid], seq);
-
-                        if (seq.length() >= 60 && seq.length() <= 200) {
-                            size_t slot = em_training_count.fetch_add(1, std::memory_order_relaxed);
-                            if (slot < EM_MAX_SEQS) {
-                                em_training_seqs[slot] = seq;
-                            }
-                        }
-                    }
-                }
-
-                count += batch.size();
-                if (count % 1000000 < BATCH_SIZE) {
-                    std::cerr << "  Scanned " << count / 1000000 << "M sequences...\n";
-                }
+            // Single-engine override: the fqdup-fit sidecar is authoritative for the damage
+            // gate (pi.state/pi.point, d_max block). Applied after finalize so it supersedes
+            // DART's self-derived profile before Pass-1.5 and the per-read scoring loop.
+            if (library_summary) {
+                library_summary->apply_to(sample_profile);
+                std::cerr << "[library-profile] applied sidecar as authoritative damage gate "
+                             "(self-profile superseded)\n";
             }
 
-            // Merge thread profiles
-            for (int t = 0; t < num_threads; ++t) {
-                taph::FrameSelector::merge_sample_profiles(sample_profile, thread_profiles[t]);
-            }
+            // Pass 1.5 (d_metamatch reweighting) removed in the profile_reads unification:
+            // it re-derived the profile from a second manual pass and never fed the damage
+            // gate when a sidecar was present (the production path). The single-engine
+            // sidecar override above is authoritative.
 
-            size_t kept_training = std::min(em_training_count.load(std::memory_order_relaxed), EM_MAX_SEQS);
-            em_training_seqs.resize(kept_training);
-
-            taph::FrameSelector::finalize_sample_profile(sample_profile);
-
-            // =========================================================================
-            // Pass 1.5: Compute d_metamatch for high-damage samples
-            // This re-weights reads by P(damaged) to better estimate the damage rate
-            // in the ancient DNA fraction, matching metaDMG's selection bias.
-            // =========================================================================
-            if (sample_profile.damage_validated && sample_profile.d_max_combined > 0.15f) {
-                bool needs_metamatch = false;
-                if (sample_profile.inverted_pattern_5prime || sample_profile.inverted_pattern_3prime) {
-                    needs_metamatch = true;
-                } else if (sample_profile.position_0_artifact_5prime) {
-                    needs_metamatch = true;
-                } else {
-                    float gap = std::abs(sample_profile.d_max_from_channel_b - sample_profile.d_max_combined);
-                    if (gap > 0.05f) {
-                        needs_metamatch = true;
-                    }
+            // Train periodic model from the hook-captured EM sequences (flattened in
+            // tid order, capped at EM_MAX_SEQS). Feeds Pass-2 gene prediction.
+            std::vector<std::string> em_training_seqs;
+            em_training_seqs.reserve(EM_MAX_SEQS);
+            for (auto& v : em_by_thread) {
+                for (auto& s : v) {
+                    if (em_training_seqs.size() >= EM_MAX_SEQS) break;
+                    em_training_seqs.push_back(std::move(s));
                 }
-
-                if (needs_metamatch) {
-                    std::cerr << "  Computing d_metamatch (weighted profile)...\n";
-
-                    dart::SequenceReader reader2(opts.input_file);
-                    std::vector<dart::SampleDamageProfile> thread_profiles2(num_threads);
-                    std::vector<dart::SequenceRecord> batch2;
-                    batch2.reserve(50000);
-
-                    while (true) {
-                        batch2.clear();
-                        dart::SequenceRecord rec;
-                        while (batch2.size() < 50000 && reader2.read_next(rec)) {
-                            batch2.push_back(std::move(rec));
-                        }
-                        if (batch2.empty()) break;
-
-                        #pragma omp parallel for schedule(static)
-                        for (size_t i = 0; i < batch2.size(); ++i) {
-                            int tid = 0;
-                            #ifdef _OPENMP
-                            tid = omp_get_thread_num();
-                            #endif
-                            std::string seq = dart::SequenceUtils::clean(batch2[i].sequence);
-                            if (seq.length() >= 30) {
-                                float p_damaged = dart::FrameSelector::compute_per_read_damage_prior(seq, sample_profile);
-                                if (p_damaged > 0.01f) {
-                                    taph::FrameSelector::update_sample_profile_weighted(
-                                        thread_profiles2[tid], seq, p_damaged);
-                                }
-                            }
-                        }
-                    }
-
-                    dart::SampleDamageProfile weighted_profile;
-                    for (int t = 0; t < num_threads; ++t) {
-                        taph::FrameSelector::merge_sample_profiles(weighted_profile, thread_profiles2[t]);
-                    }
-                    taph::FrameSelector::finalize_sample_profile(weighted_profile);
-
-                    // Update d_max_combined with d_metamatch for prediction
-                    float d_metamatch = weighted_profile.d_max_combined;
-                    std::cerr << "  d_metamatch: " << std::fixed << std::setprecision(1)
-                              << (d_metamatch * 100.0f) << "% (was "
-                              << (sample_profile.d_max_combined * 100.0f) << "%)\n";
-                    sample_profile.d_metamatch = d_metamatch;
-                    sample_profile.d_max_combined = d_metamatch;  // Use for prediction
-                }
+                if (em_training_seqs.size() >= EM_MAX_SEQS) break;
             }
-
-            // Train periodic model
             if (!em_training_seqs.empty()) {
                 dart::codon::DamageParams em_dmg;
                 em_dmg.d_max_5p = sample_profile.max_damage_5prime;
@@ -425,6 +454,16 @@ int cmd_predict(int argc, char* argv[]) {
 
             damage_model.update_from_sample_profile(sample_profile);
             calibrator.initialize(sample_profile);
+        }
+
+        // If a sidecar was supplied but Pass 1 did not run (--no-aggregate or
+        // --no-damage), the override above was skipped; apply it here so the AGD
+        // writer and the per-read authentication loop below consume the
+        // authoritative fqdup profile rather than the default/self one. Without
+        // this the --library-profile flag is silently ignored under --no-aggregate.
+        if (library_summary && !(opts.aggregate_damage && opts.use_damage)) {
+            library_summary->apply_to(sample_profile);
+            std::cerr << "[library-profile] applied sidecar (no Pass-1 profiling path)\n";
         }
 
         // Exit early if damage-only mode
@@ -484,6 +523,18 @@ int cmd_predict(int argc, char* argv[]) {
             #pragma omp parallel for schedule(dynamic, 100)
             for (size_t i = 0; i < batch.size(); ++i) {
                 std::string seq = dart::SequenceUtils::clean(batch[i].sequence);
+                // Clip adapter stubs before ORF enumeration AND per-read authentication, on
+                // BOTH the aggregate and --no-aggregate paths — un-clipped termini otherwise
+                // feed adapter remnants into per_read_damage_libtaph (the .agd authentication
+                // LLR) and the damage-aware ORF scoring, matching fqdup's universal clip.
+                // This single clipped seq is also what the emitted ORF query and .agd derive
+                // from: gene.sequence is a substr() of it, and extract_terminal_codons reads
+                // gene.sequence — so DO NOT split to keep an unclipped ORF path. Unclipping
+                // here re-poisons the per-read .agd terminal codons with adapter bases scored
+                // as terminal C->T damage. No frame desync results: six-frame ORF enumeration
+                // re-frames on this clipped seq, so every downstream product (ORF query, fasta,
+                // .agd terminal codons) derives from the same clipped sequence.
+                if (clip_reads) seq = taph::clip_adapters(seq, stub5_codes, stub3_codes, 30);
                 if (seq.length() < opts.min_length) continue;
 
                 std::string id = batch[i].id;
@@ -507,8 +558,12 @@ int cmd_predict(int argc, char* argv[]) {
                     ? dart::FrameSelector::compute_damage_percentage(seq, sample_profile)
                     : 0.0f;
 
-                // Refine per-read damage using ORF-specific evidence (stops, pre-stops)
-                float per_read_damage = dart::FrameSelector::infer_per_read_aa_damage(seq, orfs, sample_profile);
+                // Per-read damage authentication via libtaph's reference-free terminal-site
+                // LLR (short-read capable, prior-free) instead of the frame_selector AA-window
+                // path. Written to the .agd p_damaged_q and consumed by damage-annotate.
+                float per_read_damage = opts.use_damage
+                    ? dart::per_read_damage_libtaph(seq, sample_profile)
+                    : 0.0f;
 
                 // Get thread-local buffer
                 int tid = 0;
