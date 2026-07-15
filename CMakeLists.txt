@@ -39,7 +39,7 @@ message(STATUS "DART Version: ${DART_VERSION}")
 # has to be able to say which damage estimator produced it; the guard below makes this SHA true (it
 # hard-fails unless the checkout is at exactly this revision AND clean), so stamping it is not a
 # guess.
-set(LIBTAPH_PINNED_SHA "bbbe4452185cfd18b7e5c1fb40fe4e49ef7da9fb")
+set(LIBTAPH_PINNED_SHA "6239a6b4b90040a7b8704502d04876a2bbc2c36a")
 
 # Generate version header
 configure_file(
