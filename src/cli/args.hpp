@@ -28,6 +28,19 @@ struct Options {
     std::string summary_file;        // Summary statistics output file (JSON format)
     std::string damage_index;        // Binary damage index (.agd) for post-mapping annotation
 
+    // Library damage profile sidecar (single-engine: fqdup-fit DamageSummary).
+    // When set, predict applies it as the authoritative damage gate instead of
+    // re-deriving the profile from the reads it annotates. Required by default:
+    // self-profiling is disabled unless allow_self_profile is set (standalone use).
+    std::string library_profile;     // path to a taph DamageSummary sidecar (.tdmg)
+    bool allow_self_profile = false; // opt-in escape hatch for the self-profile fallback
+
+    // Self-profile input decoupling (§8.1): damage is profiled on this FASTQ, ORF
+    // prediction always runs on -i. Empty = profile -i. The pipeline profiles the
+    // MERGED pre-dedup reads (high count -> DETECTED) while predicting on the dedup set.
+    std::string profile_input;       // FASTQ to profile damage on; empty = input_file
+    size_t      profile_sample = 0;  // reads sampled for self-profile adapter pre-scan; 0 = all
+
     // Taxonomic domain
     std::string domain_name = "meta";  // Default to mixed-community hexamer tables for ancient metagenomes
 

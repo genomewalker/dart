@@ -33,6 +33,11 @@ void print_usage(const char* program_name) {
     std::cout << "                           Options: meta, gtdb, fungi, plant, protozoa,\n";
     std::cout << "                           invertebrate, mammal, vertebrate, viral\n";
     std::cout << "  --library-type <type>    Force library type: ds, ss, or auto (default)\n";
+    std::cout << "  --profile-input <file>   FASTQ to profile damage on (default: -i). ORF\n";
+    std::cout << "                           prediction always runs on -i; only the damage\n";
+    std::cout << "                           profile uses this file (e.g. merged pre-dedup reads)\n";
+    std::cout << "  --profile-sample <int>   Reads sampled for self-profile adapter pre-scan\n";
+    std::cout << "                           (default: 0 = scan all)\n";
     std::cout << "\nORF Parameters:\n";
     std::cout << "  --orf-min-aa <int>       Minimum ORF length in amino acids (default: 10)\n";
     std::cout << "  --no-adaptive            Disable adaptive ORF selection (output all 6 frames)\n";
@@ -113,6 +118,14 @@ Options parse_args(int argc, char* argv[]) {
             opts.summary_file = require_value(arg);
         } else if (arg == "--damage-index") {
             opts.damage_index = require_value(arg);
+        } else if (arg == "--library-profile") {
+            opts.library_profile = require_value(arg);
+        } else if (arg == "--allow-self-profile") {
+            opts.allow_self_profile = true;
+        } else if (arg == "--profile-input") {
+            opts.profile_input = require_value(arg);
+        } else if (arg == "--profile-sample") {
+            opts.profile_sample = parse_size(arg, require_value(arg));
         } else if (arg == "--no-damage") {
             opts.use_damage = false;
         } else if (arg == "--min-length") {
