@@ -37,6 +37,28 @@ DamageIndexWriter::DamageIndexWriter(const std::string& path,
     header_.stop_decay_llr = profile.stop_decay_llr_5prime;
     header_.terminal_shift = profile.terminal_shift_5prime;
 
+    // v5: the scalar subset libtaph read_ancient_llr / read_ancient_posterior read
+    // per read (cubes/tables already consumed by finalize_sample_profile). Annotate
+    // reconstructs a minimal SampleDamageProfile from these to score alignment reads.
+    header_.d_max_5prime         = profile.d_max_5prime;
+    header_.d_max_3prime         = profile.d_max_3prime;
+    header_.d_max_cooc_point     = profile.d_max_cooccurrence.point;
+    header_.lambda_5prime        = profile.lambda_5prime;
+    header_.lambda_3prime        = profile.lambda_3prime;
+    header_.fit_baseline_5prime  = profile.fit_baseline_5prime;
+    header_.fit_baseline_3prime  = profile.fit_baseline_3prime;
+    header_.pi_shape_lambda      = profile.pi_shape.lambda;
+    header_.pi_shape_baseline    = profile.pi_shape.baseline;
+    header_.pi_point             = profile.pi.point;
+    header_.pi_shape_fitted      = profile.pi_shape.fitted ? 1 : 0;
+    header_.pi_state             = static_cast<uint8_t>(profile.pi.state);
+
+    // v6: library-level empirical-Bayes damage prior. pi_damaged (δ/d_max) is the damaged-read
+    // FRACTION; unlike pi.point it survives LOW_ABUNDANCE, so it is the per-protein authentication
+    // prior. State carries the DamageConfidence verdict so the consumer can tier DETECTED vs advisory.
+    header_.damage_prior_point   = profile.pi_damaged;
+    header_.damage_prior_state   = static_cast<uint8_t>(profile.pi.state);
+
     // Reserve space for typical dataset
     records_.reserve(100000);
 }

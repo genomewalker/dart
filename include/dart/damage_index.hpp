@@ -22,7 +22,7 @@ namespace dart {
 
 // Magic bytes: "AGD\x01" (AGP Damage index, version 1)
 constexpr uint32_t AGD_MAGIC = 0x01444741;  // Little-endian "AGD\x01"
-constexpr uint32_t AGD_VERSION = 4;
+constexpr uint32_t AGD_VERSION = 6;
 
 /**
  * @brief File header (64 bytes, fixed size).
@@ -47,8 +47,35 @@ struct AgdHeader {
     uint8_t _reserved1[4];             // offset 44, 4 bytes (alignment pad)
     uint64_t records_compressed_size;  // offset 48, 8 bytes (v4+: ZSTD size of records+chain; 0 = uncompressed)
     uint8_t _reserved[8];              // offset 56, 8 bytes (pad to 64)
+
+    // v5: per-read damage-authentication params for libtaph read_ancient_llr /
+    // read_ancient_posterior. These are the ONLY SampleDamageProfile scalars
+    // damage_evidence_llr() reads (the pi_pos cubes / tri tables it never touches
+    // are consumed earlier by finalize_sample_profile). Annotate reconstructs a
+    // minimal SampleDamageProfile from this block; no cube/JSON serialization.
+    float    d_max_5prime;             // offset 64
+    float    d_max_3prime;             // offset 68
+    double   d_max_cooc_point;         // offset 72  (co-occurrence d_max point; <=0 ⇒ non-identifiable)
+    float    lambda_5prime;            // offset 80
+    float    lambda_3prime;            // offset 84
+    float    fit_baseline_5prime;      // offset 88
+    float    fit_baseline_3prime;      // offset 92
+    double   pi_shape_lambda;          // offset 96  (ref-free per-position decay; preferred when fitted)
+    double   pi_shape_baseline;        // offset 104
+    double   pi_point;                 // offset 112 (validated damaged fraction; for the posterior prior)
+    uint8_t  pi_shape_fitted;          // offset 120 (0/1)
+    uint8_t  pi_state;                 // offset 121 (DamageConfidence enum value; DETECTED gates the posterior)
+    uint8_t  _reserved_v5[6];          // offset 122, pad to 128
+
+    // v6: library-level empirical-Bayes damage prior. damage_prior_point is the damaged-read
+    // FRACTION (pi_damaged = δ/d_max); unlike pi_point it is NOT gated by the DamageConfidence
+    // verdict, so it survives LOW_ABUNDANCE and is the prior for per-protein p_protein_damaged.
+    // damage_prior_state carries the library's DamageConfidence so the consumer can tier the source.
+    float    damage_prior_point;       // offset 128 (library pi_damaged; <0 ⇒ unavailable)
+    uint8_t  damage_prior_state;       // offset 132 (DamageConfidence enum value)
+    uint8_t  _reserved_v6[3];          // offset 133, pad to 136
 };
-static_assert(sizeof(AgdHeader) == 64, "AgdHeader must be 64 bytes");
+static_assert(sizeof(AgdHeader) == 136, "AgdHeader must be 136 bytes (v6)");
 
 /**
  * @brief Per-gene record (32 bytes, fixed size).

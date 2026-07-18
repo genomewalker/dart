@@ -39,7 +39,7 @@ message(STATUS "DART Version: ${DART_VERSION}")
 # has to be able to say which damage estimator produced it; the guard below makes this SHA true (it
 # hard-fails unless the checkout is at exactly this revision AND clean), so stamping it is not a
 # guess.
-set(LIBTAPH_PINNED_SHA "7ef432b279c149f727d1b276f4ea3076766d83c9")
+set(LIBTAPH_PINNED_SHA "be1f750637cbc3e9f9909f4075a3a7e3cee9a90d")
 
 # Generate version header
 configure_file(
@@ -99,9 +99,12 @@ endif()
 
 # rapidgzip (via indexed_bzip2) — in-process parallel gzip decompression.
 # Replaces the pigz subprocess; no PATH dependency, true multi-threaded inflate.
+# WITH_ISAL ON: rapidgzip inflates via ISA-L igzip (hardware-accelerated), matching
+# fqdup's decompression backend. pigz is no longer used at all (removed from
+# sequence_io.cpp); the reader path is rapidgzip(ISA-L) -> zlib.
 set(LIBRAPIDARCHIVE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(LIBRAPIDARCHIVE_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
-set(LIBRAPIDARCHIVE_WITH_ISAL   OFF CACHE BOOL "" FORCE)
+set(LIBRAPIDARCHIVE_WITH_ISAL   ON  CACHE BOOL "" FORCE)
 FetchContent_Declare(
     librapidarchive
     GIT_REPOSITORY https://github.com/mxmlnkn/indexed_bzip2.git
@@ -160,6 +163,18 @@ endif()
 # Find zlib for compressed file support
 find_package(ZLIB REQUIRED)
 
+# ISA-L: igzip is DART's gzip codec for BOTH read (via rapidgzip) and write. No pigz
+# subprocess anywhere -- SequenceWriter/GeneWriter/FastaWriter compress with isal_deflate
+# in-process, matching fqdup's backend. Required: a mislabeled or missing isa-l is a
+# silent regression to no compression, so fail loud.
+find_path(ISAL_INCLUDE_DIR isa-l/igzip_lib.h)
+find_library(ISAL_LIB NAMES isal)
+if(NOT ISAL_INCLUDE_DIR OR NOT ISAL_LIB)
+    message(FATAL_ERROR "ISA-L not found (need isa-l/igzip_lib.h and libisal). "
+        "DART's gzip writers require it; there is no pigz fallback.")
+endif()
+message(STATUS "Found ISA-L: ${ISAL_LIB}")
+
 # Find zstd for columnar compression (required)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
@@ -180,6 +195,7 @@ include_directories(
     ${PROJECT_SOURCE_DIR}/include
     ${PROJECT_SOURCE_DIR}/src
     ${ZLIB_INCLUDE_DIRS}
+    ${ISAL_INCLUDE_DIR}
 )
 
 # Source files
@@ -223,11 +239,12 @@ set(DART_SUBCOMMAND_SOURCES
     src/cli/cmd_hits2emi.cpp          # hits2emi (TSV to columnar)
     src/cli/cmd_simulate.cpp          # simulate (synthetic damage reads)
     src/cli/cmd_eval.cpp              # eval (benchmark accuracy vs truth TSV)
+    src/cli/cmd_fit_calib.cpp         # fit-calib (f_true + f_0 coherent-LR model)
 )
 
 # Main executable with subcommands
 add_executable(dart ${DART_CORE_SOURCES} ${DART_SUBCOMMAND_SOURCES})
-target_link_libraries(dart ${ZLIB_LIBRARIES} PkgConfig::ZSTD rapidgzip::rapidgzip taph)
+target_link_libraries(dart ${ZLIB_LIBRARIES} ${ISAL_LIB} PkgConfig::ZSTD rapidgzip::rapidgzip taph)
 target_compile_definitions(dart PRIVATE HAVE_RAPIDGZIP)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(dart OpenMP::OpenMP_CXX)
@@ -235,7 +252,7 @@ endif()
 
 # Legacy standalone validation tool (for backwards compatibility)
 add_executable(dart-validate-standalone src/validate.cpp ${DART_CORE_SOURCES})
-target_link_libraries(dart-validate-standalone ${ZLIB_LIBRARIES} PkgConfig::ZSTD taph)
+target_link_libraries(dart-validate-standalone ${ZLIB_LIBRARIES} ${ISAL_LIB} PkgConfig::ZSTD taph)
 target_compile_definitions(dart-validate-standalone PRIVATE DART_STANDALONE_VALIDATE)
 
 # Error analysis tool
@@ -248,7 +265,7 @@ target_link_libraries(dart-benchmark-damage ${ZLIB_LIBRARIES})
 
 # Streaming EM comparison test
 add_executable(test-streaming-em tests/test_streaming_em.cpp ${DART_CORE_SOURCES})
-target_link_libraries(test-streaming-em ${ZLIB_LIBRARIES} PkgConfig::ZSTD taph)
+target_link_libraries(test-streaming-em ${ZLIB_LIBRARIES} ${ISAL_LIB} PkgConfig::ZSTD taph)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(test-streaming-em OpenMP::OpenMP_CXX)
 endif()
@@ -297,7 +314,7 @@ if(BUILD_TESTING)
         tests/test_formal_model.cpp
         ${DART_CORE_SOURCES}
     )
-    target_link_libraries(dart-formal-model-tests ${ZLIB_LIBRARIES} PkgConfig::ZSTD taph)
+    target_link_libraries(dart-formal-model-tests ${ZLIB_LIBRARIES} ${ISAL_LIB} PkgConfig::ZSTD taph)
     if(OpenMP_CXX_FOUND)
         target_link_libraries(dart-formal-model-tests OpenMP::OpenMP_CXX)
     endif()

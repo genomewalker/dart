@@ -25,7 +25,12 @@ DamageIndexReader::DamageIndexReader(const std::string& path, bool prefetch) {
     }
     file_size_ = st.st_size;
 
-    if (file_size_ < sizeof(AgdHeader)) {
+    // Smallest valid header is the legacy 64-byte layout (v2-4); the v5 layout
+    // extends it to 128B. Version is not known until the header is mapped, so
+    // gate on the legacy minimum here and re-check against the versioned size
+    // once the version field is readable.
+    constexpr size_t AGD_HEADER_LEGACY_SIZE = 64;
+    if (file_size_ < AGD_HEADER_LEGACY_SIZE) {
         ::close(fd_);
         fd_ = -1;
         throw std::runtime_error("Damage index too small: " + path);
@@ -58,15 +63,27 @@ DamageIndexReader::DamageIndexReader(const std::string& path, bool prefetch) {
                                  std::to_string(AGD_VERSION) + "): " + path);
     }
 
+    // The v5 layout appended the per-read damage-auth block, growing the header
+    // from 64B (v2-4) to sizeof(AgdHeader)==128B. Locate the bucket table at the
+    // version-correct header size, not the compiled sizeof, or v2-4 indices read
+    // their buckets at the wrong offset.
+    const size_t header_size =
+        (header_->version >= 5) ? sizeof(AgdHeader) : AGD_HEADER_LEGACY_SIZE;
+    if (file_size_ < header_size) {
+        close();
+        throw std::runtime_error("Damage index too small for version " +
+                                 std::to_string(header_->version) + ": " + path);
+    }
+
     const char* base = reinterpret_cast<const char*>(data_);
-    size_t offset = sizeof(AgdHeader);
+    size_t offset = header_size;
 
     buckets_ = reinterpret_cast<const AgdBucket*>(base + offset);
     offset += header_->num_buckets * sizeof(AgdBucket);
 
     if (header_->version >= 4 && header_->records_compressed_size > 0) {
         // v4: records+chain block is ZSTD-compressed; defer decompression to warmup_cache()
-        const size_t expected_size = sizeof(AgdHeader) +
+        const size_t expected_size = header_size +
                                      header_->num_buckets * sizeof(AgdBucket) +
                                      header_->records_compressed_size;
         if (file_size_ < expected_size) {
@@ -80,7 +97,7 @@ DamageIndexReader::DamageIndexReader(const std::string& path, bool prefetch) {
         offset += header_->num_records * sizeof(AgdRecord);
         chain_ = reinterpret_cast<const uint32_t*>(base + offset);
 
-        const size_t expected_size = sizeof(AgdHeader) +
+        const size_t expected_size = header_size +
                                      header_->num_buckets * sizeof(AgdBucket) +
                                      header_->num_records * sizeof(AgdRecord) +
                                      header_->num_records * sizeof(uint32_t);
@@ -181,7 +198,9 @@ size_t DamageIndexReader::warmup_cache() const {
     // v4: ZSTD-compressed records+chain block — read and decompress into heap buffer.
     if (header_->version >= 4 && header_->records_compressed_size > 0 &&
         decompressed_block_.empty()) {
-        const size_t compressed_off = sizeof(AgdHeader) +
+        // Version-correct header size (v2-4 = 64B, v5 = 128B); mirrors the ctor.
+        const size_t header_size = (header_->version >= 5) ? sizeof(AgdHeader) : 64;
+        const size_t compressed_off = header_size +
                                       header_->num_buckets * sizeof(AgdBucket);
         const size_t compressed_sz  = static_cast<size_t>(header_->records_compressed_size);
         const size_t expected_uncompressed = header_->num_records * sizeof(AgdRecord) +
