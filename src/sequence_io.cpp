@@ -11,43 +11,92 @@
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
+#include <vector>
+#include <cstdint>
 #include <zlib.h>
+#include <isa-l/igzip_lib.h>
 
 namespace dart {
 
 // Large I/O buffer for better throughput (4MB like fastq-rmdup)
 constexpr size_t GZBUF_SIZE = 4 * 1024 * 1024;
 
-// Shell-escape a filename for use with popen
-static std::string shell_escape(const std::string& arg) {
-    std::string escaped = "'";
-    for (char c : arg) {
-        if (c == '\'') {
-            escaped += "'\\''";
-        } else {
-            escaped += c;
+// In-process gzip sink using ISA-L igzip (isal_deflate). The single compression path
+// for every DART writer -- there is no pigz subprocess anywhere. Streams: input is fed
+// in chunks, compressed output flushed to the file as it is produced, gzip header and
+// CRC trailer handled by IGZIP_GZIP. Matches fqdup's ISA-L backend.
+class IgzipSink {
+public:
+    explicit IgzipSink(const std::string& path, int level = 1)
+        : out_buf_(GZBUF_SIZE) {
+        fp_ = std::fopen(path.c_str(), "wb");
+        if (!fp_) throw std::runtime_error("Failed to open gzip output: " + path);
+        isal_deflate_init(&zs_);
+        zs_.gzip_flag = IGZIP_GZIP;
+        static const size_t lvl_sz[] = {
+            ISAL_DEF_LVL0_DEFAULT, ISAL_DEF_LVL1_DEFAULT,
+            ISAL_DEF_LVL2_DEFAULT, ISAL_DEF_LVL3_DEFAULT};
+        int lv = level < 0 ? 0 : (level > 3 ? 3 : level);
+        zs_.level = static_cast<uint32_t>(lv);
+        level_buf_.resize(lvl_sz[lv]);
+        zs_.level_buf = level_buf_.data();
+        zs_.level_buf_size = static_cast<uint32_t>(level_buf_.size());
+    }
+    IgzipSink(const IgzipSink&) = delete;
+    IgzipSink& operator=(const IgzipSink&) = delete;
+
+    void write(const char* data, size_t len) {
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(data);
+        while (len > 0) {
+            uint32_t chunk = len > 0x40000000u ? 0x40000000u : static_cast<uint32_t>(len);
+            zs_.next_in = const_cast<uint8_t*>(p);
+            zs_.avail_in = chunk;
+            zs_.end_of_stream = 0;
+            pump();
+            p += chunk;
+            len -= chunk;
         }
     }
-    escaped += "'";
-    return escaped;
-}
 
-// Check if a command exists in PATH
-static bool command_exists(const char* cmd) {
-    std::string check = "which " + std::string(cmd) + " > /dev/null 2>&1";
-    return system(check.c_str()) == 0;
-}
+    void close() {
+        if (!fp_) return;
+        zs_.next_in = nullptr;
+        zs_.avail_in = 0;
+        zs_.end_of_stream = 1;
+        pump();
+        std::fclose(fp_);
+        fp_ = nullptr;
+    }
+    ~IgzipSink() { close(); }
+    bool is_open() const { return fp_ != nullptr; }
+
+private:
+    void pump() {
+        do {
+            zs_.next_out = out_buf_.data();
+            zs_.avail_out = static_cast<uint32_t>(out_buf_.size());
+            isal_deflate(&zs_);
+            size_t have = out_buf_.size() - zs_.avail_out;
+            if (have && std::fwrite(out_buf_.data(), 1, have, fp_) != have)
+                throw std::runtime_error("gzip write failed");
+        } while (zs_.avail_out == 0 ||
+                 (zs_.end_of_stream && zs_.internal_state.state != ZSTATE_END));
+    }
+
+    std::FILE* fp_ = nullptr;
+    isal_zstream zs_{};
+    std::vector<uint8_t> level_buf_;
+    std::vector<uint8_t> out_buf_;
+};
 
 // SequenceReader implementation
 class SequenceReader::Impl {
 public:
     std::ifstream file_;
     gzFile gz_file_ = nullptr;
-    FILE* pipe_file_ = nullptr;  // For pigz (fallback when rapidgzip unavailable)
-    std::unique_ptr<GzLineReader> rg_reader_;  // rapidgzip backend (preferred)
+    std::unique_ptr<GzLineReader> rg_reader_;  // rapidgzip (ISA-L) backend — preferred
     Format format_ = Format::UNKNOWN;
     bool is_gzipped_ = false;
-    bool use_pigz_ = false;
     char buffer_[65536];  // Line buffer (separate from I/O buffer)
     std::string lookahead_line_;  // For FASTA multi-line handling
     bool has_lookahead_ = false;
@@ -70,35 +119,8 @@ public:
                 return bool(rg_reader_);
             }
 
-            // Fallback: pigz subprocess (disable with DART_NO_PIGZ=1)
-            const char* no_pigz = std::getenv("DART_NO_PIGZ");
-            if (!no_pigz && command_exists("pigz")) {
-                const char* pigz_threads_env = std::getenv("DART_PIGZ_THREADS");
-                int pigz_threads = pigz_threads_env ? std::atoi(pigz_threads_env) : 4;
-                if (pigz_threads < 1) pigz_threads = 4;
-                std::string cmd = "pigz -dc -p " + std::to_string(pigz_threads) + " " + shell_escape(filename);
-                pipe_file_ = popen(cmd.c_str(), "r");
-                if (pipe_file_) {
-                    use_pigz_ = true;
-                    // Set large buffer for pipe reads (4MB)
-                    setvbuf(pipe_file_, nullptr, _IOFBF, GZBUF_SIZE);
-                    // Read first line to determine format
-                    if (fgets(buffer_, sizeof(buffer_), pipe_file_)) {
-                        format_ = buffer_[0] == '>' ? Format::FASTA :
-                                 buffer_[0] == '@' ? Format::FASTQ : Format::UNKNOWN;
-                        // Reopen to reset position
-                        pclose(pipe_file_);
-                        pipe_file_ = popen(cmd.c_str(), "r");
-                        if (pipe_file_) {
-                            setvbuf(pipe_file_, nullptr, _IOFBF, GZBUF_SIZE);
-                        }
-                    }
-                    return pipe_file_ != nullptr;
-                }
-            }
-
-            // Fallback to zlib
-            use_pigz_ = false;
+            // rapidgzip (ISA-L) is the decompression path. If it could not open the
+            // stream, fall back to zlib -- never a subprocess.
             gz_file_ = gzopen(filename.c_str(), "rb");
             if (!gz_file_) return false;
 
@@ -140,13 +162,8 @@ public:
                 }
             };
 
-            if (use_pigz_) {
-                auto getter = [&]() -> bool { return fgets(buffer_, sizeof(buffer_), pipe_file_) != nullptr; };
-                return read_chunk(getter);
-            } else {
-                auto getter = [&]() -> bool { return gzgets(gz_file_, buffer_, sizeof(buffer_)) != nullptr; };
-                return read_chunk(getter);
-            }
+            auto getter = [&]() -> bool { return gzgets(gz_file_, buffer_, sizeof(buffer_)) != nullptr; };
+            return read_chunk(getter);
         } else {
             return static_cast<bool>(std::getline(file_, line));
         }
@@ -193,13 +210,8 @@ public:
                 return read_into_dyn(getter);
             };
 
-            if (use_pigz_) {
-                auto getter = [&]() -> bool { return fgets(buffer_, sizeof(buffer_), pipe_file_) != nullptr; };
-                return getter_once(getter);
-            } else {
-                auto getter = [&]() -> bool { return gzgets(gz_file_, buffer_, sizeof(buffer_)) != nullptr; };
-                return getter_once(getter);
-            }
+            auto getter = [&]() -> bool { return gzgets(gz_file_, buffer_, sizeof(buffer_)) != nullptr; };
+            return getter_once(getter);
         }
         // For uncompressed, fall back to regular getline
         len = 0;
@@ -207,20 +219,14 @@ public:
     }
 
     bool is_open() const {
-        if (is_gzipped_) {
-            if (rg_reader_) return true;
-            return use_pigz_ ? (pipe_file_ != nullptr) : (gz_file_ != nullptr);
-        }
+        if (is_gzipped_) return rg_reader_ ? true : (gz_file_ != nullptr);
         return file_.is_open();
     }
 
     void close() {
         rg_reader_.reset();
         if (is_gzipped_) {
-            if (use_pigz_ && pipe_file_) {
-                pclose(pipe_file_);
-                pipe_file_ = nullptr;
-            } else if (gz_file_) {
+            if (gz_file_) {
                 gzclose(gz_file_);
                 gz_file_ = nullptr;
             }
@@ -389,16 +395,15 @@ SequenceReader::Format SequenceReader::get_format() const {
 class SequenceWriter::Impl {
 public:
     std::ofstream file_;
-    FILE* pipe_file_ = nullptr;
-    bool use_pigz_ = false;
+    std::unique_ptr<IgzipSink> gz_;  // ISA-L igzip when the output is .gz
     bool is_fastq_ = false;
     bool format_locked_ = false;
     static constexpr size_t BUFFER_SIZE = 1024 * 1024;  // 1MB buffer
     char buffer_[BUFFER_SIZE];
 
     void write(const char* data, size_t len) {
-        if (use_pigz_) {
-            fwrite(data, 1, len, pipe_file_);
+        if (gz_) {
+            gz_->write(data, len);
         } else {
             file_.write(data, len);
         }
@@ -425,28 +430,17 @@ SequenceWriter::SequenceWriter(const std::string& filename, bool compress)
     const bool want_gzip = compress ||
         (filename.size() > 3 && filename.substr(filename.size() - 3) == ".gz");
 
-    if (want_gzip && command_exists("pigz")) {
-        std::string cmd = "pigz -c > " + shell_escape(filename);
-        impl_->pipe_file_ = popen(cmd.c_str(), "w");
-        if (impl_->pipe_file_) {
-            impl_->use_pigz_ = true;
-            setvbuf(impl_->pipe_file_, nullptr, _IOFBF, GZBUF_SIZE);
-            return;
-        }
-    }
-
-    std::string out_filename = filename;
-    if (want_gzip && !command_exists("pigz") &&
-        filename.size() > 3 && filename.substr(filename.size() - 3) == ".gz") {
-        out_filename = filename.substr(0, filename.size() - 3);
-        std::cerr << "Warning: pigz not found, writing uncompressed to " << out_filename << "\n";
-    }
-
-    if (auto p = std::filesystem::path(out_filename).parent_path(); !p.empty())
+    if (auto p = std::filesystem::path(filename).parent_path(); !p.empty())
         std::filesystem::create_directories(p);
-    impl_->file_.open(out_filename);
+
+    if (want_gzip) {
+        impl_->gz_ = std::make_unique<IgzipSink>(filename);
+        return;
+    }
+
+    impl_->file_.open(filename);
     if (!impl_->file_) {
-        throw std::runtime_error("Failed to open sequence output file: " + out_filename);
+        throw std::runtime_error("Failed to open sequence output file: " + filename);
     }
     impl_->file_.rdbuf()->pubsetbuf(impl_->buffer_, SequenceWriter::Impl::BUFFER_SIZE);
 }
@@ -503,9 +497,9 @@ void SequenceWriter::write_all(const std::vector<SequenceRecord>& records) {
 }
 
 void SequenceWriter::close() {
-    if (impl_->use_pigz_ && impl_->pipe_file_) {
-        pclose(impl_->pipe_file_);
-        impl_->pipe_file_ = nullptr;
+    if (impl_->gz_) {
+        impl_->gz_->close();
+        impl_->gz_.reset();
     } else if (impl_->file_.is_open()) {
         impl_->file_.close();
     }
@@ -515,23 +509,19 @@ void SequenceWriter::close() {
 class GeneWriter::Impl {
 public:
     std::ofstream file_;
-    FILE* pipe_file_ = nullptr;
-    bool use_pigz_ = false;
+    std::unique_ptr<IgzipSink> gz_;  // ISA-L igzip when the output is .gz
     static constexpr size_t BUFFER_SIZE = 1024 * 1024;  // 1MB buffer
     char buffer_[BUFFER_SIZE];
     char fmt_buffer_[4096];  // Reusable formatting buffer
 
     void write_header() {
-        if (use_pigz_) {
-            fprintf(pipe_file_, "##gff-version 3\n");
-        } else {
-            file_ << "##gff-version 3\n";
-        }
+        static const char h[] = "##gff-version 3\n";
+        write(h, sizeof(h) - 1);
     }
 
     void write(const char* data, size_t len) {
-        if (use_pigz_) {
-            fwrite(data, 1, len, pipe_file_);
+        if (gz_) {
+            gz_->write(data, len);
         } else {
             file_.write(data, len);
         }
@@ -549,29 +539,18 @@ GeneWriter::GeneWriter(const std::string& filename)
     bool want_gzip = (filename.size() > 3 &&
                       filename.substr(filename.size() - 3) == ".gz");
 
-    if (want_gzip && command_exists("pigz")) {
-        std::string cmd = "pigz -c > " + shell_escape(filename);
-        impl_->pipe_file_ = popen(cmd.c_str(), "w");
-        if (impl_->pipe_file_) {
-            impl_->use_pigz_ = true;
-            impl_->write_header();
-            return;
-        }
-    }
-
-    // Fallback to regular file (no compression if .gz requested without pigz)
-    std::string out_filename = filename;
-    if (want_gzip && !command_exists("pigz")) {
-        // Remove .gz extension if pigz not available
-        out_filename = filename.substr(0, filename.size() - 3);
-        std::cerr << "Warning: pigz not found, writing uncompressed to " << out_filename << "\n";
-    }
-
-    if (auto p = std::filesystem::path(out_filename).parent_path(); !p.empty())
+    if (auto p = std::filesystem::path(filename).parent_path(); !p.empty())
         std::filesystem::create_directories(p);
-    impl_->file_.open(out_filename);
+
+    if (want_gzip) {
+        impl_->gz_ = std::make_unique<IgzipSink>(filename);
+        impl_->write_header();
+        return;
+    }
+
+    impl_->file_.open(filename);
     if (!impl_->file_) {
-        throw std::runtime_error("Failed to open file: " + out_filename);
+        throw std::runtime_error("Failed to open file: " + filename);
     }
     // Use larger buffer for better I/O performance
     impl_->file_.rdbuf()->pubsetbuf(impl_->buffer_, GeneWriter::Impl::BUFFER_SIZE);
@@ -667,9 +646,9 @@ void GeneWriter::write_gene(const std::string& sequence_id,
 }
 
 void GeneWriter::close() {
-    if (impl_->use_pigz_ && impl_->pipe_file_) {
-        pclose(impl_->pipe_file_);
-        impl_->pipe_file_ = nullptr;
+    if (impl_->gz_) {
+        impl_->gz_->close();
+        impl_->gz_.reset();
     } else {
         impl_->file_.close();
     }
@@ -848,16 +827,15 @@ std::array<size_t, 4> SequenceUtils::composition(const std::string& seq) {
 class FastaWriter::Impl {
 public:
     std::ofstream file_;
-    FILE* pipe_file_ = nullptr;
-    bool use_pigz_ = false;
+    std::unique_ptr<IgzipSink> gz_;  // ISA-L igzip when the output is .gz
     int gene_counter_ = 0;
     static constexpr size_t BUFFER_SIZE = 1024 * 1024;  // 1MB buffer
     char buffer_[BUFFER_SIZE];
     char fmt_buffer_[4096];  // Reusable formatting buffer
 
     void write(const char* data, size_t len) {
-        if (use_pigz_) {
-            fwrite(data, 1, len, pipe_file_);
+        if (gz_) {
+            gz_->write(data, len);
         } else {
             file_.write(data, len);
         }
@@ -875,28 +853,17 @@ FastaWriter::FastaWriter(const std::string& filename)
     bool want_gzip = (filename.size() > 3 &&
                       filename.substr(filename.size() - 3) == ".gz");
 
-    if (want_gzip && command_exists("pigz")) {
-        std::string cmd = "pigz -c > " + shell_escape(filename);
-        impl_->pipe_file_ = popen(cmd.c_str(), "w");
-        if (impl_->pipe_file_) {
-            impl_->use_pigz_ = true;
-            setvbuf(impl_->pipe_file_, nullptr, _IOFBF, GZBUF_SIZE);
-            return;
-        }
-    }
-
-    // Fallback to regular file
-    std::string out_filename = filename;
-    if (want_gzip && !command_exists("pigz")) {
-        out_filename = filename.substr(0, filename.size() - 3);
-        std::cerr << "Warning: pigz not found, writing uncompressed to " << out_filename << "\n";
-    }
-
-    if (auto p = std::filesystem::path(out_filename).parent_path(); !p.empty())
+    if (auto p = std::filesystem::path(filename).parent_path(); !p.empty())
         std::filesystem::create_directories(p);
-    impl_->file_.open(out_filename);
+
+    if (want_gzip) {
+        impl_->gz_ = std::make_unique<IgzipSink>(filename);
+        return;
+    }
+
+    impl_->file_.open(filename);
     if (!impl_->file_) {
-        throw std::runtime_error("Failed to open FASTA file: " + out_filename);
+        throw std::runtime_error("Failed to open FASTA file: " + filename);
     }
     impl_->file_.rdbuf()->pubsetbuf(impl_->buffer_, FastaWriter::Impl::BUFFER_SIZE);
 }
@@ -1140,9 +1107,9 @@ void FastaWriter::write_genes_protein_search(const std::string& sequence_id,
 }
 
 void FastaWriter::close() {
-    if (impl_->use_pigz_ && impl_->pipe_file_) {
-        pclose(impl_->pipe_file_);
-        impl_->pipe_file_ = nullptr;
+    if (impl_->gz_) {
+        impl_->gz_->close();
+        impl_->gz_.reset();
     } else if (impl_->file_.is_open()) {
         impl_->file_.close();
     }

@@ -14,6 +14,7 @@
 #include "dart/codon_tables.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -21,6 +22,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace dart {
@@ -189,6 +191,94 @@ static std::string fmt_positions(const std::vector<size_t>& v) {
     return s;
 }
 
+// ── DB-sourced synthetic reads ────────────────────────────────────────────────
+//
+// Instead of embedding a random ORF, source each read from a real protein: pick a
+// protein, reverse-translate it (random synonymous codons), fragment to an aDNA
+// length, optionally reverse-complement, optionally apply Briggs damage. Reads
+// then multi-map to real homologs, so this exercises mapping + EM reassignment,
+// not just frame prediction. Ground truth records the source protein per read.
+
+// Standard genetic code, amino acid → synonymous codons (sense strand).
+static const std::unordered_map<char, std::vector<std::string>>& codon_table() {
+    static const std::unordered_map<char, std::vector<std::string>> T = {
+        {'A', {"GCT","GCC","GCA","GCG"}},
+        {'R', {"CGT","CGC","CGA","CGG","AGA","AGG"}},
+        {'N', {"AAT","AAC"}},
+        {'D', {"GAT","GAC"}},
+        {'C', {"TGT","TGC"}},
+        {'Q', {"CAA","CAG"}},
+        {'E', {"GAA","GAG"}},
+        {'G', {"GGT","GGC","GGA","GGG"}},
+        {'H', {"CAT","CAC"}},
+        {'I', {"ATT","ATC","ATA"}},
+        {'L', {"TTA","TTG","CTT","CTC","CTA","CTG"}},
+        {'K', {"AAA","AAG"}},
+        {'M', {"ATG"}},
+        {'F', {"TTT","TTC"}},
+        {'P', {"CCT","CCC","CCA","CCG"}},
+        {'S', {"TCT","TCC","TCA","TCG","AGT","AGC"}},
+        {'T', {"ACT","ACC","ACA","ACG"}},
+        {'W', {"TGG"}},
+        {'Y', {"TAT","TAC"}},
+        {'V', {"GTT","GTC","GTA","GTG"}},
+        // Ambiguous / non-standard residues → nearest sense codon (never a stop).
+        {'B', {"GAT","AAT"}},   // Asp/Asn
+        {'Z', {"GAA","CAA"}},   // Glu/Gln
+        {'U', {"TGT"}},          // selenocysteine → Cys codon (TGA is a stop)
+        {'X', {"NNN"}},
+    };
+    return T;
+}
+
+static std::string reverse_translate(const std::string& aa, std::mt19937& rng) {
+    static const std::vector<std::string> any_sense = {
+        "GCT","CGT","AAT","GAT","TGT","CAA","GAA","GGT","CAT","ATT",
+        "CTT","AAA","ATG","TTT","CCT","TCT","ACT","TGG","TAT","GTT"};
+    std::string nt;
+    nt.reserve(aa.size() * 3);
+    const auto& T = codon_table();
+    for (char c : aa) {
+        char up = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        if (up == '*' || up == '-') continue;              // stop / gap: skip
+        auto it = T.find(up);
+        const std::vector<std::string>& codons =
+            (it != T.end()) ? it->second : any_sense;
+        nt += codons[std::uniform_int_distribution<size_t>(0, codons.size() - 1)(rng)];
+    }
+    return nt;
+}
+
+struct ProteinRef {
+    std::string id;
+    std::string seq;
+};
+
+// Minimal multi-line FASTA reader; id is the token up to the first whitespace.
+static std::vector<ProteinRef> load_faa(const std::string& path) {
+    std::vector<ProteinRef> out;
+    std::ifstream f(path);
+    if (!f) { std::cerr << "simulate: cannot open source FASTA '" << path << "'\n"; return out; }
+    std::string line;
+    ProteinRef cur;
+    bool have = false;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+        if (line[0] == '>') {
+            if (have && !cur.seq.empty()) out.push_back(std::move(cur));
+            cur = ProteinRef{};
+            size_t ws = line.find_first_of(" \t", 1);
+            cur.id = line.substr(1, ws == std::string::npos ? std::string::npos : ws - 1);
+            have = true;
+        } else if (have) {
+            cur.seq += line;
+        }
+    }
+    if (have && !cur.seq.empty()) out.push_back(std::move(cur));
+    return out;
+}
+
 // ── Simulator ─────────────────────────────────────────────────────────────────
 
 // Fragment-length CDF sampler (inverse-CDF method).
@@ -242,6 +332,11 @@ struct SimParams {
     std::string output_fastq;
     std::string output_truth;
 
+    // DB-sourced mode (reads sourced from real proteins → multi-map to homologs)
+    std::string source_faa;              // protein FASTA to source reads from
+    std::string cohort = "ancient";      // truth label: ancient|modern|spurious
+    float       rc_fraction = 0.5f;      // fraction of reads on the reverse strand
+
     // Briggs model parameters
     float    nv      = 0.024f;   // nick probability
     float    lambda  = 0.36f;    // geometric overhang parameter
@@ -263,7 +358,14 @@ static void print_usage(const char* prog) {
         "  --damage-fraction FLOAT   Fraction of reads that receive damage (default: 1.0)\n"
         "  --library-type ds|ss      ds = double-stranded, ss = single-stranded (default: ds)\n"
         "  --orf-fraction FLOAT      Fraction of read length used for ORF (default: 0.70)\n"
-        "  --min-orf-aa N            Minimum ORF length in amino acids (default: 10)\n"
+        "  --min-orf-aa N            Minimum ORF/protein length in amino acids (default: 10)\n"
+        "\n"
+        "DB-sourced mode (reads from real proteins → multi-map to homologs):\n"
+        "  --source-faa FILE         Protein FASTA to source reads from (enables this mode)\n"
+        "  --cohort NAME             Truth label: ancient|modern|spurious (default: ancient)\n"
+        "  --rc-fraction FLOAT       Fraction of reads on the reverse strand (default: 0.5)\n"
+        "                            Truth TSV: read_id cohort source_protein source_aa_len\n"
+        "                            frag_nt_start frag_nt_end strand is_damaged ct_pos ga_pos\n"
         "  --seed INT                Random seed (default: 42)\n"
         "  -o, --output FILE         Output FASTQ (default: stdout)\n"
         "  --truth FILE              Output ground-truth TSV (optional)\n"
@@ -281,6 +383,103 @@ static void print_usage(const char* prog) {
         "  read_id  frame  orf_nt_start  orf_nt_end  is_damaged  overhang_5  overhang_3\n"
         "  original_protein  damaged_protein  damage_induced_stops\n"
         "  ct_positions  ga_positions\n";
+}
+
+static int run_simulate_from_source(const SimParams& p) {
+    std::vector<ProteinRef> proteins = load_faa(p.source_faa);
+    if (proteins.empty()) {
+        std::cerr << "simulate: source FASTA '" << p.source_faa << "' has no sequences\n";
+        return 1;
+    }
+
+    std::mt19937 rng(static_cast<uint32_t>(p.seed));
+    std::uniform_real_distribution<float> U(0.0f, 1.0f);
+    std::uniform_int_distribution<size_t> pick(0, proteins.size() - 1);
+
+    LengthCDF len_cdf;
+    if (!p.length_file.empty()) {
+        len_cdf = LengthCDF::load(p.length_file);
+        if (len_cdf.empty()) return 1;
+    } else if (!p.fixed_length) {
+        len_cdf = LengthCDF::ancient();
+    }
+
+    std::ostream* fq_out = &std::cout;
+    std::unique_ptr<std::ofstream> fq_file;
+    if (!p.output_fastq.empty()) {
+        fq_file = std::make_unique<std::ofstream>(p.output_fastq);
+        if (!*fq_file) { std::cerr << "simulate: cannot open '" << p.output_fastq << "'\n"; return 1; }
+        fq_out = fq_file.get();
+    }
+
+    std::unique_ptr<std::ofstream> truth_file;
+    std::ostream* truth_out = nullptr;
+    if (!p.output_truth.empty()) {
+        truth_file = std::make_unique<std::ofstream>(p.output_truth);
+        if (!*truth_file) { std::cerr << "simulate: cannot open '" << p.output_truth << "'\n"; return 1; }
+        truth_out = truth_file.get();
+        *truth_out << "read_id\tcohort\tsource_protein\tsource_aa_len\tfrag_nt_start"
+                      "\tfrag_nt_end\tstrand\tis_damaged\tct_positions\tga_positions\n";
+    }
+
+    const int min_nt = static_cast<int>(p.min_orf_aa * 3);
+    size_t n_written = 0, n_damaged = 0, n_skipped = 0;
+
+    for (size_t r = 0; r < p.n_reads; ++r) {
+        const ProteinRef& prot = proteins[pick(rng)];
+        // Reverse-translate the full protein, then fragment the CDS.
+        std::string cds = reverse_translate(prot.seq, rng);
+        if (static_cast<int>(cds.size()) < min_nt) { ++n_skipped; continue; }
+
+        int frag_len = len_cdf.empty() ? static_cast<int>(p.read_length)
+                                       : len_cdf.sample(rng);
+        if (frag_len < min_nt) frag_len = min_nt;
+        if (frag_len > static_cast<int>(cds.size())) frag_len = static_cast<int>(cds.size());
+
+        const int max_start = static_cast<int>(cds.size()) - frag_len;
+        const int start = (max_start > 0)
+            ? std::uniform_int_distribution<int>(0, max_start)(rng) : 0;
+        std::string frag = cds.substr(static_cast<size_t>(start),
+                                      static_cast<size_t>(frag_len));
+
+        const bool minus = (U(rng) < p.rc_fraction);
+        if (minus) frag = reverse_complement(frag);
+
+        const bool is_damaged = (U(rng) < p.damage_fraction);
+        DamageRecord drec;
+        if (is_damaged) {
+            drec = apply_damage_briggs(frag, p.nv, p.lambda, p.delta_s, p.delta_d,
+                                       p.single_stranded, rng);
+            ++n_damaged;
+        }
+
+        const std::string read_id =
+            p.cohort + "_" + std::to_string(r + 1) + "_" + prot.id;
+        *fq_out << '@' << read_id << '\n'
+                << frag << '\n'
+                << "+\n"
+                << std::string(frag.size(), 'I') << '\n';
+
+        if (truth_out) {
+            *truth_out << read_id       << '\t'
+                       << p.cohort      << '\t'
+                       << prot.id       << '\t'
+                       << prot.seq.size() << '\t'
+                       << start         << '\t'
+                       << (start + frag_len) << '\t'
+                       << (minus ? '-' : '+') << '\t'
+                       << (is_damaged ? '1' : '0') << '\t'
+                       << fmt_positions(drec.ct_positions) << '\t'
+                       << fmt_positions(drec.ga_positions) << '\n';
+        }
+        ++n_written;
+    }
+
+    std::cerr << "simulate: cohort=" << p.cohort
+              << " wrote " << n_written << " reads from "
+              << proteins.size() << " proteins (" << n_damaged << " damaged"
+              << ", " << n_skipped << " skipped: protein < min length)\n";
+    return 0;
 }
 
 static int run_simulate(const SimParams& p) {
@@ -462,6 +661,15 @@ int cmd_simulate(int argc, char* argv[]) {
         } else if (!strcmp(argv[i], "--delta-d")) {
             if (!need(argv[i])) return 1;
             params.delta_d = std::stof(argv[++i]);
+        } else if (!strcmp(argv[i], "--source-faa")) {
+            if (!need(argv[i])) return 1;
+            params.source_faa = argv[++i];
+        } else if (!strcmp(argv[i], "--cohort")) {
+            if (!need(argv[i])) return 1;
+            params.cohort = argv[++i];
+        } else if (!strcmp(argv[i], "--rc-fraction")) {
+            if (!need(argv[i])) return 1;
+            params.rc_fraction = std::stof(argv[++i]);
         } else {
             std::cerr << "simulate: unknown option '" << argv[i] << "'\n";
             print_usage(argv[0]);
@@ -469,6 +677,8 @@ int cmd_simulate(int argc, char* argv[]) {
         }
     }
 
+    if (!params.source_faa.empty())
+        return run_simulate_from_source(params);
     return run_simulate(params);
 }
 

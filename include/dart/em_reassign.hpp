@@ -23,9 +23,25 @@
 
 namespace dart {
 
+// One length-bin's true-hit density f_true(bit): a 1- or 2-component Gaussian
+// mixture over the bit scores of LABELED true-source alignments. w1 == 0 selects
+// a single component. Bins share kNullBinEdges with the null Gumbel so f_true and
+// f_0 describe the same statistic on the same partition.
+struct TrueHitBin {
+    float w0 = 1.0f, mu0 = 0.0f, sd0 = 1.0f;  // component 0 (weight, mean, sd)
+    float w1 = 0.0f, mu1 = 0.0f, sd1 = 1.0f;  // component 1 (w1>0 → 2-component)
+    uint32_t n = 0;                            // true-hit count used for the fit
+};
+
 // EM algorithm parameters
 struct EMParams {
-    double lambda_b = 3.0;       // temperature for bit score: exp(lambda_b * score)
+    // Raw-bit temperature for the LEGACY (non-calibrated) real component,
+    // exp(lambda_b * bit). mmseqs bit scores are log2-odds; the principled
+    // bits→nats conversion is ln2 ≈ 0.693, so that is the default. The old value
+    // of 3.0 over-tempered ~4.3x and forced homolog near-ties to gamma≈1. When a
+    // coherent-LR calibration model is loaded (use_calib), this knob is unused —
+    // the real component becomes the normalized density log f_true (lambda ≡ 1).
+    double lambda_b = M_LN2;     // 0.6931…  (was 3.0)
     uint32_t max_iters = 200;    // maximum EM iterations
     uint32_t min_iters = 8;      // minimum iterations before early-stop is allowed
     double tol = 1e-6;           // convergence tolerance (relative log-likelihood change)
@@ -39,6 +55,12 @@ struct EMParams {
     double squarem_objfn_inc = 1.0;   // allowed objective decrease before fallback
     bool use_damage = true;      // incorporate damage evidence in responsibilities
     bool use_alignment_damage_likelihood = false;  // if true use ll_a/ll_m with per-read prior
+    // Damage-free mapping with post-hoc ancient responsibility. When true, the
+    // mapping gamma is computed damage-free (plain E-step) but gamma_ancient is
+    // still emitted as gamma * P(ancient | alignment) evaluated against the
+    // FROZEN final weights — damage never feeds back into the M-step. Consumed by
+    // streaming_em_finalize; inert unless set (zero behavior change when off).
+    bool posthoc_gamma_ancient = false;
     double em_min_margin = 0.5;  // auth keep: require top1 - top2 responsibility >= this
     double em_max_neff = 2.0;    // auth keep: require exp(entropy(gamma)) <= this
 
@@ -84,7 +106,40 @@ struct EMParams {
     double log_w_null = std::log(0.096);  // log soft abundance weight of the null column
     double alpha_null = 0.0;       // informative Dirichlet floor for the null coordinate (>1 = floor)
     double lambda_null = 1.0;      // tempering on the null log-density
+
+    // ---------------------------------------------------------------------
+    // Coherent likelihood-ratio calibration (f_true vs f_0)
+    //
+    // The legacy real component mixes an UNNORMALIZED exp(lambda_b*bit) with the
+    // NORMALIZED null Gumbel, so the null underflows and the flat-DB rejection
+    // guard is silently a no-op. The coherent-LR mode instead scores every EM
+    // component with a NORMALIZED density of the SAME statistic (the per-candidate
+    // bit score): real → log f_true(bit | Lbin), null → log f_0(bit | Lbin). f_0
+    // reuses the existing per-bin Gumbel (null_mu/null_beta) on the RAW bit scale.
+    // f_true is a per-length-bin 1-or-2-component Gaussian fitted ONCE from labeled
+    // synthetic true-source hits and frozen into the calibration model file.
+    //
+    // Inert unless use_calib == true AND true_bins is non-empty → the master
+    // switch preserves exact legacy behavior when off. lambda is implicitly 1 here;
+    // calib_temperature is the only surviving knob, a frozen global misspecification
+    // correction (1.0 = identity).
+    std::vector<TrueHitBin> true_bins;  // per null-length-bin f_true params
+    float  true_censor = 0.0f;     // reporting-threshold bit (provenance; see log_f_true)
+    double calib_temperature = 1.0;  // frozen misspecification correction on the LR
+    bool   use_calib = false;      // master switch; false → legacy raw-bit real term
     bool use_null = false;         // master switch; false → null column never added
+
+    // v2 LENGTH-CONTINUOUS calibration (sol short-fragment fix). When use_calib_cont
+    // is true these supersede the discrete true_bins / per-bin null Gumbel: both
+    // f_true and f_0 carry length-continuous locations, so a short read is never
+    // compared to a long-read pooled mean. Default-off; only a v2 calib model (loaded
+    // via load_calib_into_params) sets use_calib_cont. See log_f_true_cont/log_f0_cont.
+    bool   use_calib_cont = false;
+    double ft_mu_a = 0.0, ft_mu_b = 0.0;   // f_true mean   mu(L)    = a + b*L
+    double ft_ls_a = 0.0, ft_ls_b = 0.0;   // f_true log-sd sigma(L) = exp(a + b*L)
+    double ft_nu   = 0.0;                   // Student-t dof (<=0 → Gaussian)
+    double f0_loc_a = 0.0, f0_loc_b = 0.0;  // f_0 K-A Gumbel loc(L) = a + b*L
+    double f0_beta  = 1.0;                  // f_0 K-A Gumbel scale (bit units)
 };
 
 // Aligned-length bins for the empirical null Gumbel. aln_len falls into bin b
@@ -112,6 +167,10 @@ inline double log_p_null_gumbel(double score, double mu, double beta) {
     if (!std::isfinite(ez)) return -std::numeric_limits<double>::infinity();
     return -z - ez - std::log(beta);
 }
+
+// Forward decl: the v2 length-continuous K-A null density (defined below) is used by
+// read_null_log_density, which precedes its definition.
+inline double log_f0_cont(const EMParams& params, double bit, uint16_t aln_len);
 
 // Best null log-density over a read's alignments: max_j log p_null(b_j | L_j),
 // evaluated on the same tempered scale as the real scores (lambda_b * bit_score).
@@ -192,22 +251,152 @@ inline double read_null_log_density(
     const Alignment* alns,
     uint32_t deg)
 {
-    if (params.null_mu.empty() || params.null_beta.empty()) {
+    // v2 continuous K-A null needs no per-bin table; the discrete paths do.
+    if (!params.use_calib_cont && (params.null_mu.empty() || params.null_beta.empty())) {
         return -std::numeric_limits<double>::infinity();
     }
-    const int nbins = static_cast<int>(std::min(params.null_mu.size(), params.null_beta.size()));
+    const int nbins = params.null_mu.empty() ? 0
+        : static_cast<int>(std::min(params.null_mu.size(), params.null_beta.size()));
     double best = -std::numeric_limits<double>::infinity();
     for (uint32_t j = 0; j < deg; ++j) {
         const Alignment& a = alns[j];
-        int b = null_length_bin(a.aln_len);
-        if (b >= nbins) b = nbins - 1;
-        const double mu = static_cast<double>(params.null_mu[b]);
-        const double beta = static_cast<double>(params.null_beta[b]);
-        const double score = params.lambda_b * static_cast<double>(a.bit_score);
-        const double lp = log_p_null_gumbel(score, mu, beta);
+        double lp;
+        if (params.use_calib_cont) {
+            // Length-continuous Karlin-Altschul null density on the RAW bit scale.
+            lp = log_f0_cont(params, static_cast<double>(a.bit_score), a.aln_len);
+        } else {
+            int b = null_length_bin(a.aln_len);
+            if (b >= nbins) b = nbins - 1;
+            const double mu = static_cast<double>(params.null_mu[b]);
+            const double beta = static_cast<double>(params.null_beta[b]);
+            // Coherent-LR: f_0 lives on the RAW bit scale (same statistic as f_true);
+            // legacy: on the lambda_b*bit tempered scale the null was fit against.
+            const double score = params.use_calib
+                ? static_cast<double>(a.bit_score)
+                : params.lambda_b * static_cast<double>(a.bit_score);
+            lp = log_p_null_gumbel(score, mu, beta);
+        }
         if (lp > best) best = lp;
     }
     return best;
+}
+
+// Streaming twin of read_null_log_density: best null log-density over a read's
+// alignments, sourced from raw columnar pointers (bit_score / aln_len) rather than
+// Alignment structs. Formula is byte-identical to read_null_log_density so the
+// streaming and in-memory null columns agree.
+inline double read_null_log_density_cols(
+    const EMParams& params,
+    const float* bit_score,
+    const uint16_t* aln_len,
+    uint32_t start,
+    uint32_t deg)
+{
+    if (!params.use_calib_cont && (params.null_mu.empty() || params.null_beta.empty())) {
+        return -std::numeric_limits<double>::infinity();
+    }
+    const int nbins = params.null_mu.empty() ? 0
+        : static_cast<int>(std::min(params.null_mu.size(), params.null_beta.size()));
+    double best = -std::numeric_limits<double>::infinity();
+    for (uint32_t j = 0; j < deg; ++j) {
+        const uint32_t idx = start + j;
+        const double bit = static_cast<double>(bit_score[idx]);
+        const uint16_t al = aln_len ? aln_len[idx] : 0;
+        double lp;
+        if (params.use_calib_cont) {
+            lp = log_f0_cont(params, bit, al);
+        } else {
+            int b = null_length_bin(al);
+            if (b >= nbins) b = nbins - 1;
+            const double mu = static_cast<double>(params.null_mu[b]);
+            const double beta = static_cast<double>(params.null_beta[b]);
+            const double score = params.use_calib ? bit : params.lambda_b * bit;
+            lp = log_p_null_gumbel(score, mu, beta);
+        }
+        if (lp > best) best = lp;
+    }
+    return best;
+}
+
+// log N(x | mu, sd), guarded against sd <= 0.
+inline double log_gaussian(double x, double mu, double sd) {
+    if (!(sd > 0.0)) return -std::numeric_limits<double>::infinity();
+    const double z = (x - mu) / sd;
+    return -0.5 * z * z - std::log(sd) - 0.5 * std::log(2.0 * M_PI);
+}
+
+// log f_true(bit | Lbin): the normalized true-hit density for a candidate's bit
+// score, a 1- or 2-component Gaussian selected by the alignment's length bin.
+// Returns -inf when no calibration is loaded (caller must gate on use_calib).
+// The reporting-threshold censoring is left un-applied: f_true is fit on observed
+// (already above-threshold) true-hit bits, and the same untruncated convention is
+// used for f_0, so the ratio log f_true - log f_0 is a consistent density ratio.
+// ceiling: no left-truncation renormalization at true_censor; the residual
+// misspecification is absorbed by calib_temperature. upgrade: fit/normalize both
+// f_true and f_0 as densities left-truncated at true_censor.
+inline double log_f_true(const EMParams& params, double bit, uint16_t aln_len) {
+    if (params.true_bins.empty()) return -std::numeric_limits<double>::infinity();
+    int b = null_length_bin(aln_len);
+    const int nbins = static_cast<int>(params.true_bins.size());
+    if (b >= nbins) b = nbins - 1;
+    const TrueHitBin& t = params.true_bins[b];
+    const double w0 = std::max(0.0, static_cast<double>(t.w0));
+    const double l0 = std::log(std::max(w0, 1e-300)) + log_gaussian(bit, t.mu0, t.sd0);
+    if (t.w1 <= 0.0f) return l0;
+    const double l1 = std::log(static_cast<double>(t.w1)) + log_gaussian(bit, t.mu1, t.sd1);
+    const double m = std::max(l0, l1);
+    if (!std::isfinite(m)) return m;
+    return m + std::log(std::exp(l0 - m) + std::exp(l1 - m));
+}
+
+// log Student-t(x | mu, sigma, nu). nu<=0 or sigma<=0 → -inf (caller falls back).
+inline double log_student_t(double x, double mu, double sigma, double nu) {
+    if (!(sigma > 0.0) || !(nu > 0.0)) return -std::numeric_limits<double>::infinity();
+    const double z = (x - mu) / sigma;
+    return std::lgamma(0.5 * (nu + 1.0)) - std::lgamma(0.5 * nu)
+         - 0.5 * std::log(nu * M_PI) - std::log(sigma)
+         - 0.5 * (nu + 1.0) * std::log1p(z * z / nu);
+}
+
+// v2 LENGTH-CONTINUOUS f_true(bit | L): robust normal/Student-t with a linear mean
+// mu(L)=a+b*L and partial-pooled log-sd sigma(L)=exp(a_ls+b_ls*L). Supersedes the
+// sparse discrete-bin f_true whose empty low bins fell back to the long-read pooled
+// mean — the bug that made short true reads (bit≈25) lose to f_0 (mu≈20). Fit ONLY
+// on real short-read true-hit calibration data; never a long-read fallback.
+inline double log_f_true_cont(const EMParams& params, double bit, uint16_t aln_len) {
+    const double L = static_cast<double>(aln_len);
+    const double mu = params.ft_mu_a + params.ft_mu_b * L;
+    const double sigma = std::exp(params.ft_ls_a + params.ft_ls_b * L);
+    return (params.ft_nu > 0.0) ? log_student_t(bit, mu, sigma, params.ft_nu)
+                                : log_gaussian(bit, mu, sigma);
+}
+
+// v2 LENGTH-CONTINUOUS f_0(bit | L) as the Karlin–Altschul null-maximum density.
+// The K–A CDF of the best decoy score is F_0(B|L) = exp[-2^-((B-loc(L))/beta)], a
+// Gumbel; its density is (1/beta)·exp(-t - e^-t) with t=(B-loc(L))/beta. loc(L) is
+// the length-continuous location (∝ log2 N_eff(L)) fit empirically on the homology-
+// excluded spurious best-hits after the IDENTICAL top-hit selection. beta is the
+// pooled scale (bit units; ≈1/ln2 for pure log2-odds bits, but calibrated).
+inline double log_f0_cont(const EMParams& params, double bit, uint16_t aln_len) {
+    const double beta = (params.f0_beta > 0.0) ? params.f0_beta : 1.0;
+    const double loc = params.f0_loc_a + params.f0_loc_b * static_cast<double>(aln_len);
+    const double t = (bit - loc) / beta;
+    const double et = (t > 700.0) ? std::numeric_limits<double>::infinity() : std::exp(-t);
+    return -std::log(beta) - t - et;
+}
+
+// Real-reference log-density term for a candidate's bit score. Under the coherent
+// LR (use_calib + fitted f_true) this is the NORMALIZED true-hit density scaled by
+// the frozen calib_temperature (lambda ≡ 1). Otherwise it is the LEGACY raw-bit
+// temperature term lambda_b*bit*score_scale. score_scale (per-query max
+// normalization) applies only to the legacy branch — f_true lives on raw bits.
+inline double real_log_density(const EMParams& params, double bit,
+                               uint16_t aln_len, double score_scale) {
+    if (params.use_calib_cont)
+        return params.calib_temperature * log_f_true_cont(params, bit, aln_len);
+    if (params.use_calib && !params.true_bins.empty())
+        return params.calib_temperature * log_f_true(params, bit, aln_len);
+    return params.lambda_b * bit * score_scale;
 }
 
 // -------------------------------------------------------------------------
@@ -233,6 +422,73 @@ NullModel fit_null_model(
 //   bin lo hi mu beta n
 bool write_null_model(const std::string& path, const NullModel& m);
 bool read_null_model(const std::string& path, NullModel& m);
+
+// -------------------------------------------------------------------------
+// Coherent-LR calibration model I/O (f_true + f_0, frozen once, loaded by EM)
+// -------------------------------------------------------------------------
+struct CalibModel {
+    NullModel               null;        // f_0: per-bin Gumbel on RAW bit scale (v1)
+    std::vector<TrueHitBin> true_bins;   // f_true: per-bin Gaussian mixture (v1)
+    float                   censor = 0.0f;  // reporting-threshold bit (provenance)
+
+    // v2 length-continuous section (sol short-fragment fix). When cont is true the
+    // continuous params drive f_true/f_0; the v1 discrete sections above are still
+    // written for provenance but the EM uses the continuous forms.
+    bool   cont = false;
+    double ft_mu_a = 0.0, ft_mu_b = 0.0;
+    double ft_ls_a = 0.0, ft_ls_b = 0.0;
+    double ft_nu   = 0.0;
+    double f0_loc_a = 0.0, f0_loc_b = 0.0;
+    double f0_beta  = 1.0;
+
+    // v1 validity requires the discrete sections; v2 requires only a positive f_0
+    // scale (the continuous params are always present once cont is set).
+    bool valid() const {
+        if (cont) return f0_beta > 0.0;
+        return null.valid() && !true_bins.empty();
+    }
+};
+
+// Fit f_true per length bin from labeled true-hit bit scores via method-of-moments
+// Gaussian (single component; w1 left 0). Bins with fewer than min_n hits fall back
+// to the pooled fit. Bins share kNullBinEdges with the null Gumbel.
+std::vector<TrueHitBin> fit_true_model(
+    const std::vector<std::vector<double>>& per_bin_bits,
+    uint32_t min_n = 100);
+
+// Fit the v2 length-continuous section from raw (aln_len, bit) pairs. true_LB are
+// labeled true-source hits; null_LB are per-read best spurious hits. Fills the cont
+// fields on m (sets m.cont=true) via robust linear mu(L)/loc(L) and pooled scales.
+// nu is the Student-t dof for f_true (<=0 → Gaussian). Returns false if too sparse.
+bool fit_calib_continuous(
+    const std::vector<std::pair<double, double>>& true_LB,
+    const std::vector<std::pair<double, double>>& null_LB,
+    double nu, CalibModel& m);
+
+// Combined calibration file: a versioned TSV carrying both sections.
+bool write_calib_model(const std::string& path, const CalibModel& m);
+bool read_calib_model(const std::string& path, CalibModel& m);
+
+// Load a calibration file into EMParams (sets f_0, f_true, and use_calib=true).
+inline bool load_calib_into_params(const std::string& path, EMParams& p) {
+    CalibModel m;
+    if (!read_calib_model(path, m) || !m.valid()) return false;
+    p.null_mu = m.null.mu;
+    p.null_beta = m.null.beta;
+    p.true_bins = m.true_bins;
+    p.true_censor = m.censor;
+    p.use_calib = true;
+    p.use_null = true;
+    if (m.cont) {
+        p.use_calib_cont = true;
+        p.ft_mu_a = m.ft_mu_a; p.ft_mu_b = m.ft_mu_b;
+        p.ft_ls_a = m.ft_ls_a; p.ft_ls_b = m.ft_ls_b;
+        p.ft_nu   = m.ft_nu;
+        p.f0_loc_a = m.f0_loc_a; p.f0_loc_b = m.f0_loc_b;
+        p.f0_beta  = m.f0_beta;
+    }
+    return true;
+}
 
 // EM state vector
 struct EMState {
@@ -859,18 +1115,6 @@ std::vector<std::pair<uint32_t, float>> reassign_reads(
     const EMState& state,
     double gamma_threshold = 0.01);
 
-// Post-EM abundance filtering via the largest-gap heuristic (MMseqs2-style).
-//
-// Sorts non-zero reference weights, finds the largest multiplicative jump in the
-// sorted distribution, and returns indices of references ABOVE the cutoff.
-// Useful for removing spurious low-abundance hits without requiring a fixed threshold.
-//
-// min_refs_to_filter: skip filtering if fewer than this many refs have weight > 0.
-// Returns the set of reference indices that survive the filter (unsorted).
-std::vector<uint32_t> largest_gap_filter(
-    const std::vector<double>& weights,
-    uint32_t min_refs_to_filter = 20);
-
 // Forward declaration for columnar index
 class ColumnarIndexReader;
 
@@ -878,6 +1122,7 @@ class ColumnarIndexReader;
 struct StreamingEMResult {
     std::vector<double> weights;       // Per-reference abundance (T elements)
     double pi = 0.1;                   // Ancient fraction
+    double w_null = 0.0;               // Converged null-column weight (0 when use_null off)
     double log_likelihood = 0.0;
     uint32_t iterations = 0;
     uint32_t num_reads = 0;
@@ -906,7 +1151,10 @@ using StreamingGammaCallback = std::function<void(
     const uint32_t* read_idx,
     const uint32_t* ref_idx,
     const float* gamma,           // Per-alignment responsibility
-    const float* gamma_ancient    // Per-alignment ancient responsibility (may be null)
+    const float* gamma_ancient,   // Per-alignment ancient responsibility (may be null)
+    const float* gamma_null,      // Per-alignment: read's null responsibility, replicated (may be null)
+    const float* bit_score,       // Per-alignment raw bit score (may be null)
+    const uint16_t* aln_len       // Per-alignment alignment length (may be null)
 )>;
 
 // Compute final gamma values in streaming fashion after EM convergence.

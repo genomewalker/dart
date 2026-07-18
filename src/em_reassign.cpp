@@ -181,6 +181,212 @@ bool read_null_model(const std::string& path, NullModel& m) {
 }
 
 // ---------------------------------------------------------------------------
+// Coherent-LR calibration model: fit f_true / write / read
+// ---------------------------------------------------------------------------
+
+// Method-of-moments single Gaussian (needs n>=2 with sd>0).
+static bool fit_gaussian_mom(const std::vector<double>& xs, float& mu, float& sd) {
+    const size_t n = xs.size();
+    if (n < 2) return false;
+    double mean = 0.0;
+    for (double x : xs) mean += x;
+    mean /= static_cast<double>(n);
+    double var = 0.0;
+    for (double x : xs) { const double d = x - mean; var += d * d; }
+    var /= static_cast<double>(n - 1);
+    const double s = std::sqrt(var);
+    if (!(s > 0.0)) return false;
+    mu = static_cast<float>(mean);
+    sd = static_cast<float>(s);
+    return true;
+}
+
+std::vector<TrueHitBin> fit_true_model(
+    const std::vector<std::vector<double>>& per_bin_bits,
+    uint32_t min_n)
+{
+    const int nbins = static_cast<int>(per_bin_bits.size());
+    std::vector<TrueHitBin> bins(nbins);
+
+    std::vector<double> pooled;
+    for (const auto& v : per_bin_bits) pooled.insert(pooled.end(), v.begin(), v.end());
+    float pmu = 0.0f, psd = 1.0f;
+    const bool pooled_ok = fit_gaussian_mom(pooled, pmu, psd);
+
+    for (int b = 0; b < nbins; ++b) {
+        TrueHitBin& t = bins[b];
+        t.n = static_cast<uint32_t>(per_bin_bits[b].size());
+        float bmu = 0.0f, bsd = 1.0f;
+        if (per_bin_bits[b].size() >= min_n && fit_gaussian_mom(per_bin_bits[b], bmu, bsd)) {
+            t.w0 = 1.0f; t.mu0 = bmu; t.sd0 = bsd;
+        } else if (pooled_ok) {
+            t.w0 = 1.0f; t.mu0 = pmu; t.sd0 = psd;
+        }
+    }
+    return bins;
+}
+
+// Huber-reweighted least squares of y ~ a + b*x. Robust to the heavy right tail of
+// true-hit bits and the occasional spurious near-homolog. Returns residual sd.
+static double robust_linfit(const std::vector<double>& xs,
+                            const std::vector<double>& ys,
+                            double& a, double& b) {
+    const size_t n = xs.size();
+    a = 0.0; b = 0.0;
+    if (n < 2) { if (n == 1) a = ys[0]; return 1.0; }
+    std::vector<double> w(n, 1.0);
+    double resid_sd = 1.0;
+    for (int iter = 0; iter < 8; ++iter) {
+        double sw = 0, swx = 0, swy = 0, swxx = 0, swxy = 0;
+        for (size_t i = 0; i < n; ++i) {
+            sw += w[i]; swx += w[i] * xs[i]; swy += w[i] * ys[i];
+            swxx += w[i] * xs[i] * xs[i]; swxy += w[i] * xs[i] * ys[i];
+        }
+        const double det = sw * swxx - swx * swx;
+        if (std::abs(det) < 1e-12) { b = 0.0; a = swy / std::max(sw, 1e-12); break; }
+        b = (sw * swxy - swx * swy) / det;
+        a = (swy - b * swx) / sw;
+        // Residual scale (MAD-ish via weighted variance) → Huber weights.
+        double s2 = 0.0, ssw = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            const double e = ys[i] - (a + b * xs[i]);
+            s2 += e * e; ssw += 1.0;
+        }
+        resid_sd = std::sqrt(s2 / std::max(ssw, 1.0));
+        const double c = 1.345 * std::max(resid_sd, 1e-6);
+        for (size_t i = 0; i < n; ++i) {
+            const double e = std::abs(ys[i] - (a + b * xs[i]));
+            w[i] = (e <= c) ? 1.0 : c / e;
+        }
+    }
+    return resid_sd;
+}
+
+bool fit_calib_continuous(
+    const std::vector<std::pair<double, double>>& true_LB,
+    const std::vector<std::pair<double, double>>& null_LB,
+    double nu, CalibModel& m)
+{
+    if (true_LB.size() < 10) return false;
+    std::vector<double> tL, tB;
+    tL.reserve(true_LB.size()); tB.reserve(true_LB.size());
+    for (const auto& p : true_LB) { tL.push_back(p.first); tB.push_back(p.second); }
+    double mu_a, mu_b;
+    const double s0 = robust_linfit(tL, tB, mu_a, mu_b);
+    m.ft_mu_a = mu_a; m.ft_mu_b = mu_b;
+
+    // Partial-pooled log-sd(L): anchor the level at the global residual sd and let a
+    // shrunk length-slope tilt it. Slope from log(residual^2)~L, shrunk toward 0 by
+    // n/(n+K) so sparse data collapses to a constant sd.
+    std::vector<double> lx, ly;
+    double meanL = 0.0;
+    for (size_t i = 0; i < tL.size(); ++i) {
+        const double e = tB[i] - (mu_a + mu_b * tL[i]);
+        lx.push_back(tL[i]); ly.push_back(std::log(std::max(e * e, 1e-6)));
+        meanL += tL[i];
+    }
+    meanL /= static_cast<double>(tL.size());
+    double la, lb;
+    robust_linfit(lx, ly, la, lb);
+    const double K = 200.0;
+    const double shrink = static_cast<double>(tL.size()) / (static_cast<double>(tL.size()) + K);
+    m.ft_ls_b = 0.5 * lb * shrink;
+    m.ft_ls_a = std::log(std::max(s0, 1e-3)) - m.ft_ls_b * meanL;
+    m.ft_nu = nu;
+
+    // f_0 Karlin-Altschul: fit the spurious best-hit MEAN linearly in L, convert the
+    // mean/sd to a Gumbel loc/scale (mean = loc + euler*beta, beta = sqrt(6)*sd/pi).
+    if (null_LB.size() >= 5) {
+        std::vector<double> nL, nB;
+        for (const auto& p : null_LB) { nL.push_back(p.first); nB.push_back(p.second); }
+        double n_a, n_b;
+        const double sn = robust_linfit(nL, nB, n_a, n_b);
+        const double beta = std::max(std::sqrt(6.0) * sn / M_PI, 0.3);
+        m.f0_beta = beta;
+        m.f0_loc_b = n_b;
+        m.f0_loc_a = n_a - 0.5772156649 * beta;
+    } else {
+        // No spurious calibration: place a conservative low-location null just below
+        // the shortest true-hit level so only genuinely null-scale reads are rejected.
+        m.f0_beta = 1.5;
+        m.f0_loc_b = 0.0;
+        m.f0_loc_a = std::max(0.0, static_cast<double>(m.censor) - 3.0);
+    }
+    m.cont = true;
+    return true;
+}
+
+bool write_calib_model(const std::string& path, const CalibModel& m) {
+    std::ofstream out(path);
+    if (!out) return false;
+    out << "#dart-calib\t" << (m.cont ? "v2" : "v1") << "\tcensor=" << m.censor << '\n';
+    if (m.cont) {
+        out << "#cont\tft_mu_a\tft_mu_b\tft_ls_a\tft_ls_b\tft_nu\tf0_loc_a\tf0_loc_b\tf0_beta\n";
+        out << "cont\t" << m.ft_mu_a << '\t' << m.ft_mu_b << '\t' << m.ft_ls_a << '\t'
+            << m.ft_ls_b << '\t' << m.ft_nu << '\t' << m.f0_loc_a << '\t'
+            << m.f0_loc_b << '\t' << m.f0_beta << '\n';
+    }
+    // f_0 section (raw-bit Gumbel per bin)
+    out << "#null\tbin\tlo\thi\tmu\tbeta\tn\n";
+    const int nb = static_cast<int>(m.null.mu.size());
+    for (int b = 0; b < nb && b < kNumNullBins; ++b) {
+        out << "null\t" << b << '\t' << kNullBinEdges[b] << '\t' << kNullBinEdges[b + 1]
+            << '\t' << m.null.mu[b] << '\t' << m.null.beta[b]
+            << '\t' << (b < static_cast<int>(m.null.n.size()) ? m.null.n[b] : 0u) << '\n';
+    }
+    // f_true section (Gaussian mixture per bin)
+    out << "#true\tbin\tw0\tmu0\tsd0\tw1\tmu1\tsd1\tn\n";
+    const int nt = static_cast<int>(m.true_bins.size());
+    for (int b = 0; b < nt && b < kNumNullBins; ++b) {
+        const TrueHitBin& t = m.true_bins[b];
+        out << "true\t" << b << '\t' << t.w0 << '\t' << t.mu0 << '\t' << t.sd0
+            << '\t' << t.w1 << '\t' << t.mu1 << '\t' << t.sd1 << '\t' << t.n << '\n';
+    }
+    return static_cast<bool>(out);
+}
+
+bool read_calib_model(const std::string& path, CalibModel& m) {
+    std::ifstream in(path);
+    if (!in) return false;
+    m.null = NullModel{};
+    m.true_bins.clear();
+    m.censor = 0.0f;
+    m.cont = false;
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        if (line.rfind("#dart-calib", 0) == 0) {
+            const auto pos = line.find("censor=");
+            if (pos != std::string::npos) m.censor = std::stof(line.substr(pos + 7));
+            continue;
+        }
+        if (line[0] == '#') continue;  // section headers
+        std::istringstream ss(line);
+        std::string tag;
+        ss >> tag;
+        if (tag == "cont") {
+            if (ss >> m.ft_mu_a >> m.ft_mu_b >> m.ft_ls_a >> m.ft_ls_b >> m.ft_nu
+                   >> m.f0_loc_a >> m.f0_loc_b >> m.f0_beta)
+                m.cont = true;
+        } else if (tag == "null") {
+            int bin; double lo, hi, mu, beta; long n = 0;
+            if (!(ss >> bin >> lo >> hi >> mu >> beta)) continue;
+            ss >> n;
+            m.null.mu.push_back(static_cast<float>(mu));
+            m.null.beta.push_back(static_cast<float>(beta));
+            m.null.n.push_back(static_cast<uint32_t>(std::max(0L, n)));
+        } else if (tag == "true") {
+            int bin; TrueHitBin t; long n = 0;
+            if (!(ss >> bin >> t.w0 >> t.mu0 >> t.sd0 >> t.w1 >> t.mu1 >> t.sd1)) continue;
+            ss >> n;
+            t.n = static_cast<uint32_t>(std::max(0L, n));
+            m.true_bins.push_back(t);
+        }
+    }
+    return m.valid();
+}
+
+// ---------------------------------------------------------------------------
 // Parallel E-step with OpenMP
 // ---------------------------------------------------------------------------
 
@@ -220,7 +426,7 @@ static double e_step_parallel(
                 ll_local += std::log(std::max(weights[data.alignments[start].ref_idx], params.min_weight))
                             + length_log_penalty(data, params, data.alignments[start].ref_idx)
                             + coverage_log_penalty(params, data.alignments[start].ref_idx)
-                            + params.lambda_b * static_cast<double>(data.alignments[start].bit_score);
+                            + real_log_density(params, static_cast<double>(data.alignments[start].bit_score), data.alignments[start].aln_len, 1.0);
                 continue;
             }
 
@@ -241,7 +447,7 @@ static double e_step_parallel(
                 log_scores[j] = std::log(std::max(weights[aln.ref_idx], params.min_weight))
                                + length_log_penalty(data, params, aln.ref_idx)
                                + coverage_log_penalty(params, aln.ref_idx)
-                               + params.lambda_b * static_cast<double>(aln.bit_score) * score_scale;
+                               + real_log_density(params, static_cast<double>(aln.bit_score), aln.aln_len, score_scale);
             }
             if (null_on) {
                 const double lp = read_null_log_density(params, data.alignments.data() + start, deg);
@@ -277,7 +483,7 @@ static double e_step_parallel(
             ll += std::log(std::max(weights[data.alignments[start].ref_idx], params.min_weight))
                   + length_log_penalty(data, params, data.alignments[start].ref_idx)
                   + coverage_log_penalty(params, data.alignments[start].ref_idx)
-                  + params.lambda_b * static_cast<double>(data.alignments[start].bit_score);
+                  + real_log_density(params, static_cast<double>(data.alignments[start].bit_score), data.alignments[start].aln_len, 1.0);
             continue;
         }
 
@@ -296,7 +502,7 @@ static double e_step_parallel(
             log_scores[j] = std::log(std::max(weights[aln.ref_idx], params.min_weight))
                            + length_log_penalty(data, params, aln.ref_idx)
                            + coverage_log_penalty(params, aln.ref_idx)
-                           + params.lambda_b * static_cast<double>(aln.bit_score) * score_scale;
+                           + real_log_density(params, static_cast<double>(aln.bit_score), aln.aln_len, score_scale);
         }
         if (null_on) {
             const double lp = read_null_log_density(params, data.alignments.data() + start, deg);
@@ -373,7 +579,7 @@ static double e_step_damage_parallel(
                 double log_w = std::log(std::max(weights[aln.ref_idx], params.min_weight));
                 log_w += length_log_penalty(data, params, aln.ref_idx);
                 log_w += coverage_log_penalty(params, aln.ref_idx);
-                double score_contrib = params.lambda_b * static_cast<double>(aln.bit_score) * score_scale;
+                double score_contrib = real_log_density(params, static_cast<double>(aln.bit_score), aln.aln_len, score_scale);
 
                 if (params.use_alignment_damage_likelihood) {
                     const double p_read = std::clamp(static_cast<double>(aln.damage_score), eps, 1.0 - eps);
@@ -433,7 +639,7 @@ static double e_step_damage_parallel(
             const auto& aln = data.alignments[start + j];
             double log_w = std::log(std::max(weights[aln.ref_idx], params.min_weight));
             log_w += length_log_penalty(data, params, aln.ref_idx);
-            double score_contrib = params.lambda_b * static_cast<double>(aln.bit_score) * score_scale;
+            double score_contrib = real_log_density(params, static_cast<double>(aln.bit_score), aln.aln_len, score_scale);
             if (params.use_alignment_damage_likelihood) {
                 const double p_read = std::clamp(static_cast<double>(aln.damage_score), eps, 1.0 - eps);
                 log_scores[2 * j]     = log_w + score_contrib + std::log(p_read) + aln.damage_ll_a;
@@ -829,60 +1035,6 @@ std::vector<std::pair<uint32_t, float>> reassign_reads(
     return result;
 }
 
-// ---------------------------------------------------------------------------
-// Largest-gap abundance filter (MMseqs2-style)
-// ---------------------------------------------------------------------------
-
-std::vector<uint32_t> largest_gap_filter(
-    const std::vector<double>& weights,
-    uint32_t min_refs_to_filter)
-{
-    const uint32_t T = static_cast<uint32_t>(weights.size());
-
-    // Collect (weight, original_index) for non-negligible references
-    std::vector<std::pair<double, uint32_t>> nonzero;
-    nonzero.reserve(T);
-    for (uint32_t t = 0; t < T; ++t) {
-        if (weights[t] > 0.0) nonzero.push_back({weights[t], t});
-    }
-
-    // If too few refs to reliably detect a gap, return all non-zero
-    if (nonzero.size() < min_refs_to_filter) {
-        std::vector<uint32_t> all;
-        all.reserve(nonzero.size());
-        for (auto& p : nonzero) all.push_back(p.second);
-        return all;
-    }
-
-    // Sort ascending by weight
-    std::sort(nonzero.begin(), nonzero.end());
-
-    // Find the largest multiplicative gap between consecutive sorted weights.
-    // We use log-ratio (= log(w[i+1]/w[i])) to find the gap robustly across
-    // orders of magnitude without being dominated by tiny absolute differences.
-    const size_t n = nonzero.size();
-    size_t gap_pos = 0;           // index AFTER which the gap occurs (cutoff = keep > gap_pos)
-    double max_log_ratio = -1.0;
-
-    for (size_t i = 0; i + 1 < n; ++i) {
-        const double lo = nonzero[i].first;
-        const double hi = nonzero[i + 1].first;
-        if (lo <= 0.0) continue;
-        const double log_ratio = std::log(hi / lo);
-        if (log_ratio > max_log_ratio) {
-            max_log_ratio = log_ratio;
-            gap_pos = i;
-        }
-    }
-
-    // Keep everything above the gap (indices gap_pos+1 .. n-1)
-    std::vector<uint32_t> survivors;
-    survivors.reserve(n - gap_pos - 1);
-    for (size_t i = gap_pos + 1; i < n; ++i) {
-        survivors.push_back(nonzero[i].second);
-    }
-    return survivors;
-}
 
 } // namespace dart
 
@@ -927,12 +1079,16 @@ double streaming_e_step_rowgroup(
     const float* dmg_ll_a,    // Alignment-level log P(evidence | ancient)
     const float* dmg_ll_m,    // Alignment-level log P(evidence | modern)
     const uint16_t* tlen,     // Reference length per alignment (for normalize_by_length)
+    const uint16_t* aln_len,  // Alignment length per alignment (for coherent-LR densities)
     const double* log_weights,
     uint32_t num_refs,
     const dart::EMParams& params,
     double pi_ancient,
+    bool null_on,             // Null column active (calib/null model wired)
+    double log_w_null_dyn,    // Current log w_null for the null column
     std::vector<std::vector<double>>& thread_ref_sums,
     std::vector<std::vector<double>>& thread_ref_sums_ancient,
+    std::vector<double>& thread_null_sums,   // Per-thread Σ gamma_null accumulator
     int num_threads
 ) {
     const double eps = 1e-12;
@@ -974,6 +1130,7 @@ double streaming_e_step_rowgroup(
         const int tid = omp_get_thread_num();
         auto& local_ref_sums = thread_ref_sums[static_cast<size_t>(tid)];
         auto& local_ref_sums_ancient = thread_ref_sums_ancient[static_cast<size_t>(tid)];
+        double& local_null_sum = thread_null_sums[static_cast<size_t>(tid)];
 
 #pragma omp for schedule(static)
         for (int read_i = 0; read_i < read_count; ++read_i) {
@@ -986,14 +1143,17 @@ double streaming_e_step_rowgroup(
             if (deg == 0) continue;
 
             if (params.use_damage) {
-                log_scores.resize(2 * deg);
+                const uint32_t n_cols = null_on ? 2 * deg + 1 : 2 * deg;
+                log_scores.resize(n_cols);
                 for (uint32_t j = 0; j < deg; ++j) {
                     const uint32_t idx = read_start + j;
                     double log_w = log_weights[ref_idx[idx]];
                     if (params.normalize_by_length && tlen && tlen[idx] > 0) {
                         log_w -= half_log_tlen(tlen[idx]);
                     }
-                    const double score_contrib = params.lambda_b * static_cast<double>(bit_score[idx]);
+                    const double score_contrib = real_log_density(
+                        params, static_cast<double>(bit_score[idx]),
+                        aln_len ? aln_len[idx] : 0, 1.0);
 
                     if (use_aln_dmg) {
                         const double p_read = std::clamp(static_cast<double>(damage_score[idx]), eps, 1.0 - eps);
@@ -1005,8 +1165,13 @@ double streaming_e_step_rowgroup(
                         log_scores[2 * j + 1] = log_w + score_contrib + std::log(1.0 - pi_a) + std::log(1.0 - ds);
                     }
                 }
+                if (null_on) {
+                    const double lp = read_null_log_density_cols(
+                        params, bit_score, aln_len, read_start, deg);
+                    log_scores[2 * deg] = log_w_null_dyn + params.lambda_null * lp;
+                }
 
-                const double lse = dart::log_sum_exp(log_scores.data(), 2 * deg);
+                const double lse = dart::log_sum_exp(log_scores.data(), n_cols);
                 ll += lse;
 
                 for (uint32_t j = 0; j < deg; ++j) {
@@ -1022,18 +1187,30 @@ double streaming_e_step_rowgroup(
                     local_ref_sums[ri] += g_total;
                     local_ref_sums_ancient[ri] += g_ancient;
                 }
+                if (null_on) {
+                    const double dn = log_scores[2 * deg] - lse;
+                    local_null_sum += (dn > -700.0) ? std::exp(dn) : 0.0;
+                }
             } else {
-                log_scores.resize(deg);
+                const uint32_t n_cols = null_on ? deg + 1 : deg;
+                log_scores.resize(n_cols);
                 for (uint32_t j = 0; j < deg; ++j) {
                     const uint32_t idx = read_start + j;
                     double log_w = log_weights[ref_idx[idx]];
                     if (params.normalize_by_length && tlen && tlen[idx] > 0) {
                         log_w -= half_log_tlen(tlen[idx]);
                     }
-                    log_scores[j] = log_w + params.lambda_b * static_cast<double>(bit_score[idx]);
+                    log_scores[j] = log_w + real_log_density(
+                        params, static_cast<double>(bit_score[idx]),
+                        aln_len ? aln_len[idx] : 0, 1.0);
+                }
+                if (null_on) {
+                    const double lp = read_null_log_density_cols(
+                        params, bit_score, aln_len, read_start, deg);
+                    log_scores[deg] = log_w_null_dyn + params.lambda_null * lp;
                 }
 
-                const double lse = dart::log_sum_exp(log_scores.data(), deg);
+                const double lse = dart::log_sum_exp(log_scores.data(), n_cols);
                 ll += lse;
 
                 for (uint32_t j = 0; j < deg; ++j) {
@@ -1044,12 +1221,17 @@ double streaming_e_step_rowgroup(
                     if (ri >= num_refs) continue;
                     local_ref_sums[ri] += g_val;
                 }
+                if (null_on) {
+                    const double dn = log_scores[deg] - lse;
+                    local_null_sum += (dn > -700.0) ? std::exp(dn) : 0.0;
+                }
             }
         }
     }
 #else
     auto& local_ref_sums = thread_ref_sums[0];
     auto& local_ref_sums_ancient = thread_ref_sums_ancient[0];
+    double& local_null_sum = thread_null_sums[0];
     std::vector<double> log_scores;
     for (int read_i = 0; read_i < read_count; ++read_i) {
         const uint32_t read_start = read_starts[static_cast<size_t>(read_i)];
@@ -1061,14 +1243,17 @@ double streaming_e_step_rowgroup(
         if (deg == 0) continue;
 
         if (params.use_damage) {
-            log_scores.resize(2 * deg);
+            const uint32_t n_cols = null_on ? 2 * deg + 1 : 2 * deg;
+            log_scores.resize(n_cols);
             for (uint32_t j = 0; j < deg; ++j) {
                 const uint32_t idx = read_start + j;
                 double log_w = log_weights[ref_idx[idx]];
                 if (params.normalize_by_length && tlen && tlen[idx] > 0) {
                     log_w -= half_log_tlen(tlen[idx]);
                 }
-                const double score_contrib = params.lambda_b * static_cast<double>(bit_score[idx]);
+                const double score_contrib = real_log_density(
+                    params, static_cast<double>(bit_score[idx]),
+                    aln_len ? aln_len[idx] : 0, 1.0);
 
                 if (use_aln_dmg) {
                     const double p_read = std::clamp(static_cast<double>(damage_score[idx]), eps, 1.0 - eps);
@@ -1080,8 +1265,13 @@ double streaming_e_step_rowgroup(
                     log_scores[2 * j + 1] = log_w + score_contrib + std::log(1.0 - pi_a) + std::log(1.0 - ds);
                 }
             }
+            if (null_on) {
+                const double lp = read_null_log_density_cols(
+                    params, bit_score, aln_len, read_start, deg);
+                log_scores[2 * deg] = log_w_null_dyn + params.lambda_null * lp;
+            }
 
-            const double lse = dart::log_sum_exp(log_scores.data(), 2 * deg);
+            const double lse = dart::log_sum_exp(log_scores.data(), n_cols);
             ll += lse;
 
             for (uint32_t j = 0; j < deg; ++j) {
@@ -1097,18 +1287,30 @@ double streaming_e_step_rowgroup(
                 local_ref_sums[ri] += g_total;
                 local_ref_sums_ancient[ri] += g_ancient;
             }
+            if (null_on) {
+                const double dn = log_scores[2 * deg] - lse;
+                local_null_sum += (dn > -700.0) ? std::exp(dn) : 0.0;
+            }
         } else {
-            log_scores.resize(deg);
+            const uint32_t n_cols = null_on ? deg + 1 : deg;
+            log_scores.resize(n_cols);
             for (uint32_t j = 0; j < deg; ++j) {
                 const uint32_t idx = read_start + j;
                 double log_w = log_weights[ref_idx[idx]];
                 if (params.normalize_by_length && tlen && tlen[idx] > 0) {
                     log_w -= half_log_tlen(tlen[idx]);
                 }
-                log_scores[j] = log_w + params.lambda_b * static_cast<double>(bit_score[idx]);
+                log_scores[j] = log_w + real_log_density(
+                    params, static_cast<double>(bit_score[idx]),
+                    aln_len ? aln_len[idx] : 0, 1.0);
+            }
+            if (null_on) {
+                const double lp = read_null_log_density_cols(
+                    params, bit_score, aln_len, read_start, deg);
+                log_scores[deg] = log_w_null_dyn + params.lambda_null * lp;
             }
 
-            const double lse = dart::log_sum_exp(log_scores.data(), deg);
+            const double lse = dart::log_sum_exp(log_scores.data(), n_cols);
             ll += lse;
 
             for (uint32_t j = 0; j < deg; ++j) {
@@ -1118,6 +1320,10 @@ double streaming_e_step_rowgroup(
                 const uint32_t ri = ref_idx[idx];
                 if (ri >= num_refs) continue;
                 local_ref_sums[ri] += g_val;
+            }
+            if (null_on) {
+                const double dn = log_scores[deg] - lse;
+                local_null_sum += (dn > -700.0) ? std::exp(dn) : 0.0;
             }
         }
     }
@@ -1130,7 +1336,10 @@ double streaming_e_step_rowgroup(
 void streaming_m_step(
     const std::vector<double>& ref_sums,
     std::vector<double>& weights,
-    const dart::EMParams& params
+    const dart::EMParams& params,
+    double null_mass,
+    bool null_on,
+    double& w_null_io
 ) {
     const uint32_t T = static_cast<uint32_t>(weights.size());
     const double prior_offset = params.alpha_prior - 1.0;
@@ -1141,10 +1350,19 @@ void streaming_m_step(
         sum += weights[t];
     }
 
+    // Null coordinate: informative Dirichlet floor (alpha_null) mirrors the in-memory
+    // m_step_parallel so streaming w_null co-evolves identically.
+    double w_null = 0.0;
+    if (null_on) {
+        w_null = std::max(null_mass + params.alpha_null - 1.0, params.min_weight);
+        sum += w_null;
+    }
+
     double inv_sum = 1.0 / sum;
     for (uint32_t t = 0; t < T; ++t) {
         weights[t] *= inv_sum;
     }
+    if (null_on) w_null_io = w_null * inv_sum;
 }
 
 } // anonymous namespace
@@ -1185,6 +1403,18 @@ StreamingEMResult streaming_em(
     }
     result.pi = 0.1;
 
+    // Null column: parallels the in-memory squarem_em null coordinate. When active,
+    // seed w_null from exp(log_w_null) and shrink the real weights by (1 - w_null0)
+    // so the simplex including the null still sums to 1.
+    const bool null_on = params.use_null &&
+        (!params.null_mu.empty() || params.use_calib_cont);
+    if (null_on) {
+        const double w_null0 = std::clamp(std::exp(params.log_w_null),
+                                          params.min_weight, 1.0 - 1e-6);
+        for (uint32_t t = 0; t < T; ++t) result.weights[t] *= (1.0 - w_null0);
+        result.w_null = w_null0;
+    }
+
     // Thread-local accumulators for per-row-group read-parallel processing.
     int num_threads = 1;
 #ifdef _OPENMP
@@ -1198,6 +1428,7 @@ StreamingEMResult streaming_em(
 
     std::vector<std::vector<double>> thread_ref_sums(num_threads);
     std::vector<std::vector<double>> thread_ref_sums_ancient(num_threads);
+    std::vector<double> thread_null_sums(num_threads, 0.0);
     for (int t = 0; t < num_threads; ++t) {
         thread_ref_sums[t].resize(T, 0.0);
         if (params.use_damage) {
@@ -1220,10 +1451,13 @@ StreamingEMResult streaming_em(
                 std::fill(thread_ref_sums_ancient[t].begin(), thread_ref_sums_ancient[t].end(), 0.0);
             }
         }
+        std::fill(thread_null_sums.begin(), thread_null_sums.end(), 0.0);
 
         for (uint32_t t = 0; t < T; ++t) {
             log_weights[t] = std::log(std::max(result.weights[t], params.min_weight));
         }
+        const double log_w_null_dyn = null_on
+            ? std::log(std::max(result.w_null, params.min_weight)) : 0.0;
 
         double total_ll = 0.0;
 
@@ -1242,7 +1476,7 @@ StreamingEMResult streaming_em(
             const float* dmg_ll_a,
             const float* dmg_ll_m,
             const uint16_t* /*identity_q*/,
-            const uint16_t* /*aln_len*/,
+            const uint16_t* aln_len,
             const uint16_t* /*qstart*/,
             const uint16_t* /*qend*/,
             const uint16_t* /*tstart*/,
@@ -1254,9 +1488,10 @@ StreamingEMResult streaming_em(
         ) {
             total_ll += streaming_e_step_rowgroup(
                 num_rows, read_idx, ref_idx, bit_score, damage_score,
-                dmg_ll_a, dmg_ll_m, tlen,
+                dmg_ll_a, dmg_ll_m, tlen, aln_len,
                 log_weights.data(), T, params, result.pi,
-                thread_ref_sums, thread_ref_sums_ancient, num_threads
+                null_on, log_w_null_dyn,
+                thread_ref_sums, thread_ref_sums_ancient, thread_null_sums, num_threads
             );
         });
 
@@ -1276,8 +1511,13 @@ StreamingEMResult streaming_em(
             }
         }
 
-        // M-step: update weights from accumulated sums
-        streaming_m_step(ref_sums, result.weights, params);
+        // M-step: update weights from accumulated sums (+ null coordinate)
+        double total_null_mass = 0.0;
+        if (null_on) {
+            for (int t = 0; t < num_threads; ++t) total_null_mass += thread_null_sums[t];
+        }
+        streaming_m_step(ref_sums, result.weights, params,
+                         total_null_mass, null_on, result.w_null);
 
         // Update pi from accumulated ancient sums
         if (params.use_damage) {
@@ -1336,6 +1576,11 @@ void streaming_em_finalize(
     for (size_t t = 0; t < result.weights.size(); ++t) {
         log_weights[t] = std::log(std::max(result.weights[t], params.min_weight));
     }
+    // Null column against the FROZEN converged weights (matches the E-step's null col).
+    const bool null_on = params.use_null &&
+        (!params.null_mu.empty() || params.use_calib_cont);
+    const double log_w_null_dyn = null_on
+        ? std::log(std::max(result.w_null, params.min_weight)) : 0.0;
 
     // Process each row group and compute final gamma
     reader.parallel_scan([&](
@@ -1351,7 +1596,7 @@ void streaming_em_finalize(
         const float* dmg_ll_a,
         const float* dmg_ll_m,
         const uint16_t* /*identity_q*/,
-        const uint16_t* /*aln_len*/,
+        const uint16_t* aln_len,
         const uint16_t* /*qstart*/,
         const uint16_t* /*qend*/,
         const uint16_t* /*tstart*/,
@@ -1363,9 +1608,19 @@ void streaming_em_finalize(
     ) {
         // Allocate per-row-group buffers (renamed to avoid conflict with std::tgamma)
         std::vector<float> g_vals(num_rows);
+        // Emit gamma_ancient when the mapping itself is damage-aware (use_damage),
+        // or when the mapping is damage-free but a post-hoc ancient responsibility
+        // is requested against the frozen weights (posthoc_gamma_ancient). The
+        // latter needs the per-alignment damage_score column to be present.
+        const bool posthoc_anc = params.posthoc_gamma_ancient && damage_score;
+        const bool emit_anc = params.use_damage || posthoc_anc;
         std::vector<float> g_ancient_vals;
-        if (params.use_damage) {
+        if (emit_anc) {
             g_ancient_vals.resize(num_rows);
+        }
+        std::vector<float> g_null_vals;
+        if (null_on) {
+            g_null_vals.resize(num_rows, 0.0f);
         }
 
         // Compute gamma for each alignment
@@ -1382,14 +1637,17 @@ void streaming_em_finalize(
 
             if (params.use_damage) {
                 const bool use_aln_dmg = params.use_alignment_damage_likelihood && dmg_ll_a && dmg_ll_m;
-                log_scores.resize(2 * deg);
+                const uint32_t n_cols = null_on ? 2 * deg + 1 : 2 * deg;
+                log_scores.resize(n_cols);
                 for (uint32_t j = 0; j < deg; ++j) {
                     uint32_t idx = read_start + j;
                     double log_w = log_weights[ref_idx[idx]];
                     if (params.normalize_by_length && tlen && tlen[idx] > 0) {
                         log_w -= half_log_tlen(tlen[idx]);
                     }
-                    double score_contrib = params.lambda_b * static_cast<double>(bit_score[idx]);
+                    double score_contrib = real_log_density(
+                        params, static_cast<double>(bit_score[idx]),
+                        aln_len ? aln_len[idx] : 0, 1.0);
 
                     if (use_aln_dmg) {
                         double p_read = std::clamp(static_cast<double>(damage_score[idx]), eps, 1.0 - eps);
@@ -1401,8 +1659,13 @@ void streaming_em_finalize(
                         log_scores[2 * j + 1] = log_w + score_contrib + std::log(1.0 - pi_a) + std::log(1.0 - ds);
                     }
                 }
+                if (null_on) {
+                    double lp = read_null_log_density_cols(
+                        params, bit_score, aln_len, read_start, deg);
+                    log_scores[2 * deg] = log_w_null_dyn + params.lambda_null * lp;
+                }
 
-                double lse = log_sum_exp(log_scores.data(), 2 * deg);
+                double lse = log_sum_exp(log_scores.data(), n_cols);
 
                 for (uint32_t j = 0; j < deg; ++j) {
                     uint32_t idx = read_start + j;
@@ -1414,23 +1677,65 @@ void streaming_em_finalize(
                     g_vals[idx] = static_cast<float>(g_ancient + g_modern);
                     g_ancient_vals[idx] = static_cast<float>(g_ancient);
                 }
+                if (null_on) {
+                    double dn = log_scores[2 * deg] - lse;
+                    float gnull = static_cast<float>((dn > -700.0) ? std::exp(dn) : 0.0);
+                    for (uint32_t j = 0; j < deg; ++j) g_null_vals[read_start + j] = gnull;
+                }
             } else {
-                log_scores.resize(deg);
+                const uint32_t n_cols = null_on ? deg + 1 : deg;
+                log_scores.resize(n_cols);
                 for (uint32_t j = 0; j < deg; ++j) {
                     uint32_t idx = read_start + j;
                     double log_w = log_weights[ref_idx[idx]];
                     if (params.normalize_by_length && tlen && tlen[idx] > 0) {
                         log_w -= half_log_tlen(tlen[idx]);
                     }
-                    log_scores[j] = log_w + params.lambda_b * static_cast<double>(bit_score[idx]);
+                    log_scores[j] = log_w + real_log_density(
+                        params, static_cast<double>(bit_score[idx]),
+                        aln_len ? aln_len[idx] : 0, 1.0);
+                }
+                if (null_on) {
+                    double lp = read_null_log_density_cols(
+                        params, bit_score, aln_len, read_start, deg);
+                    log_scores[deg] = log_w_null_dyn + params.lambda_null * lp;
                 }
 
-                double lse = log_sum_exp(log_scores.data(), deg);
+                double lse = log_sum_exp(log_scores.data(), n_cols);
 
                 for (uint32_t j = 0; j < deg; ++j) {
                     uint32_t idx = read_start + j;
                     double diff = log_scores[j] - lse;
                     g_vals[idx] = static_cast<float>((diff > -700.0) ? std::exp(diff) : 0.0);
+                }
+                if (null_on) {
+                    double dn = log_scores[deg] - lse;
+                    float gnull = static_cast<float>((dn > -700.0) ? std::exp(dn) : 0.0);
+                    for (uint32_t j = 0; j < deg; ++j) g_null_vals[read_start + j] = gnull;
+                }
+
+                // Post-hoc ancient responsibility against the FROZEN weights: the
+                // damage-free mapping gamma is left untouched; gamma_ancient is the
+                // clean gamma scaled by the per-alignment P(ancient | evidence).
+                // Damage never re-enters the mapping/M-step (that already converged).
+                if (posthoc_anc) {
+                    const bool use_aln_dmg = dmg_ll_a && dmg_ll_m;
+                    for (uint32_t j = 0; j < deg; ++j) {
+                        uint32_t idx = read_start + j;
+                        double ds = std::clamp(static_cast<double>(damage_score[idx]), eps, 1.0 - eps);
+                        double p_anc;
+                        if (use_aln_dmg) {
+                            double la = std::log(ds) + dmg_ll_a[idx];
+                            double lm = std::log(1.0 - ds) + dmg_ll_m[idx];
+                            double mx = std::max(la, lm);
+                            double ea = std::exp(la - mx), em = std::exp(lm - mx);
+                            p_anc = ea / (ea + em);
+                        } else {
+                            double num = pi_a * ds;
+                            p_anc = num / (num + (1.0 - pi_a) * (1.0 - ds));
+                        }
+                        g_ancient_vals[idx] = static_cast<float>(g_vals[idx] * p_anc);
+                    }
                 }
             }
         }
@@ -1439,7 +1744,9 @@ void streaming_em_finalize(
         callback(
             rg_idx, num_rows, read_idx, ref_idx,
             g_vals.data(),
-            params.use_damage ? g_ancient_vals.data() : nullptr
+            emit_anc ? g_ancient_vals.data() : nullptr,
+            null_on ? g_null_vals.data() : nullptr,
+            bit_score, aln_len
         );
     });
 }

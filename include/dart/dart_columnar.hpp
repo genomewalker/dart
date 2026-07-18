@@ -90,6 +90,9 @@ enum ColFlag : uint32_t {
     COL_BEST_CODON    = 1u << 7,   // Grain B: MAP (damage-corrected) codon + its posterior present (panbarley).
                                    // Needs the marginalized-out codon posterior DART discards for KapK, so
                                    // off by default; RefAa/ObsAa (mandatory) carry the residues regardless.
+    COL_GAMMA_NULL    = 1u << 8,   // Grain A: gamma_null present (u16). Per-read null-component responsibility
+                                   // (spurious-hit mass). Carried for visibility; aggregation still respects
+                                   // em_keep/null by default — this column only exposes the raw value.
 };
 
 // Sample-level semantics (FileHeader.sample_flags). Deamination discrimination
@@ -107,6 +110,7 @@ enum class ColumnId : uint16_t {
     Presence, BestCodon, BestPostQ, PDamageQ, Dist5, Dist3, DamageClass2,
     Strand, ObsCodon,   // appended (minor bump): read strand (Grain A), raw observed codon (Grain B)
     RefAa, ObsAa,       // v2 mandatory Grain B: reference and observed residue as ASCII byte (Raw u8)
+    GammaNull,          // appended (minor bump): Grain A per-read null responsibility (U16Quant)
 };
 
 enum class ColEncoding : uint16_t {
@@ -224,6 +228,7 @@ struct Footer {
 //                 strand; needed to test strand-symmetry of the substitution
 //                 (real variants symmetric; deamination strand-biased).
 //   [GammaAncientQ U16Quant] [EmMarginQ U16Quant] [EmRefNeff F32]   (per col_flags)
+//   [GammaNull U16Quant]     (per COL_GAMMA_NULL) per-read null responsibility
 //   Presence      Bitset1   concatenated: ceil(span_i/8) bytes per record.
 //                 Bit k => target position tstart_i + k is observed.
 //                 INVARIANT: bits [span_i, 8*ceil(span_i/8)) MUST be zero;
@@ -293,6 +298,7 @@ struct Batch {
     std::vector<float>    gamma_ancient; // present iff COL_GAMMA_ANCIENT
     std::vector<float>    em_margin;     // present iff COL_EM_MARGIN
     std::vector<float>    em_ref_neff;   // present iff COL_EM_REF_NEFF
+    std::vector<float>    gamma_null;    // per-read null responsibility; present iff COL_GAMMA_NULL
     // presence bitmaps concatenated in record order; ceil(span_i/8) bytes each,
     // tail bits [span_i, 8*ceil(span_i/8)) MUST be zero. n_obs_i = popcount.
     std::vector<uint8_t>  presence;

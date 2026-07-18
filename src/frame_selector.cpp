@@ -515,6 +515,10 @@ float FrameSelector::compute_per_read_damage_prior(
     constexpr float EPS = 1e-6f;
 
     const size_t seq_len = seq.length();
+    // By design the per-read damage prior only modulates reads ≥60bp (needs a full 20bp window at
+    // each terminus with interior separation); shorter reads return 0 here. This is NOT a rescue gap:
+    // stop-rescue keys off the sample-level p_stop_sample, so 30–60bp merged reads still rescue on
+    // sample damage — the per-read prior is a refinement, not a gate.
     if (seq_len < 60) {
         return 0.0f;
     }
@@ -792,9 +796,10 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
                     // empirical-rate-preferred, multi-path combined.
                     float p_stop_sample = compute_stop_damage_probability(
                         codon_ptr, codon_nt_start, oriented.length(), sample_profile, is_forward);
-                    // Combine sample-level and per-read priors in logit space (not multiplicative).
-                    // Multiplicative form p_sample * p_read is a conjunction that suppresses rescue
-                    // too aggressively (e.g. p_sample=0.68, p_read=0.5 → p=0.34 → cost=1.26 nats).
+                    // Combine sample-level and per-read priors as max(p_sample*p_read, 0.4*p_sample):
+                    // pure multiplicative p_sample*p_read suppresses rescue too aggressively when the
+                    // per-read signal is uncertain (p_sample=0.68, p_read=0.5 → 0.34), so the 0.4*p_sample
+                    // floor is the operative term for low-confidence reads (see combine_p_stop).
                     float p_stop = combine_p_stop(p_stop_sample);
 
                     // Rescue: continue ORF through this stop when plausibly damage-induced.

@@ -12,6 +12,7 @@
 
 #include "damage_index.hpp"
 
+#include <cmath>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -112,6 +113,80 @@ public:
     bool damage_informative() const {
         if (header_->version < 3) return d_max() > 0.0f;
         return damage_validated() && !damage_artifact();
+    }
+
+    /**
+     * @brief v5+: DamageConfidence enum value of the library's validated pi.
+     * @return 0 = DETECTED; 255 for pre-v5 indices (unknown).
+     */
+    uint8_t pi_state() const {
+        return header_->version >= 5 ? header_->pi_state : 255;
+    }
+
+    /**
+     * @brief v5+: library authenticated as DETECTED damage.
+     *
+     * The per-read pre-gate: libtaph read_ancient_posterior only emits a per-read
+     * damage claim when pi.state == DETECTED (0). Libraries that do not validate
+     * are surfaced (their proteins are dropped from the damage gate), never
+     * silently scored via the AA-window fallback.
+     */
+    bool pi_detected() const {
+        return header_->version >= 5 && header_->pi_state == 0;
+    }
+
+    /**
+     * @brief v5+: the library's validated damaged-fraction point (pi.point).
+     * @return the point estimate, or -1.0 for pre-v5 indices.
+     */
+    double pi_point() const {
+        return header_->version >= 5 ? header_->pi_point : -1.0;
+    }
+
+    /**
+     * @brief v5+: the library's pi is USABLE for damage annotation.
+     *
+     * Broader than pi_detected(): a library need not validate as DETECTED(0) to be
+     * annotatable. The per-read path already degrades to the prior-free
+     * damage_evidence_llr ranking when read_ancient_posterior refuses, so the ONLY
+     * states that must fail every protein are the abstain-equivalents with no usable
+     * pi point -- NOT_DETECTED(2), UNDETERMINED(3), BELOW_FLOOR(6), or a non-positive
+     * point. DETECTED(0), TRACE(1), ANCIENT_CPG(4) and LOW_ABUNDANCE(5) all carry a
+     * usable positive pi.point and are annotated (advisory when not DETECTED), so a
+     * library whose deamination is authenticated but whose independent-molecule count
+     * lands LOW_ABUNDANCE is no longer erased.
+     */
+    bool pi_usable() const {
+        const double p = pi_point();
+        if (header_->version < 5 || !std::isfinite(p) || p <= 0.0) return false;
+        switch (header_->pi_state) {
+            case 0:  // DETECTED
+            case 1:  // TRACE
+            case 4:  // ANCIENT_CPG
+            case 5:  // LOW_ABUNDANCE
+                return true;
+            default: // NOT_DETECTED(2), UNDETERMINED(3), BELOW_FLOOR(6)
+                return false;
+        }
+    }
+
+    /**
+     * @brief v6+: library-level empirical-Bayes damage prior (pi_damaged = δ/d_max).
+     *
+     * The damaged-read FRACTION. Unlike pi_point() (the state-gated pi.point), this survives
+     * the abstain states (LOW_ABUNDANCE etc.) and is the prior for per-protein p_protein_damaged.
+     * A library constant. Returns -1.0 for pre-v6 indices.
+     */
+    double damage_prior_point() const {
+        return header_->version >= 6 ? static_cast<double>(header_->damage_prior_point) : -1.0;
+    }
+
+    /**
+     * @brief v6+: DamageConfidence enum value attached to the damage prior.
+     * @return the enum value, or 255 for pre-v6 indices.
+     */
+    uint8_t damage_prior_state() const {
+        return header_->version >= 6 ? header_->damage_prior_state : 255;
     }
 
     /**
