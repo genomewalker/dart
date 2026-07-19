@@ -129,13 +129,21 @@ struct DcxReadRec {
     uint32_t tstart = 0, span = 0;       // 0-based target start; tend = tstart+span-1
     float gamma = 0, gamma_ancient = 0, em_margin = 0, em_ref_neff = 0;
     float gamma_null = 0;                 // per-read null responsibility (spurious-hit mass)
-    float posterior = 0;                 // filled post-scoring
+    float p_read = 0;                    // AGD reference-free per-read damage posterior (auth axis)
+    float posterior = 0;                 // filled post-scoring (identity-fused posterior; audit only)
     uint8_t strand = 0;
     uint8_t em_keep = 0;                  // real EM keep bit (SOFT weight, not a filter)
     std::vector<uint8_t> presence;       // ceil(span/8), bit k => covered
     std::vector<uint8_t> ref_aa, obs_aa, dcls;   // Grain B, covered positions
     std::vector<float>   p_damage;
     std::vector<uint16_t> dist5, dist3;
+    // RAW observed codon at the substitution -> the designed COL_OBS_CODON column
+    // (packed 0-63, A=0 C=1 G=2 T=3; 255 = not in the AGD terminal zone / unavailable).
+    // Lets convergence verify damage at the NUCLEOTIDE level (is the read codon a
+    // C->T/G->A deamination of a ref_aa-coding codon) vs only the AA-consistency in
+    // damage_class. Sourced from AgdRecord terminal codons indexed by dist5/dist3 (damage
+    // is terminal, so central positions carry no codon and don't need one).
+    std::vector<uint8_t> obs_codon;
 };
 
 struct ProteinDamageSummary {
@@ -3756,7 +3764,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                             rec.em_margin = em.em_margin;
                             rec.em_ref_neff = em.em_ref_neff;
                             rec.gamma_null = em.gamma_null;
+                            rec.p_read = summary.p_read;   // reference-free per-read damage posterior
                             rec.em_keep = em.em_keep ? 1 : 0;
+                            // AGD record carries this read's terminal codons (first/last 5),
+                            // indexed by terminal AA distance -> the actual read codon at a
+                            // terminal substitution (where damage occurs).
+                            const AgdRecord* agd = damage_index ? damage_index->find(query_id) : nullptr;
 
                             std::vector<uint8_t> cover;
                             uint32_t tpos = hit.tstart_0;
@@ -3771,6 +3784,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                                     rec.obs_aa.push_back(uint8_t(qc));
                                     float pd = 0.0f; uint16_t d5 = 0, d3 = 0;
                                     uint8_t dc = uint8_t(dcx::DamageClass::None);
+                                    uint8_t codon = 255;   // 255 = central / not in AGD terminal zone
                                     auto sit = site_by_pos.find(tpos);
                                     if (sit != site_by_pos.end()) {
                                         const DamageSite* s = sit->second;
@@ -3780,11 +3794,18 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                                         dc = (s->damage_class == 'C')
                                             ? uint8_t(dcx::DamageClass::CT)
                                             : uint8_t(dcx::DamageClass::GA);
+                                        // actual read codon at this substitution: terminal codons
+                                        // are indexed by terminal AA distance (one codon per AA).
+                                        if (agd) {
+                                            if (d5 < agd->n_5prime)      codon = agd->codons_5prime[d5];
+                                            else if (d3 < agd->n_3prime) codon = agd->codons_3prime[d3];
+                                        }
                                     }
                                     rec.p_damage.push_back(pd);
                                     rec.dist5.push_back(d5);
                                     rec.dist3.push_back(d3);
                                     rec.dcls.push_back(dc);
+                                    rec.obs_codon.push_back(codon);
                                 }
                                 ++tpos;
                             }
@@ -4396,6 +4417,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         dcx::Batch B;
         B.col_flags = dcx::COL_GAMMA_ANCIENT | dcx::COL_EM_MARGIN |
                       dcx::COL_EM_REF_NEFF | dcx::COL_GAMMA_NULL |
+                      dcx::COL_P_READ | dcx::COL_OBS_CODON |
                       dcx::COL_STRAND | dcx::COL_QID_DICT;
         std::unordered_map<std::string, uint32_t> tord_map;
         std::unordered_map<std::string, uint64_t> qord_map;
@@ -4425,9 +4447,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             B.em_margin.push_back(rec.em_margin);
             B.em_ref_neff.push_back(rec.em_ref_neff);
             B.gamma_null.push_back(rec.gamma_null);
+            B.p_read.push_back(rec.p_read);
             B.presence.insert(B.presence.end(), rec.presence.begin(), rec.presence.end());
             B.ref_aa.insert(B.ref_aa.end(), rec.ref_aa.begin(), rec.ref_aa.end());
             B.obs_aa.insert(B.obs_aa.end(), rec.obs_aa.begin(), rec.obs_aa.end());
+            B.obs_codon.insert(B.obs_codon.end(), rec.obs_codon.begin(), rec.obs_codon.end());
             B.p_damage.insert(B.p_damage.end(), rec.p_damage.begin(), rec.p_damage.end());
             B.dist5.insert(B.dist5.end(), rec.dist5.begin(), rec.dist5.end());
             B.dist3.insert(B.dist3.end(), rec.dist3.begin(), rec.dist3.end());
