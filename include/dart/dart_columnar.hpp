@@ -45,7 +45,12 @@ constexpr uint8_t  INDEX_MAGIC[4] = {'D','C','X','I'};
 constexpr uint8_t  FOOTER_MAGIC[4]= {'D','C','X','E'};
 
 constexpr uint8_t  VERSION_MAJOR = 2;  // bump => bytes reordered/reinterpreted
-constexpr uint8_t  VERSION_MINOR = 0;  // bump => only skippable sections / optional columns added
+constexpr uint8_t  VERSION_MINOR = 1;  // bump => only skippable sections / optional columns added
+// v2.1: Grain-A p_read (COL_P_READ) — the AGD reference-FREE per-read damage
+// posterior. Distinct from PosteriorQ, which is the identity-FUSED posterior
+// (p_read + AA evidence). Convergence gates/weights on the reference-free
+// p_read (anti-circularity: the reference must not authenticate itself); the
+// fused posterior is retained for audit only.
 // v2: mandatory Grain-B residue columns RefAa/ObsAa (ASCII); codon columns
 // (BestCodon/BestPostQ/ObsCodon) are now capability-gated, not the residue
 // carrier. v1 carried the observed residue ONLY via BestCodon, so a codon-free
@@ -93,6 +98,10 @@ enum ColFlag : uint32_t {
     COL_GAMMA_NULL    = 1u << 8,   // Grain A: gamma_null present (u16). Per-read null-component responsibility
                                    // (spurious-hit mass). Carried for visibility; aggregation still respects
                                    // em_keep/null by default — this column only exposes the raw value.
+    COL_P_READ        = 1u << 9,   // Grain A: p_read present (u16). AGD reference-FREE per-read damage
+                                   // posterior — sigmoid(damage LLR) with no baked prior, no AA/reference
+                                   // evidence. This is the authentication axis convergence gates/weights on;
+                                   // PosteriorQ (the identity-fused posterior) is audit-only downstream.
 };
 
 // Sample-level semantics (FileHeader.sample_flags). Deamination discrimination
@@ -111,6 +120,7 @@ enum class ColumnId : uint16_t {
     Strand, ObsCodon,   // appended (minor bump): read strand (Grain A), raw observed codon (Grain B)
     RefAa, ObsAa,       // v2 mandatory Grain B: reference and observed residue as ASCII byte (Raw u8)
     GammaNull,          // appended (minor bump): Grain A per-read null responsibility (U16Quant)
+    PReadQ,             // appended (minor bump): Grain A reference-free per-read damage posterior (U16Quant)
 };
 
 enum class ColEncoding : uint16_t {
@@ -229,6 +239,7 @@ struct Footer {
 //                 (real variants symmetric; deamination strand-biased).
 //   [GammaAncientQ U16Quant] [EmMarginQ U16Quant] [EmRefNeff F32]   (per col_flags)
 //   [GammaNull U16Quant]     (per COL_GAMMA_NULL) per-read null responsibility
+//   [PReadQ U16Quant]        (per COL_P_READ) reference-free per-read damage posterior
 //   Presence      Bitset1   concatenated: ceil(span_i/8) bytes per record.
 //                 Bit k => target position tstart_i + k is observed.
 //                 INVARIANT: bits [span_i, 8*ceil(span_i/8)) MUST be zero;
@@ -299,6 +310,7 @@ struct Batch {
     std::vector<float>    em_margin;     // present iff COL_EM_MARGIN
     std::vector<float>    em_ref_neff;   // present iff COL_EM_REF_NEFF
     std::vector<float>    gamma_null;    // per-read null responsibility; present iff COL_GAMMA_NULL
+    std::vector<float>    p_read;        // [0,1] reference-free per-read damage posterior; present iff COL_P_READ
     // presence bitmaps concatenated in record order; ceil(span_i/8) bytes each,
     // tail bits [span_i, 8*ceil(span_i/8)) MUST be zero. n_obs_i = popcount.
     std::vector<uint8_t>  presence;

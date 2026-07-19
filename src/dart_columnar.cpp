@@ -91,6 +91,7 @@ bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
     const bool has_em = cf & COL_EM_MARGIN;
     const bool has_neff = cf & COL_EM_REF_NEFF;
     const bool has_gnull = cf & COL_GAMMA_NULL;
+    const bool has_pread = cf & COL_P_READ;
     const bool dist3_derived = cf & COL_DIST3_DERIVED;
     const bool has_strand = cf & COL_STRAND;
     const bool has_obs = cf & COL_OBS_CODON;
@@ -114,6 +115,8 @@ bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
         throw std::runtime_error("dcx: obs_codon size != ref_aa size — desynced observation grain");
     if (has_strand && B.strand.size() != nA)
         throw std::runtime_error("dcx: strand size != n_records_a");
+    if (has_pread && B.p_read.size() != nA)
+        throw std::runtime_error("dcx: p_read size != n_records_a");
     bool calibed = false;
     for (int i = 0; i < 16; ++i) calibed |= (opt.calib_contract_id[i] != 0);
     if (!calibed)
@@ -143,7 +146,7 @@ bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
         const size_t nB = b_hi - b_lo;
 
         // ---- encode Grain A columns ----
-        std::vector<uint8_t> qid, tord, tst, spn, gq, pq, emk, strd, gaq, emq, neff, gnullq;
+        std::vector<uint8_t> qid, tord, tst, spn, gq, pq, emk, strd, gaq, emq, neff, gnullq, preadq;
         uint64_t pq_prev = 0, tord_prev = 0; int64_t tst_prev = 0, qid_prev = 0;
         emk.assign(bytes_for_bits(nblk), 0);
         if (has_strand) strd.assign(bytes_for_bits(nblk), 0);
@@ -160,6 +163,7 @@ bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
             if (has_em) put_u16(emq, enc_unit(B.em_margin[r]));
             if (has_neff) { float f = B.em_ref_neff[r]; put_bytes(neff, &f, 4); }
             if (has_gnull) put_u16(gnullq, enc_unit(B.gamma_null[r]));
+            if (has_pread) put_u16(preadq, enc_unit(B.p_read[r]));
             (void)pq_prev;
         }
         std::vector<uint8_t> pres(B.presence.begin() + pres_off[lo], B.presence.begin() + pres_off[hi]);
@@ -196,6 +200,7 @@ bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
         if (has_em) push_col(dir, cols, ColumnId::EmMarginQ, ColEncoding::U16Quant, uint32_t(nblk), emq);
         if (has_neff) push_col(dir, cols, ColumnId::EmRefNeff, ColEncoding::F32, uint32_t(nblk), neff);
         if (has_gnull) push_col(dir, cols, ColumnId::GammaNull, ColEncoding::U16Quant, uint32_t(nblk), gnullq);
+        if (has_pread) push_col(dir, cols, ColumnId::PReadQ, ColEncoding::U16Quant, uint32_t(nblk), preadq);
         push_col(dir, cols, ColumnId::Presence, ColEncoding::Bitset1, uint32_t(nblk), pres);
         push_col(dir, cols, ColumnId::RefAa, ColEncoding::Raw, uint32_t(nB), refaa);
         push_col(dir, cols, ColumnId::ObsAa, ColEncoding::Raw, uint32_t(nB), obsaa);
