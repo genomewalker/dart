@@ -3641,6 +3641,45 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             }
         }
 
+        // --emit-multimap: finalize the soft top-K pool by gamma and REBUILD best_rows_by_rg
+        // from the kept candidates. best_rows was built pre-EM from the argmax; the gamma
+        // top-K is only known now. mm_row_cand maps (rg,row)->candidate for the annotation
+        // loop. best_rows / selected_row_groups are consumed ONLY in the scan below.
+        std::unordered_map<uint64_t, const BestHitData*> mm_row_cand;
+        if (emit_multimap) {
+            for (auto& rg : best_rows_by_rg) rg.clear();
+            selected_row_groups.clear();
+            selected_best_hits = 0;
+            std::vector<uint8_t> rg_seen(best_rows_by_rg.size(), 0);
+            const float floorv = static_cast<float>(multimap_floor);
+            const int K = std::max(1, multimap_k);
+            for (uint32_t r = 0; r < n_reads; ++r) {
+                auto& pool = mm_pool[r];
+                if (pool.empty()) continue;
+                std::sort(pool.begin(), pool.end(),
+                          [](const BestHitData& a, const BestHitData& b) { return a.gamma > b.gamma; });
+                std::vector<BestHitData> kept;
+                std::unordered_set<uint32_t> seen_ref;
+                for (auto& c : pool) {
+                    if (c.gamma <= floorv) break;                       // gamma-sorted desc
+                    if (static_cast<int>(kept.size()) >= K) break;
+                    if (!seen_ref.insert(c.ref_idx).second) continue;   // one HSP per ref
+                    c.candidate_rank = static_cast<uint8_t>(kept.size());
+                    kept.push_back(c);
+                }
+                pool.swap(kept);
+                for (auto& c : pool) {
+                    if (c.best_rg >= best_rows_by_rg.size()) continue;
+                    if (!rg_seen[c.best_rg]) { rg_seen[c.best_rg] = 1; selected_row_groups.push_back(c.best_rg); }
+                    best_rows_by_rg[c.best_rg].emplace_back(c.best_row, r);
+                    mm_row_cand[(static_cast<uint64_t>(c.best_rg) << 32) | c.best_row] = &c;
+                    selected_best_hits++;
+                }
+            }
+            for (auto& rows : best_rows_by_rg) std::sort(rows.begin(), rows.end());
+            std::sort(selected_row_groups.begin(), selected_row_groups.end());
+        }
+
         if (selected_best_hits > 0) {
             reader.set_columns({dart::ColumnID::QALN, dart::ColumnID::TALN});
 
@@ -3675,7 +3714,16 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     for (size_t i = 0; i < rows.size(); ++i) {
                         const auto& [row_in_group, ridx] = rows[i];
                         if (row_in_group >= num_rows) continue;
-                        BestHitData& hit = best_hits[ridx];
+                        BestHitData mm_cand;  // --emit-multimap: THIS candidate's own metadata
+                        BestHitData* hitp = &best_hits[ridx];
+                        if (emit_multimap) {
+                            auto itc = mm_row_cand.find(
+                                (static_cast<uint64_t>(rg_idx) << 32) | row_in_group);
+                            if (itc == mm_row_cand.end()) continue;
+                            mm_cand = *itc->second;
+                            hitp = &mm_cand;
+                        }
+                        BestHitData& hit = *hitp;
                         if (!hit.has) continue;
 
                         std::string_view qaln_sv = reader.get_qaln(rg_idx, row_in_group);
@@ -3835,6 +3883,14 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                             rec.gamma_null = em.gamma_null;
                             rec.p_read = summary.p_read;   // reference-free per-read damage posterior
                             rec.em_keep = em.em_keep ? 1 : 0;
+                            if (emit_multimap) {
+                                // per-candidate: this (read,target)'s own gamma + rank; em_keep=1
+                                // on exactly the argmax (rank 0) so v2.1 one-row-per-read consumers bridge.
+                                rec.gamma = hit.gamma;
+                                rec.gamma_ancient = hit.gamma_ancient;
+                                rec.candidate_rank = hit.candidate_rank;
+                                rec.em_keep = (hit.candidate_rank == 0) ? 1 : 0;
+                            }
                             // AGD record carries this read's terminal codons (first/last 5),
                             // indexed by terminal AA distance -> the actual read codon at a
                             // terminal substitution (where damage occurs).
