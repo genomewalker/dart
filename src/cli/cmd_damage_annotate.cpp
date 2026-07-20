@@ -2963,6 +2963,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                         em_read_results[r].gamma = g;
                         em_read_results[r].gamma_ancient = g_a;
                     }
+                    if (emit_multimap && r < mm_pool.size()) {  // join gamma onto the top-K pool
+                        for (auto& c : mm_pool[r]) {
+                            if (c.ref_idx == ref) { c.gamma = g; c.gamma_ancient = g_a; break; }
+                        }
+                    }
                 }
             });
 
@@ -3422,6 +3427,19 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 if (aln_data.alignments[j].ref_idx == em_best_ref) {
                     em_best_bit = static_cast<double>(aln_data.alignments[j].bit_score);
                     em_best_aln = aln_data.alignments[j].aln_len;
+                }
+            }
+            if (emit_multimap && r < mm_pool.size() && !mm_pool[r].empty()) {  // join gamma onto the pool
+                for (uint32_t j = start; j < end; ++j) {
+                    const uint32_t jref = aln_data.alignments[j].ref_idx;
+                    for (auto& c : mm_pool[r]) {
+                        if (c.ref_idx == jref) {
+                            c.gamma = static_cast<float>(em_state.gamma[j]);
+                            c.gamma_ancient = em_state.gamma_ancient.empty() ? 0.0f
+                                : static_cast<float>(em_state.gamma_ancient[j]);
+                            break;
+                        }
+                    }
                 }
             }
 
