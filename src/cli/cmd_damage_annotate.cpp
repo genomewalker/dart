@@ -133,6 +133,7 @@ struct DcxReadRec {
     float posterior = 0;                 // filled post-scoring (identity-fused posterior; audit only)
     uint8_t strand = 0;
     uint8_t em_keep = 0;                  // real EM keep bit (SOFT weight, not a filter)
+    uint8_t candidate_rank = 0;           // DCX 2.2: EM candidate rank per read, 0=argmax (COL_CANDIDATE_RANK)
     std::vector<uint8_t> presence;       // ceil(span/8), bit k => covered
     std::vector<uint8_t> ref_aa, obs_aa, dcls;   // Grain B, covered positions
     std::vector<float>   p_damage;
@@ -1389,6 +1390,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // pick the homolog and then be reused in gamma_ancient). OFF => mapping gamma
     // is damage-free; gamma_ancient is still emitted post-hoc against frozen weights.
     bool em_use_damage_mapping = false;
+    // Soft multi-mapping emit (DCX 2.2): emit the top-K EM candidates per read (not just the
+    // argmax) so downstream can distribute a read's SAAV evidence across homologs by gamma.
+    // OFF => byte-identical one-argmax-row-per-read. See convergence/DCX_2.2_MULTIMAP.md.
+    bool   emit_multimap = false;
+    int    multimap_k = 5;           // keep top-K candidates per read (ranked by gamma)
+    double multimap_floor = 0.05;    // AND gamma > floor
 
     // Null/noise component (spurious short-peptide rejection). Off by default.
     std::string em_null_model_file;  // load empirical decoy Gumbel (bin lo hi mu beta n)
@@ -1467,6 +1474,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             corrected_file = argv[++i];
         } else if (strcmp(argv[i], "--dcx") == 0 && i + 1 < argc) {
             dcx_file = argv[++i];
+        } else if (strcmp(argv[i], "--emit-multimap") == 0) {
+            emit_multimap = true;
+        } else if (strcmp(argv[i], "--multimap-k") == 0 && i + 1 < argc) {
+            multimap_k = std::stoi(argv[++i]);
+        } else if (strcmp(argv[i], "--multimap-floor") == 0 && i + 1 < argc) {
+            multimap_floor = std::stod(argv[++i]);
         } else if (strcmp(argv[i], "--library-label") == 0 && i + 1 < argc) {
             library_label = argv[++i];
         } else if (strcmp(argv[i], "--protein-summary") == 0 && i + 1 < argc) {
@@ -4419,6 +4432,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                       dcx::COL_EM_REF_NEFF | dcx::COL_GAMMA_NULL |
                       dcx::COL_P_READ | dcx::COL_OBS_CODON |
                       dcx::COL_STRAND | dcx::COL_QID_DICT;
+        if (emit_multimap)
+            B.col_flags |= dcx::COL_SOFT_MULTIMAP | dcx::COL_CANDIDATE_RANK;
         std::unordered_map<std::string, uint32_t> tord_map;
         std::unordered_map<std::string, uint64_t> qord_map;
         for (auto& rec : dcx_recs) {
@@ -4448,6 +4463,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             B.em_ref_neff.push_back(rec.em_ref_neff);
             B.gamma_null.push_back(rec.gamma_null);
             B.p_read.push_back(rec.p_read);
+            if (emit_multimap) B.candidate_rank.push_back(rec.candidate_rank);
             B.presence.insert(B.presence.end(), rec.presence.begin(), rec.presence.end());
             B.ref_aa.insert(B.ref_aa.end(), rec.ref_aa.begin(), rec.ref_aa.end());
             B.obs_aa.insert(B.obs_aa.end(), rec.obs_aa.begin(), rec.obs_aa.end());

@@ -96,6 +96,7 @@ bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
     const bool has_strand = cf & COL_STRAND;
     const bool has_obs = cf & COL_OBS_CODON;
     const bool has_best = cf & COL_BEST_CODON;
+    const bool has_crank = cf & COL_CANDIDATE_RANK;
 
     // Per-record presence byte offset and popcount (also the Grain B offset).
     std::vector<size_t> pres_off(nA + 1, 0), obs_off(nA + 1, 0);
@@ -117,6 +118,8 @@ bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
         throw std::runtime_error("dcx: strand size != n_records_a");
     if (has_pread && B.p_read.size() != nA)
         throw std::runtime_error("dcx: p_read size != n_records_a");
+    if (has_crank && B.candidate_rank.size() != nA)
+        throw std::runtime_error("dcx: candidate_rank size != n_records_a");
     bool calibed = false;
     for (int i = 0; i < 16; ++i) calibed |= (opt.calib_contract_id[i] != 0);
     if (!calibed)
@@ -146,7 +149,7 @@ bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
         const size_t nB = b_hi - b_lo;
 
         // ---- encode Grain A columns ----
-        std::vector<uint8_t> qid, tord, tst, spn, gq, pq, emk, strd, gaq, emq, neff, gnullq, preadq;
+        std::vector<uint8_t> qid, tord, tst, spn, gq, pq, emk, strd, gaq, emq, neff, gnullq, preadq, crank;
         uint64_t pq_prev = 0, tord_prev = 0; int64_t tst_prev = 0, qid_prev = 0;
         emk.assign(bytes_for_bits(nblk), 0);
         if (has_strand) strd.assign(bytes_for_bits(nblk), 0);
@@ -164,6 +167,7 @@ bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
             if (has_neff) { float f = B.em_ref_neff[r]; put_bytes(neff, &f, 4); }
             if (has_gnull) put_u16(gnullq, enc_unit(B.gamma_null[r]));
             if (has_pread) put_u16(preadq, enc_unit(B.p_read[r]));
+            if (has_crank) crank.push_back(B.candidate_rank[r]);
             (void)pq_prev;
         }
         std::vector<uint8_t> pres(B.presence.begin() + pres_off[lo], B.presence.begin() + pres_off[hi]);
@@ -201,6 +205,7 @@ bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
         if (has_neff) push_col(dir, cols, ColumnId::EmRefNeff, ColEncoding::F32, uint32_t(nblk), neff);
         if (has_gnull) push_col(dir, cols, ColumnId::GammaNull, ColEncoding::U16Quant, uint32_t(nblk), gnullq);
         if (has_pread) push_col(dir, cols, ColumnId::PReadQ, ColEncoding::U16Quant, uint32_t(nblk), preadq);
+        if (has_crank) push_col(dir, cols, ColumnId::CandidateRank, ColEncoding::Raw, uint32_t(nblk), crank);
         push_col(dir, cols, ColumnId::Presence, ColEncoding::Bitset1, uint32_t(nblk), pres);
         push_col(dir, cols, ColumnId::RefAa, ColEncoding::Raw, uint32_t(nB), refaa);
         push_col(dir, cols, ColumnId::ObsAa, ColEncoding::Raw, uint32_t(nB), obsaa);
@@ -304,7 +309,10 @@ bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
     // ---- patch FileHeader ----
     FileHeader fh{};
     std::memcpy(fh.magic, FILE_MAGIC, 8);
-    fh.version_major = VERSION_MAJOR; fh.version_minor = VERSION_MINOR;
+    fh.version_major = VERSION_MAJOR;
+    // v2.2 (soft multi-mapping) only when the capability is actually emitted; a non-multimap
+    // write stays v2.1 so it is byte-identical to the pre-2.2 writer.
+    fh.version_minor = (cf & COL_SOFT_MULTIMAP) ? uint8_t(2) : VERSION_MINOR;
     fh.header_bytes = uint16_t(sizeof(FileHeader));
     fh.col_flags = cf; fh.codec = CODEC_ZSTD;
     fh.sample_flags = opt.sample_flags;

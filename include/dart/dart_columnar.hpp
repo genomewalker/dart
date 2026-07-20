@@ -319,6 +319,7 @@ struct Batch {
     std::vector<float>    em_ref_neff;   // present iff COL_EM_REF_NEFF
     std::vector<float>    gamma_null;    // per-read null responsibility; present iff COL_GAMMA_NULL
     std::vector<float>    p_read;        // [0,1] reference-free per-read damage posterior; present iff COL_P_READ
+    std::vector<uint8_t>  candidate_rank; // EM candidate rank per read, 0=argmax; present iff COL_CANDIDATE_RANK
     // presence bitmaps concatenated in record order; ceil(span_i/8) bytes each,
     // tail bits [span_i, 8*ceil(span_i/8)) MUST be zero. n_obs_i = popcount.
     std::vector<uint8_t>  presence;
