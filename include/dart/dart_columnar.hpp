@@ -102,6 +102,13 @@ enum ColFlag : uint32_t {
                                    // posterior — sigmoid(damage LLR) with no baked prior, no AA/reference
                                    // evidence. This is the authentication axis convergence gates/weights on;
                                    // PosteriorQ (the identity-fused posterior) is audit-only downstream.
+    COL_SOFT_MULTIMAP = 1u << 10,  // v2.2 Grain A: MULTIPLE rows per read — the top-K EM candidates
+                                   // (rank<=K AND gamma>floor), not the argmax alone. Grain B carries the
+                                   // per-position rows for those SAME (query_id,target_id) pairs. Readers that
+                                   // assume one-row-per-read MUST fail closed. em_keep=1 marks exactly the
+                                   // single argmax row, bridging v2.1 one-row-per-read consumers (auth axis).
+    COL_CANDIDATE_RANK= 1u << 11,  // v2.2 Grain A: candidate_rank present (u8, 0=argmax). Emitted with
+                                   // COL_SOFT_MULTIMAP so a consumer can order/threshold a read's candidates.
 };
 
 // Sample-level semantics (FileHeader.sample_flags). Deamination discrimination
@@ -121,6 +128,7 @@ enum class ColumnId : uint16_t {
     RefAa, ObsAa,       // v2 mandatory Grain B: reference and observed residue as ASCII byte (Raw u8)
     GammaNull,          // appended (minor bump): Grain A per-read null responsibility (U16Quant)
     PReadQ,             // appended (minor bump): Grain A reference-free per-read damage posterior (U16Quant)
+    CandidateRank,      // v2.2: Grain A per-read EM candidate rank (Raw u8, 0=argmax); with COL_SOFT_MULTIMAP
 };
 
 enum class ColEncoding : uint16_t {
