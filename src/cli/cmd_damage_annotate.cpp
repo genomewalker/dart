@@ -2102,8 +2102,16 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         uint32_t aln_len_on_target = 0;
         uint32_t best_rg = UINT32_MAX;
         uint32_t best_row = UINT32_MAX;
+        // Soft multi-mapping (--emit-multimap): the EM mapping responsibility for THIS
+        // (read,ref), joined from the finalize; candidate_rank assigned 0..k-1 by gamma.
+        float    gamma = 0.0f, gamma_ancient = 0.0f;
+        uint8_t  candidate_rank = 0;
     };
     std::vector<BestHitData> best_hits(n_reads);
+    // Per-read top-K-by-bits candidate POOL for --emit-multimap (metadata is only
+    // available here in the scan). gamma is joined post-EM, then filtered rank<K & gamma>floor.
+    std::vector<std::vector<BestHitData>> mm_pool;
+    if (emit_multimap) mm_pool.assign(n_reads, {});
     const bool need_unique_degree = !blast8_unique_file.empty();
     std::vector<uint32_t> read_degree;
     if (need_unique_degree) {
@@ -2257,6 +2265,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
         std::vector<std::pair<uint32_t, BestHitCandidate>> local_best_sorted;
         std::unordered_map<uint32_t, BestHitCandidate> local_best_unsorted;
+        // --emit-multimap: collect EVERY passing (read,ref) candidate (not collapsed to
+        // argmax) so the pool can keep the true top-K; merged into mm_pool after the loop.
+        std::vector<std::pair<uint32_t, BestHitData>> local_mm;
         if (local_sorted_hits) {
             local_best_sorted.reserve(std::max<uint32_t>(1, num_rows / 8));
         } else {
@@ -2325,6 +2336,17 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             const uint32_t tlen_v = static_cast<uint32_t>(tlen[i]);
             const uint32_t qlen_v = static_cast<uint32_t>(qlen[i]);
             const uint16_t aln_len_v = aln_len[i];
+
+            if (emit_multimap) {
+                BestHitData d;
+                d.has = true; d.bits = bits; d.ref_idx = tidx;
+                d.damage_score = std::clamp(damage_score[i], 0.0f, 1.0f);
+                d.fident = fident; d.evalue = std::pow(10.0f, evalue_log10_row);
+                d.qstart_0 = qstart_0; d.tstart_0 = tstart_0; d.qlen = qlen_v; d.tlen = tlen_v;
+                d.aln_len_on_target = static_cast<uint32_t>(aln_len_v);
+                d.best_rg = rg_idx; d.best_row = i;
+                local_mm.emplace_back(ridx, d);
+            }
 
             if (need_unique_degree) {
                 auto it_deg = local_degree_counts.find(ridx);
@@ -2467,6 +2489,22 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         } else {
             for (const auto& kv : local_best_unsorted) {
                 merge_candidate(kv.first, kv.second);
+            }
+        }
+
+        if (emit_multimap && !local_mm.empty()) {
+            const size_t soft_cap = static_cast<size_t>(8 * std::max(1, multimap_k));
+            for (auto& kv : local_mm) {
+                const uint32_t ridx = kv.first;
+                const size_t shard = static_cast<size_t>(ridx) & (kBestHitShards - 1);
+                std::lock_guard<std::mutex> lock(best_hit_mutexes[shard]);
+                auto& pool = mm_pool[ridx];
+                pool.push_back(kv.second);
+                if (pool.size() > soft_cap) {  // keep memory bounded; final top-K taken post-EM
+                    std::sort(pool.begin(), pool.end(),
+                              [](const BestHitData& a, const BestHitData& b) { return a.bits > b.bits; });
+                    pool.resize(static_cast<size_t>(std::max(1, multimap_k)));
+                }
             }
         }
 
