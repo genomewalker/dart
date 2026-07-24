@@ -270,6 +270,13 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(test-streaming-em OpenMP::OpenMP_CXX)
 endif()
 
+# compact_em_map bitwise gate (fusion dual-b8247d43)
+add_executable(gate-compact-em tests/gate_compact_em.cpp ${DART_CORE_SOURCES})
+target_link_libraries(gate-compact-em ${ZLIB_LIBRARIES} ${ISAL_LIB} PkgConfig::ZSTD taph)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(gate-compact-em OpenMP::OpenMP_CXX)
+endif()
+
 if(BUILD_TESTING)
     add_executable(
         dart-cli-args-tests

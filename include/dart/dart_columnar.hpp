@@ -344,6 +344,21 @@ struct Batch {
 
 bool write_dcx(const char* path, const Batch& batch, const DcxWriteOptions& opt);
 
+// Grain-A auth sidecar (fold-gap fast path, fusion dual-f6f6aa14): a grain-A-ONLY .dcx
+// (n_records_b=0) with byte-identical grain-A scalar VALUES, read by the same reader.
+// Drops the grain-B position bulk so protein_auth reads a small fraction.
+bool write_dcx_auth(const char* path, const Batch& batch, const DcxWriteOptions& opt);
+
+// Write-time auth reduce output (fusion dual-66c04a26): a tiny versioned zstd'd per-target
+// table {N, logLR, k@tau-grid} the annotate accumulates in its read-grouped pass. Convergence
+// auth reads this instead of re-decoding grain_a. See write_auth_stats in the .cpp.
+bool write_auth_stats(const char* path, const std::string& lib_label,
+                      const double* tau, uint32_t n_tau,
+                      const std::vector<std::string>& targets,
+                      const std::vector<uint64_t>& N,
+                      const std::vector<uint64_t>& k_flat,
+                      const std::vector<double>& logLR, int zstd_level);
+
 // Consumer-side (also usable from C++ tests). The Rust reader mirrors this:
 // mmap the file, read Footer at EOF-24, adler32-check the index, prune blocks
 // by BlockIndexEntry zone maps, then decode a block into borrowed column

@@ -328,4 +328,66 @@ bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
     return bool(out);
 }
 
+// write_dcx_auth — the GRAIN-A AUTH SIDECAR (fold-gap fast path; fusion dual-f6f6aa14).
+// A tiny companion `<lib>.dcx.auth` holding ONLY the grain-A scalars protein_auth needs
+// (query_id, target_id, gamma, em_keep, p_read; the v1 alignment ordinal is the row order).
+// Implemented as a grain-A-ONLY .dcx (n_records_b = 0): we reuse write_dcx verbatim with
+// grain_b stripped, so the grain-A scalar VALUES are byte-identical to the full .dcx and the
+// SAME reader/reduce (dcx_rs.reduce_grain_a) consumes it — zero new format, zero drift. The
+// sidecar drops the entire grain-B position payload (the ~200GB bulk), so auth reads a small
+// fraction. (DCX2 follow-up: also drop tstart/span/posterior for the exact grain_a.parquet
+// projection; kept here for maximal reuse + guaranteed value-identity.)
+bool write_dcx_auth(const char* path, const Batch& B, const DcxWriteOptions& opt) {
+    Batch A = B;                       // grain-A scalars + dicts + col_flags carried verbatim
+    A.span.assign(B.span.size(), 0);   // span=0 -> zero presence bytes, zero grain-B records
+    A.presence.clear();
+    A.ref_aa.clear();  A.obs_aa.clear();
+    A.best_codon.clear();  A.obs_codon.clear();  A.best_post.clear();
+    A.p_damage.clear();  A.dist5.clear();  A.dist3.clear();  A.damage_class.clear();
+    return write_dcx(path, A, opt);    // Σpopcount(empty presence)=0=ref_aa.size() -> valid
+}
+
+// write_auth_stats — WRITE-TIME AUTH REDUCE output (fusion dual-66c04a26 #1). A tiny
+// versioned, zstd'd per-target table {N, logLR, k@tau-grid} the annotate accumulates in its
+// read-grouped pass (BEFORE the target-sort), so convergence auth reads bytes/target instead
+// of re-decoding grain_a. Columnar payload: target dict + N[u64] + k[n_tau][u64] + logLR[f64].
+// Header (uncompressed): magic|version|n_targets|n_tau|tau[n_tau]|lib_label|raw_sz|frame_sz.
+bool write_auth_stats(const char* path, const std::string& lib_label,
+                      const double* tau, uint32_t n_tau,
+                      const std::vector<std::string>& targets,
+                      const std::vector<uint64_t>& N,
+                      const std::vector<uint64_t>& k_flat,   // n_targets*n_tau, row-major
+                      const std::vector<double>& logLR, int zstd_level) {
+    const uint64_t nt = targets.size();
+    if (N.size() != nt || logLR.size() != nt || k_flat.size() != nt * n_tau)
+        throw std::runtime_error("authstats: column length mismatch");
+
+    std::vector<uint8_t> pay;                // columnar payload (zstd'd)
+    put_u64(pay, nt);
+    for (const auto& s : targets) { put_u32(pay, uint32_t(s.size())); put_bytes(pay, s.data(), s.size()); }
+    for (uint64_t i = 0; i < nt; ++i) put_u64(pay, N[i]);
+    for (uint32_t j = 0; j < n_tau; ++j)
+        for (uint64_t i = 0; i < nt; ++i) put_u64(pay, k_flat[i * n_tau + j]);
+    for (uint64_t i = 0; i < nt; ++i) { uint64_t b; std::memcpy(&b, &logLR[i], 8); put_u64(pay, b); }
+    std::vector<uint8_t> frame = zstd_frame(pay, zstd_level);
+
+    std::vector<uint8_t> file;               // header (uncompressed) + frame
+    const char magic[8] = {'D','C','X','A','U','T','H','S'};
+    put_bytes(file, magic, 8);
+    put_u32(file, 1u);                       // format version
+    put_u64(file, nt);
+    put_u32(file, n_tau);
+    for (uint32_t j = 0; j < n_tau; ++j) { uint64_t b; std::memcpy(&b, &tau[j], 8); put_u64(file, b); }
+    put_u32(file, uint32_t(lib_label.size()));
+    put_bytes(file, lib_label.data(), lib_label.size());
+    put_u64(file, uint64_t(pay.size()));
+    put_u64(file, uint64_t(frame.size()));
+    file.insert(file.end(), frame.begin(), frame.end());
+
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out.write(reinterpret_cast<const char*>(file.data()), std::streamsize(file.size()));
+    return bool(out);
+}
+
 }  // namespace dcx

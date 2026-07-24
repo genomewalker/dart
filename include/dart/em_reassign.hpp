@@ -1110,6 +1110,61 @@ EMState squarem_em(
     ReferenceStatsCollector* stats_collector = nullptr,
     const EMProgressCallback& progress_cb = EMProgressCallback());
 
+// compact_em_map (fusion dual-b8247d43): the single EM solver. Decode-once CSR + fused
+// per-ref sufficient stats + deterministic-lane M-step -> bitwise-identical across thread
+// counts; ~same math as squarem_em within float reassociation (frozen-damage branch).
+// Per-read finalize callback (streaming production form of compact_em_map), invoked
+// SERIALLY in ascending read order during the single final gamma pass. ref[]/gamma[]
+// have `deg` entries; gamma_anc is non-null when params.use_damage OR
+// params.posthoc_gamma_ancient (joint / post-hoc-derived ancient responsibility).
+using TapeFinalizeCb = std::function<void(uint32_t r, uint32_t deg,
+    const uint32_t* ref, const double* gamma, const double* gamma_anc)>;
+
+// gamma is EM-transient: iterations hold only per-ref sufficient stats (no O(alignments)
+// gamma). When finalize_cb is set, the single final frozen-weight pass streams per-read
+// gamma to it and NO O(A) gamma is materialized (production path, ~O(num_refs) RSS); when
+// empty, the final pass fills state.gamma exactly as before (gate / back-compat).
+// data is taken by non-const ref: in the streaming (finalize_cb) path with the null
+// column off, compact_em_map RELEASES data.alignments right after the one-time decode
+// (nothing reads it afterward), so steady-state RSS is ~the 20 B/aln CSR, not 20+32.
+EMState compact_em_map(AlignmentData& data, const EMParams& params,
+                       const TapeFinalizeCb& finalize_cb = TapeFinalizeCb());
+
+// compact_em_map_tape (PI mandate 2026-07-23): O_DIRECT read-major "EM tape" on
+// scratch NVMe (scratch_dir). Bit-for-bit identical result to compact_em_map, but
+// gamma is EM-transient (per-ref sufficient stats accumulated per streamed scan;
+// full gamma materialized only in a single final pass) => peak RSS is O(num_refs)
+// + fixed I/O buffers, INDEPENDENT of alignment count. scratch_dir must be a
+// writable directory on a fast local filesystem that supports O_DIRECT.
+EMState compact_em_map_tape(const AlignmentData& data, const EMParams& params,
+                            const std::string& scratch_dir);
+
+// ---- EM tape production API (shared streaming core) ----------------------
+// Converged EM output that carries NO O(alignments) arrays.
+struct TapeEMResult {
+    std::vector<double> weights;   // num_refs entries (null coordinate stripped)
+    double pi = 0.10;
+    double w_null = 0.0;
+    double log_likelihood = 0.0;
+    double gamma_sum = 0.0;        // Σ gamma over all alignments (final pass)
+    double gamma_anc_sum = 0.0;    // Σ gamma_ancient over all alignments (final pass)
+    uint32_t iterations = 0;
+};
+
+// (TapeFinalizeCb is declared above, next to compact_em_map.)
+//
+// Stream-solve on an existing SoA hot tape (3 O_DIRECT files: uint32 ref, double
+// base_a, double base_m, in CSR/read order). read_offsets is uint64[num_reads+1]
+// (alignment offsets; may exceed 2^32). null_lp is double[num_reads] or nullptr.
+// gnull_out is double[num_reads] or nullptr (filled at frozen weights when
+// params.use_null). Result is bit-for-bit identical to compact_em_map; peak RSS is
+// O(num_refs) + fixed I/O buffers — INDEPENDENT of alignment count.
+TapeEMResult tape_em_core(
+    const std::string& p_ref, const std::string& p_basea, const std::string& p_basem,
+    const uint64_t* read_offsets, uint32_t num_reads, uint32_t num_refs, uint64_t num_alns,
+    const EMParams& params, const double* null_lp, double* gnull_out,
+    const TapeFinalizeCb& finalize_cb);
+
 std::vector<std::pair<uint32_t, float>> reassign_reads(
     const AlignmentData& data,
     const EMState& state,
@@ -1138,8 +1193,13 @@ struct StreamingEMResult {
 // The algorithm:
 // 1. During iteration: E-step per row group, accumulate ref_sums, discard gamma
 // 2. After convergence: weights are final, gamma computed on-demand per row group
+// Templated on the reader type so both ColumnarIndexReader (v6) and emiv7::Reader
+// (v7) drive it — both expose num_reads/num_refs/num_alignments/num_row_groups and
+// parallel_scan with the same 21-arg callback. Explicit instantiations live in
+// em_reassign.cpp.
+template <class ReaderT>
 StreamingEMResult streaming_em(
-    ColumnarIndexReader& reader,
+    ReaderT& reader,
     const EMParams& params,
     const EMProgressCallback& progress_cb = EMProgressCallback());
 
@@ -1159,8 +1219,9 @@ using StreamingGammaCallback = std::function<void(
 
 // Compute final gamma values in streaming fashion after EM convergence.
 // Calls callback for each row group with computed responsibilities.
+template <class ReaderT>
 void streaming_em_finalize(
-    ColumnarIndexReader& reader,
+    ReaderT& reader,
     const StreamingEMResult& result,
     const EMParams& params,
     StreamingGammaCallback callback);

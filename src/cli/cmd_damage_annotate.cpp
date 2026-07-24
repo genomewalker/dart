@@ -17,6 +17,7 @@
 #include "dart/theta_d_coordinator.hpp"
 #include "dart/coverage_em.hpp"
 #include "dart/columnar_index.hpp"
+#include "dart/emi_v7_io.hpp"
 #include "dart/log_utils.hpp"
 #include "dart/mmap_array.hpp"
 #include "dart/damage_index.hpp"      // fnv1a_hash for the .dcx calib_contract_id
@@ -39,6 +40,11 @@
 #ifdef __linux__
 #include <malloc.h>
 #endif
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <cstdio>
+#include <cerrno>
 #include <sstream>
 #include <atomic>
 #include <mutex>
@@ -1373,6 +1379,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     bool use_em = true;
     bool em_streaming = false;       // Use streaming EM (O(num_refs) memory instead of O(num_alns))
     size_t em_max_memory_mb = 4096;  // Max memory for EM (MB), 0 = no limit, auto-switch to streaming if exceeded
+    // Node-local scratch dir for the O_DIRECT EM tape (production streaming path).
+    // Must be fast local NVMe supporting O_DIRECT (NOT /tmp, NOT NFS). Env fallback
+    // DART_EM_TAPE_DIR; when unset the tape path errors and asks for it explicitly.
+    std::string em_tape_dir;
     uint32_t em_max_iters = 100;
     // Raw-bit temperature for the legacy (non-calibrated) real component. mmseqs
     // bit scores are log2-odds; the principled bits→nats factor is ln2≈0.693.
@@ -1604,9 +1614,13 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--auto-prior-ancient") == 0) {
             auto_prior_ancient = true;
         } else if (strcmp(argv[i], "--em-streaming") == 0) {
-            em_streaming = true;
+            std::cerr << "Error: --em-streaming was removed; compact_em_map is the sole "
+                         "EM solver (in-memory CSR). Drop --em-streaming.\n";
+            return 1;
         } else if ((strcmp(argv[i], "--em-max-memory") == 0 || strcmp(argv[i], "-m") == 0) && i + 1 < argc) {
             em_max_memory_mb = static_cast<size_t>(std::stoul(argv[++i]));
+        } else if (strcmp(argv[i], "--em-tape-dir") == 0 && i + 1 < argc) {
+            em_tape_dir = argv[++i];
         } else if (strcmp(argv[i], "--gene-summary") == 0 && i + 1 < argc) {
             gene_summary_file = argv[++i];
         } else if (strcmp(argv[i], "--min-breadth") == 0 && i + 1 < argc) {
@@ -1910,6 +1924,16 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         std::cerr << "Error: --coverage-em-tau must be >= 0\n";
         return 1;
     }
+    // compact_em_map is the sole EM reassignment solver and ignores initial_weights /
+    // coverage reweighting; the coverage wrapper still calls squarem_em internally
+    // (coverage_em.cpp:712,800). Refuse rather than silently run a solver whose result
+    // does not reflect the requested coverage-aware objective.
+    if (use_coverage_em) {
+        std::cerr << "Error: --coverage-em is not supported: compact_em_map is the sole "
+                     "EM solver and does not honor coverage reweighting. Re-run without "
+                     "--coverage-em.\n";
+        return 1;
+    }
     if (depth_gate_lo < 0.0f || depth_gate_hi <= depth_gate_lo) {
         std::cerr << "Error: --depth-gate-lo must be >= 0 and < --depth-gate-hi\n";
         return 1;
@@ -2055,8 +2079,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         }
     }
 
-    // Open EMI index
-    dart::ColumnarIndexReader reader(emi_file);
+    // Open EMI index (v7 native reader — thread-safe per-block decode + get_qaln)
+    dart::emiv7::Reader reader(emi_file);
     if (!reader.is_valid()) {
         std::cerr << "Error: Cannot open EMI index: " << emi_file << "\n";
         return 1;
@@ -2117,8 +2141,25 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     if (need_unique_degree) {
         read_degree.assign(n_reads, 0);
     }
+    // Production streaming EM tape path (PI mandate 2026-07-23): when the config needs
+    // only ref/gamma/gamma_ancient per read (no --em-audit, no calib, no null column,
+    // damage-free mapping) the EM runs off an O_DIRECT tape on node-local scratch, feeding
+    // tape_em_core directly from streaming ingestion. Nothing O(alignments) is materialized
+    // in RAM (kills the ~288 GB in-RAM transient measured on LV626), giving aln-independent
+    // peak RSS for the 6-10B-aln production target. All predicates here are CLI-known, so the
+    // O(A) em_alignments buffers below are skipped entirely on this path.
+    const bool tape_path = use_em && em_audit_file.empty() && !use_em_calib &&
+                           !use_em_null && !em_use_damage_mapping;
+    // read-major per-read degree (uint64 prefix: aln offsets exceed 2^32 at 6B+ alns) and
+    // per-ref length (== build_alignment_data's ref_lengths). Tape path only.
+    std::vector<uint64_t> em_read_deg;    // [n_reads+1], prefix-summed into read_offsets
+    std::vector<uint32_t> em_ref_lengths; // max(tlen | aln_end) per ref
+    if (tape_path) {
+        em_read_deg.assign(static_cast<size_t>(n_reads) + 1, 0);
+        em_ref_lengths.assign(n_refs, 0);
+    }
     std::vector<dart::CompactAlignment> em_alignments;
-    if (use_em && !em_streaming) {
+    if (use_em && !em_streaming && !tape_path) {
         em_alignments.reserve(static_cast<size_t>(reader.num_alignments()));
     }
     std::mutex em_damage_stats_mutex;
@@ -2157,12 +2198,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
     size_t em_shard_count = 1;
 #ifdef _OPENMP
-    if (use_em && !em_streaming) {
+    if (use_em && !em_streaming && !tape_path) {
         em_shard_count = static_cast<size_t>(std::max(1, omp_get_max_threads()));
     }
 #endif
     std::vector<std::vector<dart::CompactAlignment>> em_alignments_by_thread;
-    if (use_em && !em_streaming) {
+    if (use_em && !em_streaming && !tape_path) {
         em_alignments_by_thread.resize(em_shard_count);
         const size_t reserve_per_shard =
             static_cast<size_t>(reader.num_alignments() / std::max<size_t>(1, em_shard_count) + 1);
@@ -2230,7 +2271,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         size_t local_filtered_evalue = 0;
 
         std::vector<dart::CompactAlignment> local_em;
-        if (use_em && !em_streaming) {
+        if (use_em && !em_streaming && !tape_path) {
             local_em.reserve(num_rows);
         }
         uint64_t local_em_n = 0;
@@ -2384,7 +2425,20 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     std::min(tstart_0 + static_cast<uint32_t>(aln_len_v), 65535u));
                 ca.identity_q = identity_q[i];
                 ca.flags = tlen[i];  // pass true reference length hint to EM builder
-                if (!em_streaming) local_em.push_back(ca);
+                if (tape_path) {
+                    // read-major: each read lives in one row group (one thread), so these
+                    // shared vectors are written at disjoint read indices — no atomics needed
+                    // (guarded by is_sorted_by_read_then_score() before the solve). The
+                    // em_ref_lengths max is racy but benign: tlen is constant per ref, so all
+                    // writers store the same value. ceiling: a tlen==0 ref with varying aln_end
+                    // could under-max under the race; upgrade: serial reduce (real refs tlen>0).
+                    em_read_deg[ridx + 1]++;
+                    const uint32_t ref_len =
+                        (tlen[i] > 0) ? static_cast<uint32_t>(tlen[i]) : static_cast<uint32_t>(ca.aln_end);
+                    if (ref_len > em_ref_lengths[tidx]) em_ref_lengths[tidx] = ref_len;
+                } else if (!em_streaming) {
+                    local_em.push_back(ca);
+                }
                 local_em_n++;
                 local_em_sum += ds;
                 local_em_sumsq += static_cast<double>(ds) * static_cast<double>(ds);
@@ -2715,7 +2769,21 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // fit and q_modern their 0/n_eligible negative evidence (BUG1 fix).
     std::vector<uint32_t> per_read_m_opp(n_reads, 0);
 
-    const size_t em_aln_count = em_alignments.size();
+    // CSR read offsets (uint64: aln offsets exceed 2^32 at 6B+ alns) + total kept alns.
+    // Tape path: prefix-sum the streaming per-read degrees. In-RAM path: copied from
+    // aln_data.read_offsets after build_alignment_data (below). Kept in scope for both the
+    // solve (tape_em_core) and the verbose per-read stats.
+    std::vector<uint64_t> read_offsets;
+    uint64_t em_tape_A = 0;
+    if (tape_path) {
+        read_offsets.assign(static_cast<size_t>(n_reads) + 1, 0);
+        for (uint32_t r = 0; r < n_reads; ++r)
+            read_offsets[r + 1] = read_offsets[r] + em_read_deg[r + 1];
+        em_tape_A = read_offsets[n_reads];
+        std::vector<uint64_t>().swap(em_read_deg);  // degrees folded into read_offsets
+    }
+    const size_t em_aln_count = tape_path ? static_cast<size_t>(em_tape_A)
+                                          : em_alignments.size();
 
     // EM reassignment
     dart::EMState em_state;
@@ -2741,25 +2809,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // or lazily at output phase for non-streaming paths.
     std::vector<std::string> cached_ref_names;
 
-    // Auto-switch to streaming EM if estimated memory exceeds limit
-    // Memory estimate: ~72 bytes per alignment at SQUAREM peak:
-    //   Alignment struct (40B) + gamma (8B) + gamma_ancient (8B)
-    //   + gamma_scratch (8B) + gamma_ancient_scratch (8B) = 72B
-    // Plus ~4 bytes per read for offsets
-    if (use_em && !em_streaming && em_max_memory_mb > 0) {
-        const size_t num_alignments = reader.num_alignments();
-        const size_t estimated_mb = (num_alignments * 72 + n_reads * 4) / (1024 * 1024);
-        if (estimated_mb > em_max_memory_mb) {
-            em_streaming = true;
-            if (verbose) {
-                std::cerr << "\nAuto-switching to streaming EM:\n";
-                std::cerr << "  Estimated memory: " << estimated_mb << " MB\n";
-                std::cerr << "  Memory limit: " << em_max_memory_mb << " MB\n";
-                std::cerr << "  Use --em-max-memory to adjust limit, or --em-streaming to force\n";
-            }
-        }
-    }
-
     // Fail-loud null-model gate — fires for BOTH the streaming and non-streaming
     // EM branches below. A flat targeted database (barley SAAV / KEGG / viral) has
     // no "other" column, so an absent-protein read is force-mapped onto its nearest
@@ -2772,379 +2821,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                      "accept this explicitly.\n";
         return 1;
     }
-    // Streaming EM now wires the null column: streaming_e_step_rowgroup computes the
-    // per-read null log-density (read_null_log_density_cols), co-evolves w_null in the
-    // M-step, and streaming_em_finalize emits gamma_null + the best-hit bit/aln_len via
-    // StreamingGammaCallback. The coherent-LR real density (real_log_density on aln_len)
-    // is applied identically to the in-memory path, so a spill to streaming keeps the
-    // fix rather than silently reverting to raw exp(lambda_b*bit).
-
-    if (use_em && em_streaming) {
-        // Streaming EM path - O(num_refs) memory instead of O(num_alignments)
-        if (verbose) {
-            std::cerr << "\nEM reassignment (streaming mode):\n";
-            std::cerr << "  Alignments: " << reader.num_alignments() << " (from EMI)\n";
-            std::cerr << "  Reads: " << n_reads << "\n";
-            std::cerr << "  References: " << n_refs << "\n";
-            std::cerr << "  Lambda_b: " << em_lambda_b << "\n";
-            std::cerr << "  Max iters: " << em_max_iters << "\n";
-            std::cerr << "  Note: Streaming mode uses all EMI alignments (ignores pre-filters)\n";
-        }
-
-        dart::EMParams em_params;
-        em_params.lambda_b = em_lambda_b;
-        em_params.max_iters = em_max_iters;
-        em_params.tol = em_tol;
-        em_params.use_squarem = false;  // Streaming doesn't support SQUAREM yet
-        em_params.normalize_by_length = true;
-        // Damage-free mapping by default (removes the choose-then-reuse circularity):
-        // damage influences the mapping only with --em-use-damage-mapping. When the
-        // mapping is damage-free, gamma_ancient is still emitted post-hoc against the
-        // frozen weights (streaming_em_finalize honors posthoc_gamma_ancient).
-        em_params.use_damage = em_use_damage_mapping;
-        em_params.use_alignment_damage_likelihood = em_use_damage_mapping;
-        em_params.posthoc_gamma_ancient = !em_use_damage_mapping;
-        // Null / coherent-LR wiring (parity with the in-memory branch below). Without
-        // this a streaming spill would map with raw exp(lambda_b*bit) and no null.
-        if (use_em_null) {
-            em_params.use_null = true;
-            em_params.null_mu = em_null_model.mu;
-            em_params.null_beta = em_null_model.beta;
-            em_params.log_w_null = std::log(0.096);
-            em_params.alpha_null = 2.0;
-            em_params.lambda_null = 1.0;
-            em_params.normalize_scores_per_query = false;
-        }
-        if (use_em_calib) {
-            em_params.use_calib = true;
-            em_params.true_bins = em_calib_model.true_bins;
-            em_params.true_censor = em_calib_model.censor;
-            em_params.calib_temperature = em_calib_temperature;
-            if (em_calib_model.cont) {
-                em_params.use_calib_cont = true;
-                em_params.ft_mu_a = em_calib_model.ft_mu_a;
-                em_params.ft_mu_b = em_calib_model.ft_mu_b;
-                em_params.ft_ls_a = em_calib_model.ft_ls_a;
-                em_params.ft_ls_b = em_calib_model.ft_ls_b;
-                em_params.ft_nu   = em_calib_model.ft_nu;
-                em_params.f0_loc_a = em_calib_model.f0_loc_a;
-                em_params.f0_loc_b = em_calib_model.f0_loc_b;
-                em_params.f0_beta  = em_calib_model.f0_beta;
-            }
-        }
-
-        const auto em_start = std::chrono::steady_clock::now();
-        // Flush all NFS-backed EMI pages accumulated during Pass 1 and scoring.
-        // Without this, ~80-150 GB of page-cache pages from the sequential scan
-        // stay resident, consuming headroom before streaming_em even starts.
-        reader.flush_pages();
-
-        // Restrict to the 7 columns streaming_em actually reads.
-        // set_all_columns() would include QALN/TALN (~13 MB/row-group) in
-        // MADV_WILLNEED prefetch, inflating NFS RSS by ~50-100 GB over 100+
-        // EM iterations. Scoring passes that need QALN/TALN run before this
-        // block and restore their own column set; streaming_em_finalize uses
-        // the same 7 columns. No restore needed — reader not used after finalize.
-        reader.set_columns({
-            dart::ColumnID::READ_IDX,
-            dart::ColumnID::REF_IDX,
-            dart::ColumnID::BIT_SCORE,
-            dart::ColumnID::DAMAGE_SCORE,
-            dart::ColumnID::DMG_LL_A,
-            dart::ColumnID::DMG_LL_M,
-            dart::ColumnID::TLEN,
-            dart::ColumnID::ALN_LEN,   // coherent-LR needs per-alignment length
-        });
-
-        if (verbose) {
-            std::cerr << "  Starting streaming EM"
-                      << (use_coverage_em ? " (with coverage outer loop)" : "")
-                      << "...\n";
-            std::cerr << std::flush;
-        }
-
-        // Coverage EM accumulation now happens after streaming_em_finalize (below).
-        // Always run standalone streaming_em; build coverage stats from sorted CovEntry
-        // after per-read gammas are available. Eliminates per-thread unordered_maps
-        // (source of ~400 GB heap fragmentation in coverage_em_outer_loop).
-        dart::CoverageEMParams cov_params_streaming;
-        if (use_coverage_em) {
-            cov_params_streaming.max_outer_iters = coverage_em_iters;
-            cov_params_streaming.tau = coverage_em_tau;
-            cov_params_streaming.default_bins = coverage_em_bins;
-            cov_params_streaming.depth_gate_lo = depth_gate_lo;
-            cov_params_streaming.depth_gate_hi = depth_gate_hi;
-            cov_params_streaming.w_min = w_min;
-        }
-
-        dart::StreamingEMResult streaming_result;
-        streaming_result = dart::streaming_em(reader, em_params,
-            [verbose](const dart::EMIterationDiagnostics& d) {
-                if (verbose && (d.iteration % 10 == 0 || d.iteration < 5)) {
-                    std::cerr << "    iter " << d.iteration
-                              << " ll=" << std::fixed << std::setprecision(2) << d.log_likelihood
-                              << "\n";
-                    std::cerr << std::flush;
-                }
-                // Return per-row-group Parquet heap back to OS after each EM iteration.
-                // Without this, 100 sequential EMI scans accumulate ~150 GB of fragmented
-                // glibc arena pages that MADV_DONTNEED alone cannot reclaim on NFS mounts.
-#ifdef __linux__
-                malloc_trim(0);
-#endif
-            });
-
-        const auto em_end = std::chrono::steady_clock::now();
-
-        if (verbose) {
-            std::cerr << "  Converged in " << streaming_result.iterations << " iterations\n";
-            std::cerr << "  Log-likelihood: " << std::fixed << std::setprecision(2)
-                      << streaming_result.log_likelihood << "\n";
-            std::cerr << "  Pi (ancient): " << std::fixed << std::setprecision(4)
-                      << streaming_result.pi << "\n";
-            std::cerr << "  Memory: O(" << n_refs << " refs) vs O("
-                      << reader.num_alignments() << " alignments)\n";
-            std::cerr << "  Runtime: "
-                      << dart::log_utils::format_elapsed(em_start, em_end) << "\n";
-        }
-
-        // Copy weights to em_state for downstream use
-        em_state.weights = streaming_result.weights;
-        em_state.pi = streaming_result.pi;
-        em_state.log_likelihood = streaming_result.log_likelihood;
-        em_state.iterations = streaming_result.iterations;
-
-        // Compute per-read stats via streaming finalize (parallel_scan → mutex per shard)
-        std::vector<float> read_top1(n_reads, 0.0f);
-        std::vector<float> read_top2(n_reads, 0.0f);
-        std::vector<double> read_sum_sq(n_reads, 0.0);
-        // Per-read EM-best (argmax-gamma) alignment stats + whether the read had any hit.
-        // Feed the coherent-LR 3-way decision, mirroring the in-memory audit block.
-        std::vector<double> em_best_bit(n_reads, 0.0);
-        std::vector<uint16_t> em_best_aln(n_reads, 0);
-        std::vector<uint32_t> em_best_ref_v(n_reads, UINT32_MAX);
-        std::vector<uint8_t> read_has_hit(n_reads, 0);
-        constexpr size_t kFinalizeShards = 4096;
-        std::array<std::mutex, kFinalizeShards> finalize_mutexes;
-
-        dart::streaming_em_finalize(reader, streaming_result, em_params,
-            [&](uint32_t /*rg_idx*/, uint32_t num_rows,
-                const uint32_t* read_idx, const uint32_t* ref_idx,
-                const float* gamma, const float* gamma_ancient,
-                const float* gamma_null, const float* bit_score, const uint16_t* aln_len)
-            {
-                if (gamma_ancient) damage_em_active = true;
-                for (uint32_t i = 0; i < num_rows; ++i) {
-                    const uint32_t r = read_idx[i];
-                    if (r >= n_reads) continue;
-                    const float g = gamma[i];
-                    const float g_a = gamma_ancient ? gamma_ancient[i] : 0.0f;
-                    const uint32_t ref = ref_idx[i];
-
-                    const size_t shard = static_cast<size_t>(r) & (kFinalizeShards - 1);
-                    std::lock_guard<std::mutex> lock(finalize_mutexes[shard]);
-
-                    read_has_hit[r] = 1;
-                    read_sum_sq[r] += static_cast<double>(g) * g;
-                    if (g > read_top1[r]) {
-                        read_top2[r] = read_top1[r];
-                        read_top1[r] = g;
-                        // New argmax target: capture its bit/aln_len for the LLR decision.
-                        em_best_ref_v[r] = ref;
-                        if (bit_score) em_best_bit[r] = static_cast<double>(bit_score[i]);
-                        if (aln_len)   em_best_aln[r] = aln_len[i];
-                    } else if (g > read_top2[r]) {
-                        read_top2[r] = g;
-                    }
-                    if (gamma_null) em_read_results[r].gamma_null = gamma_null[i];
-
-                    const auto& bh = best_hits[r];
-                    if (bh.has && ref == bh.ref_idx) {
-                        em_read_results[r].gamma = g;
-                        em_read_results[r].gamma_ancient = g_a;
-                    }
-                    if (emit_multimap && r < mm_pool.size()) {  // join gamma onto the top-K pool
-                        for (auto& c : mm_pool[r]) {
-                            if (c.ref_idx == ref) { c.gamma = g; c.gamma_ancient = g_a; break; }
-                        }
-                    }
-                }
-            });
-
-        // Finalize per-read stats + coherent-LR 3-way decision + audit dump.
-        // Mirrors the in-memory branch: the decision keys on the LLR of the EM-best
-        // candidate (log f_true - log f_0), which is weight-independent, so streaming
-        // and in-memory reach the SAME decision for every hit-read.
-        const bool do_audit = !em_audit_file.empty();
-        std::vector<std::string> audit_rows;
-        if (do_audit) audit_rows.reserve(n_reads);
-
-        for (uint32_t r = 0; r < n_reads; ++r) {
-            const float keep_thr = static_cast<float>(em_min_prob);
-            const double gnull = em_read_results[r].gamma_null;
-            const double real_norm = (gnull < 1.0 - 1e-9) ? (1.0 / (1.0 - gnull)) : 0.0;
-
-            const float best_hit_gamma = static_cast<float>(em_read_results[r].gamma * real_norm);
-            const float em_margin = std::max(0.0f,
-                static_cast<float>((read_top1[r] - read_top2[r]) * real_norm));
-            const float em_ref_neff = (read_sum_sq[r] > 0.0)
-                ? static_cast<float>(1.0 / (read_sum_sq[r] * real_norm * real_norm)) : 0.0f;
-            bool em_keep = (best_hit_gamma >= keep_thr);
-
-            // Per-read identifiability densities for the best EM candidate (frozen calib).
-            double log_ft = std::numeric_limits<double>::quiet_NaN();
-            double log_f0 = std::numeric_limits<double>::quiet_NaN();
-            if (em_params.use_calib_cont) {
-                log_ft = dart::log_f_true_cont(em_params, em_best_bit[r], em_best_aln[r]);
-                log_f0 = dart::log_f0_cont(em_params, em_best_bit[r], em_best_aln[r]);
-            } else if (em_params.use_calib && !em_params.true_bins.empty()) {
-                log_ft = dart::log_f_true(em_params, em_best_bit[r], em_best_aln[r]);
-                int nb = dart::null_length_bin(em_best_aln[r]);
-                if (nb < static_cast<int>(em_params.null_mu.size()))
-                    log_f0 = dart::log_p_null_gumbel(em_best_bit[r],
-                                 em_params.null_mu[nb], em_params.null_beta[nb]);
-            }
-            const bool have_llr = std::isfinite(log_ft) && std::isfinite(log_f0);
-            const double llr = have_llr ? (log_ft - log_f0) : 0.0;
-
-            uint8_t reason = 0;
-            if (em_margin < static_cast<float>(em_min_margin)) reason |= 0x2;
-            if (em_ref_neff > static_cast<float>(em_max_neff)) reason |= 0x4;
-
-            const char* decision = "kept";
-            if (em_params.use_null && read_has_hit[r]) {
-                if (have_llr) {
-                    if (llr <= em_reject_llr)     { decision = "reject";  reason |= 0x1; em_keep = false; }
-                    else if (llr < em_keep_llr)   { decision = "abstain"; reason |= 0x8; em_keep = false; }
-                } else if (gnull > em_null_tau)   { decision = "reject";  reason |= 0x1; }
-            }
-
-            if (do_audit && read_has_hit[r]) {
-                std::string qn(reader.read_name(r));
-                std::string tn = (em_best_ref_v[r] < n_refs)
-                    ? std::string(reader.ref_name(em_best_ref_v[r])) : std::string("*");
-                char buf[512];
-                std::snprintf(buf, sizeof(buf),
-                    "%s\t%u\t%.1f\t%.4g\t%.4g\t%.4g\t%.6g\t%s\t%s\t%.4f\t%.4f",
-                    qn.c_str(), static_cast<unsigned>(em_best_aln[r]), em_best_bit[r],
-                    log_ft, log_f0, llr, gnull, decision, tn.c_str(),
-                    best_hit_gamma, em_margin);
-                audit_rows.emplace_back(buf);
-            }
-
-            em_read_results[r].gamma = best_hit_gamma;
-            em_read_results[r].em_threshold = keep_thr;
-            em_read_results[r].em_margin = em_margin;
-            em_read_results[r].em_ref_neff = em_ref_neff;
-            em_read_results[r].em_keep = em_keep;
-            em_read_results[r].em_reject_reason = reason;
-        }
-
-        if (do_audit) {
-            std::ofstream af(em_audit_file);
-            if (!af) {
-                std::cerr << "Error: cannot open --em-audit " << em_audit_file << "\n";
-                return 1;
-            }
-            af << "query_id\taln_len\tbit\tlog_f_true\tlog_f_0\tllr\tgamma_null\t"
-                  "decision\tassigned_target\tbest_hit_gamma\tem_margin\n";
-            for (const auto& row : audit_rows) af << row << '\n';
-            size_t nk = 0, na = 0, nr = 0;
-            for (const auto& row : audit_rows) {
-                if (row.find("\tkept\t") != std::string::npos) ++nk;
-                else if (row.find("\tabstain\t") != std::string::npos) ++na;
-                else if (row.find("\treject\t") != std::string::npos) ++nr;
-            }
-            std::cerr << "  EM audit (streaming): " << audit_rows.size() << " hit-reads -> "
-                      << em_audit_file << " (kept=" << nk << " abstain=" << na
-                      << " reject=" << nr << ")\n";
-        }
-
-        if (verbose) {
-            std::cerr << "  Streaming finalize complete\n\n";
-        }
-
-        // Post-finalize coverage accumulation: build sorted CovEntry from
-        // best_hits + em_read_results.gamma, then accumulate per-ref coverage
-        // stats in a single linear scan (O(1) memory per ref, no fragmentation).
-        if (use_coverage_em) {
-            const auto cov_start = std::chrono::steady_clock::now();
-            if (verbose) {
-                std::cerr << "Coverage EM (sorted in-memory pass)...\n";
-                std::cerr << std::flush;
-            }
-
-            // Build compact CovEntry vector from best_hits + em_read_results
-            std::vector<dart::CovEntry> cov_entries;
-            cov_entries.reserve(n_reads);
-            for (uint32_t r = 0; r < n_reads; ++r) {
-                const auto& bh = best_hits[r];
-                if (!bh.has) continue;
-                const float g = em_read_results[r].gamma;
-                if (g < 1e-6f) continue;
-                dart::CovEntry e;
-                e.ref_idx           = bh.ref_idx;
-                e.gamma             = g;
-                e.tstart_0          = static_cast<uint16_t>(std::min(bh.tstart_0,          65535u));
-                e.aln_len_on_target = static_cast<uint16_t>(std::min(bh.aln_len_on_target, 65535u));
-                e.tlen              = static_cast<uint16_t>(std::min(bh.tlen,              65535u));
-                cov_entries.push_back(e);
-            }
-            std::sort(cov_entries.begin(), cov_entries.end(),
-                [](const dart::CovEntry& a, const dart::CovEntry& b) {
-                    return a.ref_idx < b.ref_idx;
-                });
-
-            dart::coverage_accumulate_from_sorted(
-                cov_entries, cov_params_streaming, coverage_stats_map);
-
-            // Apply coverage weights to em_state.weights (one reweighting step)
-            double w_sum = 0.0;
-            for (uint32_t j = 0; j < static_cast<uint32_t>(em_state.weights.size()); ++j) {
-                auto it = coverage_stats_map.find(j);
-                if (it != coverage_stats_map.end()) {
-                    const double cw = static_cast<double>(it->second.coverage_weight);
-                    em_state.weights[j] *= cw;
-                }
-                w_sum += em_state.weights[j];
-            }
-            if (w_sum > 0.0) {
-                const double inv = 1.0 / w_sum;
-                for (auto& w : em_state.weights) w *= inv;
-            }
-
-            const auto cov_end = std::chrono::steady_clock::now();
-            if (verbose) {
-                std::cerr << "  Coverage stats: " << coverage_stats_map.size() << " proteins\n";
-                std::cerr << "  Runtime: "
-                          << dart::log_utils::format_elapsed(cov_start, cov_end) << "\n\n";
-            }
-        }
-
-        // Release EMI mmap pages after 100+ streaming EM iterations.
-        // Without this, ~100 GB of NFS pages stay resident and push later
-        // allocations (ref_names cache, output buffers) past the memory limit.
-        reader.flush_pages();
-#ifdef __linux__
-        malloc_trim(0);
-#endif
-
-        // Cache ref_names NOW while memory is at its lowest (after flush_pages + malloc_trim).
-        // Doing this BEFORE annotation prevents OOM: annotation adds ~50GB of summaries,
-        // and ref_names_pread needs ~1GB peak. With 300GB limit, this order works.
-        if (verbose) {
-            std::cerr << "Caching ref_names via pread...\n";
-        }
-        cached_ref_names = reader.ref_names_pread();
-        if (cached_ref_names.empty() && reader.num_refs() > 0) {
-            std::cerr << "Error: ref_names_pread() returned empty vector\n";
-            return 1;
-        }
-        if (verbose) {
-            std::cerr << "Cached " << cached_ref_names.size() << " ref names\n";
-        }
-
-    } else if (use_em && em_aln_count > 0) {
+    if (use_em && em_aln_count > 0) {
         if (verbose) {
             std::cerr << "\nEM reassignment:\n";
             std::cerr << "  Alignments: " << em_aln_count << "\n";
@@ -3159,11 +2836,17 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cerr << "  Length normalization: on\n";
         }
 
-        // Build CSR-format alignment data
-        auto aln_data = dart::build_alignment_data(
-            em_alignments.data(), em_aln_count, n_reads, n_refs);
-        // Fix 3: release em_alignments – aln_data has its own copy
-        std::vector<dart::CompactAlignment>{}.swap(em_alignments);
+        // Build CSR-format alignment data (in-RAM path only). On the tape path aln_data
+        // stays empty — the EM runs off the O_DIRECT tape and nothing O(A) is materialized;
+        // read_offsets was already prefix-summed from the streaming degrees above.
+        dart::AlignmentData aln_data;
+        if (!tape_path) {
+            aln_data = dart::build_alignment_data(
+                em_alignments.data(), em_aln_count, n_reads, n_refs);
+            // Fix 3: release em_alignments – aln_data has its own copy
+            std::vector<dart::CompactAlignment>{}.swap(em_alignments);
+            read_offsets.assign(aln_data.read_offsets.begin(), aln_data.read_offsets.end());
+        }
 
         // Set up EM parameters
         dart::EMParams em_params;
@@ -3285,48 +2968,276 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cerr << "  EM iteration diagnostics:\n";
         }
 
-        dart::EMProgressCallback em_progress;
-        if (verbose) {
-            em_progress = [&](const dart::EMIterationDiagnostics& d) {
-                const bool rel_valid = std::isfinite(d.rel_change) && d.iteration > 1;
-                std::cerr << "    iter " << d.iteration
-                          << " ll=" << std::fixed << std::setprecision(2) << d.log_likelihood
-                          << " obj=" << std::fixed << std::setprecision(2) << d.objective
-                          << " rel=";
-                if (rel_valid) {
-                    std::cerr << std::scientific << std::setprecision(3) << d.rel_change;
-                } else {
-                    std::cerr << "NA";
+        // Post-hoc ancient responsibility is produced by the EM final pass itself when the
+        // mapping is damage-free (gamma_ancient = gamma * P(ancient|aln) at frozen weights).
+        em_params.posthoc_gamma_ancient =
+            !em_use_damage_mapping &&
+            (emi_has_alignment_damage || (emi_has_damage_scores && em_damage_varies_within_read));
+
+        // Streaming (transient-gamma) EM: iterations hold no O(alignments) gamma, the final
+        // pass streams per-read gamma straight into the finalization below, and
+        // compact_em_map releases aln_data.alignments after decode -> steady RSS ~20 B/aln
+        // (vs 20+32). Gated to the production config where per-read finalization needs only
+        // ref/gamma/gamma_ancient: no --em-audit, no calib densities, no null column,
+        // damage-free mapping, and — when post-hoc ancient is active — alignment-level damage
+        // likelihoods so p_anc = sigmoid(base_a - base_m) is EXACT (matches the legacy loop).
+        const bool can_stream =
+            em_audit_file.empty() && !use_em_calib && !use_em_null && !em_params.use_damage &&
+            (!em_params.posthoc_gamma_ancient || emi_has_alignment_damage);
+        const float em_keep_thr = static_cast<float>(em_min_prob);
+
+        // ---- Tape path: build the O_DIRECT hot tape by a streaming decode (scan-2) ----
+        // read_offsets + em_aln_count are already computed. The production finalize callback
+        // needs only ref/gamma/gamma_ancient per read, and gamma_ancient is derived in-core
+        // (posthoc: gamma*sigmoid(base_a-base_m)), so NO raw {bit,aln_len,ds} tape is needed —
+        // only the 3 SoA hot streams tape_em_core consumes. Nothing O(alignments) in RAM.
+        std::string tape_dir_path, p_tape_ref, p_tape_ba, p_tape_bm;
+        struct TapeDirGuard {
+            std::string dir, a, b, c;
+            ~TapeDirGuard() {
+                if (dir.empty()) return;
+                ::unlink(a.c_str()); ::unlink(b.c_str()); ::unlink(c.c_str());
+                ::rmdir(dir.c_str());
+            }
+        } tape_guard;
+        if (tape_path) {
+            if (!can_stream) {
+                std::cerr << "Error: EM tape path needs alignment-level damage likelihoods when "
+                             "post-hoc ancient responsibility is active (DAMAGE_SCORE varies within "
+                             "read but no DMG_LL columns). Re-run with an EMI carrying alignment "
+                             "damage likelihoods.\n";
+                return 1;
+            }
+            if (em_tape_dir.empty()) { const char* e = std::getenv("DART_EM_TAPE_DIR"); if (e) em_tape_dir = e; }
+            if (em_tape_dir.empty()) {
+                std::cerr << "Error: EM tape path needs a node-local scratch dir. Pass --em-tape-dir "
+                             "DIR (fast local NVMe with O_DIRECT; not /tmp, not NFS) or set "
+                             "DART_EM_TAPE_DIR.\n";
+                return 1;
+            }
+            // Read-major invariant: the tape is written in scan/CSR order with no reorder, so
+            // reads must not span row groups and row groups must be globally read-ordered.
+            if (!reader.is_sorted_by_read_then_score()) {
+                std::cerr << "Error: EMI is not read-major (is_sorted_by_read_then_score=false); "
+                             "the streaming EM tape requires read-major order.\n";
+                return 1;
+            }
+            // Ensure the (node-local, possibly not-yet-present) base dir exists, then a
+            // uniquely-named subdir. /scratch is per-node, so the base may be absent on this
+            // node even if it exists elsewhere — create it best-effort before the leaf.
+            ::mkdir(em_tape_dir.c_str(), 0755);  // best-effort; EEXIST is fine
+            tape_dir_path = em_tape_dir + "/dart_emtape_" + std::to_string(::getpid());
+            if (::mkdir(tape_dir_path.c_str(), 0755) != 0 && errno != EEXIST) {
+                std::cerr << "Error: cannot create EM tape dir " << tape_dir_path << ": "
+                          << std::strerror(errno) << "\n";
+                return 1;
+            }
+            p_tape_ref = tape_dir_path + "/tape.ref";
+            p_tape_ba  = tape_dir_path + "/tape.basea";
+            p_tape_bm  = tape_dir_path + "/tape.basem";
+            // Arm the RAII cleanup by assigning FIELDS directly. Do NOT construct a
+            // temporary (tape_guard = TapeDirGuard{...}) — the temporary's destructor would
+            // run at end of statement and rmdir the dir we just created, before we open it.
+            tape_guard.dir = tape_dir_path;
+            tape_guard.a = p_tape_ref;
+            tape_guard.b = p_tape_ba;
+            tape_guard.c = p_tape_bm;
+
+            // Shell ref metadata — bit-identical to build_alignment_data: ref_log_len_half =
+            // (float)(0.5*log(max(len,1))), consumed by length_log_penalty in the decode below.
+            dart::AlignmentData shell;
+            shell.num_reads = n_reads; shell.num_refs = n_refs;
+            shell.ref_lengths = em_ref_lengths;
+            shell.ref_log_len_half.assign(n_refs, 0.0f);
+            for (uint32_t t = 0; t < n_refs; ++t) {
+                const double len = static_cast<double>(std::max(shell.ref_lengths[t], 1u));
+                shell.ref_log_len_half[t] = static_cast<float>(0.5 * std::log(len));
+            }
+
+            const uint64_t tape_A = static_cast<uint64_t>(em_aln_count);
+            // Hot tape: 3 SoA streams (ref u32, base_a f64, base_m f64) in CSR order. Written
+            // buffered at CSR offsets (per row group, contiguous under read-major), then fsync'd
+            // and tail-padded to 4096 so tape_em_core's O_DIRECT aligned reads never straddle
+            // EOF. Buffered writes touch only reclaimable page cache (not RssAnon), then
+            // posix_fadvise(DONTNEED) drops it — peak RSS stays O(num_refs).
+            int fd_ref = ::open(p_tape_ref.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            int fd_ba  = ::open(p_tape_ba.c_str(),  O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            int fd_bm  = ::open(p_tape_bm.c_str(),  O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd_ref < 0 || fd_ba < 0 || fd_bm < 0) {
+                std::cerr << "Error: cannot create EM tape files in " << tape_dir_path
+                          << ": " << std::strerror(errno) << "\n";
+                return 1;
+            }
+            std::atomic<bool> tape_ok{true};
+            const double eps_dec = 1e-12;
+            reader.set_columns({
+                dart::ColumnID::READ_IDX, dart::ColumnID::REF_IDX, dart::ColumnID::BIT_SCORE,
+                dart::ColumnID::DAMAGE_SCORE, dart::ColumnID::EVALUE_LOG10,
+                dart::ColumnID::DMG_LL_A, dart::ColumnID::DMG_LL_M,
+                dart::ColumnID::IDENTITY_Q, dart::ColumnID::ALN_LEN,
+                dart::ColumnID::TSTART, dart::ColumnID::TLEN
+            });
+            reader.parallel_scan([&](
+                uint32_t /*rg_idx*/, uint32_t num_rows,
+                const uint32_t* read_idx, const uint32_t* ref_idx,
+                const float* bit_score, const float* damage_score,
+                const float* evalue_log10,
+                const uint16_t* /*dmg_k*/, const uint16_t* /*dmg_m*/,
+                const float* dmg_ll_a, const float* dmg_ll_m,
+                const uint16_t* identity_q,
+                const uint16_t* aln_len, const uint16_t* /*qstart*/, const uint16_t* /*qend*/,
+                const uint16_t* tstart, const uint16_t* /*tend*/,
+                const uint16_t* tlen, const uint16_t* /*qlen*/,
+                const uint16_t* /*mismatch*/, const uint16_t* /*gapopen*/)
+            {
+                if (!read_idx || !ref_idx || !bit_score || !evalue_log10 || !identity_q ||
+                    !aln_len || !tstart || !tlen || !damage_score) return;
+                std::vector<uint32_t> lref; std::vector<double> lba, lbm;
+                lref.reserve(num_rows); lba.reserve(num_rows); lbm.reserve(num_rows);
+                uint64_t base = UINT64_MAX;
+                for (uint32_t i = 0; i < num_rows; ++i) {
+                    const float fident = static_cast<float>(identity_q[i]) / 65535.0f;
+                    const float bits = bit_score[i];
+                    if (fident < aln_min_identity) continue;
+                    if (bits < aln_min_bits) continue;
+                    if (evalue_log10[i] > aln_max_evalue_log10) continue;
+                    const uint32_t ridx = read_idx[i];
+                    if (base == UINT64_MAX) base = read_offsets[ridx];  // read-major: rg is contiguous
+                    const uint32_t tstart_0 = (tstart[i] > 0) ? static_cast<uint32_t>(tstart[i] - 1) : 0u;
+                    const uint32_t aln_start = std::min(tstart_0, 65535u);
+                    const uint32_t aln_end = std::min(tstart_0 + static_cast<uint32_t>(aln_len[i]), 65535u);
+                    const uint16_t aln_len_em = (aln_end > aln_start)
+                        ? static_cast<uint16_t>(std::min(aln_end - aln_start, 65535u)) : 0;
+                    const uint32_t ref = ref_idx[i];
+                    // Decode == tape_decode_read with score_scale=1 (normalize_scores_per_query is
+                    // always false here): bc = length_log_penalty(shell) + coverage(0) + lambda_b*bit.
+                    const double bc = dart::length_log_penalty(shell, em_params, ref)
+                                    + dart::coverage_log_penalty(em_params, ref)
+                                    + dart::real_log_density(em_params, static_cast<double>(bits), aln_len_em, 1.0);
+                    const double pr = std::clamp(
+                        static_cast<double>(std::clamp(damage_score[i], 0.0f, 1.0f)), eps_dec, 1.0 - eps_dec);
+                    const double la = dmg_ll_a ? static_cast<double>(dmg_ll_a[i]) : 0.0;
+                    const double lm = dmg_ll_m ? static_cast<double>(dmg_ll_m[i]) : 0.0;
+                    lref.push_back(ref);
+                    lba.push_back(bc + std::log(pr) + la);
+                    lbm.push_back(bc + std::log(1.0 - pr) + lm);
                 }
-                std::cerr << " dphi=" << std::scientific << std::setprecision(3)
-                          << d.param_change;
-                std::cerr
-                          << " mode=" << (d.squarem_active ? "SQUAREM" : "EM");
-                if (d.squarem_active) {
-                    std::cerr << " alpha=" << std::fixed << std::setprecision(3) << d.alpha
-                              << " fallback=" << (d.fallback_to_em ? "1" : "0");
-                }
-                std::cerr << std::defaultfloat << "\n";
+                if (lref.empty()) return;
+                const off_t o_ref = static_cast<off_t>(base) * static_cast<off_t>(sizeof(uint32_t));
+                const off_t o_d   = static_cast<off_t>(base) * static_cast<off_t>(sizeof(double));
+                if (::pwrite(fd_ref, lref.data(), lref.size() * sizeof(uint32_t), o_ref) < 0) tape_ok = false;
+                if (::pwrite(fd_ba,  lba.data(),  lba.size()  * sizeof(double),   o_d)   < 0) tape_ok = false;
+                if (::pwrite(fd_bm,  lbm.data(),  lbm.size()  * sizeof(double),   o_d)   < 0) tape_ok = false;
+            });
+            auto pad4096 = [](int fd, uint64_t nbytes) {
+                uint64_t padded = (nbytes + 4095) & ~uint64_t(4095);
+                return ::ftruncate(fd, static_cast<off_t>(padded)) == 0;
             };
+            bool ok = tape_ok.load();
+            ok = pad4096(fd_ref, tape_A * sizeof(uint32_t)) && ok;
+            ok = pad4096(fd_ba,  tape_A * sizeof(double))   && ok;
+            ok = pad4096(fd_bm,  tape_A * sizeof(double))   && ok;
+            ::fsync(fd_ref); ::fsync(fd_ba); ::fsync(fd_bm);
+#ifdef __linux__
+            ::posix_fadvise(fd_ref, 0, 0, POSIX_FADV_DONTNEED);
+            ::posix_fadvise(fd_ba,  0, 0, POSIX_FADV_DONTNEED);
+            ::posix_fadvise(fd_bm,  0, 0, POSIX_FADV_DONTNEED);
+#endif
+            ::close(fd_ref); ::close(fd_ba); ::close(fd_bm);
+            if (!ok) { std::cerr << "Error: EM tape write failed\n"; return 1; }
+            reader.flush_pages();
+            if (verbose) {
+                const double bh_gb = static_cast<double>(n_reads) *
+                    static_cast<double>(sizeof(best_hits[0])) / (1024.0 * 1024.0 * 1024.0);
+                std::cerr << "  EM tape: A=" << tape_A << " alns, R=" << n_reads
+                          << " reads -> " << tape_dir_path
+                          << " | O(R) best_hits ~" << std::fixed << std::setprecision(2) << bh_gb
+                          << " GB (" << sizeof(best_hits[0]) << " B/read) + read_offsets "
+                          << std::setprecision(2)
+                          << (static_cast<double>(n_reads) * 8.0 / (1024.0*1024.0*1024.0)) << " GB\n";
+            }
         }
 
         const auto em_start = std::chrono::steady_clock::now();
 
-        if (use_coverage_em) {
-            dart::CoverageEMParams cov_params;
-            cov_params.max_outer_iters = coverage_em_iters;
-            cov_params.tau = coverage_em_tau;
-            cov_params.default_bins = coverage_em_bins;
-            cov_params.depth_gate_lo = depth_gate_lo;
-            cov_params.depth_gate_hi = depth_gate_hi;
-            cov_params.w_min = w_min;
-            if (verbose) {
-                std::cerr << "  Coverage-EM outer iterations: " << cov_params.max_outer_iters << "\n";
+        // compact_em_map (fusion dual-b8247d43): the SOLE EM reassignment solver. Decode-once
+        // CSR + fused per-ref sufficient stats + deterministic-lane M-step -> bitwise-identical
+        // across thread counts. Streaming form additionally makes gamma EM-transient.
+        if (can_stream) {
+            // Per-read finalization, streamed from the EM final pass (serial, ascending read
+            // order). gamma is transient; only O(reads) results survive. Mirrors the legacy
+            // per-read loop below for the production config (null off, calib off, audit off).
+            auto finalize_cb = [&](uint32_t r, uint32_t deg, const uint32_t* ref,
+                                   const double* gamma, const double* gamma_anc) {
+                uint32_t em_best_ref = 0;
+                double best_g = -1.0;
+                float top1 = 0.0f, top2 = 0.0f;
+                double sum_sq = 0.0;
+                for (uint32_t j = 0; j < deg; ++j) {
+                    const double g = gamma[j];
+                    if (g > best_g) { best_g = g; em_best_ref = ref[j]; }
+                    sum_sq += g * g;
+                    if (g > static_cast<double>(top1)) { top2 = top1; top1 = static_cast<float>(g); }
+                    else if (g > static_cast<double>(top2)) { top2 = static_cast<float>(g); }
+                }
+                float best_hit_gamma = 0.0f, best_hit_gamma_ancient = 0.0f;
+                bool bitscore_best_matches_em = false;
+                bool em_keep = false;
+                if (deg > 0 && best_hits[r].has) {
+                    const uint32_t best_hit_ref = best_hits[r].ref_idx;
+                    bitscore_best_matches_em = (best_hit_ref == em_best_ref);
+                    for (uint32_t j = 0; j < deg; ++j) {
+                        if (ref[j] == best_hit_ref) {
+                            best_hit_gamma = static_cast<float>(gamma[j]);
+                            if (gamma_anc) {
+                                best_hit_gamma_ancient = static_cast<float>(gamma_anc[j]);
+                                damage_em_active = true;
+                            }
+                            break;
+                        }
+                    }
+                    em_keep = (best_hit_gamma >= em_keep_thr);
+                }
+                if (deg > 0 && emit_multimap && r < mm_pool.size() && !mm_pool[r].empty()) {
+                    for (uint32_t j = 0; j < deg; ++j) {
+                        const uint32_t jref = ref[j];
+                        for (auto& c : mm_pool[r]) {
+                            if (c.ref_idx == jref) {
+                                c.gamma = static_cast<float>(gamma[j]);
+                                c.gamma_ancient = gamma_anc ? static_cast<float>(gamma_anc[j]) : 0.0f;
+                                break;
+                            }
+                        }
+                    }
+                }
+                const float em_margin = std::max(0.0f, top1 - top2);
+                const float em_ref_neff = (sum_sq > 0.0) ? static_cast<float>(1.0 / sum_sq) : 0.0f;
+                uint8_t reason = 0;
+                if (em_margin < static_cast<float>(em_min_margin)) reason |= 0x2;
+                if (em_ref_neff > static_cast<float>(em_max_neff)) reason |= 0x4;
+                em_read_results[r] = {
+                    best_hit_gamma, best_hit_gamma_ancient, bitscore_best_matches_em,
+                    em_keep, em_keep_thr, em_margin, em_ref_neff, 0.0f, reason
+                };
+            };
+            if (tape_path) {
+                // Stream-solve directly off the O_DIRECT hot tape: base_a/base_m live on
+                // scratch NVMe, not RAM, so peak RSS is O(num_refs) + fixed I/O buffers,
+                // INDEPENDENT of alignment count. null off => null_lp/gnull_out null.
+                dart::TapeEMResult res = dart::tape_em_core(
+                    p_tape_ref, p_tape_ba, p_tape_bm, read_offsets.data(),
+                    n_reads, n_refs, static_cast<uint64_t>(em_aln_count), em_params,
+                    nullptr, nullptr, finalize_cb);
+                em_state.weights = std::move(res.weights);
+                em_state.pi = res.pi;
+                em_state.w_null = res.w_null;
+                em_state.log_likelihood = res.log_likelihood;
+                em_state.iterations = res.iterations;
+            } else {
+                em_state = dart::compact_em_map(aln_data, em_params, finalize_cb);
             }
-            em_state = dart::coverage_em_squarem(
-                aln_data, em_params, cov_params, coverage_stats_map, em_progress, verbose);
         } else {
-            em_state = dart::squarem_em(aln_data, em_params, nullptr, em_progress);
+            em_state = dart::compact_em_map(aln_data, em_params);
         }
 
         const auto em_end = std::chrono::steady_clock::now();
@@ -3348,6 +3259,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             }
         }
 
+        // The remaining per-read finalization runs only on the NON-streaming path. The
+        // streaming path already produced em_read_results / mm_pool joins inside the EM
+        // final-pass callback above (and released aln_data.alignments).
+        if (!can_stream) {
         // Post-hoc gamma_ancient when the mapping was damage-free (default). The
         // mapping marginal em_state.gamma is left BIT-IDENTICAL; gamma_ancient is the
         // factorized product gamma_map_j * P(ancient | alignment_j), the ancient
@@ -3551,6 +3466,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cerr << "  EM audit: " << audit_rows.size() << " hit-reads -> " << em_audit_file
                       << " (kept=" << nk << " abstain=" << na << " reject=" << nr << ")\n";
         }
+        }  // end if(!can_stream) legacy per-read finalization
 
         if (verbose) {
             // Filtering stats
@@ -3562,7 +3478,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             double neff_sum = 0.0;
             size_t margin_n = 0;
             for (uint32_t r = 0; r < n_reads; ++r) {
-                uint32_t deg = aln_data.read_offsets[r + 1] - aln_data.read_offsets[r];
+                uint32_t deg = static_cast<uint32_t>(read_offsets[r + 1] - read_offsets[r]);
                 if (deg > 1) multi++;
                 else unique++;
                 const auto& er = em_read_results[r];
@@ -4442,7 +4358,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
         // Reconstruct names at output time. Query name via mmap (safe for read names).
         // Ref name from cached vector (NFS-safe pread).
-        const std::string_view qname = reader.read_name(s.read_idx);
+        const std::string qname = reader.read_name(s.read_idx);
         const uint32_t ref_idx = best_hits[s.read_idx].ref_idx;
         const std::string& tname = cached_ref_names[ref_idx];
 
@@ -4531,6 +4447,58 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         for (auto& rec : dcx_recs) {
             auto it = post_by_read.find(rec.read_idx);
             rec.posterior = (it != post_by_read.end()) ? it->second : 0.0f;
+        }
+
+        // ── WRITE-TIME AUTH REDUCE (fusion dual-66c04a26 #1) ─────────────────
+        // Runs HERE, while dcx_recs is still READ-GROUPED — before the (target,tstart)
+        // sort below scatters each read's alignments by target (which is exactly why a
+        // reduce over the written target-sorted .dcx over-counts multi-mapped reads).
+        // Per read: EM-pick = max quantized gamma among em_keep, tie-break target_id ASC
+        // then ordinal (== struct_auth rn=1). Per target accumulate {N, logLR=Σ
+        // gamma*ln(clamp(p_read,eps,1-eps)/(1-clamp)), k@τ-grid}. Values are the writer's
+        // quantized dec_unit(enc_unit(.)) so the stats == any grain_a re-derive; logLR
+        // summed in canonical read_idx order. Written to <dcx>.authstats after the label
+        // is resolved (below). p_read is always present here (COL_P_READ is set).
+        std::vector<std::string> a_targets;
+        std::vector<uint64_t> a_N, a_k;          // a_k row-major: [target*5 + j]
+        std::vector<double> a_logLR;
+        static const double AUTH_TAU[5] = {0.3, 0.4, 0.5, 0.6, 0.7};
+        {
+            const double AEPS = 1e-6;
+            struct Best { double g, pr; const std::string* tgt; uint64_t ord; };
+            std::unordered_map<uint32_t, Best> best;
+            best.reserve(dcx_recs.size());
+            for (uint64_t i = 0; i < dcx_recs.size(); ++i) {
+                const DcxReadRec& r = dcx_recs[i];
+                if (!r.em_keep) continue;
+                double g = dcx::dec_unit(dcx::enc_unit(r.gamma));
+                double pr = dcx::dec_unit(dcx::enc_unit(r.p_read));
+                auto it = best.find(r.read_idx);
+                if (it == best.end()) { best.emplace(r.read_idx, Best{g, pr, &r.target_id, i}); continue; }
+                Best& b = it->second;
+                bool better = g > b.g
+                           || (g == b.g && r.target_id < *b.tgt)
+                           || (g == b.g && r.target_id == *b.tgt && i < b.ord);
+                if (better) { b = Best{g, pr, &r.target_id, i}; }
+            }
+            std::vector<uint32_t> rids; rids.reserve(best.size());
+            for (auto& kv : best) rids.push_back(kv.first);
+            std::sort(rids.begin(), rids.end());          // canonical read_idx order
+            std::unordered_map<std::string, uint32_t> tix;
+            for (uint32_t rid : rids) {
+                const Best& b = best[rid];
+                auto ti = tix.find(*b.tgt);
+                uint32_t ix;
+                if (ti == tix.end()) {
+                    ix = uint32_t(a_targets.size()); tix.emplace(*b.tgt, ix);
+                    a_targets.push_back(*b.tgt); a_N.push_back(0); a_logLR.push_back(0.0);
+                    a_k.insert(a_k.end(), 5, 0);
+                } else ix = ti->second;
+                a_N[ix] += 1;
+                double pc = std::min(std::max(b.pr, AEPS), 1.0 - AEPS);
+                a_logLR[ix] += b.g * std::log(pc / (1.0 - pc));
+                for (int j = 0; j < 5; ++j) if (b.pr > AUTH_TAU[j]) a_k[ix * 5 + j] += 1;
+            }
         }
 
         std::sort(dcx_recs.begin(), dcx_recs.end(),
@@ -4642,10 +4610,38 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cerr << "Error: --dcx write_dcx returned false for " << dcx_file << "\n";
             return 1;
         }
+        // DUAL-EMIT the grain-A auth sidecar (<dcx>.auth) so convergence protein_auth
+        // (fold-gap) reads a small grain-A-only file instead of inflating the full .dcx.
+        const std::string auth_file = dcx_file + ".auth";
+        try {
+            if (!dcx::write_dcx_auth(auth_file.c_str(), B, opt)) {
+                std::cerr << "Error: --dcx auth sidecar write returned false for " << auth_file << "\n";
+                return 1;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Error: --dcx auth sidecar write failed: " << e.what() << "\n";
+            return 1;
+        }
+        // EMIT the write-time auth-stats table (<dcx>.authstats) computed above.
+        const std::string authstats_file = dcx_file + ".authstats";
+        try {
+            if (!dcx::write_auth_stats(authstats_file.c_str(), opt.library_label,
+                                       AUTH_TAU, 5, a_targets, a_N, a_k, a_logLR, 19)) {
+                std::cerr << "Error: authstats write returned false for " << authstats_file << "\n";
+                return 1;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Error: authstats write failed: " << e.what() << "\n";
+            return 1;
+        }
         if (verbose) {
             std::cerr << ".dcx written to: " << dcx_file << " (" << B.target_ord.size()
                       << " alignments, " << B.ref_aa.size() << " covered positions, "
                       << B.target_dict.size() << " targets)\n";
+            std::cerr << ".dcx auth sidecar: " << auth_file << " (grain-A only, "
+                      << B.target_ord.size() << " alignments)\n";
+            std::cerr << ".dcx authstats: " << authstats_file << " (write-time reduce, "
+                      << a_targets.size() << " targets)\n";
         }
     }
 
