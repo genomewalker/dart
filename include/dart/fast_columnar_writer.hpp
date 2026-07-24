@@ -29,6 +29,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <numeric>
 #include <condition_variable>
@@ -385,8 +386,24 @@ public:
 
     SpillingStringDict(const std::string& name, size_t memory_cap = DICT_MEMORY_CAP / 2)
         : name_(name), memory_cap_(memory_cap) {
-        // Create temp directory
-        temp_dir_ = std::filesystem::temp_directory_path() / ("agp_dict_" + name_ + "_" + std::to_string(getpid()));
+        // Spill directory. std::filesystem::temp_directory_path() falls back to /tmp
+        // when TMPDIR/TMP/TEMP are unset, which is unusable on compute nodes: they
+        // advertise TmpDisk=0 and carry only a 40-100GB /tmp shared with everything
+        // else. At billions of rows with tens of millions of distinct reference
+        // names this dictionary spills gigabytes and WILL fill it (that failure mode
+        // already took several nodes to 100% and triggered an ops alarm).
+        // DART_SPILL_DIR is honoured first so a job can pin spill onto its own
+        // scratch; otherwise fall back to the standard lookup.
+        const char* spill_env = std::getenv("DART_SPILL_DIR");
+        std::filesystem::path base;
+        if (spill_env && *spill_env) {
+            base = spill_env;
+            std::error_code ec;
+            std::filesystem::create_directories(base, ec);
+        } else {
+            base = std::filesystem::temp_directory_path();
+        }
+        temp_dir_ = base / ("agp_dict_" + name_ + "_" + std::to_string(getpid()));
         std::filesystem::create_directories(temp_dir_);
     }
 

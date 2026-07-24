@@ -162,6 +162,54 @@ int main() {
         std::remove("/tmp/dcx_nocodon.dcx");
     }
 
+    // Grain-A auth SIDECAR (write_dcx_auth): grain-B stripped (n_records_b==0), grain-A
+    // auth columns intact. Written to a stable path for the cross-language E2E (dcx_rs
+    // reads it and computes protein_auth).
+    {
+        Batch Ba = B;
+        Ba.p_read = {0.9f, 0.3f};                 // COL_P_READ auth column
+        DcxWriteOptions oa = opt;
+        oa.col_flags = opt.col_flags | COL_P_READ;
+        const char* apath = "/projects/caeg/scratch/kbd606/tmp/convergence_v63_rebuild/dcx_auth_test.dcx.auth";
+        assert(write_dcx_auth(apath, Ba, oa));
+        std::vector<uint8_t> a = slurp(apath);
+        FileHeader fha = read_at<FileHeader>(a, 0);
+        assert(fha.n_records_a == 2);
+        assert(fha.n_records_b == 0);             // grain-B stripped -> tiny sidecar
+        BlockIndexEntry iea = read_at<BlockIndexEntry>(
+            a, read_at<Footer>(a, a.size() - sizeof(Footer)).index_offset + sizeof(IndexHeader));
+        BlockHeader bha = read_at<BlockHeader>(a, iea.offset);
+        std::vector<uint8_t> rawa(bha.raw_sz);
+        assert(!ZSTD_isError(ZSTD_decompress(rawa.data(), rawa.size(),
+               a.data() + iea.offset + sizeof(BlockHeader), bha.compressed_sz)));
+        RawBlockHeader rbha = read_at<RawBlockHeader>(rawa, 0);
+        assert(rbha.n_records_a == 2 && rbha.n_records_b == 0);
+        bool saw_pread = false, saw_gamma = false, saw_keep = false, saw_qid = false, saw_tid = false;
+        for (uint32_t c = 0; c < rbha.n_columns; ++c) {
+            ColumnDirEntry e = read_at<ColumnDirEntry>(rawa, sizeof(RawBlockHeader) + c * sizeof(ColumnDirEntry));
+            if (e.column_id == uint16_t(ColumnId::PReadQ))  { saw_pread = true; assert(e.elem_count == 2); }
+            if (e.column_id == uint16_t(ColumnId::GammaQ))  { saw_gamma = true; assert(e.elem_count == 2); }
+            if (e.column_id == uint16_t(ColumnId::EmKeep))    saw_keep = true;
+            if (e.column_id == uint16_t(ColumnId::QueryId))   saw_qid = true;
+            if (e.column_id == uint16_t(ColumnId::TargetId))  saw_tid = true;
+            if (e.column_id == uint16_t(ColumnId::RefAa))    assert(e.elem_count == 0);  // grain-B stripped
+        }
+        assert(saw_pread && saw_gamma && saw_keep && saw_qid && saw_tid);
+        std::puts("DCX_AUTH_SIDECAR_OK");
+    }
+
+    // Write-time AUTHSTATS format round-trip (write_auth_stats -> Rust read_auth_stats E2E).
+    {
+        std::vector<std::string> tg = {"tgtA", "tgtB"};
+        std::vector<uint64_t> Nv = {3, 1};
+        std::vector<uint64_t> kf = {2,2,2,1,0,  1,1,0,0,0};   // 2 targets x 5 tau, row-major
+        std::vector<double>   ll = {5.189665109725213, 2.061107285416508};
+        double tg_tau[5] = {0.3, 0.4, 0.5, 0.6, 0.7};
+        const char* sp = "/projects/caeg/scratch/kbd606/tmp/convergence_v63_rebuild/authstats_test.authstats";
+        assert(write_auth_stats(sp, "Lx", tg_tau, 5, tg, Nv, kf, ll, 19));
+        std::puts("DCX_AUTHSTATS_WRITE_OK");
+    }
+
     // The uncalibrated-write guard must fire (all-zero calib_contract_id).
     DcxWriteOptions bad = opt;
     std::memset(bad.calib_contract_id, 0, 16);

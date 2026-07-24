@@ -1,3 +1,7 @@
+// O_DIRECT (compact_em_map_tape) needs _GNU_SOURCE before the first system header.
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 // EM multi-mapping resolution with SQUAREM acceleration
 //
 // Resolves ambiguous protein-to-reference alignments using iteratively-refined
@@ -16,11 +20,17 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <string>
 #include <thread>
 #include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 #ifdef _OPENMP
 #include <omp.h>
@@ -1002,6 +1012,665 @@ EMState squarem_em(
 }
 
 // ---------------------------------------------------------------------------
+// compact_em_map (fusion dual-b8247d43): the SINGLE EM solver. Decode-once CSR
+// {ref_idx, base_a, base_m} where base = length_log_penalty + coverage_log_penalty +
+// real_log_density (+ frozen damage log(p_read)+ll_a / log(1-p_read)+ll_m), all
+// iteration-independent. Per-iter E-step adds only log(weights[ref]); fused per-ref
+// s_t = Σγ; full SQUAREM; DETERMINISTIC-LANE M-step (fixed lanes, read-order per lane,
+// ascending-lane reduce) -> bitwise-identical across thread counts. Frozen-damage branch
+// (use_alignment_damage_likelihood): pi is post-hoc, only w_null rides the SQUAREM state.
+static constexpr int COMPACT_EM_LANES = 32;
+
+EMState compact_em_map(AlignmentData& data, const EMParams& params,
+                       const TapeFinalizeCb& finalize_cb) {
+    EMState state;
+    const uint32_t T = data.num_refs;
+    const size_t A = data.alignments.size();
+    const uint32_t R = data.num_reads;
+    const bool null_on = params.use_null && !params.null_mu.empty();
+    const uint32_t Tn = null_on ? T + 1 : T;
+    const double eps = 1e-12;
+
+    // gamma is EM-TRANSIENT: iterations accumulate only per-ref sufficient stats
+    // (lane_s) + optional per-read null mass; the full gamma is materialized ONLY in
+    // the single final frozen-weight pass. When finalize_cb is supplied it is streamed
+    // per read and NO O(alignments) gamma is ever held (production, ~O(num_refs) RSS);
+    // otherwise the final pass fills state.gamma exactly as before (gate/back-compat).
+    const bool stream = static_cast<bool>(finalize_cb);
+    const bool want_anc = params.use_damage || params.posthoc_gamma_ancient;
+    if (!stream) {
+        state.gamma.assign(A, 0.0);
+        if (want_anc) state.gamma_ancient.assign(A, 0.0);
+    }
+    if (null_on) state.gamma_null.assign(R, 0.0);
+    if (T == 0) { state.log_likelihood = 0.0; state.iterations = 0; return state; }
+
+    // ---- decode ONCE: base_a/base_m per alignment (iteration-independent) ----
+    std::vector<uint32_t> csr_ref(A);
+    std::vector<double> base_a(A), base_m(A);
+    #pragma omp parallel for schedule(static)
+    for (uint32_t r = 0; r < R; ++r) {
+        const uint32_t s = data.read_offsets[r], e = data.read_offsets[r + 1];
+        const uint32_t deg = e - s;
+        if (deg == 0) continue;
+        double score_scale = 1.0;
+        if (params.normalize_scores_per_query && deg > 1) {
+            float mx = data.alignments[s].bit_score;
+            for (uint32_t j = 1; j < deg; ++j) mx = std::max(mx, data.alignments[s + j].bit_score);
+            if (mx > 0.0f) score_scale = 1.0 / static_cast<double>(mx);
+        }
+        for (uint32_t j = s; j < e; ++j) {
+            const auto& aln = data.alignments[j];
+            csr_ref[j] = aln.ref_idx;
+            double bc = length_log_penalty(data, params, aln.ref_idx)
+                      + coverage_log_penalty(params, aln.ref_idx)
+                      + real_log_density(params, static_cast<double>(aln.bit_score), aln.aln_len, score_scale);
+            const double pr = std::clamp(static_cast<double>(aln.damage_score), eps, 1.0 - eps);
+            base_a[j] = bc + std::log(pr) + aln.damage_ll_a;
+            base_m[j] = bc + std::log(1.0 - pr) + aln.damage_ll_m;
+        }
+    }
+
+    // Streaming path with the null column off never reads data.alignments again (decode
+    // is done; iterations + final pass use only csr_ref/base_a/base_m). Release the
+    // 32 B/aln ingestion copy NOW so steady-state RSS is ~the 20 B/aln CSR alone. The
+    // non-streaming (gate/back-compat) path keeps it — callers may reuse data.
+    if (stream && !null_on) std::vector<Alignment>{}.swap(data.alignments);
+
+    // ---- init weights (+ null coordinate), same as squarem_em ----
+    state.weights.assign(Tn, 1.0 / static_cast<double>(T));
+    if (null_on) {
+        double w0n = std::clamp(std::exp(params.log_w_null), params.min_weight, 1.0 - 1e-6);
+        for (uint32_t t = 0; t < T; ++t) state.weights[t] *= (1.0 - w0n);
+        state.weights[T] = w0n;
+    }
+
+    // deterministic lane read ranges (contiguous CSR ranges)
+    std::array<uint32_t, COMPACT_EM_LANES + 1> lane_lo;
+    for (int l = 0; l <= COMPACT_EM_LANES; ++l)
+        lane_lo[l] = static_cast<uint32_t>((static_cast<uint64_t>(R) * l) / COMPACT_EM_LANES);
+    std::vector<double> lane_s(static_cast<size_t>(COMPACT_EM_LANES) * T, 0.0);
+    std::vector<double> gn_s(null_on ? R : 0, 0.0);
+
+    // Fused E-step -> per-lane s_t (deterministic) + optional null mass; returns ll.
+    // gamma is NOT stored here (transient): only lane_s/gn_s survive the iteration.
+    auto e_step_iter = [&](const double* w) -> double {
+        const double log_w_null_dyn = null_on ? std::log(std::max(w[T], params.min_weight)) : 0.0;
+        std::fill(lane_s.begin(), lane_s.end(), 0.0);
+        std::vector<double> ll_lane(COMPACT_EM_LANES, 0.0);
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int l = 0; l < COMPACT_EM_LANES; ++l) {
+            double* s_t = lane_s.data() + static_cast<size_t>(l) * T;
+            double ll_local = 0.0;
+            std::vector<double> ls;
+            for (uint32_t r = lane_lo[l]; r < lane_lo[l + 1]; ++r) {
+                const uint32_t s = data.read_offsets[r], e = data.read_offsets[r + 1];
+                const uint32_t deg = e - s;
+                if (deg == 0) continue;
+                const uint32_t ncol = null_on ? 2 * deg + 1 : 2 * deg;
+                ls.resize(ncol);
+                for (uint32_t j = 0; j < deg; ++j) {
+                    const double lw = std::log(std::max(w[csr_ref[s + j]], params.min_weight));
+                    ls[2 * j] = lw + base_a[s + j];
+                    ls[2 * j + 1] = lw + base_m[s + j];
+                }
+                if (null_on) {
+                    const double lp = read_null_log_density(params, data.alignments.data() + s, deg);
+                    ls[2 * deg] = log_w_null_dyn + params.lambda_null * lp;
+                }
+                const double lse = log_sum_exp(ls.data(), ncol);
+                ll_local += lse;
+                for (uint32_t j = 0; j < deg; ++j) {
+                    const double da = ls[2 * j] - lse, dm = ls[2 * j + 1] - lse;
+                    const double ga = (da > -700.0) ? std::exp(da) : 0.0;
+                    const double gm = (dm > -700.0) ? std::exp(dm) : 0.0;
+                    s_t[csr_ref[s + j]] += ga + gm;   // read-order accumulate within lane
+                }
+                if (null_on) {
+                    const double d = ls[2 * deg] - lse;
+                    gn_s[r] = (d > -700.0) ? std::exp(d) : 0.0;
+                }
+            }
+            ll_lane[l] = ll_local;
+        }
+        double ll = 0.0; for (int l = 0; l < COMPACT_EM_LANES; ++l) ll += ll_lane[l];
+        return ll;
+    };
+    // M-step: weights[t] = (prior + Σ_lane s_lane[l][t]) ascending-lane, then normalize.
+    auto m_step_fused = [&](double* out_w) {
+        const double prior_offset = params.alpha_prior - 1.0;
+        double tot = 0.0;
+        for (uint32_t t = 0; t < T; ++t) {
+            double w = prior_offset;
+            for (int l = 0; l < COMPACT_EM_LANES; ++l) w += lane_s[static_cast<size_t>(l) * T + t];
+            w = std::max(w, params.min_weight);
+            out_w[t] = w; tot += w;
+        }
+        double wn = 0.0;
+        if (null_on) {
+            wn = prior_offset;
+            for (uint32_t r = 0; r < R; ++r) wn += gn_s[r];
+            wn = std::max(wn, params.min_weight); tot += wn;
+        }
+        if (tot > 0.0) { for (uint32_t t = 0; t < T; ++t) out_w[t] /= tot; if (null_on) out_w[T] = wn / tot; }
+    };
+    auto do_e = [&](const double* w) { return e_step_iter(w); };
+    auto do_m = [&](double* out) { m_step_fused(out); };
+
+    std::vector<double> w0(Tn), w1(Tn), w2(Tn), r_buf(Tn), v_buf(Tn), prev_w(Tn);
+    double prev_obj = -std::numeric_limits<double>::infinity();
+    double step_min = params.squarem_step_min0, step_max0 = params.squarem_step_max0;
+    if (step_max0 < step_min) std::swap(step_max0, step_min);
+    double step_max = step_max0;
+    const double mstep = std::max(params.squarem_mstep, 1.0000001);
+    const double param_tol = std::sqrt(std::max(params.tol, 1e-15));
+
+    for (uint32_t iter = 0; iter < params.max_iters; ++iter) {
+        double ll, objective;
+        std::copy(state.weights.begin(), state.weights.end(), prev_w.begin());
+        const bool sq = params.use_squarem && (iter >= params.squarem_warmup_iters);
+        if (sq) {
+            std::copy(state.weights.begin(), state.weights.end(), w0.begin());
+            do_e(w0.data()); do_m(w1.data());
+            do_e(w1.data()); do_m(w2.data());
+            double sr2 = 0, sv2 = 0, srv = 0;
+            squarem_build_directions(w0.data(), w1.data(), w2.data(), r_buf.data(), v_buf.data(), Tn, sr2, sv2, srv);
+            double alpha = std::clamp(squarem_step_length(params.squarem_method, sr2, sv2, srv), step_min, step_max);
+            squarem_extrapolate(w0.data(), r_buf.data(), v_buf.data(), Tn, alpha, params.min_weight);
+            do_e(w0.data()); do_m(w1.data()); std::copy(w1.begin(), w1.end(), w0.begin());
+            ll = do_e(w0.data());
+            objective = em_objective_from_ll(params, w0.data(), T, ll);
+            const bool nonmono = (iter > 0) && std::isfinite(params.squarem_objfn_inc)
+                                 && (objective < (prev_obj - params.squarem_objfn_inc));
+            if (nonmono) {
+                std::copy(w2.begin(), w2.end(), state.weights.begin());
+                ll = do_e(state.weights.data());
+                objective = em_objective_from_ll(params, state.weights.data(), T, ll);
+                if (std::abs(alpha - step_max) <= (1e-12 * (1.0 + std::abs(step_max)))) step_max = std::max(step_max0, step_max / mstep);
+            } else {
+                std::copy(w0.begin(), w0.end(), state.weights.begin());
+            }
+            if (std::abs(alpha - step_max) <= (1e-12 * (1.0 + std::abs(step_max)))) step_max = mstep * step_max;
+            if (step_min < 0.0 && std::abs(alpha - step_min) <= (1e-12 * (1.0 + std::abs(step_min)))) step_min = mstep * step_min;
+        } else {
+            ll = do_e(state.weights.data());
+            objective = em_objective_from_ll(params, state.weights.data(), T, ll);
+            do_m(state.weights.data());
+        }
+        state.log_likelihood = ll; state.iterations = iter + 1;
+        double rel = std::numeric_limits<double>::infinity();
+        if (iter > 0) rel = std::abs(objective - prev_obj) / (std::abs(prev_obj) + 1e-15);
+        double pcs = 0.0; for (uint32_t t = 0; t < T; ++t) { double d = state.weights[t] - prev_w[t]; pcs += d * d; }
+        if (iter > 0 && (iter + 1) >= params.min_iters && rel <= params.tol && std::sqrt(pcs) <= param_tol) break;
+        prev_obj = objective;
+    }
+
+    // ---- single SERIAL final pass at frozen weights: gamma is transient (per read).
+    // Recomputing at the converged weights reproduces the previous per-iteration stored
+    // gamma bit-for-bit (convergence always lands in the SQUAREM branch, whose stored
+    // gamma is likewise at state.weights). When streaming, hand each read to finalize_cb
+    // and hold no O(A) gamma; else fill state.gamma / state.gamma_ancient as before.
+    // gamma_ancient: use_damage -> ga (joint); posthoc_gamma_ancient -> gamma * p_anc with
+    // p_anc = sigmoid(base_a - base_m) (bc cancels; == the CLI's post-hoc formula). ----
+    {
+        const double log_w_null_dyn = null_on ? std::log(std::max(state.weights[T], params.min_weight)) : 0.0;
+        std::vector<double> ls, gbuf, gabuf;
+        std::vector<uint32_t> rbuf;
+        double final_ll = 0.0, sum_a = 0.0, sum_t = 0.0;
+        for (uint32_t r = 0; r < R; ++r) {
+            const uint32_t s = data.read_offsets[r], e = data.read_offsets[r + 1];
+            const uint32_t deg = e - s;
+            if (null_on) state.gamma_null[r] = 0.0;
+            if (deg == 0) { if (stream) finalize_cb(r, 0, nullptr, nullptr, nullptr); continue; }
+            const uint32_t ncol = null_on ? 2 * deg + 1 : 2 * deg;
+            ls.resize(ncol);
+            if (stream) { gbuf.resize(deg); rbuf.resize(deg); if (want_anc) gabuf.resize(deg); }
+            for (uint32_t j = 0; j < deg; ++j) {
+                const uint32_t rf = csr_ref[s + j];
+                if (stream) rbuf[j] = rf;
+                const double lw = std::log(std::max(state.weights[rf], params.min_weight));
+                ls[2 * j] = lw + base_a[s + j];
+                ls[2 * j + 1] = lw + base_m[s + j];
+            }
+            if (null_on) {
+                const double lp = read_null_log_density(params, data.alignments.data() + s, deg);
+                ls[2 * deg] = log_w_null_dyn + params.lambda_null * lp;
+            }
+            const double lse = log_sum_exp(ls.data(), ncol);
+            final_ll += lse;
+            for (uint32_t j = 0; j < deg; ++j) {
+                const double da = ls[2 * j] - lse, dm = ls[2 * j + 1] - lse;
+                const double ga = (da > -700.0) ? std::exp(da) : 0.0;
+                const double gm = (dm > -700.0) ? std::exp(dm) : 0.0;
+                const double g = ga + gm;
+                double ganc = 0.0;
+                if (params.use_damage) {
+                    ganc = ga;
+                } else if (params.posthoc_gamma_ancient) {
+                    const double p_anc = 1.0 / (1.0 + std::exp(base_m[s + j] - base_a[s + j]));
+                    ganc = g * p_anc;
+                }
+                if (stream) { gbuf[j] = g; if (want_anc) gabuf[j] = ganc; }
+                else { state.gamma[s + j] = g; if (want_anc) state.gamma_ancient[s + j] = ganc; }
+                sum_a += ganc; sum_t += g;
+            }
+            if (null_on) {
+                const double d = ls[2 * deg] - lse;
+                state.gamma_null[r] = (d > -700.0) ? std::exp(d) : 0.0;
+            }
+            if (stream)
+                finalize_cb(r, deg, rbuf.data(), gbuf.data(), want_anc ? gabuf.data() : nullptr);
+        }
+        state.log_likelihood = final_ll;
+        // pi is the joint-EM ancient fraction ONLY (matches the old per-iter update);
+        // in the post-hoc (damage-free mapping) path pi stays at its 0.10 prior, exactly
+        // as before — the post-hoc formula consumes that prior, it does not redefine pi.
+        (void)sum_a;
+        if (params.use_damage && sum_t > 0.0) state.pi = std::clamp(sum_a / sum_t, 0.01, 0.99);
+    }
+
+    if (null_on) { state.w_null = state.weights[T]; state.weights.resize(T); }
+    return state;
+}
+
+// ===========================================================================
+// compact_em_map_tape (PI mandate 2026-07-23): decode-once, read-major "EM
+// tape" on scratch NVMe, streamed per iteration with O_DIRECT. Reproduces
+// compact_em_map BIT-FOR-BIT (identical decode, identical 32 contiguous-read
+// lanes, identical read-order + ascending-lane reductions, identical SQUAREM),
+// but never holds an O(alignments) gamma/base vector in RAM: per-iteration the
+// E-step accumulates only per-ref sufficient stats (lane_s), gamma is transient
+// and materialized ONLY in a single final pass. RAM = O(num_refs) + fixed I/O
+// buffers => independent of alignment count.
+//
+// Tape = 3 SoA streams (each element indexed by CSR alignment position j):
+//   <dir>/tape.ref   : uint32 ref_idx[j]
+//   <dir>/tape.basea : double  base_a[j]   (== compact_em_map's base_a)
+//   <dir>/tape.basem : double  base_m[j]   (== compact_em_map's base_m)
+// SoA (not AoS) so every O_DIRECT request is block-aligned with zero record
+// straddle: 4096 % 4 == 0 and 4096 % 8 == 0, and a chunk start aligned to a
+// multiple of 1024 records makes both the 4B and 8B streams 4096-aligned.
+// ===========================================================================
+
+namespace {
+
+constexpr size_t kODAlign = 4096;                 // O_DIRECT block alignment
+constexpr uint64_t kTapeChunkRecs = 1u << 18;     // 262144 (mult. of 1024) records/refill
+
+// Write a typed array to `path` with O_DIRECT, padding the file tail to kODAlign.
+// Readers bound access by record count, so the zero padding is never consumed.
+static bool tape_write_array(const std::string& path, const void* data, size_t nbytes) {
+    int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_DIRECT, 0644);
+    if (fd < 0) { std::perror(("tape_write open " + path).c_str()); return false; }
+    const size_t BUF = size_t(1) << 22;  // 4 MiB (multiple of kODAlign)
+    void* buf = nullptr;
+    if (posix_memalign(&buf, kODAlign, BUF) != 0) { ::close(fd); return false; }
+    bool ok = true;
+    size_t off = 0;
+    while (off < nbytes) {
+        size_t n = std::min(BUF, nbytes - off);
+        std::memcpy(buf, static_cast<const char*>(data) + off, n);
+        size_t wlen = (n + kODAlign - 1) & ~(kODAlign - 1);
+        if (wlen > n) std::memset(static_cast<char*>(buf) + n, 0, wlen - n);
+        ssize_t w = ::pwrite(fd, buf, wlen, static_cast<off_t>(off));
+        if (w < 0 || static_cast<size_t>(w) != wlen) { ok = false; std::perror("tape_write pwrite"); break; }
+        off += n;  // stays kODAlign-aligned every iter except the (final) short one
+    }
+    free(buf);
+    if (::fsync(fd) != 0) ok = false;
+    ::close(fd);
+    return ok;
+}
+
+// One O_DIRECT-backed SoA stream reader with a per-lane sliding record window.
+// Records [lo, hi) are served by refilling a kTapeChunkRecs window whose start
+// is snapped down to a 1024-record boundary (=> byte offset is kODAlign-aligned
+// for both 4B and 8B element sizes). ptr(j) returns a typed pointer to record j.
+template <class T>
+struct TapeStream {
+    int fd = -1;
+    T* buf = nullptr;          // kODAlign-aligned
+    uint64_t win_lo = 0;       // first record currently buffered
+    uint64_t win_n = 0;        // records currently buffered
+    uint64_t file_recs = 0;    // total valid records in the file
+
+    bool open(const std::string& path, uint64_t total_recs) {
+        file_recs = total_recs;
+        fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+        if (fd < 0) { std::perror(("tape_read open " + path).c_str()); return false; }
+        size_t bytes = size_t(kTapeChunkRecs) * sizeof(T);
+        void* p = nullptr;
+        if (posix_memalign(&p, kODAlign, bytes) != 0) { ::close(fd); fd = -1; return false; }
+        buf = static_cast<T*>(p);
+        win_lo = 0; win_n = 0;
+        return true;
+    }
+    void close() { if (buf) { free(buf); buf = nullptr; } if (fd >= 0) { ::close(fd); fd = -1; } }
+
+    // Ensure records [s, e) are resident; snap window start to 1024-record boundary.
+    void ensure(uint64_t s, uint64_t e) {
+        if (s >= win_lo && e <= win_lo + win_n) return;
+        uint64_t start = s & ~uint64_t(1023);
+        uint64_t want = std::min<uint64_t>(kTapeChunkRecs, file_recs - start);
+        // Round read length up to kODAlign; safe because the file tail is padded.
+        size_t nbytes = size_t(want) * sizeof(T);
+        size_t rlen = (nbytes + kODAlign - 1) & ~(kODAlign - 1);
+        off_t offb = static_cast<off_t>(start * sizeof(T));
+        ssize_t got = ::pread(fd, buf, rlen, offb);
+        if (got < 0) { std::perror("tape_read pread"); std::abort(); }
+        win_lo = start;
+        win_n = std::min<uint64_t>(want, static_cast<uint64_t>(got) / sizeof(T));
+    }
+    inline const T& at(uint64_t j) const { return buf[j - win_lo]; }
+};
+
+}  // anonymous namespace
+
+// Fill base_a[]/base_m[]/csr_ref[] for one read exactly as compact_em_map's decode.
+// Shared by the tape writer so the on-disk base is bit-identical to the in-RAM path.
+static inline void tape_decode_read(
+    const AlignmentData& data, const EMParams& params, uint32_t r,
+    uint32_t* ref_out, double* basea_out, double* basem_out) {
+    const uint32_t s = data.read_offsets[r], e = data.read_offsets[r + 1];
+    const uint32_t deg = e - s;
+    if (deg == 0) return;
+    const double eps = 1e-12;
+    double score_scale = 1.0;
+    if (params.normalize_scores_per_query && deg > 1) {
+        float mx = data.alignments[s].bit_score;
+        for (uint32_t j = 1; j < deg; ++j) mx = std::max(mx, data.alignments[s + j].bit_score);
+        if (mx > 0.0f) score_scale = 1.0 / static_cast<double>(mx);
+    }
+    for (uint32_t j = s; j < e; ++j) {
+        const auto& aln = data.alignments[j];
+        ref_out[j] = aln.ref_idx;
+        double bc = length_log_penalty(data, params, aln.ref_idx)
+                  + coverage_log_penalty(params, aln.ref_idx)
+                  + real_log_density(params, static_cast<double>(aln.bit_score), aln.aln_len, score_scale);
+        const double pr = std::clamp(static_cast<double>(aln.damage_score), eps, 1.0 - eps);
+        basea_out[j] = bc + std::log(pr) + aln.damage_ll_a;
+        basem_out[j] = bc + std::log(1.0 - pr) + aln.damage_ll_m;
+    }
+}
+
+// Shared streaming core for the EM tape. Iterations use the 32 contiguous-read
+// lanes in parallel (per-ref transient sufficient stats); the single final pass is
+// SERIAL in ascending read order so finalize_cb can drive the ordered CLI reduction
+// with no O(alignments) state. Determinism (bitwise across thread counts) comes from
+// the fixed lane boundaries + read-order within-lane + ascending-lane reduction —
+// identical to compact_em_map.
+TapeEMResult tape_em_core(
+    const std::string& p_ref, const std::string& p_basea, const std::string& p_basem,
+    const uint64_t* read_offsets, uint32_t R, uint32_t T, uint64_t A,
+    const EMParams& params, const double* null_lp, double* gnull_out,
+    const TapeFinalizeCb& finalize_cb)
+{
+    TapeEMResult res;
+    const bool null_on = params.use_null && null_lp != nullptr;
+    const uint32_t Tn = null_on ? T + 1 : T;
+    if (T == 0) return res;
+
+    // deterministic lane read ranges (identical to compact_em_map)
+    std::array<uint32_t, COMPACT_EM_LANES + 1> lane_lo;
+    for (int l = 0; l <= COMPACT_EM_LANES; ++l)
+        lane_lo[l] = static_cast<uint32_t>((static_cast<uint64_t>(R) * l) / COMPACT_EM_LANES);
+    std::vector<double> lane_s(static_cast<size_t>(COMPACT_EM_LANES) * T, 0.0);
+    std::vector<double> gn_s(null_on ? R : 0, 0.0);
+
+    // init weights (+ null coordinate) — identical to compact_em_map
+    std::vector<double> weights(Tn, 1.0 / static_cast<double>(T));
+    if (null_on) {
+        double w0n = std::clamp(std::exp(params.log_w_null), params.min_weight, 1.0 - 1e-6);
+        for (uint32_t t = 0; t < T; ++t) weights[t] *= (1.0 - w0n);
+        weights[T] = w0n;
+    }
+
+    // Parallel streaming E-step (iterations): transient per-ref lane_s (+ gnull), no gamma.
+    auto e_step_iter = [&](const double* w) -> double {
+        const double log_w_null_dyn = null_on ? std::log(std::max(w[T], params.min_weight)) : 0.0;
+        std::fill(lane_s.begin(), lane_s.end(), 0.0);
+        std::vector<double> ll_lane(COMPACT_EM_LANES, 0.0);
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int l = 0; l < COMPACT_EM_LANES; ++l) {
+            TapeStream<uint32_t> ts_ref;
+            TapeStream<double> ts_ba, ts_bm;
+            if (!ts_ref.open(p_ref, A) || !ts_ba.open(p_basea, A) || !ts_bm.open(p_basem, A)) std::abort();
+            double* s_t = lane_s.data() + static_cast<size_t>(l) * T;
+            double ll_local = 0.0;
+            std::vector<double> ls;
+            for (uint32_t r = lane_lo[l]; r < lane_lo[l + 1]; ++r) {
+                const uint64_t s = read_offsets[r], e = read_offsets[r + 1];
+                const uint32_t deg = static_cast<uint32_t>(e - s);
+                if (deg == 0) continue;
+                ts_ref.ensure(s, e); ts_ba.ensure(s, e); ts_bm.ensure(s, e);
+                const uint32_t ncol = null_on ? 2 * deg + 1 : 2 * deg;
+                ls.resize(ncol);
+                for (uint32_t j = 0; j < deg; ++j) {
+                    const double lw = std::log(std::max(w[ts_ref.at(s + j)], params.min_weight));
+                    ls[2 * j] = lw + ts_ba.at(s + j);
+                    ls[2 * j + 1] = lw + ts_bm.at(s + j);
+                }
+                if (null_on)
+                    ls[2 * deg] = log_w_null_dyn + params.lambda_null * null_lp[r];
+                const double lse = log_sum_exp(ls.data(), ncol);
+                ll_local += lse;
+                for (uint32_t j = 0; j < deg; ++j) {
+                    const double da = ls[2 * j] - lse, dm = ls[2 * j + 1] - lse;
+                    const double ga = (da > -700.0) ? std::exp(da) : 0.0;
+                    const double gm = (dm > -700.0) ? std::exp(dm) : 0.0;
+                    s_t[ts_ref.at(s + j)] += ga + gm;   // read-order accumulate within lane
+                }
+                if (null_on) {
+                    const double d = ls[2 * deg] - lse;
+                    gn_s[r] = (d > -700.0) ? std::exp(d) : 0.0;
+                }
+            }
+            ll_lane[l] = ll_local;
+            ts_ref.close(); ts_ba.close(); ts_bm.close();
+        }
+        double ll = 0.0; for (int l = 0; l < COMPACT_EM_LANES; ++l) ll += ll_lane[l];
+        return ll;
+    };
+    // M-step: ascending-lane reduction — identical to compact_em_map's m_step_fused.
+    auto m_step = [&](double* out_w) {
+        const double prior_offset = params.alpha_prior - 1.0;
+        double tot = 0.0;
+        for (uint32_t t = 0; t < T; ++t) {
+            double w = prior_offset;
+            for (int l = 0; l < COMPACT_EM_LANES; ++l) w += lane_s[static_cast<size_t>(l) * T + t];
+            w = std::max(w, params.min_weight);
+            out_w[t] = w; tot += w;
+        }
+        double wn = 0.0;
+        if (null_on) {
+            wn = prior_offset;
+            for (uint32_t r = 0; r < R; ++r) wn += gn_s[r];
+            wn = std::max(wn, params.min_weight); tot += wn;
+        }
+        if (tot > 0.0) { for (uint32_t t = 0; t < T; ++t) out_w[t] /= tot; if (null_on) out_w[T] = wn / tot; }
+    };
+    auto do_e = [&](const double* w) { return e_step_iter(w); };
+    auto do_m = [&](double* out) { m_step(out); };
+
+    // ---- SQUAREM outer loop — structurally identical to compact_em_map ----
+    std::vector<double> w0(Tn), w1(Tn), w2(Tn), r_buf(Tn), v_buf(Tn), prev_w(Tn);
+    double prev_obj = -std::numeric_limits<double>::infinity();
+    double step_min = params.squarem_step_min0, step_max0 = params.squarem_step_max0;
+    if (step_max0 < step_min) std::swap(step_max0, step_min);
+    double step_max = step_max0;
+    const double mstep = std::max(params.squarem_mstep, 1.0000001);
+    const double param_tol = std::sqrt(std::max(params.tol, 1e-15));
+
+    for (uint32_t iter = 0; iter < params.max_iters; ++iter) {
+        double ll, objective;
+        std::copy(weights.begin(), weights.end(), prev_w.begin());
+        const bool sq = params.use_squarem && (iter >= params.squarem_warmup_iters);
+        if (sq) {
+            std::copy(weights.begin(), weights.end(), w0.begin());
+            do_e(w0.data()); do_m(w1.data());
+            do_e(w1.data()); do_m(w2.data());
+            double sr2 = 0, sv2 = 0, srv = 0;
+            squarem_build_directions(w0.data(), w1.data(), w2.data(), r_buf.data(), v_buf.data(), Tn, sr2, sv2, srv);
+            double alpha = std::clamp(squarem_step_length(params.squarem_method, sr2, sv2, srv), step_min, step_max);
+            squarem_extrapolate(w0.data(), r_buf.data(), v_buf.data(), Tn, alpha, params.min_weight);
+            do_e(w0.data()); do_m(w1.data()); std::copy(w1.begin(), w1.end(), w0.begin());
+            ll = do_e(w0.data());
+            objective = em_objective_from_ll(params, w0.data(), T, ll);
+            const bool nonmono = (iter > 0) && std::isfinite(params.squarem_objfn_inc)
+                                 && (objective < (prev_obj - params.squarem_objfn_inc));
+            if (nonmono) {
+                std::copy(w2.begin(), w2.end(), weights.begin());
+                ll = do_e(weights.data());
+                objective = em_objective_from_ll(params, weights.data(), T, ll);
+                if (std::abs(alpha - step_max) <= (1e-12 * (1.0 + std::abs(step_max)))) step_max = std::max(step_max0, step_max / mstep);
+            } else {
+                std::copy(w0.begin(), w0.end(), weights.begin());
+            }
+            if (std::abs(alpha - step_max) <= (1e-12 * (1.0 + std::abs(step_max)))) step_max = mstep * step_max;
+            if (step_min < 0.0 && std::abs(alpha - step_min) <= (1e-12 * (1.0 + std::abs(step_min)))) step_min = mstep * step_min;
+        } else {
+            ll = do_e(weights.data());
+            objective = em_objective_from_ll(params, weights.data(), T, ll);
+            do_m(weights.data());
+        }
+        res.log_likelihood = ll; res.iterations = iter + 1;
+        double rel = std::numeric_limits<double>::infinity();
+        if (iter > 0) rel = std::abs(objective - prev_obj) / (std::abs(prev_obj) + 1e-15);
+        double pcs = 0.0; for (uint32_t t = 0; t < T; ++t) { double d = weights[t] - prev_w[t]; pcs += d * d; }
+        if (iter > 0 && (iter + 1) >= params.min_iters && rel <= params.tol && std::sqrt(pcs) <= param_tol) break;
+        prev_obj = objective;
+    }
+
+    // ---- single SERIAL final pass at frozen weights: gamma is transient (per read),
+    // handed to finalize_cb; Σγ / Σγ_ancient accumulated for pi. Recomputing at the
+    // converged weights reproduces compact_em_map's stored gamma bit-for-bit. ----
+    {
+        const double log_w_null_dyn = null_on ? std::log(std::max(weights[T], params.min_weight)) : 0.0;
+        // gamma_ancient is delivered when the joint damage E-step ran (use_damage -> ga)
+        // OR when the CLI requested a post-hoc ancient responsibility (posthoc_gamma_ancient
+        // -> gamma * p_anc with p_anc = sigmoid(base_a - base_m); bc cancels). Mirrors
+        // compact_em_map's final pass so the streaming tape and in-RAM paths agree bitwise.
+        const bool want_anc = params.use_damage || params.posthoc_gamma_ancient;
+        TapeStream<uint32_t> ts_ref;
+        TapeStream<double> ts_ba, ts_bm;
+        if (!ts_ref.open(p_ref, A) || !ts_ba.open(p_basea, A) || !ts_bm.open(p_basem, A)) std::abort();
+        std::vector<double> ls, gbuf, gabuf;
+        std::vector<uint32_t> rbuf;
+        double final_ll = 0.0, sum_a = 0.0, sum_t = 0.0;
+        for (uint32_t r = 0; r < R; ++r) {
+            const uint64_t s = read_offsets[r], e = read_offsets[r + 1];
+            const uint32_t deg = static_cast<uint32_t>(e - s);
+            if (gnull_out) gnull_out[r] = 0.0;
+            if (deg == 0) { if (finalize_cb) finalize_cb(r, 0, nullptr, nullptr, nullptr); continue; }
+            ts_ref.ensure(s, e); ts_ba.ensure(s, e); ts_bm.ensure(s, e);
+            const uint32_t ncol = null_on ? 2 * deg + 1 : 2 * deg;
+            ls.resize(ncol); gbuf.resize(deg); rbuf.resize(deg);
+            if (want_anc) gabuf.resize(deg);
+            for (uint32_t j = 0; j < deg; ++j) {
+                rbuf[j] = ts_ref.at(s + j);
+                const double lw = std::log(std::max(weights[rbuf[j]], params.min_weight));
+                ls[2 * j] = lw + ts_ba.at(s + j);
+                ls[2 * j + 1] = lw + ts_bm.at(s + j);
+            }
+            if (null_on) ls[2 * deg] = log_w_null_dyn + params.lambda_null * null_lp[r];
+            const double lse = log_sum_exp(ls.data(), ncol);
+            final_ll += lse;
+            for (uint32_t j = 0; j < deg; ++j) {
+                const double da = ls[2 * j] - lse, dm = ls[2 * j + 1] - lse;
+                const double ga = (da > -700.0) ? std::exp(da) : 0.0;
+                const double gm = (dm > -700.0) ? std::exp(dm) : 0.0;
+                gbuf[j] = ga + gm;
+                if (params.use_damage) gabuf[j] = ga;
+                else if (params.posthoc_gamma_ancient) {
+                    const double p_anc = 1.0 / (1.0 + std::exp(ts_bm.at(s + j) - ts_ba.at(s + j)));
+                    gabuf[j] = (ga + gm) * p_anc;
+                }
+                sum_a += ga; sum_t += ga + gm;
+            }
+            if (null_on && gnull_out) {
+                const double d = ls[2 * deg] - lse;
+                gnull_out[r] = (d > -700.0) ? std::exp(d) : 0.0;
+            }
+            if (finalize_cb)
+                finalize_cb(r, deg, rbuf.data(), gbuf.data(), want_anc ? gabuf.data() : nullptr);
+        }
+        ts_ref.close(); ts_ba.close(); ts_bm.close();
+        res.log_likelihood = final_ll;
+        res.gamma_anc_sum = sum_a; res.gamma_sum = sum_t;
+        if (params.use_damage && sum_t > 0.0) res.pi = std::clamp(sum_a / sum_t, 0.01, 0.99);
+    }
+
+    if (null_on) { res.w_null = weights[Tn - 1]; weights.resize(T); }
+    res.weights = std::move(weights);
+    return res;
+}
+
+// Gate/small-fixture wrapper: writes the SoA tape from an in-RAM AlignmentData, runs
+// the shared streaming core, and materializes full gamma into an EMState (so
+// tests/gate_compact_em can compare bit-for-bit against compact_em_map). Production
+// feeds tape_em_core directly from the streaming ingestion — no AlignmentData.
+EMState compact_em_map_tape(const AlignmentData& data, const EMParams& params,
+                            const std::string& scratch_dir) {
+    EMState state;
+    const uint32_t T = data.num_refs;
+    const uint64_t A = data.alignments.size();
+    const uint32_t R = data.num_reads;
+    const bool null_on = params.use_null && !params.null_mu.empty();
+    if (T == 0) { state.log_likelihood = 0.0; state.iterations = 0; return state; }
+
+    const std::string p_ref = scratch_dir + "/tape.ref";
+    const std::string p_ba  = scratch_dir + "/tape.basea";
+    const std::string p_bm  = scratch_dir + "/tape.basem";
+    {
+        std::vector<uint32_t> csr_ref(A);
+        std::vector<double> base_a(A), base_m(A);
+        #pragma omp parallel for schedule(static)
+        for (uint32_t r = 0; r < R; ++r)
+            tape_decode_read(data, params, r, csr_ref.data(), base_a.data(), base_m.data());
+        bool ok = tape_write_array(p_ref, csr_ref.data(), A * sizeof(uint32_t))
+               && tape_write_array(p_ba,  base_a.data(),  A * sizeof(double))
+               && tape_write_array(p_bm,  base_m.data(),  A * sizeof(double));
+        if (!ok) { std::cerr << "compact_em_map_tape: tape write failed\n"; state.iterations = 0; return state; }
+    }
+
+    std::vector<uint64_t> ro64(R + 1);
+    for (uint32_t r = 0; r <= R; ++r) ro64[r] = data.read_offsets[r];
+
+    std::vector<double> null_lp;
+    if (null_on) {
+        null_lp.assign(R, 0.0);
+        #pragma omp parallel for schedule(static)
+        for (uint32_t r = 0; r < R; ++r) {
+            const uint32_t s = data.read_offsets[r], e = data.read_offsets[r + 1];
+            if (e > s) null_lp[r] = read_null_log_density(params, data.alignments.data() + s, e - s);
+        }
+    }
+
+    state.gamma.assign(A, 0.0);
+    if (params.use_damage || params.posthoc_gamma_ancient) state.gamma_ancient.assign(A, 0.0);
+    if (null_on) state.gamma_null.assign(R, 0.0);
+    auto cb = [&](uint32_t r, uint32_t deg, const uint32_t*, const double* g, const double* ganc) {
+        const uint64_t base = ro64[r];
+        for (uint32_t j = 0; j < deg; ++j) {
+            state.gamma[base + j] = g[j];
+            if (ganc) state.gamma_ancient[base + j] = ganc[j];
+        }
+    };
+    TapeEMResult res = tape_em_core(p_ref, p_ba, p_bm, ro64.data(), R, T, A, params,
+                                    null_on ? null_lp.data() : nullptr,
+                                    null_on ? state.gamma_null.data() : nullptr, cb);
+
+    state.weights = std::move(res.weights);
+    state.log_likelihood = res.log_likelihood;
+    state.iterations = res.iterations;
+    state.pi = res.pi;
+    state.w_null = res.w_null;
+
+    ::unlink(p_ref.c_str()); ::unlink(p_ba.c_str()); ::unlink(p_bm.c_str());
+    return state;
+}
+
+// ---------------------------------------------------------------------------
 // Produce reassigned output: best or weighted assignments
 // ---------------------------------------------------------------------------
 
@@ -1052,6 +1721,7 @@ std::vector<std::pair<uint32_t, float>> reassign_reads(
 // For 584M alignments with 10M refs: ~80MB instead of ~18GB
 
 #include "dart/columnar_index.hpp"
+#include "dart/emi_v7_io.hpp"
 
 namespace {
 
@@ -1369,8 +2039,9 @@ void streaming_m_step(
 
 namespace dart {
 
+template <class ReaderT>
 StreamingEMResult streaming_em(
-    ColumnarIndexReader& reader,
+    ReaderT& reader,
     const EMParams& params,
     const EMProgressCallback& progress_cb)
 {
@@ -1564,8 +2235,9 @@ StreamingEMResult streaming_em(
     return result;
 }
 
+template <class ReaderT>
 void streaming_em_finalize(
-    ColumnarIndexReader& reader,
+    ReaderT& reader,
     const StreamingEMResult& result,
     const EMParams& params,
     StreamingGammaCallback callback)
@@ -1750,5 +2422,15 @@ void streaming_em_finalize(
         );
     });
 }
+
+// Explicit instantiations: v6 (ColumnarIndexReader) and v7 (emiv7::Reader).
+template StreamingEMResult streaming_em<ColumnarIndexReader>(
+    ColumnarIndexReader&, const EMParams&, const EMProgressCallback&);
+template void streaming_em_finalize<ColumnarIndexReader>(
+    ColumnarIndexReader&, const StreamingEMResult&, const EMParams&, StreamingGammaCallback);
+template StreamingEMResult streaming_em<emiv7::Reader>(
+    emiv7::Reader&, const EMParams&, const EMProgressCallback&);
+template void streaming_em_finalize<emiv7::Reader>(
+    emiv7::Reader&, const StreamingEMResult&, const EMParams&, StreamingGammaCallback);
 
 } // namespace dart
