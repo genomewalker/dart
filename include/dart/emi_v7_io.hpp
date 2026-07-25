@@ -13,6 +13,11 @@
 #include "dart/emi_v7.hpp"
 
 #include <zstd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -236,6 +241,71 @@ inline void encode_block_columns(const Row* rows, uint64_t bn, std::vector<char>
     write_chunk(block_bytes, toff.data(), (bn + 1) * sizeof(uint32_t));
     write_chunk(block_bytes, tdata.data(), tdata.size());
 }
+
+// Read-only whole-file mmap with RAII teardown. Replaces the heap slurp the
+// Reader used to do: a 130-200 GB .emi read into std::vector<char> is 130-200 GB
+// of *anonymous* memory (resize() value-initializes, so every page is dirtied and
+// resident before a single byte is read from disk). Mapped file pages are clean
+// and page-cache backed, so the kernel can evict them under pressure and
+// drop_cache() can release them outright.
+class MappedFile {
+public:
+    MappedFile() = default;
+    explicit MappedFile(const std::string& path) {
+        fd_ = ::open(path.c_str(), O_RDONLY);
+        if (fd_ < 0) throw std::runtime_error("cannot open " + path + ": " + std::strerror(errno));
+        struct stat st{};
+        if (::fstat(fd_, &st) != 0) {
+            int e = errno; ::close(fd_); fd_ = -1;
+            throw std::runtime_error("cannot stat " + path + ": " + std::strerror(e));
+        }
+        size_ = static_cast<size_t>(st.st_size);
+        if (size_ == 0) return;   // nothing to map; data() stays null
+        void* p = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd_, 0);
+        if (p == MAP_FAILED) {
+            int e = errno; ::close(fd_); fd_ = -1; size_ = 0;
+            throw std::runtime_error("mmap failed for " + path + ": " + std::strerror(e));
+        }
+        data_ = static_cast<const char*>(p);
+        // Block-level access is random (annotate's pass 2 scans a selected subset of
+        // row groups), so whole-file readahead only inflates residency — that is what
+        // pinned the entire file in page cache before. Sequential prefetch is still
+        // wanted *within* a block; Reader asks for it explicitly via willneed().
+        ::madvise(const_cast<char*>(data_), size_, MADV_RANDOM);
+    }
+    ~MappedFile() {
+        if (data_) ::munmap(const_cast<char*>(data_), size_);
+        if (fd_ >= 0) ::close(fd_);
+    }
+    MappedFile(const MappedFile&) = delete;
+    MappedFile& operator=(const MappedFile&) = delete;
+
+    const char* data() const { return data_; }
+    size_t size() const { return size_; }
+
+    // Prefetch a byte range that is about to be read contiguously.
+    void willneed(uint64_t off, uint64_t len) const {
+        if (!data_ || off >= size_) return;
+        if (len > size_ - off) len = size_ - off;
+        ::madvise(const_cast<char*>(data_) + off, len, MADV_WILLNEED);
+    }
+
+    // Drop every resident page of the mapping. MADV_DONTNEED on a read-only
+    // MAP_PRIVATE file mapping unmaps the pages (a later access re-faults them from
+    // the file); POSIX_FADV_DONTNEED then evicts the underlying page cache, which
+    // madvise alone does not do.
+    void drop_cache() const {
+        if (!data_) return;
+        ::madvise(const_cast<char*>(data_), size_, MADV_DONTNEED);
+        ::posix_fadvise(fd_, 0, 0, POSIX_FADV_DONTNEED);
+    }
+
+private:
+    const char* data_ = nullptr;
+    size_t size_ = 0;
+    int fd_ = -1;
+};
+
 }  // namespace detail
 
 // ================= WRITER =================
@@ -399,17 +469,16 @@ public:
 // ================= READER =================
 class Reader {
 public:
-    explicit Reader(const std::string& path) {
-        std::ifstream in(path, std::ios::binary | std::ios::ate);
-        if (!in) throw std::runtime_error("cannot open " + path);
-        size_t sz = in.tellg(); in.seekg(0);
-        buf_.resize(sz); in.read(buf_.data(), sz);
+    explicit Reader(const std::string& path) : buf_(path) {
+        const size_t sz = buf_.size();
+        // Size check first: the header memcpy below indexes buf_.data(), which is
+        // null for an empty file and short of 256 bytes for a stub.
+        if (sz < sizeof(EMIv7Header) + sizeof(EMIv7Footer))
+            throw std::runtime_error("EMI v7 file truncated (no footer): " + path);
         std::memcpy(&h_, buf_.data(), sizeof(h_));
         if (h_.magic != EMI_V7_MAGIC || h_.version != EMI_V7_VERSION)
             throw std::runtime_error("not an EMI v7 file");
         // Footer integrity: the trailing magic catches truncation/corruption.
-        if (sz < sizeof(EMIv7Header) + sizeof(EMIv7Footer))
-            throw std::runtime_error("EMI v7 file truncated (no footer)");
         EMIv7Footer ftr;
         std::memcpy(&ftr, buf_.data() + sz - sizeof(EMIv7Footer), sizeof(EMIv7Footer));
         if (ftr.magic != EMI_V7_MAGIC)
@@ -459,7 +528,10 @@ public:
     void set_all_columns() const {}
     void add_filter(const FilterPredicate&) const {}
     void clear_filters() const {}
-    void flush_pages() const {}
+    // Release every resident page of the mapped .emi. Callers use this between
+    // passes (cmd_damage_annotate.cpp:2656, :3148) to hand the page cache back
+    // before the next phase allocates.
+    void flush_pages() const { buf_.drop_cache(); }
     std::vector<std::string> ref_names_pread() const {
         std::vector<std::string> v(h_.num_refs);
         for (uint32_t i = 0; i < h_.num_refs; ++i) v[i] = ref_dict_.name(i);
@@ -514,6 +586,7 @@ public:
     // Selective HOT-only scan of a block (EM path): ref_idx + bit_score + damage_score.
     struct HotBlock { uint32_t n; std::vector<uint32_t> ref; std::vector<float> bit, dmg; };
     HotBlock hot_block(uint32_t bidx) const {
+        prefetch_block(bidx);
         uint64_t o = blocks_[bidx].chunks_offset;
         uint32_t n = blocks_[bidx].num_rows;
         HotBlock hb; hb.n = n;
@@ -571,6 +644,7 @@ private:
     // scans (annotate pass 1) — those blocks pull alignment strings on demand via
     // get_qaln, which re-decodes with aln through tls_decoded.
     BlockDecoded decode_block(uint32_t bidx, bool with_aln = true) const {
+        prefetch_block(bidx);
         uint64_t o = blocks_[bidx].chunks_offset;
         const BlockMeta& bm = blocks_[bidx];
         BlockDecoded d; d.n = bm.num_rows; d.first_read = bm.first_read_idx;
@@ -598,6 +672,18 @@ private:
         return d;
     }
 
+    // The mapping is MADV_RANDOM (block *selection* is random), but one block's
+    // column chunks are a single contiguous run that is decoded front to back.
+    // Ask for that run up front, otherwise every 4 KB page of it is an
+    // independent NFS round trip.
+    void prefetch_block(uint32_t bidx) const {
+        const uint64_t beg = blocks_[bidx].chunks_offset;
+        const auto& bc = h_.sections[(int)SectionID::BLOCK_CHUNKS];
+        const uint64_t end = (bidx + 1 < h_.num_blocks) ? blocks_[bidx + 1].chunks_offset
+                                                        : bc.offset + bc.size;
+        if (end > beg) buf_.willneed(beg, end - beg);
+    }
+
     void decode_degree() {
         uint64_t o = h_.sections[(int)SectionID::READ_DEGREE].offset;
         uint64_t nesc = detail::get<uint64_t>(buf_.data(), o);
@@ -614,7 +700,7 @@ private:
         }
     }
 
-    std::vector<char> buf_;
+    detail::MappedFile buf_;
     EMIv7Header h_{};
     const BlockMeta* blocks_ = nullptr;
     std::vector<uint32_t> read_to_block_;
