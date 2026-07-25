@@ -269,11 +269,12 @@ public:
             throw std::runtime_error("mmap failed for " + path + ": " + std::strerror(e));
         }
         data_ = static_cast<const char*>(p);
-        // Block-level access is random (annotate's pass 2 scans a selected subset of
-        // row groups), so whole-file readahead only inflates residency — that is what
-        // pinned the entire file in page cache before. Sequential prefetch is still
-        // wanted *within* a block; Reader asks for it explicitly via willneed().
-        advise(const_cast<char*>(data_), size_, MADV_RANDOM, "MADV_RANDOM");
+        // No madvise here: kernel default (MADV_NORMAL) readahead is what we want.
+        // MADV_RANDOM was tried and measured — it disables readahead, so on NFS every
+        // 4 KB fault becomes its own round trip, and the explicit per-block
+        // MADV_WILLNEED that compensated for it bought nothing back. Same library,
+        // same node, same window: with advice+prefetch 46:49.22, without either
+        // 46:44.96 (0.15%), identical peak anon (50.99 GiB) and file (43.59 GiB).
     }
     ~MappedFile() {
         if (data_) ::munmap(const_cast<char*>(data_), size_);
@@ -284,21 +285,6 @@ public:
 
     const char* data() const { return data_; }
     size_t size() const { return size_; }
-
-    // Prefetch a byte range that is about to be read contiguously.
-    // madvise() requires a PAGE-ALIGNED start address and returns EINVAL otherwise,
-    // so the start is rounded DOWN to a page boundary and the end clamped to the
-    // mapping (the kernel rounds the length up itself). Block offsets are chunk
-    // offsets, not page multiples, so passing data_+off directly made this call
-    // fail with EINVAL on essentially every block -- a silent no-op.
-    void willneed(uint64_t off, uint64_t len) const {
-        if (!data_ || off >= size_ || len == 0) return;
-        if (len > size_ - off) len = size_ - off;
-        const uint64_t pg = page_size();
-        const uint64_t beg = off & ~(pg - 1);
-        const uint64_t end = off + len;
-        advise(const_cast<char*>(data_) + beg, end - beg, MADV_WILLNEED, "MADV_WILLNEED");
-    }
 
     // Drop every resident page of the mapping. MADV_DONTNEED on a read-only
     // MAP_PRIVATE file mapping unmaps the pages (a later access re-faults them from
@@ -314,13 +300,8 @@ public:
     }
 
 private:
-    static uint64_t page_size() {
-        static const uint64_t pg = static_cast<uint64_t>(::sysconf(_SC_PAGESIZE));
-        return pg;
-    }
     // These are advisory hints: a failure must not abort the read, but it must not
-    // pass unnoticed either -- an unaligned MADV_WILLNEED failed silently on every
-    // block and made the whole per-block prefetch a no-op. Warn once per advice kind.
+    // pass unnoticed either. Warn once per advice kind.
     static void warn_once(std::atomic<bool>& flag, const char* what, int err) {
         bool expected = false;
         if (flag.compare_exchange_strong(expected, true))
@@ -328,10 +309,8 @@ private:
                       << " (performance hint only; results unaffected)\n";
     }
     static void advise(void* p, size_t n, int adv, const char* what) {
-        if (::madvise(p, n, adv) == 0) return;
-        warn_once(adv == MADV_WILLNEED ? willneed_warned_ : madv_warned_, what, errno);
+        if (::madvise(p, n, adv) != 0) warn_once(madv_warned_, what, errno);
     }
-    inline static std::atomic<bool> willneed_warned_{false};
     inline static std::atomic<bool> madv_warned_{false};
     inline static std::atomic<bool> fadv_warned_{false};
 
@@ -620,7 +599,6 @@ public:
     // Selective HOT-only scan of a block (EM path): ref_idx + bit_score + damage_score.
     struct HotBlock { uint32_t n; std::vector<uint32_t> ref; std::vector<float> bit, dmg; };
     HotBlock hot_block(uint32_t bidx) const {
-        prefetch_block(bidx);
         uint64_t o = blocks_[bidx].chunks_offset;
         uint32_t n = blocks_[bidx].num_rows;
         HotBlock hb; hb.n = n;
@@ -678,7 +656,6 @@ private:
     // scans (annotate pass 1) — those blocks pull alignment strings on demand via
     // get_qaln, which re-decodes with aln through tls_decoded.
     BlockDecoded decode_block(uint32_t bidx, bool with_aln = true) const {
-        prefetch_block(bidx);
         uint64_t o = blocks_[bidx].chunks_offset;
         const BlockMeta& bm = blocks_[bidx];
         BlockDecoded d; d.n = bm.num_rows; d.first_read = bm.first_read_idx;
@@ -704,18 +681,6 @@ private:
             row += deg;
         }
         return d;
-    }
-
-    // The mapping is MADV_RANDOM (block *selection* is random), but one block's
-    // column chunks are a single contiguous run that is decoded front to back.
-    // Ask for that run up front, otherwise every 4 KB page of it is an
-    // independent NFS round trip.
-    void prefetch_block(uint32_t bidx) const {
-        const uint64_t beg = blocks_[bidx].chunks_offset;
-        const auto& bc = h_.sections[(int)SectionID::BLOCK_CHUNKS];
-        const uint64_t end = (bidx + 1 < h_.num_blocks) ? blocks_[bidx + 1].chunks_offset
-                                                        : bc.offset + bc.size;
-        if (end > beg) buf_.willneed(beg, end - beg);
     }
 
     void decode_degree() {
