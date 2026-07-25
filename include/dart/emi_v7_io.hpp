@@ -17,10 +17,12 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -271,7 +273,7 @@ public:
         // row groups), so whole-file readahead only inflates residency — that is what
         // pinned the entire file in page cache before. Sequential prefetch is still
         // wanted *within* a block; Reader asks for it explicitly via willneed().
-        ::madvise(const_cast<char*>(data_), size_, MADV_RANDOM);
+        advise(const_cast<char*>(data_), size_, MADV_RANDOM, "MADV_RANDOM");
     }
     ~MappedFile() {
         if (data_) ::munmap(const_cast<char*>(data_), size_);
@@ -284,10 +286,18 @@ public:
     size_t size() const { return size_; }
 
     // Prefetch a byte range that is about to be read contiguously.
+    // madvise() requires a PAGE-ALIGNED start address and returns EINVAL otherwise,
+    // so the start is rounded DOWN to a page boundary and the end clamped to the
+    // mapping (the kernel rounds the length up itself). Block offsets are chunk
+    // offsets, not page multiples, so passing data_+off directly made this call
+    // fail with EINVAL on essentially every block -- a silent no-op.
     void willneed(uint64_t off, uint64_t len) const {
-        if (!data_ || off >= size_) return;
+        if (!data_ || off >= size_ || len == 0) return;
         if (len > size_ - off) len = size_ - off;
-        ::madvise(const_cast<char*>(data_) + off, len, MADV_WILLNEED);
+        const uint64_t pg = page_size();
+        const uint64_t beg = off & ~(pg - 1);
+        const uint64_t end = off + len;
+        advise(const_cast<char*>(data_) + beg, end - beg, MADV_WILLNEED, "MADV_WILLNEED");
     }
 
     // Drop every resident page of the mapping. MADV_DONTNEED on a read-only
@@ -296,11 +306,35 @@ public:
     // madvise alone does not do.
     void drop_cache() const {
         if (!data_) return;
-        ::madvise(const_cast<char*>(data_), size_, MADV_DONTNEED);
-        ::posix_fadvise(fd_, 0, 0, POSIX_FADV_DONTNEED);
+        // data_ comes from mmap, so it is already page-aligned here.
+        advise(const_cast<char*>(data_), size_, MADV_DONTNEED, "MADV_DONTNEED");
+        // posix_fadvise returns the error number; it does NOT set errno.
+        int rc = ::posix_fadvise(fd_, 0, 0, POSIX_FADV_DONTNEED);
+        if (rc != 0) warn_once(fadv_warned_, "POSIX_FADV_DONTNEED", rc);
     }
 
 private:
+    static uint64_t page_size() {
+        static const uint64_t pg = static_cast<uint64_t>(::sysconf(_SC_PAGESIZE));
+        return pg;
+    }
+    // These are advisory hints: a failure must not abort the read, but it must not
+    // pass unnoticed either -- an unaligned MADV_WILLNEED failed silently on every
+    // block and made the whole per-block prefetch a no-op. Warn once per advice kind.
+    static void warn_once(std::atomic<bool>& flag, const char* what, int err) {
+        bool expected = false;
+        if (flag.compare_exchange_strong(expected, true))
+            std::cerr << "warning: " << what << " failed: " << std::strerror(err)
+                      << " (performance hint only; results unaffected)\n";
+    }
+    static void advise(void* p, size_t n, int adv, const char* what) {
+        if (::madvise(p, n, adv) == 0) return;
+        warn_once(adv == MADV_WILLNEED ? willneed_warned_ : madv_warned_, what, errno);
+    }
+    inline static std::atomic<bool> willneed_warned_{false};
+    inline static std::atomic<bool> madv_warned_{false};
+    inline static std::atomic<bool> fadv_warned_{false};
+
     const char* data_ = nullptr;
     size_t size_ = 0;
     int fd_ = -1;
