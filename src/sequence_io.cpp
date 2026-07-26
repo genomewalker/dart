@@ -1051,61 +1051,6 @@ void FastaWriter::write_genes_nucleotide_corrected(const std::string& sequence_i
     }
 }
 
-void FastaWriter::write_genes_protein_search(const std::string& sequence_id,
-                                             const std::vector<Gene>& genes) {
-    // Search-optimized protein output:
-    // - Early damage-convertible stops are extended with 'X' instead of truncating
-    // - This allows MMseqs2 to align through these positions without penalty
-    // - X is interpreted as "unknown amino acid" and gets neutral scoring
-    // - Better than correction (which makes false claims) or truncation (which loses signal)
-    for (size_t i = 0; i < genes.size(); ++i) {
-        const auto& gene = genes[i];
-
-        // Use pre-computed search_protein from frame_selector (has extension logic)
-        // Falls back to original protein if search_protein is empty
-        const std::string& source_protein = gene.search_protein.empty() ?
-            gene.protein : gene.search_protein;
-
-        // Extract longest ORF (before first real stop) for output
-        // X characters are preserved, only real stops (*) truncate
-        std::string output_protein;
-        for (char c : source_protein) {
-            if (c == '*') break;  // Real stop terminates ORF
-            output_protein += c;   // X characters pass through
-        }
-
-        // Skip genes with empty proteins (no valid ORF found)
-        if (output_protein.empty()) continue;
-
-        impl_->gene_counter_++;
-
-        // Use read name + strand + gene index as ID for MMseqs2 compatibility
-        char id_buf[1024];
-        snprintf(id_buf, sizeof(id_buf), "%s_%c_%zu",
-            sequence_id.c_str(),
-            gene.is_forward ? '+' : '-',
-            i + 1);
-
-        // Count X characters for header metadata
-        size_t x_count = 0;
-        for (char c : output_protein) {
-            if (c == 'X') x_count++;
-        }
-
-        // Calculate confidence score from protein length and coding probability
-        float confidence = calculate_confidence(output_protein.length(), gene.coding_prob);
-
-        int desc_len;
-        desc_len = snprintf(impl_->fmt_buffer_, sizeof(impl_->fmt_buffer_),
-            "%u..%u length=%zuaa conf=%.3f x_count=%zu damage_pct=%g p_damaged=%g",
-            gene.start, gene.end,
-            output_protein.length(), confidence, x_count,
-            gene.damage_score, gene.p_read_damaged);
-
-        write_sequence(id_buf, std::string(impl_->fmt_buffer_, desc_len), output_protein);
-    }
-}
-
 void FastaWriter::close() {
     if (impl_->gz_) {
         impl_->gz_->close();

@@ -177,14 +177,6 @@ public:
     void write_genes_nucleotide_corrected(const std::string& sequence_id,
                                           const std::vector<Gene>& genes);
 
-    /**
-     * Write genes as search-optimized amino acid FASTA
-     * Terminal damage-convertible stops are masked as X (unknown AA)
-     * This improves MMseqs2 alignment sensitivity without making false AA claims
-     */
-    void write_genes_protein_search(const std::string& sequence_id,
-                                    const std::vector<Gene>& genes);
-
     void close();
 
 private:

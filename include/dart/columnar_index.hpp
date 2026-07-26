@@ -176,60 +176,7 @@ struct FilterPredicate {
 };
 
 // Forward declarations
-class ColumnarIndexWriter;
 class ColumnarIndexReader;
-
-/**
- * @brief Alignment record for writing (expanded form)
- */
-struct AlignmentRecord {
-    uint32_t read_idx;
-    uint32_t ref_idx;
-    float bit_score;
-    float damage_score;   // per-read prior p_read
-    uint16_t dmg_k = 0;
-    uint16_t dmg_m = 0;
-    float dmg_ll_a = 0.0f;
-    float dmg_ll_m = 0.0f;
-    float evalue_log10;
-    float identity;      // 0-1, will be quantized
-    uint16_t aln_len;
-    uint16_t qstart;
-    uint16_t qend;
-    uint16_t tstart;
-    uint16_t tend;
-    uint16_t tlen;
-    uint16_t qlen;
-    uint16_t mismatch;
-    uint16_t gapopen;
-    std::string_view qaln;
-    std::string_view taln;
-};
-
-/**
- * @brief Writer for columnar index files
- */
-class ColumnarIndexWriter {
-public:
-    explicit ColumnarIndexWriter(const std::string& path);
-    ~ColumnarIndexWriter();
-
-    // Add a reference name, returns index
-    uint32_t add_ref(std::string_view name);
-
-    // Add a read name, returns index
-    uint32_t add_read(std::string_view name);
-
-    // Add an alignment record
-    void add_alignment(const AlignmentRecord& rec);
-
-    // Finalize and write to disk
-    void finalize(float d_max, float lambda);
-
-private:
-    struct Impl;
-    std::unique_ptr<Impl> impl_;
-};
 
 /**
  * @brief Reader for columnar index files with predicate pushdown
