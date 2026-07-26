@@ -1199,7 +1199,8 @@ std::vector<FrameSelector::ORFFragment> FrameSelector::enumerate_orf_fragments(
             }
         }
     } else {
-        // 6-FRAME MODE (DEFAULT): Best ORF per frame
+        // 6-FRAME MODE (--no-adaptive only; adaptive is the actual default,
+        // see args.hpp adaptive_orf = true / args.cpp --no-adaptive): best ORF per frame
         // This ensures we never drop a frame solely due to hexamer score
         std::array<bool, 6> frame_represented = {false, false, false, false, false, false};
 

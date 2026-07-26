@@ -1158,7 +1158,11 @@ struct TapeEMResult {
 // (alignment offsets; may exceed 2^32). null_lp is double[num_reads] or nullptr.
 // gnull_out is double[num_reads] or nullptr (filled at frozen weights when
 // params.use_null). Result is bit-for-bit identical to compact_em_map; peak RSS is
-// O(num_refs) + fixed I/O buffers — INDEPENDENT of alignment count.
+// O(num_refs) + fixed I/O buffers — INDEPENDENT of alignment count, but that
+// O(num_refs) term is not small: lane_s is COMPACT_EM_LANES(32) * num_refs
+// doubles, so at 47M refs it is 32 * 47e6 * 8B =~ 11+ GiB on its own
+// (src/em_reassign.cpp:1417). Do not read "independent of alignment count"
+// as "cheap".
 TapeEMResult tape_em_core(
     const std::string& p_ref, const std::string& p_basea, const std::string& p_basem,
     const uint64_t* read_offsets, uint32_t num_reads, uint32_t num_refs, uint64_t num_alns,
