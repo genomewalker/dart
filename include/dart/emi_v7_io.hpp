@@ -13,9 +13,16 @@
 #include "dart/emi_v7.hpp"
 
 #include <zstd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -236,6 +243,82 @@ inline void encode_block_columns(const Row* rows, uint64_t bn, std::vector<char>
     write_chunk(block_bytes, toff.data(), (bn + 1) * sizeof(uint32_t));
     write_chunk(block_bytes, tdata.data(), tdata.size());
 }
+
+// Read-only whole-file mmap with RAII teardown. Replaces the heap slurp the
+// Reader used to do: a 130-200 GB .emi read into std::vector<char> is 130-200 GB
+// of *anonymous* memory (resize() value-initializes, so every page is dirtied and
+// resident before a single byte is read from disk). Mapped file pages are clean
+// and page-cache backed, so the kernel can evict them under pressure and
+// drop_cache() can release them outright.
+class MappedFile {
+public:
+    MappedFile() = default;
+    explicit MappedFile(const std::string& path) {
+        fd_ = ::open(path.c_str(), O_RDONLY);
+        if (fd_ < 0) throw std::runtime_error("cannot open " + path + ": " + std::strerror(errno));
+        struct stat st{};
+        if (::fstat(fd_, &st) != 0) {
+            int e = errno; ::close(fd_); fd_ = -1;
+            throw std::runtime_error("cannot stat " + path + ": " + std::strerror(e));
+        }
+        size_ = static_cast<size_t>(st.st_size);
+        if (size_ == 0) return;   // nothing to map; data() stays null
+        void* p = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd_, 0);
+        if (p == MAP_FAILED) {
+            int e = errno; ::close(fd_); fd_ = -1; size_ = 0;
+            throw std::runtime_error("mmap failed for " + path + ": " + std::strerror(e));
+        }
+        data_ = static_cast<const char*>(p);
+        // No madvise here: kernel default (MADV_NORMAL) readahead is what we want.
+        // MADV_RANDOM was tried and measured — it disables readahead, so on NFS every
+        // 4 KB fault becomes its own round trip, and the explicit per-block
+        // MADV_WILLNEED that compensated for it bought nothing back. Same library,
+        // same node, same window: with advice+prefetch 46:49.22, without either
+        // 46:44.96 (0.15%), identical peak anon (50.99 GiB) and file (43.59 GiB).
+    }
+    ~MappedFile() {
+        if (data_) ::munmap(const_cast<char*>(data_), size_);
+        if (fd_ >= 0) ::close(fd_);
+    }
+    MappedFile(const MappedFile&) = delete;
+    MappedFile& operator=(const MappedFile&) = delete;
+
+    const char* data() const { return data_; }
+    size_t size() const { return size_; }
+
+    // Drop every resident page of the mapping. MADV_DONTNEED on a read-only
+    // MAP_PRIVATE file mapping unmaps the pages (a later access re-faults them from
+    // the file); POSIX_FADV_DONTNEED then evicts the underlying page cache, which
+    // madvise alone does not do.
+    void drop_cache() const {
+        if (!data_) return;
+        // data_ comes from mmap, so it is already page-aligned here.
+        advise(const_cast<char*>(data_), size_, MADV_DONTNEED, "MADV_DONTNEED");
+        // posix_fadvise returns the error number; it does NOT set errno.
+        int rc = ::posix_fadvise(fd_, 0, 0, POSIX_FADV_DONTNEED);
+        if (rc != 0) warn_once(fadv_warned_, "POSIX_FADV_DONTNEED", rc);
+    }
+
+private:
+    // These are advisory hints: a failure must not abort the read, but it must not
+    // pass unnoticed either. Warn once per advice kind.
+    static void warn_once(std::atomic<bool>& flag, const char* what, int err) {
+        bool expected = false;
+        if (flag.compare_exchange_strong(expected, true))
+            std::cerr << "warning: " << what << " failed: " << std::strerror(err)
+                      << " (performance hint only; results unaffected)\n";
+    }
+    static void advise(void* p, size_t n, int adv, const char* what) {
+        if (::madvise(p, n, adv) != 0) warn_once(madv_warned_, what, errno);
+    }
+    inline static std::atomic<bool> madv_warned_{false};
+    inline static std::atomic<bool> fadv_warned_{false};
+
+    const char* data_ = nullptr;
+    size_t size_ = 0;
+    int fd_ = -1;
+};
+
 }  // namespace detail
 
 // ================= WRITER =================
@@ -399,17 +482,16 @@ public:
 // ================= READER =================
 class Reader {
 public:
-    explicit Reader(const std::string& path) {
-        std::ifstream in(path, std::ios::binary | std::ios::ate);
-        if (!in) throw std::runtime_error("cannot open " + path);
-        size_t sz = in.tellg(); in.seekg(0);
-        buf_.resize(sz); in.read(buf_.data(), sz);
+    explicit Reader(const std::string& path) : buf_(path) {
+        const size_t sz = buf_.size();
+        // Size check first: the header memcpy below indexes buf_.data(), which is
+        // null for an empty file and short of 256 bytes for a stub.
+        if (sz < sizeof(EMIv7Header) + sizeof(EMIv7Footer))
+            throw std::runtime_error("EMI v7 file truncated (no footer): " + path);
         std::memcpy(&h_, buf_.data(), sizeof(h_));
         if (h_.magic != EMI_V7_MAGIC || h_.version != EMI_V7_VERSION)
             throw std::runtime_error("not an EMI v7 file");
         // Footer integrity: the trailing magic catches truncation/corruption.
-        if (sz < sizeof(EMIv7Header) + sizeof(EMIv7Footer))
-            throw std::runtime_error("EMI v7 file truncated (no footer)");
         EMIv7Footer ftr;
         std::memcpy(&ftr, buf_.data() + sz - sizeof(EMIv7Footer), sizeof(EMIv7Footer));
         if (ftr.magic != EMI_V7_MAGIC)
@@ -459,7 +541,10 @@ public:
     void set_all_columns() const {}
     void add_filter(const FilterPredicate&) const {}
     void clear_filters() const {}
-    void flush_pages() const {}
+    // Release every resident page of the mapped .emi. Callers use this between
+    // passes (cmd_damage_annotate.cpp:2656, :3148) to hand the page cache back
+    // before the next phase allocates.
+    void flush_pages() const { buf_.drop_cache(); }
     std::vector<std::string> ref_names_pread() const {
         std::vector<std::string> v(h_.num_refs);
         for (uint32_t i = 0; i < h_.num_refs; ++i) v[i] = ref_dict_.name(i);
@@ -614,7 +699,7 @@ private:
         }
     }
 
-    std::vector<char> buf_;
+    detail::MappedFile buf_;
     EMIv7Header h_{};
     const BlockMeta* blocks_ = nullptr;
     std::vector<uint32_t> read_to_block_;
