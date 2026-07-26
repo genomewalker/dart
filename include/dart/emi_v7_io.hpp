@@ -28,7 +28,6 @@
 #include <string_view>
 #include <vector>
 #include <algorithm>
-#include <atomic>
 #include <functional>
 
 namespace dart {
