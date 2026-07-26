@@ -355,6 +355,7 @@ if(BUILD_TESTING)
     add_test(
         NAME orf_id_uniqueness
         COMMAND dart-orf-id-uniqueness $<TARGET_FILE:dart>
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/orf_id_golden.tsv
     )
 
     # EMI v7 format round-trip: blocks, degree-CSR, hot/cold columns, var-length

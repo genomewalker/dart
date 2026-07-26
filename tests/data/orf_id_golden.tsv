@@ -1,0 +1,102 @@
+# Golden case table for the DART ORF id grammar.
+#
+# ONE table, TWO consumers, kept byte-identical in two repositories:
+#   dart/tests/data/orf_id_golden.tsv         -> tests/test_orf_id_uniqueness.cpp
+#   convergence/kapk_refinement/tests/data/   -> tests/test_damage_control.py
+#
+# Each test hashes the case lines with fnv1a_hash and asserts the constant
+# below, so editing this table without also updating the constant fails that
+# repo's suite immediately, with a message naming the other repo.
+#
+#   FNV1A = 0xeb0477812b363fed   over the 38 case lines (comments and blank
+#   lines excluded, '\n'-joined, UTF-8 bytes, no trailing newline)
+#
+# What that does and does NOT enforce, stated plainly because the weaker
+# guarantee is the one that matters when someone relies on it:
+#   CAUGHT     -- adding, removing or editing a case in one repo and not the
+#                 other. This is the realistic drift, and it fails on the spot.
+#   NOT CAUGHT -- editing the table AND the constant in one repo only. The two
+#                 constants are separate literals and nothing compares them
+#                 across repositories. Closing that needs shared CI or one repo
+#                 vendoring the other; neither exists today.
+#
+# The expectations here were WRITTEN BY HAND from the grammar, then confirmed
+# against both implementations. They are not the output of either one -- a table
+# generated from an implementation only proves that implementation equals itself.
+#
+# Format, tab-separated, UTF-8, no escapes:
+#   id  ok  read  strand  frame  ordinal
+#
+# ok=1  -> parses as an ORF id; all four fields are asserted.
+# ok=0  -> not an ORF id; ONLY `read` is asserted, and it must equal `id`
+#          (that is the strip-returns-input contract). strand/frame/ordinal are
+#          written as . -1 -1 and are NOT asserted, because asserting a parser's
+#          uninitialised defaults tests nothing.
+#
+# ordinal = -1 means "absent" (legacy 3-field id).
+#
+# --- legacy 3-field ids -------------------------------------------------------
+readA_+_0	1	readA	+	0	-1
+readA_-_2	1	readA	-	2	-1
+SRR123.4567_+_1	1	SRR123.4567	+	1	-1
+A00627:18:HGV7TDSXX:4:1101:5439:1000_-_0	1	A00627:18:HGV7TDSXX:4:1101:5439:1000	-	0	-1
+# --- current 4-field ids ------------------------------------------------------
+readA_+_0_0	1	readA	+	0	0
+readA_-_1_7	1	readA	-	1	7
+readA_-_0_123	1	readA	-	0	123
+SRR123.4567_+_1_2	1	SRR123.4567	+	1	2
+# Two-digit ordinal. The pre-fix backward digit scan bailed out here and
+# returned its hardcoded defaults instead of failing.
+readA_+_2_10	1	readA	+	2	10
+# Ordinals 0..2 collide in value with the frame field. A backward scan absorbs
+# them AS the frame and overwrites it -- these three look correct to a broken
+# parser only because the wrong answer is in range.
+readA_+_1_0	1	readA	+	1	0
+readA_+_1_1	1	readA	+	1	1
+readA_+_1_2	1	readA	+	1	2
+# --- values the grammar allows but `predict` never emits ----------------------
+# The parser does not range-check the frame. Recorded so that adding a check
+# becomes a visible decision rather than a silent one.
+readA_+_9	1	readA	+	9	-1
+readA_+_15_3	1	readA	+	15	3
+# Leading zeros are accepted in both numeric fields.
+readA_+_01	1	readA	+	1	-1
+readA_+_1_007	1	readA	+	1	7
+# --- the marker must be found from the END, not the start ---------------------
+# A read name that itself ends in a marker. `find` gives readA/`a`; `rfind` is
+# correct because `predict` appends, so the LAST marker is always the real one.
+a_+_1_+_2	1	a_+_1	+	2	-1
+a_-_0_+_1_3	1	a_-_0	+	1	3
+# Both markers present: the later one wins, whichever strand it carries.
+x_-_1_+_0	1	x_-_1	+	0	-1
+x_+_1_-_0	1	x_+_1	-	0	-1
+# --- not ORF ids: strip must return the input unchanged -----------------------
+readA	0	readA	.	-1	-1
+readA_+	0	readA_+	.	-1	-1
+readA_+_	0	readA_+_	.	-1	-1
+readA_+_x	0	readA_+_x	.	-1	-1
+readA_+_1x	0	readA_+_1x	.	-1	-1
+readA_+_-1	0	readA_+_-1	.	-1	-1
+readA_+_1_	0	readA_+_1_	.	-1	-1
+readA_+_1_x	0	readA_+_1_x	.	-1	-1
+readA_+_1_2_3	0	readA_+_1_2_3	.	-1	-1
+readA_*_1	0	readA_*_1	.	-1	-1
+# Empty read name: the marker at offset 0 is rejected, so an id is never
+# stripped down to nothing.
+_+_1	0	_+_1	.	-1	-1
+# --- Unicode: the cases that regress first ------------------------------------
+# Python's str.isdigit() is True for these and C++'s '0'..'9' range is not.
+# Without the .isascii() guard the port OVER-STRIPS: readA_+_² -> readA.
+readA_+_²	0	readA_+_²	.	-1	-1
+readA_+_١	0	readA_+_١	.	-1	-1
+readA_+_1_²	0	readA_+_1_²	.	-1	-1
+readA_+_1٢	0	readA_+_1٢	.	-1	-1
+# U+00BD: isdigit() False but isnumeric() True. Catches an isdigit->isnumeric
+# swap, which would otherwise look like a harmless tidy-up.
+readA_+_½	0	readA_+_½	.	-1	-1
+# Non-ASCII in the READ NAME is fine and must NOT block a parse: the marker is
+# ASCII and UTF-8 never places an ASCII byte inside a multi-byte sequence.
+# C++ slices at a byte offset and Python at a code-point offset; both are right
+# in their own domain, and the resulting read name is the same text.
+réad_+_1	1	réad	+	1	-1
+read٠_+_1_2	1	read٠	+	1	2
