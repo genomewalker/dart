@@ -36,57 +36,81 @@ bool expect(bool cond, const std::string& what) {
     return cond;
 }
 
-void check_id_grammar() {
-    std::cout << "Running ORF id grammar checks...\n";
+// The golden case table, shared byte-for-byte with the convergence repo's
+// Python port (kapk_refinement/tests/data/orf_id_golden.tsv). Without it,
+// "bit-exact port" is a docstring claim -- and that claim was already wrong in
+// two directions at once (Unicode digits over-stripped, the 4-field id
+// under-stripped) while both suites stayed green.
+//
+// The hash below catches a one-sided edit to the table. It does NOT catch a
+// coordinated edit of table AND constant in one repo only: the two constants
+// are separate literals and nothing compares them across repositories. See the
+// table's own header for why that gap is still open.
+constexpr uint64_t kGoldenTableHash = 0xeb0477812b363fedULL;
+
+void check_golden_table(const char* path) {
+    std::cout << "Running ORF id golden table (" << path << ")...\n";
+
+    std::ifstream in(path);
+    if (!expect(in.good(), std::string("cannot open golden table '") + path + "'")) return;
 
     struct Case {
-        const char* id;
+        std::string id, read;
         bool        ok;
-        const char* read;
         char        strand;
-        int         frame;
-        int         ordinal;
+        int         frame, ordinal;
     };
-    // ordinal -1 means "absent" (legacy id).
-    const Case cases[] = {
-        {"readA_+_0",              true,  "readA",              '+', 0, -1},
-        {"readA_-_2",              true,  "readA",              '-', 2, -1},
-        {"readA_+_0_0",            true,  "readA",              '+', 0,  0},
-        {"readA_-_1_7",            true,  "readA",              '-', 1,  7},
-        // Two-digit ordinal. The pre-fix backward digit scan bailed here and
-        // silently returned the hardcoded defaults {'+', 0}.
-        {"readA_+_2_10",           true,  "readA",              '+', 2, 10},
-        {"readA_-_0_123",          true,  "readA",              '-', 0, 123},
-        // Illumina-style name: colons, dots and digits before the marker.
-        {"A00706:851:H5FH3DSX7:1:1110:25000:13000_-_1_4", true,
-         "A00706:851:H5FH3DSX7:1:1110:25000:13000", '-', 1, 4},
-        // Not ORF ids: must be rejected, and strip must leave them alone.
-        {"plain_read_name",        false, "plain_read_name",    '+', 0, -1},
-        {"readA_+_",               false, "readA_+_",           '+', 0, -1},
-        {"readA_+_0_",             false, "readA_+_0_",         '+', 0, -1},
-        {"readA_+_0_x",            false, "readA_+_0_x",        '+', 0, -1},
-        {"readA_*_0",              false, "readA_*_0",          '+', 0, -1},
-        {"_+_0",                   false, "_+_0",               '+', 0, -1},
-        {"",                       false, "",                   '+', 0, -1},
-    };
+    // ordinal -1 means "absent" (legacy id). ok=false rows assert `read` only:
+    // the other three fields are the parser's uninitialised defaults, and
+    // asserting a default tests nothing.
+    std::vector<Case> cases;
+    std::string blob, line;
+    while (std::getline(in, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
+        if (!blob.empty()) blob += '\n';
+        blob += line;
+
+        std::vector<std::string> f;
+        std::stringstream ss(line);
+        std::string tok;
+        while (std::getline(ss, tok, '\t')) f.push_back(tok);
+        if (!expect(f.size() == 6, "golden row has " + std::to_string(f.size()) +
+                                   " fields, expected 6: " + line)) continue;
+        cases.push_back({f[0], f[2], f[1] == "1", f[3][0],
+                         std::stoi(f[4]), std::stoi(f[5])});
+    }
+
+    expect(dart::fnv1a_hash(blob) == kGoldenTableHash,
+           "golden table content hash mismatch -- this copy and the convergence "
+           "copy have diverged; update BOTH tables and both constants");
+    expect(!cases.empty(), "golden table parsed to zero cases");
 
     for (const Case& c : cases) {
         dart::DartOrfId p = dart::parse_dart_orf_id(c.id);
-        std::string tag = std::string("'") + c.id + "'";
+        std::string tag = "'" + c.id + "'";
+        // strip_dart_suffix must agree with the parse on every input, including
+        // the rejects: the .agd read key and the parsed read name are the same
+        // thing, and a divergence between them is the silent-miss failure mode.
+        // Asserted FIRST and unconditionally -- it is the invariant that keeps
+        // every already-written .agd valid across the id format change.
+        expect(dart::strip_dart_suffix(c.id) == c.read,
+               tag + " strip='" + std::string(dart::strip_dart_suffix(c.id)) +
+               "', expected '" + c.read + "'");
         if (!expect(p.ok == c.ok, tag + " ok=" + (p.ok ? "true" : "false") +
                                   ", expected " + (c.ok ? "true" : "false"))) continue;
+        if (!c.ok) continue;
         expect(p.read == c.read, tag + " read='" + std::string(p.read) + "', expected '" + c.read + "'");
         expect(p.strand == c.strand, tag + " strand");
         expect(p.frame == c.frame, tag + " frame=" + std::to_string(p.frame) +
                                    ", expected " + std::to_string(c.frame));
         expect(p.ordinal == c.ordinal, tag + " ordinal=" + std::to_string(p.ordinal) +
                                        ", expected " + std::to_string(c.ordinal));
-        // strip_dart_suffix must agree with the parse on every input, including
-        // the rejects: the .agd read key and the parsed read name are the same
-        // thing, and a divergence between them is the silent-miss failure mode.
-        expect(dart::strip_dart_suffix(c.id) == c.read,
-               tag + " strip='" + std::string(dart::strip_dart_suffix(c.id)) + "'");
     }
+
+    // The empty id cannot be written as a TSV first field, so it stays here.
+    expect(!dart::parse_dart_orf_id("").ok, "empty id parses as an ORF id");
+    expect(dart::strip_dart_suffix("") == "", "strip('') is not ''");
 
     // Every ordinal of one read+frame must strip to the same read key, or the
     // damage index splits one read across N entries.
@@ -94,6 +118,8 @@ void check_id_grammar() {
         std::string id = "readZ_+_1_" + std::to_string(n);
         expect(dart::strip_dart_suffix(id) == "readZ", "strip('" + id + "')");
     }
+
+    std::cout << "  golden cases=" << cases.size() << "\n";
 }
 
 // Four 150 nt reads, each of which `dart predict` splits into two ORFs within
@@ -218,9 +244,12 @@ void check_predict_emits_distinct_ids(const char* dart_bin) {
 } // namespace
 
 int main(int argc, char** argv) {
-    check_id_grammar();
-    if (argc > 1) check_predict_emits_distinct_ids(argv[1]);
-    else { std::cerr << "usage: " << argv[0] << " <path-to-dart>\n"; return 2; }
+    if (argc < 3) {
+        std::cerr << "usage: " << argv[0] << " <path-to-dart> <orf_id_golden.tsv>\n";
+        return 2;
+    }
+    check_golden_table(argv[2]);
+    check_predict_emits_distinct_ids(argv[1]);
 
     if (failures) {
         std::cout << "ORF ID UNIQUENESS: " << failures << " FAILURE(S)\n";
