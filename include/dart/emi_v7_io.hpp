@@ -21,6 +21,7 @@
 #include <string_view>
 #include <vector>
 #include <algorithm>
+#include <atomic>
 #include <functional>
 
 namespace dart {
@@ -109,11 +110,16 @@ inline std::vector<char> encode_name_dict(const std::vector<std::string>& names,
     return sec;
 }
 
+// Cache identity for the thread_local caches below. A `this` pointer is NOT usable
+// as a key: an object can be freed and a new one allocated at the same address, and
+// the cache would then serve the previous file's data. Values are never reused.
+inline uint64_t next_instance_uid() { static std::atomic<uint64_t> c{0}; return ++c; }
+
 // Reader for a front-coded name dict section. Lazily decodes + caches one block.
 class NameDict {
 public:
     NameDict() = default;
-    NameDict(const char* base, uint64_t off, uint64_t size) {
+    NameDict(const char* base, uint64_t off, uint64_t size) : uid_(next_instance_uid()) {
         if (size == 0) return;
         sec_ = base + off;
         uint64_t o = 0;
@@ -131,9 +137,9 @@ public:
         if (i >= n_) throw std::out_of_range("name idx");
         uint32_t b = i / block_size_;
         static thread_local std::vector<std::string> tnames;
-        static thread_local const NameDict* owner = nullptr;
+        static thread_local uint64_t owner = 0;
         static thread_local uint32_t tblk = 0xFFFFFFFF;
-        if (owner != this || tblk != b) { decode_block(b, tnames); owner = this; tblk = b; }
+        if (owner != uid_ || tblk != b) { decode_block(b, tnames); owner = uid_; tblk = b; }
         return tnames[i - b * block_size_];
     }
 private:
@@ -154,6 +160,7 @@ private:
     }
     const char* sec_ = nullptr; const char* body_ = nullptr;
     uint32_t n_ = 0, block_size_ = 1;
+    uint64_t uid_ = 0;
     std::vector<NameBlockDir> dir_;
 };
 
@@ -542,18 +549,20 @@ private:
     };
 
     // Thread-safe decoded-block access. Each thread caches its most-recently
-    // decoded block in a thread_local keyed by (this, bidx, with_aln). invoke_block
+    // decoded block in a thread_local keyed by (uid_, bidx, with_aln). invoke_block
     // and get_qaln/get_taln share it, so a parallel callback decodes each block at
     // most once per thread with NO shared mutable state (no data race). If a block
     // was cached without alignment strings but aln is now required, it re-decodes.
+    // uid_ (not `this`) is the key: a freed Reader's address can be reused by a new
+    // Reader, and pointer keying would then serve the previous file's cached block.
     const BlockDecoded& tls_decoded(uint32_t bidx, bool with_aln = true) const {
         static thread_local BlockDecoded cache;
-        static thread_local const Reader* owner = nullptr;
+        static thread_local uint64_t owner = 0;
         static thread_local uint32_t cached_blk = 0xFFFFFFFFu;
         static thread_local bool cached_aln = false;
-        if (owner != this || cached_blk != bidx || (with_aln && !cached_aln)) {
+        if (owner != uid_ || cached_blk != bidx || (with_aln && !cached_aln)) {
             cache = decode_block(bidx, with_aln);
-            owner = this; cached_blk = bidx; cached_aln = with_aln;
+            owner = uid_; cached_blk = bidx; cached_aln = with_aln;
         }
         return cache;
     }
@@ -612,6 +621,9 @@ private:
     std::vector<EmiReadAnnot> annots_;
     std::vector<uint64_t> csr_;
     detail::NameDict read_dict_, ref_dict_;
+    // See next_instance_uid(): keying the decoded-block cache on `this` hands a new
+    // Reader the previous Reader's block when the allocator reuses the address.
+    const uint64_t uid_ = detail::next_instance_uid();
 
     // OpenMP-safe block scan: each thread decodes its own block into a thread_local
     // cache (tls_decoded), so there is no shared mutable state across threads.

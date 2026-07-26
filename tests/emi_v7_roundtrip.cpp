@@ -117,6 +117,42 @@ int main() {
         printf("read-dict: raw=%zuB encoded=%zuB (%.1f%%)\n", raw, enc.size(), 100.0*enc.size()/raw);
     }
 
+    // Regression: two Readers opened back to back can land on the same stack
+    // (or heap) address. The decoded-block and name-dict caches used to be keyed
+    // on `this`, so the second Reader silently served the first file's block and
+    // names when that happened. Use a second, distinct fixture and nested scopes
+    // shaped like the first Reader's, so the allocator/stack is likely to reuse
+    // the just-freed slot -- the scenario that used to trigger the bug.
+    {
+        const uint32_t NREADS2 = 6;
+        std::vector<Row> rows2;
+        std::vector<EmiReadAnnot> annots2(NREADS2);
+        for (uint32_t r = 0; r < NREADS2; ++r) {
+            Row row;
+            row.read_idx = r; row.ref_idx = r;
+            row.bit_score = float(900 + r);
+            row.tlen = uint16_t(77); row.qlen = uint16_t(77);
+            row.qaln = "ZZZZ"; row.taln = "ZZZZ";
+            rows2.push_back(row);
+        }
+        std::vector<std::string> read_names2(NREADS2), ref_names2(NREADS2);
+        for (uint32_t r = 0; r < NREADS2; ++r) {
+            read_names2[r] = "SECOND_FILE_READ_" + std::to_string(r);
+            ref_names2[r]  = "TGT_" + std::to_string(r);
+        }
+        const std::string path2 = "/dev/shm/emi_v7_rt2.emi";
+        Writer::write(path2, rows2, annots2, read_names2, ref_names2, BLOCK_TARGET);
+
+        std::string n2;
+        float b2 = 0.0f;
+        { Reader r1(path); r1.ref_name(0); r1.rows_for_read(0); }
+        { Reader r2(path2); n2 = r2.ref_name(0); b2 = r2.rows_for_read(0)[0].bit_score; }
+        // Expected values belong to path2, NOT the stale path1 data (ref_names[0]
+        // "A0A100000X0", read0 bit_score 50.0f) a `this`-keyed cache would serve.
+        CHECK(n2 == "TGT_0", "NameDict cache not aliased across Reader instances");
+        CHECK(b2 == 900.0f, "decoded-block cache not aliased across Reader instances");
+    }
+
     if (failures == 0) { printf("EMI v7 ROUND-TRIP: ALL PASS\n"); return 0; }
     printf("EMI v7 ROUND-TRIP: %d FAILURES\n", failures); return 1;
 }
