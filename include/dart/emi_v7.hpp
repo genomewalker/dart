@@ -72,6 +72,11 @@ constexpr uint32_t EMI_V7_FLAG_READ_ALIGNED_BLKS = 1u << 1;  // no read straddle
 constexpr uint32_t EMI_V7_FLAG_DEGREE_CSR        = 1u << 2;  // CSR stored as per-read degrees
 constexpr uint32_t EMI_V7_FLAG_COMPRESSED_DICT   = 1u << 3;  // front-coded + ZSTD name dicts
 constexpr uint32_t EMI_V7_FLAG_SELF_CONTAINED    = 1u << 4;  // READ_ANNOT present: no .agd needed
+// KNOWN LIE ON PRODUCTION FILES: files written by merge_hits2emi_stream (an
+// 8.4 MB binary with no source under version control anywhere -- it cannot be
+// fixed) have been observed with this flag set while READ_ANNOT is entirely
+// zero. Do not trust this flag alone; verify READ_ANNOT has non-zero content
+// before treating a file as self-contained.
 constexpr uint32_t EMI_V7_FLAG_HAS_ALN_STRINGS   = 1u << 5;  // qaln/taln cold columns present
 constexpr uint32_t EMI_V7_FLAG_ID_TRAILER        = 1u << 6;  // dense-ID provenance trailer present
 constexpr uint32_t EMI_V7_FLAG_HOT_OUT_OF_CORE   = 1u << 7;  // built for block-streaming EM (billions)
