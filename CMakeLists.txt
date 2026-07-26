@@ -344,6 +344,20 @@ if(BUILD_TESTING)
         NAME dcx_roundtrip
         COMMAND dart-dcx-roundtrip
     )
+
+    # EMI v7 format round-trip: blocks, degree-CSR, hot/cold columns, var-length
+    # qaln/taln, per-read random access, name-dict, and the two-Reader
+    # cache-aliasing regression (thread_local caches keyed on a monotonic uid,
+    # not `this`).
+    add_executable(
+        dart-emi-v7-roundtrip
+        tests/emi_v7_roundtrip.cpp
+    )
+    target_link_libraries(dart-emi-v7-roundtrip PkgConfig::ZSTD)
+    add_test(
+        NAME emi_v7_roundtrip
+        COMMAND dart-emi-v7-roundtrip
+    )
 endif()
 
 # Install
