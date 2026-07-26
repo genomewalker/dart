@@ -319,29 +319,18 @@ int min_n_for_power(double pi, double eps0, double alpha, double power, int nmax
 }
 } // namespace
 
-// Parse strand and frame from DART header suffix (e.g., readname_+_1 -> '+', 1)
-// Returns {strand, frame} where frame is 0, 1, or 2
+// Parse strand and frame from a DART ORF id: "readname_+_1" or "readname_+_1_3".
+// Returns {strand, frame}, defaulting to {'+', 0} when the id is not an ORF id.
+//
+// This used to scan backwards from the end taking the last '0'-'2' digit as the
+// frame. That answered correctly only while the frame was the final field: once
+// an ORF ordinal followed it, the scan either absorbed the ordinal as the frame
+// or bailed and returned the defaults, silently. parse_dart_orf_id anchors on
+// the '_<strand>_' marker and reads forward, so field count cannot shift the
+// answer -- it either parses or reports failure.
 static std::pair<char, int> parse_strand_and_frame(const std::string& query_id) {
-    char strand = '+';
-    int frame = 0;
-
-    if (query_id.size() >= 4) {
-        size_t n = query_id.size();
-        for (size_t i = n - 1; i >= 2; --i) {
-            if (query_id[i] >= '0' && query_id[i] <= '2') {
-                frame = query_id[i] - '0';
-                continue;
-            }
-            if (query_id[i] == '_' && i >= 2 &&
-                (query_id[i-1] == '+' || query_id[i-1] == '-') &&
-                query_id[i-2] == '_') {
-                strand = query_id[i-1];
-                break;
-            }
-            if (query_id[i] != '_') break;
-        }
-    }
-    return {strand, frame};
+    dart::DartOrfId p = dart::parse_dart_orf_id(query_id);
+    return {p.strand, p.frame};
 }
 
 // Legacy wrapper for code that only needs strand

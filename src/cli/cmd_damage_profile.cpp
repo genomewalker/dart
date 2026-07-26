@@ -7,6 +7,7 @@
 #include "dart/version.h"
 #include "dart/log_utils.hpp"
 #include "dart/sequence_io.hpp"
+#include "dart/damage_index.hpp"
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -44,20 +45,12 @@ struct NucleotideCounts {
     }
 };
 
-// Extract read name from query_id (remove _+_0, _-_1 etc suffix)
+// Extract the read name from an ORF id: "read_+_0" and "read_+_0_3" both give
+// "read". Shares one parser with the .agd key path (damage_index.hpp) so the two
+// cannot drift; the previous local copy counted underscores from the end and
+// would have returned the id unstripped once the ORF ordinal was appended.
 static std::string extract_read_name(const std::string& query_id) {
-    // Pattern: readname_[+-]_[012]
-    size_t pos = query_id.rfind('_');
-    if (pos != std::string::npos && pos > 0) {
-        size_t pos2 = query_id.rfind('_', pos - 1);
-        if (pos2 != std::string::npos) {
-            char strand = query_id[pos2 + 1];
-            if (strand == '+' || strand == '-') {
-                return query_id.substr(0, pos2);
-            }
-        }
-    }
-    return query_id;
+    return std::string(strip_dart_suffix(query_id));
 }
 
 static void print_usage(const char* prog) {

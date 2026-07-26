@@ -345,6 +345,18 @@ if(BUILD_TESTING)
         COMMAND dart-dcx-roundtrip
     )
 
+    # ORF id uniqueness: the id grammar (legacy 3-field and current 4-field,
+    # incl. a two-digit ordinal) plus an end-to-end check that `dart predict`
+    # gives two same-frame ORFs of one read two distinct names.
+    add_executable(
+        dart-orf-id-uniqueness
+        tests/test_orf_id_uniqueness.cpp
+    )
+    add_test(
+        NAME orf_id_uniqueness
+        COMMAND dart-orf-id-uniqueness $<TARGET_FILE:dart>
+    )
+
     # EMI v7 format round-trip: blocks, degree-CSR, hot/cold columns, var-length
     # qaln/taln, per-read random access, name-dict, and the two-Reader
     # cache-aliasing regression (thread_local caches keyed on a monotonic uid,
