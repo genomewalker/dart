@@ -134,8 +134,14 @@ struct ThreadOutputBuffer {
     }
 
     // Format FASTA entry for nucleotide
+    //
+    // The trailing _<gene_num> is what makes the id unique. Without it, adaptive
+    // ORF selection (frame_selector.cpp:1106) can emit two fragments of the same
+    // (strand, frame) for one read, and they collided under one name -- measured
+    // on production at 0.48-0.77% of ORF records across four libraries.
     void write_fasta_nt(const std::string& seq_id, const Gene& gene, int gene_num) {
         fasta_nt << ">" << seq_id << "_" << (gene.is_forward ? "+" : "-") << "_" << gene.frame
+                 << "_" << gene_num
                  << " " << (gene.start + 1) << ".." << gene.end
                  << " length=" << gene.sequence.length() << "nt"
                  << "\n" << gene.sequence << "\n";
@@ -144,6 +150,7 @@ struct ThreadOutputBuffer {
     // Format FASTA entry for protein
     void write_fasta_aa(const std::string& seq_id, const Gene& gene, int gene_num) {
         fasta_aa << ">" << seq_id << "_" << (gene.is_forward ? "+" : "-") << "_" << gene.frame
+                 << "_" << gene_num
                  << " " << (gene.start + 1) << ".." << gene.end
                  << " length=" << gene.protein.length() << "aa"
                  << " damage_pct=" << static_cast<int>(gene.damage_score)
@@ -160,6 +167,7 @@ struct ThreadOutputBuffer {
     void write_fasta_aa_corrected(const std::string& seq_id, const Gene& gene, int gene_num) {
         const std::string& prot = gene.corrected_protein.empty() ? gene.protein : gene.corrected_protein;
         fasta_aa_corrected << ">" << seq_id << "_" << (gene.is_forward ? "+" : "-") << "_" << gene.frame
+                           << "_" << gene_num
                            << " " << (gene.start + 1) << ".." << gene.end
                            << " length=" << prot.length() << "aa"
                            << " stop_fix=" << gene.stop_restorations
@@ -171,6 +179,7 @@ struct ThreadOutputBuffer {
     void write_fasta_aa_masked(const std::string& seq_id, const Gene& gene, int gene_num) {
         const std::string& prot = gene.search_protein.empty() ? gene.protein : gene.search_protein;
         fasta_aa_masked << ">" << seq_id << "_" << (gene.is_forward ? "+" : "-") << "_" << gene.frame
+                        << "_" << gene_num
                         << " " << (gene.start + 1) << ".." << gene.end
                         << " length=" << prot.length() << "aa"
                         << " x_count=" << gene.x_count

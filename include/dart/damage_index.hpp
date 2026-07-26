@@ -129,24 +129,69 @@ inline uint64_t fnv1a_hash(std::string_view str) {
 }
 
 /**
- * @brief Strip AGP frame/strand suffix from read ID.
+ * @brief One parsed DART ORF id.
  *
- * AGP output format: "read_name_+_1" or "read_name_-_2"
- * Frames can be 1-6 (6-frame translation) or 0-2 (3-frame)
- * Returns: "read_name"
+ * Grammar, emitted by `dart predict` (src/main.cpp):
+ *   <read>_<strand>_<frame>              legacy, before ORF ordinals
+ *   <read>_<strand>_<frame>_<ordinal>    current
+ * <strand> is '+' or '-'; <ordinal> is the per-read gene number, which makes
+ * the id unique when one frame of one read yields more than one ORF.
+ *
+ * Parsing anchors on the `_<strand>_` marker and reads FORWARD. It must not
+ * scan backwards from the end: every previous implementation did, and appending
+ * a field silently changed their answer instead of failing.
+ */
+struct DartOrfId {
+    std::string_view read;         ///< the id itself when !ok
+    char             strand  = '+';
+    int              frame   = 0;
+    int              ordinal = -1; ///< -1 when absent (legacy id)
+    bool             ok      = false;
+};
+
+inline DartOrfId parse_dart_orf_id(std::string_view id) {
+    DartOrfId r;
+    r.read = id;
+
+    constexpr size_t npos = std::string_view::npos;
+    const size_t p = id.rfind("_+_");
+    const size_t m = id.rfind("_-_");
+    const size_t s = (p == npos) ? m : (m == npos ? p : (p > m ? p : m));
+    if (s == npos || s == 0) return r;
+
+    size_t i = s + 3, j = i;
+    while (j < id.size() && id[j] >= '0' && id[j] <= '9') ++j;
+    if (j == i) return r;
+    int frame = 0;
+    for (size_t k = i; k < j; ++k) frame = frame * 10 + (id[k] - '0');
+
+    int ordinal = -1;
+    if (j < id.size()) {
+        if (id[j] != '_') return r;
+        const size_t o = j + 1;
+        size_t e = o;
+        while (e < id.size() && id[e] >= '0' && id[e] <= '9') ++e;
+        if (e == o || e != id.size()) return r;
+        ordinal = 0;
+        for (size_t k = o; k < e; ++k) ordinal = ordinal * 10 + (id[k] - '0');
+    }
+
+    r.read    = id.substr(0, s);
+    r.strand  = id[s + 1];
+    r.frame   = frame;
+    r.ordinal = ordinal;
+    r.ok      = true;
+    return r;
+}
+
+/**
+ * @brief Strip the strand/frame/ordinal suffix from an ORF id.
+ *
+ * "read_+_1" and "read_+_1_3" both return "read". Anything that is not an ORF
+ * id is returned unchanged.
  */
 inline std::string_view strip_dart_suffix(std::string_view id) {
-    // Look for pattern _[+-]_[0-9] at end
-    if (id.size() >= 4) {
-        size_t pos = id.size() - 4;
-        if (id[pos] == '_' &&
-            (id[pos + 1] == '+' || id[pos + 1] == '-') &&
-            id[pos + 2] == '_' &&
-            id[pos + 3] >= '0' && id[pos + 3] <= '9') {
-            return id.substr(0, pos);
-        }
-    }
-    return id;
+    return parse_dart_orf_id(id).read;
 }
 
 // -----------------------------------------------------------------------------
