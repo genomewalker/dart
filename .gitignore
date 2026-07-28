@@ -1,6 +1,7 @@
 # Build
 build/
 build_*/
+build-*/
 *.o
 *.a
 
