@@ -97,6 +97,7 @@ bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
     const bool has_obs = cf & COL_OBS_CODON;
     const bool has_best = cf & COL_BEST_CODON;
     const bool has_crank = cf & COL_CANDIDATE_RANK;
+    const bool has_fident = cf & COL_FIDENT;
 
     // Per-record presence byte offset and popcount (also the Grain B offset).
     std::vector<size_t> pres_off(nA + 1, 0), obs_off(nA + 1, 0);
@@ -149,7 +150,7 @@ bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
         const size_t nB = b_hi - b_lo;
 
         // ---- encode Grain A columns ----
-        std::vector<uint8_t> qid, tord, tst, spn, gq, pq, emk, strd, gaq, emq, neff, gnullq, preadq, crank;
+        std::vector<uint8_t> qid, tord, tst, spn, gq, pq, emk, strd, gaq, emq, neff, gnullq, preadq, crank, fidq;
         uint64_t pq_prev = 0, tord_prev = 0; int64_t tst_prev = 0, qid_prev = 0;
         emk.assign(bytes_for_bits(nblk), 0);
         if (has_strand) strd.assign(bytes_for_bits(nblk), 0);
@@ -168,6 +169,7 @@ bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
             if (has_gnull) put_u16(gnullq, enc_unit(B.gamma_null[r]));
             if (has_pread) put_u16(preadq, enc_unit(B.p_read[r]));
             if (has_crank) crank.push_back(B.candidate_rank[r]);
+            if (has_fident) put_u16(fidq, enc_unit(B.fident[r]));
             (void)pq_prev;
         }
         std::vector<uint8_t> pres(B.presence.begin() + pres_off[lo], B.presence.begin() + pres_off[hi]);
@@ -206,6 +208,7 @@ bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
         if (has_gnull) push_col(dir, cols, ColumnId::GammaNull, ColEncoding::U16Quant, uint32_t(nblk), gnullq);
         if (has_pread) push_col(dir, cols, ColumnId::PReadQ, ColEncoding::U16Quant, uint32_t(nblk), preadq);
         if (has_crank) push_col(dir, cols, ColumnId::CandidateRank, ColEncoding::Raw, uint32_t(nblk), crank);
+        if (has_fident) push_col(dir, cols, ColumnId::FidentQ, ColEncoding::U16Quant, uint32_t(nblk), fidq);
         push_col(dir, cols, ColumnId::Presence, ColEncoding::Bitset1, uint32_t(nblk), pres);
         push_col(dir, cols, ColumnId::RefAa, ColEncoding::Raw, uint32_t(nB), refaa);
         push_col(dir, cols, ColumnId::ObsAa, ColEncoding::Raw, uint32_t(nB), obsaa);

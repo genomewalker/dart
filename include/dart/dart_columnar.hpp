@@ -109,6 +109,9 @@ enum ColFlag : uint32_t {
                                    // single argmax row, bridging v2.1 one-row-per-read consumers (auth axis).
     COL_CANDIDATE_RANK= 1u << 11,  // v2.2 Grain A: candidate_rank present (u8, 0=argmax). Emitted with
                                    // COL_SOFT_MULTIMAP so a consumer can order/threshold a read's candidates.
+    COL_FIDENT        = 1u << 12,  // Grain A: alignment identity (fident, [0,1]) present (u16 quant). The
+                                   // recruitment identity per (read,target); consumers aggregate it per target
+                                   // for coverage/QC (read2Struct cov_data avg_identity).
 };
 
 // Sample-level semantics (FileHeader.sample_flags). Deamination discrimination
@@ -129,6 +132,7 @@ enum class ColumnId : uint16_t {
     GammaNull,          // appended (minor bump): Grain A per-read null responsibility (U16Quant)
     PReadQ,             // appended (minor bump): Grain A reference-free per-read damage posterior (U16Quant)
     CandidateRank,      // v2.2: Grain A per-read EM candidate rank (Raw u8, 0=argmax); with COL_SOFT_MULTIMAP
+    FidentQ,            // appended (minor bump): Grain A alignment identity (U16Quant); present iff COL_FIDENT
 };
 
 enum class ColEncoding : uint16_t {
@@ -320,6 +324,7 @@ struct Batch {
     std::vector<float>    gamma_null;    // per-read null responsibility; present iff COL_GAMMA_NULL
     std::vector<float>    p_read;        // [0,1] reference-free per-read damage posterior; present iff COL_P_READ
     std::vector<uint8_t>  candidate_rank; // EM candidate rank per read, 0=argmax; present iff COL_CANDIDATE_RANK
+    std::vector<float>    fident;        // [0,1] alignment identity; present iff COL_FIDENT
     // presence bitmaps concatenated in record order; ceil(span_i/8) bytes each,
     // tail bits [span_i, 8*ceil(span_i/8)) MUST be zero. n_obs_i = popcount.
     std::vector<uint8_t>  presence;
