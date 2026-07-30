@@ -134,6 +134,7 @@ struct DcxReadRec {
     std::string query_id, target_id;     // dict keys; strand derived from query_id
     uint32_t tstart = 0, span = 0;       // 0-based target start; tend = tstart+span-1
     float gamma = 0, gamma_ancient = 0, em_margin = 0, em_ref_neff = 0;
+    float fident = 0;                     // alignment identity [0,1] (COL_FIDENT); recruitment QC
     float gamma_null = 0;                 // per-read null responsibility (spurious-hit mass)
     float p_read = 0;                    // AGD reference-free per-read damage posterior (auth axis)
     float posterior = 0;                 // filled post-scoring (identity-fused posterior; audit only)
@@ -3782,6 +3783,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                             rec.strand = (query_id.find("_-_") != std::string::npos) ? 1 : 0;
                             const auto& em = em_read_results[ridx];
                             rec.gamma = em.gamma;
+                            rec.fident = hit.fident;   // recruitment identity (COL_FIDENT)
                             rec.gamma_ancient = em.gamma_ancient;
                             rec.em_margin = em.em_margin;
                             rec.em_ref_neff = em.em_ref_neff;
@@ -4500,7 +4502,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         B.col_flags = dcx::COL_GAMMA_ANCIENT | dcx::COL_EM_MARGIN |
                       dcx::COL_EM_REF_NEFF | dcx::COL_GAMMA_NULL |
                       dcx::COL_P_READ | dcx::COL_OBS_CODON |
-                      dcx::COL_STRAND | dcx::COL_QID_DICT;
+                      dcx::COL_STRAND | dcx::COL_QID_DICT | dcx::COL_FIDENT;
         if (emit_multimap)
             B.col_flags |= dcx::COL_SOFT_MULTIMAP | dcx::COL_CANDIDATE_RANK;
         std::unordered_map<std::string, uint32_t> tord_map;
@@ -4532,6 +4534,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             B.em_ref_neff.push_back(rec.em_ref_neff);
             B.gamma_null.push_back(rec.gamma_null);
             B.p_read.push_back(rec.p_read);
+            B.fident.push_back(rec.fident);
             if (emit_multimap) B.candidate_rank.push_back(rec.candidate_rank);
             B.presence.insert(B.presence.end(), rec.presence.begin(), rec.presence.end());
             B.ref_aa.insert(B.ref_aa.end(), rec.ref_aa.begin(), rec.ref_aa.end());
