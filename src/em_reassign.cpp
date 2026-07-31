@@ -19,11 +19,13 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -1020,6 +1022,7 @@ EMState squarem_em(
 // ascending-lane reduce) -> bitwise-identical across thread counts. Frozen-damage branch
 // (use_alignment_damage_likelihood): pi is post-hoc, only w_null rides the SQUAREM state.
 static constexpr int COMPACT_EM_LANES = 32;
+static constexpr uint32_t kEmPfDist = 16;   // gather/scatter lookahead, in alignment slots (OPT-C)
 
 EMState compact_em_map(AlignmentData& data, const EMParams& params,
                        const TapeFinalizeCb& finalize_cb) {
@@ -1393,17 +1396,77 @@ static inline void tape_decode_read(
     }
 }
 
-// Shared streaming core for the EM tape. Iterations use the 32 contiguous-read
-// lanes in parallel (per-ref transient sufficient stats); the single final pass is
-// SERIAL in ascending read order so finalize_cb can drive the ordered CLI reduction
-// with no O(alignments) state. Determinism (bitwise across thread counts) comes from
-// the fixed lane boundaries + read-order within-lane + ascending-lane reduction —
-// identical to compact_em_map.
+// ---- EM fixed-point checkpoint (OPT-G) ----------------------------------
+// Only the SQUAREM iterations are checkpointed. The final streaming pass is NOT:
+// it re-reads the whole tape and drives finalize_cb, so it always re-runs, and a
+// resumed run is therefore bit-identical (final pass is a pure function of weights).
+static constexpr uint64_t TAPE_CKPT_MAGIC   = 0x5441504543484B31ULL;  // "TAPECHK1"
+static constexpr uint32_t TAPE_CKPT_VERSION = 1;
+
+struct TapeCkptHeader {
+    uint64_t magic;
+    uint32_t version;
+    uint32_t n_weights;     // == Tn (T, or T+1 when the null column is on)
+    uint64_t fingerprint;
+    double   log_likelihood;
+    uint32_t iterations;
+    uint32_t pad;
+};
+
+static inline uint64_t tape_ckpt_fnv1a(const void* p, size_t n, uint64_t h) {
+    const unsigned char* b = static_cast<const unsigned char*>(p);
+    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ULL; }
+    return h;
+}
+
+// Hashes exactly the inputs that move the EM fixed point: the tape identity
+// (caller-supplied input_fingerprint) + shape (R, T, A) + the EMParams read by
+// the iteration loop / stop test. use_damage / posthoc_gamma_ancient are excluded:
+// they only steer the final pass, which always re-runs.
+static uint64_t tape_ckpt_fingerprint(const std::string& input_fingerprint,
+                                      uint32_t R, uint32_t T, uint64_t A,
+                                      const EMParams& params, bool null_on) {
+    uint64_t h = 14695981039346656037ULL;
+    h = tape_ckpt_fnv1a(input_fingerprint.data(), input_fingerprint.size(), h);
+    h = tape_ckpt_fnv1a(&R, sizeof(R), h);
+    h = tape_ckpt_fnv1a(&T, sizeof(T), h);
+    h = tape_ckpt_fnv1a(&A, sizeof(A), h);
+    h = tape_ckpt_fnv1a(&params.min_weight, sizeof(double), h);
+    h = tape_ckpt_fnv1a(&params.alpha_prior, sizeof(double), h);
+    h = tape_ckpt_fnv1a(&params.max_iters, sizeof(uint32_t), h);
+    h = tape_ckpt_fnv1a(&params.min_iters, sizeof(uint32_t), h);
+    h = tape_ckpt_fnv1a(&params.tol, sizeof(double), h);
+    const uint8_t sq = params.use_squarem ? 1 : 0;
+    h = tape_ckpt_fnv1a(&sq, 1, h);
+    h = tape_ckpt_fnv1a(&params.squarem_warmup_iters, sizeof(uint32_t), h);
+    h = tape_ckpt_fnv1a(&params.squarem_method, sizeof(int), h);
+    h = tape_ckpt_fnv1a(&params.squarem_step_min0, sizeof(double), h);
+    h = tape_ckpt_fnv1a(&params.squarem_step_max0, sizeof(double), h);
+    h = tape_ckpt_fnv1a(&params.squarem_mstep, sizeof(double), h);
+    h = tape_ckpt_fnv1a(&params.squarem_objfn_inc, sizeof(double), h);
+    const uint8_t nl = null_on ? 1 : 0;
+    h = tape_ckpt_fnv1a(&nl, 1, h);
+    h = tape_ckpt_fnv1a(&params.lambda_null, sizeof(double), h);
+    h = tape_ckpt_fnv1a(&params.log_w_null, sizeof(double), h);
+    return h;
+}
+
+// Shared streaming core for the EM tape. Both the iterations and the single final
+// pass run over the same 32 contiguous-read lanes in parallel (per-ref transient
+// sufficient stats during iterations; per-read transient gamma in the final pass,
+// streamed to finalize_cb with no O(alignments) state). Determinism (bitwise across
+// thread counts) comes from the fixed lane boundaries + read-order within-lane +
+// ascending-lane reduction — the lane geometry is identical to compact_em_map, but
+// the final-pass scalar reductions (log_likelihood, gamma_sum, gamma_anc_sum) are
+// lane-partitioned here and so differ in the last ulps from compact_em_map's serial
+// running sum. Per-read gamma is bit-identical.
 TapeEMResult tape_em_core(
     const std::string& p_ref, const std::string& p_basea, const std::string& p_basem,
     const uint64_t* read_offsets, uint32_t R, uint32_t T, uint64_t A,
     const EMParams& params, const double* null_lp, double* gnull_out,
-    const TapeFinalizeCb& finalize_cb)
+    const TapeFinalizeCb& finalize_cb,
+    const std::string& checkpoint_path, bool resume,
+    const std::string& input_fingerprint)
 {
     TapeEMResult res;
     const bool null_on = params.use_null && null_lp != nullptr;
@@ -1414,8 +1477,27 @@ TapeEMResult tape_em_core(
     std::array<uint32_t, COMPACT_EM_LANES + 1> lane_lo;
     for (int l = 0; l <= COMPACT_EM_LANES; ++l)
         lane_lo[l] = static_cast<uint32_t>((static_cast<uint64_t>(R) * l) / COMPACT_EM_LANES);
-    std::vector<double> lane_s(static_cast<size_t>(COMPACT_EM_LANES) * T, 0.0);
-    std::vector<double> gn_s(null_on ? R : 0, 0.0);
+    // OPT-D: lane_s is 32*T doubles (11+ GiB at 47M refs). Value-init would zero-fill it
+    // on THIS thread, first-touching every page onto one NUMA node and paying a serial
+    // 11 GiB memset again on every e_step_iter call. Allocate WITHOUT value-init (new[]
+    // default-inits doubles = no fill); each lane zeroes (and first-touches) its own
+    // T-slice inside the parallel E-step region. Stride is exactly T — layout is
+    // byte-for-byte what it was, so every l*T+t index is unchanged.
+    std::unique_ptr<double[]> lane_s_buf(new double[static_cast<size_t>(COMPACT_EM_LANES) * T]);
+    double* const lane_s = lane_s_buf.get();
+    // gn_s: written by lane l over r in [lane_lo[l], lane_lo[l+1]) and read ascending in
+    // m_step, so first-touch on the same partition. Zeroed ONCE: deg==0 reads never assign
+    // gn_s[r] and must stay 0.0 across all E-steps. null is OFF on the production CLI path.
+    std::unique_ptr<double[]> gn_s_buf(null_on ? new double[R] : nullptr);
+    double* const gn_s = gn_s_buf.get();
+    if (null_on) {
+        #pragma omp parallel for schedule(static)
+        for (int l = 0; l < COMPACT_EM_LANES; ++l)
+            std::fill(gn_s + lane_lo[l], gn_s + lane_lo[l + 1], 0.0);
+    }
+    // OPT-B: log(max(w_t, min_weight)) hoisted out of the O(A) inner gather; refilled once
+    // per E-step by a static-scheduled parallel loop (stable first-touch across NUMA nodes).
+    std::vector<double> logw(T);
 
     // init weights (+ null coordinate) — identical to compact_em_map
     std::vector<double> weights(Tn, 1.0 / static_cast<double>(T));
@@ -1428,14 +1510,18 @@ TapeEMResult tape_em_core(
     // Parallel streaming E-step (iterations): transient per-ref lane_s (+ gnull), no gamma.
     auto e_step_iter = [&](const double* w) -> double {
         const double log_w_null_dyn = null_on ? std::log(std::max(w[T], params.min_weight)) : 0.0;
-        std::fill(lane_s.begin(), lane_s.end(), 0.0);
+        // OPT-B: fill the hoisted log-weight table (schedule(static) => stable first-touch).
+        #pragma omp parallel for schedule(static)
+        for (int64_t t = 0; t < static_cast<int64_t>(T); ++t)
+            logw[t] = std::log(std::max(w[t], params.min_weight));
         std::vector<double> ll_lane(COMPACT_EM_LANES, 0.0);
         #pragma omp parallel for schedule(dynamic, 1)
         for (int l = 0; l < COMPACT_EM_LANES; ++l) {
             TapeStream<uint32_t> ts_ref;
             TapeStream<double> ts_ba, ts_bm;
             if (!ts_ref.open(p_ref, A) || !ts_ba.open(p_basea, A) || !ts_bm.open(p_basem, A)) std::abort();
-            double* s_t = lane_s.data() + static_cast<size_t>(l) * T;
+            double* s_t = lane_s + static_cast<size_t>(l) * T;
+            std::fill_n(s_t, T, 0.0);   // OPT-D: parallel first-touch (was the serial std::fill)
             double ll_local = 0.0;
             std::vector<double> ls;
             for (uint32_t r = lane_lo[l]; r < lane_lo[l + 1]; ++r) {
@@ -1446,7 +1532,9 @@ TapeEMResult tape_em_core(
                 const uint32_t ncol = null_on ? 2 * deg + 1 : 2 * deg;
                 ls.resize(ncol);
                 for (uint32_t j = 0; j < deg; ++j) {
-                    const double lw = std::log(std::max(w[ts_ref.at(s + j)], params.min_weight));
+                    const uint32_t pf = std::min(j + kEmPfDist, deg - 1);   // OPT-C
+                    __builtin_prefetch(&logw[ts_ref.at(s + pf)], 0, 3);
+                    const double lw = logw[ts_ref.at(s + j)];   // OPT-B
                     ls[2 * j] = lw + ts_ba.at(s + j);
                     ls[2 * j + 1] = lw + ts_bm.at(s + j);
                 }
@@ -1455,6 +1543,8 @@ TapeEMResult tape_em_core(
                 const double lse = log_sum_exp(ls.data(), ncol);
                 ll_local += lse;
                 for (uint32_t j = 0; j < deg; ++j) {
+                    const uint32_t pf = std::min(j + kEmPfDist, deg - 1);   // OPT-C
+                    __builtin_prefetch(&s_t[ts_ref.at(s + pf)], 1, 3);
                     const double da = ls[2 * j] - lse, dm = ls[2 * j + 1] - lse;
                     const double ga = (da > -700.0) ? std::exp(da) : 0.0;
                     const double gm = (dm > -700.0) ? std::exp(dm) : 0.0;
@@ -1472,25 +1562,64 @@ TapeEMResult tape_em_core(
         return ll;
     };
     // M-step: ascending-lane reduction — identical to compact_em_map's m_step_fused.
+    // OPT-D: parallelism is over t ONLY; the per-t reduction over lanes stays serial and
+    // ascending (that ordering is the bit-identity guarantee). `tot` is a separate serial
+    // ascending-t sum of the exact values stored into out_w, so it is the same left-to-right
+    // sum it was when fused into the t loop. The null reduction stays serial ascending r.
     auto m_step = [&](double* out_w) {
         const double prior_offset = params.alpha_prior - 1.0;
-        double tot = 0.0;
-        for (uint32_t t = 0; t < T; ++t) {
+        #pragma omp parallel for schedule(static)
+        for (int64_t t = 0; t < static_cast<int64_t>(T); ++t) {
             double w = prior_offset;
             for (int l = 0; l < COMPACT_EM_LANES; ++l) w += lane_s[static_cast<size_t>(l) * T + t];
-            w = std::max(w, params.min_weight);
-            out_w[t] = w; tot += w;
+            out_w[t] = std::max(w, params.min_weight);
         }
+        double tot = 0.0;
+        for (uint32_t t = 0; t < T; ++t) tot += out_w[t];        // ascending t, SERIAL
         double wn = 0.0;
         if (null_on) {
             wn = prior_offset;
-            for (uint32_t r = 0; r < R; ++r) wn += gn_s[r];
+            for (uint32_t r = 0; r < R; ++r) wn += gn_s[r];      // ascending r, SERIAL
             wn = std::max(wn, params.min_weight); tot += wn;
         }
-        if (tot > 0.0) { for (uint32_t t = 0; t < T; ++t) out_w[t] /= tot; if (null_on) out_w[T] = wn / tot; }
+        if (tot > 0.0) {
+            #pragma omp parallel for schedule(static)
+            for (int64_t t = 0; t < static_cast<int64_t>(T); ++t) out_w[t] /= tot;
+            if (null_on) out_w[T] = wn / tot;
+        }
     };
     auto do_e = [&](const double* w) { return e_step_iter(w); };
     auto do_m = [&](double* out) { m_step(out); };
+
+    // ---- OPT-G: resume from a matching EM fixed-point checkpoint ----
+    const uint64_t ckpt_fp = checkpoint_path.empty()
+        ? 0ULL : tape_ckpt_fingerprint(input_fingerprint, R, T, A, params, null_on);
+    bool resumed = false;
+    if (resume && !checkpoint_path.empty()) {
+        FILE* f = std::fopen(checkpoint_path.c_str(), "rb");
+        if (!f) {
+            std::fprintf(stderr, "warning: EM checkpoint %s not readable (%s); running from scratch\n",
+                         checkpoint_path.c_str(), std::strerror(errno));
+        } else {
+            TapeCkptHeader h{};
+            std::vector<double> wtmp(Tn);
+            if (std::fread(&h, sizeof(h), 1, f) == 1 &&
+                h.magic == TAPE_CKPT_MAGIC && h.version == TAPE_CKPT_VERSION &&
+                h.fingerprint == ckpt_fp && h.n_weights == Tn &&
+                std::fread(wtmp.data(), sizeof(double), Tn, f) == Tn) {
+                weights.swap(wtmp);
+                res.iterations = h.iterations;
+                res.log_likelihood = h.log_likelihood;
+                resumed = true;
+                std::fprintf(stderr, "EM: resumed fixed point from %s (%u iterations)\n",
+                             checkpoint_path.c_str(), h.iterations);
+            } else {
+                std::fprintf(stderr, "warning: EM checkpoint %s stale or corrupt; running from scratch\n",
+                             checkpoint_path.c_str());
+            }
+            std::fclose(f);
+        }
+    }
 
     // ---- SQUAREM outer loop — structurally identical to compact_em_map ----
     std::vector<double> w0(Tn), w1(Tn), w2(Tn), r_buf(Tn), v_buf(Tn), prev_w(Tn);
@@ -1501,13 +1630,25 @@ TapeEMResult tape_em_core(
     const double mstep = std::max(params.squarem_mstep, 1.0000001);
     const double param_tol = std::sqrt(std::max(params.tol, 1e-15));
 
+    // OPT-A: true iff lane_s/gn_s currently hold E(weights) for the CURRENT `weights`.
+    // Every SQUAREM iteration ends with an E-scan taken at exactly the weight vector it
+    // commits to `weights` (accepted branch: scan at w0, commit w0; squeeze branch: commit
+    // w2, scan at w2), so the next iteration's opening E-scan is a recomputation of an
+    // unchanged pure function and can be skipped. False on entry (iter 0 / warmup pay the
+    // full scans); the plain-EM branch never sets it, so it stays false there.
+    bool stats_at_weights = false;
+
+    if (!resumed)
     for (uint32_t iter = 0; iter < params.max_iters; ++iter) {
         double ll, objective;
         std::copy(weights.begin(), weights.end(), prev_w.begin());
         const bool sq = params.use_squarem && (iter >= params.squarem_warmup_iters);
         if (sq) {
             std::copy(weights.begin(), weights.end(), w0.begin());
-            do_e(w0.data()); do_m(w1.data());
+            // OPT-A: w0 is a bit-copy of `weights`; when stats_at_weights holds, lane_s/gn_s
+            // already ARE E(w0), so this scan is skipped (its return was already discarded).
+            if (!stats_at_weights) do_e(w0.data());
+            do_m(w1.data());
             do_e(w1.data()); do_m(w2.data());
             double sr2 = 0, sv2 = 0, srv = 0;
             squarem_build_directions(w0.data(), w1.data(), w2.data(), r_buf.data(), v_buf.data(), Tn, sr2, sv2, srv);
@@ -1526,6 +1667,9 @@ TapeEMResult tape_em_core(
             } else {
                 std::copy(w0.begin(), w0.end(), weights.begin());
             }
+            // OPT-A: both branches leave lane_s/gn_s equal to E(weights) — accepted: last
+            // scan do_e(w0), weights<-w0; squeeze: weights<-w2, last scan do_e(weights).
+            stats_at_weights = true;
             if (std::abs(alpha - step_max) <= (1e-12 * (1.0 + std::abs(step_max)))) step_max = mstep * step_max;
             if (step_min < 0.0 && std::abs(alpha - step_min) <= (1e-12 * (1.0 + std::abs(step_min)))) step_min = mstep * step_min;
         } else {
@@ -1541,60 +1685,107 @@ TapeEMResult tape_em_core(
         prev_obj = objective;
     }
 
-    // ---- single SERIAL final pass at frozen weights: gamma is transient (per read),
-    // handed to finalize_cb; Σγ / Σγ_ancient accumulated for pi. Recomputing at the
-    // converged weights reproduces compact_em_map's stored gamma bit-for-bit. ----
+    // ---- OPT-G: persist the converged fixed point (iterations only; the final pass
+    // always re-runs). Skipped when we resumed (weights already came from disk). ----
+    if (!checkpoint_path.empty() && !resumed) {
+        TapeCkptHeader h{};
+        h.magic = TAPE_CKPT_MAGIC;
+        h.version = TAPE_CKPT_VERSION;
+        h.n_weights = Tn;
+        h.fingerprint = ckpt_fp;
+        h.log_likelihood = res.log_likelihood;
+        h.iterations = res.iterations;
+        h.pad = 0;
+        FILE* f = std::fopen(checkpoint_path.c_str(), "wb");
+        if (!f) {
+            std::fprintf(stderr, "warning: cannot write EM checkpoint %s: %s\n",
+                         checkpoint_path.c_str(), std::strerror(errno));
+        } else {
+            std::fwrite(&h, sizeof(h), 1, f);
+            std::fwrite(weights.data(), sizeof(double), Tn, f);
+            std::fclose(f);
+        }
+    }
+
+    // ---- OPT-F: final pass at frozen weights, PARALLEL over the same 32 fixed lanes the
+    // iterations use: each lane owns a contiguous read range, opens its own TapeStream trio,
+    // computes per-read transient gamma, and calls finalize_cb from the worker thread.
+    // finalize_cb writes only per-r slots, so its call ORDER cannot affect output. The three
+    // scalars use per-lane partials folded ascending — reproducible across thread counts, but
+    // NOT bit-equal to the old serial running sum (they only reach a stderr line / dead
+    // fields / a pi path that is disabled whenever finalize_cb is supplied). Per-read gamma
+    // is bit-identical. Recomputing at the converged weights reproduces compact_em_map's
+    // gamma bit-for-bit. finalize_cb is invoked CONCURRENTLY: it must be thread-safe. ----
     {
         const double log_w_null_dyn = null_on ? std::log(std::max(weights[T], params.min_weight)) : 0.0;
+        // OPT-B.4: refill the shared log-weight table at the frozen weights before the lane
+        // region — one std::log per ref instead of one per alignment, same value.
+        #pragma omp parallel for schedule(static)
+        for (int64_t t = 0; t < static_cast<int64_t>(T); ++t)
+            logw[t] = std::log(std::max(weights[t], params.min_weight));
+
         // gamma_ancient is delivered when the joint damage E-step ran (use_damage -> ga)
         // OR when the CLI requested a post-hoc ancient responsibility (posthoc_gamma_ancient
         // -> gamma * p_anc with p_anc = sigmoid(base_a - base_m); bc cancels). Mirrors
         // compact_em_map's final pass so the streaming tape and in-RAM paths agree bitwise.
         const bool want_anc = params.use_damage || params.posthoc_gamma_ancient;
-        TapeStream<uint32_t> ts_ref;
-        TapeStream<double> ts_ba, ts_bm;
-        if (!ts_ref.open(p_ref, A) || !ts_ba.open(p_basea, A) || !ts_bm.open(p_basem, A)) std::abort();
-        std::vector<double> ls, gbuf, gabuf;
-        std::vector<uint32_t> rbuf;
-        double final_ll = 0.0, sum_a = 0.0, sum_t = 0.0;
-        for (uint32_t r = 0; r < R; ++r) {
-            const uint64_t s = read_offsets[r], e = read_offsets[r + 1];
-            const uint32_t deg = static_cast<uint32_t>(e - s);
-            if (gnull_out) gnull_out[r] = 0.0;
-            if (deg == 0) { if (finalize_cb) finalize_cb(r, 0, nullptr, nullptr, nullptr); continue; }
-            ts_ref.ensure(s, e); ts_ba.ensure(s, e); ts_bm.ensure(s, e);
-            const uint32_t ncol = null_on ? 2 * deg + 1 : 2 * deg;
-            ls.resize(ncol); gbuf.resize(deg); rbuf.resize(deg);
-            if (want_anc) gabuf.resize(deg);
-            for (uint32_t j = 0; j < deg; ++j) {
-                rbuf[j] = ts_ref.at(s + j);
-                const double lw = std::log(std::max(weights[rbuf[j]], params.min_weight));
-                ls[2 * j] = lw + ts_ba.at(s + j);
-                ls[2 * j + 1] = lw + ts_bm.at(s + j);
-            }
-            if (null_on) ls[2 * deg] = log_w_null_dyn + params.lambda_null * null_lp[r];
-            const double lse = log_sum_exp(ls.data(), ncol);
-            final_ll += lse;
-            for (uint32_t j = 0; j < deg; ++j) {
-                const double da = ls[2 * j] - lse, dm = ls[2 * j + 1] - lse;
-                const double ga = (da > -700.0) ? std::exp(da) : 0.0;
-                const double gm = (dm > -700.0) ? std::exp(dm) : 0.0;
-                gbuf[j] = ga + gm;
-                if (params.use_damage) gabuf[j] = ga;
-                else if (params.posthoc_gamma_ancient) {
-                    const double p_anc = 1.0 / (1.0 + std::exp(ts_bm.at(s + j) - ts_ba.at(s + j)));
-                    gabuf[j] = (ga + gm) * p_anc;
+        std::vector<double> ll_lane(COMPACT_EM_LANES, 0.0);
+        std::vector<double> sa_lane(COMPACT_EM_LANES, 0.0);
+        std::vector<double> st_lane(COMPACT_EM_LANES, 0.0);
+
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int l = 0; l < COMPACT_EM_LANES; ++l) {
+            TapeStream<uint32_t> ts_ref;
+            TapeStream<double> ts_ba, ts_bm;
+            if (!ts_ref.open(p_ref, A) || !ts_ba.open(p_basea, A) || !ts_bm.open(p_basem, A)) std::abort();
+            std::vector<double> ls, gbuf, gabuf;
+            std::vector<uint32_t> rbuf;
+            double ll_local = 0.0, sa_local = 0.0, st_local = 0.0;
+            for (uint32_t r = lane_lo[l]; r < lane_lo[l + 1]; ++r) {
+                const uint64_t s = read_offsets[r], e = read_offsets[r + 1];
+                const uint32_t deg = static_cast<uint32_t>(e - s);
+                if (gnull_out) gnull_out[r] = 0.0;
+                if (deg == 0) { if (finalize_cb) finalize_cb(r, 0, nullptr, nullptr, nullptr); continue; }
+                ts_ref.ensure(s, e); ts_ba.ensure(s, e); ts_bm.ensure(s, e);
+                const uint32_t ncol = null_on ? 2 * deg + 1 : 2 * deg;
+                ls.resize(ncol); gbuf.resize(deg); rbuf.resize(deg);
+                if (want_anc) gabuf.resize(deg);
+                for (uint32_t j = 0; j < deg; ++j) {
+                    rbuf[j] = ts_ref.at(s + j);
+                    const double lw = logw[rbuf[j]];
+                    ls[2 * j] = lw + ts_ba.at(s + j);
+                    ls[2 * j + 1] = lw + ts_bm.at(s + j);
                 }
-                sum_a += ga; sum_t += ga + gm;
+                if (null_on) ls[2 * deg] = log_w_null_dyn + params.lambda_null * null_lp[r];
+                const double lse = log_sum_exp(ls.data(), ncol);
+                ll_local += lse;
+                for (uint32_t j = 0; j < deg; ++j) {
+                    const double da = ls[2 * j] - lse, dm = ls[2 * j + 1] - lse;
+                    const double ga = (da > -700.0) ? std::exp(da) : 0.0;
+                    const double gm = (dm > -700.0) ? std::exp(dm) : 0.0;
+                    gbuf[j] = ga + gm;
+                    if (params.use_damage) gabuf[j] = ga;
+                    else if (params.posthoc_gamma_ancient) {
+                        const double p_anc = 1.0 / (1.0 + std::exp(ts_bm.at(s + j) - ts_ba.at(s + j)));
+                        gabuf[j] = (ga + gm) * p_anc;
+                    }
+                    sa_local += ga; st_local += ga + gm;
+                }
+                if (null_on && gnull_out) {
+                    const double d = ls[2 * deg] - lse;
+                    gnull_out[r] = (d > -700.0) ? std::exp(d) : 0.0;
+                }
+                if (finalize_cb)
+                    finalize_cb(r, deg, rbuf.data(), gbuf.data(), want_anc ? gabuf.data() : nullptr);
             }
-            if (null_on && gnull_out) {
-                const double d = ls[2 * deg] - lse;
-                gnull_out[r] = (d > -700.0) ? std::exp(d) : 0.0;
-            }
-            if (finalize_cb)
-                finalize_cb(r, deg, rbuf.data(), gbuf.data(), want_anc ? gabuf.data() : nullptr);
+            ll_lane[l] = ll_local; sa_lane[l] = sa_local; st_lane[l] = st_local;
+            ts_ref.close(); ts_ba.close(); ts_bm.close();
         }
-        ts_ref.close(); ts_ba.close(); ts_bm.close();
+
+        double final_ll = 0.0, sum_a = 0.0, sum_t = 0.0;
+        for (int l = 0; l < COMPACT_EM_LANES; ++l) {
+            final_ll += ll_lane[l]; sum_a += sa_lane[l]; sum_t += st_lane[l];
+        }
         res.log_likelihood = final_ll;
         res.gamma_anc_sum = sum_a; res.gamma_sum = sum_t;
         if (params.use_damage && sum_t > 0.0) res.pi = std::clamp(sum_a / sum_t, 0.01, 0.99);
