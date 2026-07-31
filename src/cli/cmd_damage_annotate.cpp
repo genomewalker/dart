@@ -3025,9 +3025,18 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 return 1;
             }
             // Ensure the (node-local, possibly not-yet-present) base dir exists, then a
-            // uniquely-named subdir. /scratch is per-node, so the base may be absent on this
-            // node even if it exists elsewhere — create it best-effort before the leaf.
-            ::mkdir(em_tape_dir.c_str(), 0755);  // best-effort; EEXIST is fine
+            // uniquely-named subdir. /scratch is per-node AND may be reaped during the long
+            // pre-EM setup (Pass 1 + sort can run ~1h on a giant, leaving emtape empty and
+            // eligible for an empty-dir reaper). A single ::mkdir then fails ENOENT because an
+            // ANCESTOR is gone — so recreate the WHOLE chain (mkdir -p), best-effort.
+            auto mkdir_p = [](const std::string& p) {
+                for (size_t i = 1; i <= p.size(); ++i)
+                    if (i == p.size() || p[i] == '/') {
+                        std::string sub = p.substr(0, i);
+                        ::mkdir(sub.c_str(), 0755);  // best-effort; EEXIST is fine
+                    }
+            };
+            mkdir_p(em_tape_dir);  // recursive best-effort; EEXIST is fine
             tape_dir_path = em_tape_dir + "/dart_emtape_" + std::to_string(::getpid());
             // OPT-G: default checkpoint is a SIBLING of tape_dir_path (not a child), so the
             // TapeDirGuard that unlinks the tape does not delete it. Resume across runs needs
