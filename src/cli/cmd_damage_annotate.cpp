@@ -141,6 +141,11 @@ struct DcxReadRec {
     uint8_t strand = 0;
     uint8_t em_keep = 0;                  // real EM keep bit (SOFT weight, not a filter)
     uint8_t candidate_rank = 0;           // DCX 2.2: EM candidate rank per read, 0=argmax (COL_CANDIDATE_RANK)
+    uint64_t src_idx = 0;                 // (rg_idx<<32)|row_in_group: globally-unique source ordinal.
+                                          // Sort tiebreak -> byte-deterministic dcx independent of the
+                                          // omp thread-completion order records are built in (two HSPs of
+                                          // one read to one target share (target_id,tstart,span,...) but
+                                          // never a source row, so this alone is a total order).
     std::vector<uint8_t> presence;       // ceil(span/8), bit k => covered
     std::vector<uint8_t> ref_aa, obs_aa, dcls;   // Grain B, covered positions
     std::vector<float>   p_damage;
@@ -3796,6 +3801,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
                             DcxReadRec rec;
                             rec.read_idx = ridx;
+                            rec.src_idx = (static_cast<uint64_t>(rg_idx) << 32) | uint64_t(row_in_group);
                             rec.query_id = query_id;
                             rec.target_id = target_id;
                             rec.tstart = hit.tstart_0;
@@ -4453,7 +4459,15 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     if (emit_dcx) {
         std::unordered_map<uint32_t, float> post_by_read;
         post_by_read.reserve(summaries.size() * 2);
-        for (const auto& s : summaries) post_by_read.emplace(s.read_idx, s.posterior);
+        // Deterministic per-read collapse. A multimapping read has one summary per candidate,
+        // each with its own posterior; plain emplace() kept whichever appeared first in the
+        // parallel-built summaries vector -> the kept value flipped between runs. Take the max
+        // (order-independent) so the audit posterior is reproducible. posterior is audit-only
+        // (convergence detect reads gamma/em_keep/p_damage, never posterior).
+        for (const auto& s : summaries) {
+            auto [it, ins] = post_by_read.try_emplace(s.read_idx, s.posterior);
+            if (!ins && s.posterior > it->second) it->second = s.posterior;
+        }
         for (auto& rec : dcx_recs) {
             auto it = post_by_read.find(rec.read_idx);
             rec.posterior = (it != post_by_read.end()) ? it->second : 0.0f;
@@ -4511,10 +4525,19 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             }
         }
 
+        // Total order -> byte-deterministic dcx. (target_id,tstart) alone leaves ties that
+        // std::sort (unstable) resolved by omp thread-completion order (records are merged
+        // per-thread under an omp critical at the parallel record-build), so reruns diverged:
+        // two HSPs of one read to one target share (target_id,tstart,span,strand,read_idx,
+        // candidate_rank) yet carry different scores, and swapped between runs. src_idx
+        // (source row ordinal) is globally unique -> a genuine total order. (target_id,tstart)
+        // stays primary to keep each target's records contiguous (dcx blocks split on target).
+        // Detection is order-independent, so this changes bytes only, never results.
         std::sort(dcx_recs.begin(), dcx_recs.end(),
             [](const DcxReadRec& a, const DcxReadRec& b) {
                 if (a.target_id != b.target_id) return a.target_id < b.target_id;
-                return a.tstart < b.tstart;
+                if (a.tstart != b.tstart)       return a.tstart < b.tstart;
+                return a.src_idx < b.src_idx;
             });
 
         dcx::Batch B;
