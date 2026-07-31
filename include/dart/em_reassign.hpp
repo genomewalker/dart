@@ -1113,10 +1113,13 @@ EMState squarem_em(
 // compact_em_map (fusion dual-b8247d43): the single EM solver. Decode-once CSR + fused
 // per-ref sufficient stats + deterministic-lane M-step -> bitwise-identical across thread
 // counts; ~same math as squarem_em within float reassociation (frozen-damage branch).
-// Per-read finalize callback (streaming production form of compact_em_map), invoked
-// SERIALLY in ascending read order during the single final gamma pass. ref[]/gamma[]
+// Per-read finalize callback (streaming production form of compact_em_map). ref[]/gamma[]
 // have `deg` entries; gamma_anc is non-null when params.use_damage OR
 // params.posthoc_gamma_ancient (joint / post-hoc-derived ancient responsibility).
+// compact_em_map invokes it SERIALLY in ascending read order; tape_em_core invokes it
+// CONCURRENTLY from 32 lanes, each lane in ascending read order over its own contiguous
+// range. Implementations must therefore write only per-read state indexed by r, or
+// synchronize themselves — no cross-read running state, no assumption of global order.
 using TapeFinalizeCb = std::function<void(uint32_t r, uint32_t deg,
     const uint32_t* ref, const double* gamma, const double* gamma_anc)>;
 
@@ -1163,11 +1166,21 @@ struct TapeEMResult {
 // doubles, so at 47M refs it is 32 * 47e6 * 8B =~ 11+ GiB on its own
 // (src/em_reassign.cpp:1417). Do not read "independent of alignment count"
 // as "cheap".
+// checkpoint_path (when non-empty): after the SQUAREM loop converges, the full
+// null-inclusive weight vector is written there. With resume=true an existing,
+// fingerprint-matching checkpoint is loaded and the SQUAREM loop is skipped entirely —
+// numerically neutral (the final pass is a pure function of weights, so a resumed run is
+// bit-identical to a full one). A missing/mismatched checkpoint warns and runs from
+// scratch. input_fingerprint is an opaque caller identity for the tape source (the CLI
+// passes "<emi path>:<emi size>"), hashed with num_alns/num_reads/num_refs + EM params.
 TapeEMResult tape_em_core(
     const std::string& p_ref, const std::string& p_basea, const std::string& p_basem,
     const uint64_t* read_offsets, uint32_t num_reads, uint32_t num_refs, uint64_t num_alns,
     const EMParams& params, const double* null_lp, double* gnull_out,
-    const TapeFinalizeCb& finalize_cb);
+    const TapeFinalizeCb& finalize_cb,
+    const std::string& checkpoint_path = std::string(),
+    bool resume = false,
+    const std::string& input_fingerprint = std::string());
 
 std::vector<std::pair<uint32_t, float>> reassign_reads(
     const AlignmentData& data,

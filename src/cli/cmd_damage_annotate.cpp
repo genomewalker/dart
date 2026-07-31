@@ -1373,6 +1373,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // Must be fast local NVMe supporting O_DIRECT (NOT /tmp, NOT NFS). Env fallback
     // DART_EM_TAPE_DIR; when unset the tape path errors and asks for it explicitly.
     std::string em_tape_dir;
+    // EM fixed-point checkpoint (OPT-G). Iterations only; the final tape pass always re-runs.
+    std::string em_checkpoint_path;  // --em-checkpoint; default <em_tape_dir>/dart_emtape_<pid>.ckpt
+    bool em_resume = false;          // --resume: load the checkpoint when its fingerprint matches
     uint32_t em_max_iters = 100;
     // Raw-bit temperature for the legacy (non-calibrated) real component. mmseqs
     // bit scores are log2-odds; the principled bits→nats factor is ln2≈0.693.
@@ -1611,6 +1614,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             em_max_memory_mb = static_cast<size_t>(std::stoul(argv[++i]));
         } else if (strcmp(argv[i], "--em-tape-dir") == 0 && i + 1 < argc) {
             em_tape_dir = argv[++i];
+        } else if (strcmp(argv[i], "--em-checkpoint") == 0 && i + 1 < argc) {
+            em_checkpoint_path = argv[++i];
+        } else if (strcmp(argv[i], "--resume") == 0) {
+            em_resume = true;
         } else if (strcmp(argv[i], "--gene-summary") == 0 && i + 1 < argc) {
             gene_summary_file = argv[++i];
         } else if (strcmp(argv[i], "--min-breadth") == 0 && i + 1 < argc) {
@@ -2981,7 +2988,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         // needs only ref/gamma/gamma_ancient per read, and gamma_ancient is derived in-core
         // (posthoc: gamma*sigmoid(base_a-base_m)), so NO raw {bit,aln_len,ds} tape is needed —
         // only the 3 SoA hot streams tape_em_core consumes. Nothing O(alignments) in RAM.
-        std::string tape_dir_path, p_tape_ref, p_tape_ba, p_tape_bm;
+        std::string tape_dir_path, p_tape_ref, p_tape_ba, p_tape_bm, em_input_fp;
         struct TapeDirGuard {
             std::string dir, a, b, c;
             ~TapeDirGuard() {
@@ -3017,6 +3024,15 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             // node even if it exists elsewhere — create it best-effort before the leaf.
             ::mkdir(em_tape_dir.c_str(), 0755);  // best-effort; EEXIST is fine
             tape_dir_path = em_tape_dir + "/dart_emtape_" + std::to_string(::getpid());
+            // OPT-G: default checkpoint is a SIBLING of tape_dir_path (not a child), so the
+            // TapeDirGuard that unlinks the tape does not delete it. Resume across runs needs
+            // an explicit shared --em-checkpoint (this default embeds the pid).
+            if (em_checkpoint_path.empty())
+                em_checkpoint_path = em_tape_dir + "/dart_emtape_" + std::to_string(::getpid()) + ".ckpt";
+            struct ::stat emi_st {};
+            em_input_fp = emi_file + ":" +
+                (::stat(emi_file.c_str(), &emi_st) == 0
+                     ? std::to_string(static_cast<long long>(emi_st.st_size)) : "0");
             if (::mkdir(tape_dir_path.c_str(), 0755) != 0 && errno != EEXIST) {
                 std::cerr << "Error: cannot create EM tape dir " << tape_dir_path << ": "
                           << std::strerror(errno) << "\n";
@@ -3154,9 +3170,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         // CSR + fused per-ref sufficient stats + deterministic-lane M-step -> bitwise-identical
         // across thread counts. Streaming form additionally makes gamma EM-transient.
         if (can_stream) {
-            // Per-read finalization, streamed from the EM final pass (serial, ascending read
-            // order). gamma is transient; only O(reads) results survive. Mirrors the legacy
-            // per-read loop below for the production config (null off, calib off, audit off).
+            // Per-read finalization, streamed from the EM final pass. gamma is transient;
+            // only O(reads) results survive. Mirrors the legacy per-read loop below for the
+            // production config (null off, calib off, audit off). On the tape path (OPT-F)
+            // this runs CONCURRENTLY across 32 read lanes: every write below is indexed by r
+            // (em_read_results[r], mm_pool[r]) and damage_em_active is atomic, so no lock.
             auto finalize_cb = [&](uint32_t r, uint32_t deg, const uint32_t* ref,
                                    const double* gamma, const double* gamma_anc) {
                 uint32_t em_best_ref = 0;
@@ -3217,7 +3235,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 dart::TapeEMResult res = dart::tape_em_core(
                     p_tape_ref, p_tape_ba, p_tape_bm, read_offsets.data(),
                     n_reads, n_refs, static_cast<uint64_t>(em_aln_count), em_params,
-                    nullptr, nullptr, finalize_cb);
+                    nullptr, nullptr, finalize_cb,
+                    em_checkpoint_path, em_resume, em_input_fp);
                 em_state.weights = std::move(res.weights);
                 em_state.pi = res.pi;
                 em_state.w_null = res.w_null;
@@ -4544,6 +4563,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             B.dist5.insert(B.dist5.end(), rec.dist5.begin(), rec.dist5.end());
             B.dist3.insert(B.dist3.end(), rec.dist3.begin(), rec.dist3.end());
             B.damage_class.insert(B.damage_class.end(), rec.dcls.begin(), rec.dcls.end());
+            // OPT-H2: this record's grain-B payload is now fully copied into B; free it so
+            // peak stays at ~one Batch (B) instead of dcx_recs + B simultaneously. Byte
+            // output is unchanged — B already holds the data. dcx_recs is unused hereafter.
+            rec.presence = {}; rec.ref_aa = {}; rec.obs_aa = {}; rec.obs_codon = {};
+            rec.p_damage = {}; rec.dist5 = {}; rec.dist3 = {}; rec.dcls = {};
+            rec.query_id = {}; rec.target_id = {};
         }
 
         dcx::DcxWriteOptions opt;
