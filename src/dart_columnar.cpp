@@ -126,8 +126,18 @@ bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
     if (!calibed)
         throw std::runtime_error("dcx: p_damage emitted without calib_contract_id — uncalibrated write");
 
-    std::vector<uint8_t> file;
-    file.resize(sizeof(FileHeader));  // FileHeader patched at the end
+    // OPT-H: stream blocks straight to disk instead of buffering the whole file in RAM
+    // (peak was O(total compressed output)). The byte layout is IDENTICAL — same header,
+    // same blocks, same trailer, in the same order — only WHEN bytes are written changes.
+    // The FileHeader is written twice: a zero placeholder now, then the real one via
+    // seekp(0) at the end, once n_blocks / n_records are known (as the old code patched
+    // file.data() in place).
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    size_t off = 0;
+    { const std::vector<uint8_t> hdr0(sizeof(FileHeader), 0);
+      out.write(reinterpret_cast<const char*>(hdr0.data()), std::streamsize(hdr0.size()));
+      off += hdr0.size(); }
     std::vector<BlockIndexEntry> index;
 
     // Greedy block cut: accumulate records until the raw estimate exceeds the
@@ -245,20 +255,23 @@ bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
         bh.max_target_ord = B.target_ord[hi - 1];
 
         BlockIndexEntry ie{};
-        ie.offset = file.size();
+        ie.offset = off;
         ie.compressed_sz = bh.compressed_sz; ie.raw_sz = bh.raw_sz;
         ie.n_records_a = uint32_t(nblk); ie.n_records_b = uint32_t(nB);
         ie.min_target_ord = bh.min_target_ord; ie.max_target_ord = bh.max_target_ord;
         ie.min_tstart = min_ts; ie.max_tend = max_te;
         index.push_back(ie);
 
-        put_bytes(file, &bh, sizeof(bh));
-        file.insert(file.end(), frame.begin(), frame.end());
+        out.write(reinterpret_cast<const char*>(&bh), sizeof(bh));
+        out.write(reinterpret_cast<const char*>(frame.data()), std::streamsize(frame.size()));
+        off += sizeof(bh) + frame.size();
         lo = hi;
     }
 
-    // ---- trailer index + dictionaries + footer ----
-    const uint64_t index_offset = file.size();
+    // ---- trailer index + dictionaries + footer (built in a small `tail` buffer — its
+    // size is O(n_blocks + dict) not O(records) — then streamed once) ----
+    std::vector<uint8_t> file;   // OPT-H: now holds ONLY the trailer, not the blocks
+    const uint64_t index_offset = off;
     IndexHeader ih{};
     std::memcpy(ih.magic, INDEX_MAGIC, 4);
     ih.version = VERSION_MAJOR;
@@ -323,11 +336,14 @@ bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
     fh.n_blocks = uint32_t(index.size());
     fh.n_records_a = nA; fh.n_records_b = B.ref_aa.size();
     fh.first_block_offset = sizeof(FileHeader);
-    std::memcpy(file.data(), &fh, sizeof(fh));
 
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out) return false;
+    // OPT-H: stream the trailer, then seekp(0) and overwrite the placeholder FileHeader
+    // with the real one (identical bytes to the old in-place file.data() patch).
     out.write(reinterpret_cast<const char*>(file.data()), std::streamsize(file.size()));
+    off += file.size();
+    (void)off;
+    out.seekp(0);
+    out.write(reinterpret_cast<const char*>(&fh), sizeof(fh));
     return bool(out);
 }
 
