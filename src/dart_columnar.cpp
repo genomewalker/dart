@@ -8,9 +8,15 @@
 
 #include <zstd.h>
 
+#include <algorithm>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <utility>
+#include <vector>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace dcx {
 namespace {
@@ -140,21 +146,11 @@ bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
       off += hdr0.size(); }
     std::vector<BlockIndexEntry> index;
 
-    // Greedy block cut: accumulate records until the raw estimate exceeds the
-    // cap, then cut at the next target boundary. A single oversized target is
-    // its own block.
-    size_t lo = 0;
-    while (lo < nA) {
-        size_t hi = lo;
-        size_t est = 0;
-        while (hi < nA) {
-            uint32_t pb = bytes_for_bits(B.span[hi]);
-            size_t nobs = obs_off[hi + 1] - obs_off[hi];
-            est += 12 + pb + nobs * 8;  // ~A scalars + presence + B scalars
-            ++hi;
-            bool at_boundary = (hi == nA) || (B.target_ord[hi] != B.target_ord[hi - 1]);
-            if (est >= opt.block_raw_cap && at_boundary) break;
-        }
+    // encode_block: pure per-block encode + zstd compress. Depends only on the block's
+    // own records (delta encoders reset per block) + read-only offsets, so blocks are
+    // independent and can be compressed in parallel, then flushed in order (below).
+    struct EncBlock { std::vector<uint8_t> frame; BlockHeader bh; BlockIndexEntry ie; };
+    auto encode_block = [&](size_t lo, size_t hi) -> EncBlock {
         const size_t nblk = hi - lo;
         const size_t b_lo = obs_off[lo], b_hi = obs_off[hi];
         const size_t nB = b_hi - b_lo;
@@ -255,17 +251,61 @@ bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
         bh.max_target_ord = B.target_ord[hi - 1];
 
         BlockIndexEntry ie{};
-        ie.offset = off;
         ie.compressed_sz = bh.compressed_sz; ie.raw_sz = bh.raw_sz;
         ie.n_records_a = uint32_t(nblk); ie.n_records_b = uint32_t(nB);
         ie.min_target_ord = bh.min_target_ord; ie.max_target_ord = bh.max_target_ord;
         ie.min_tstart = min_ts; ie.max_tend = max_te;
-        index.push_back(ie);
 
-        out.write(reinterpret_cast<const char*>(&bh), sizeof(bh));
-        out.write(reinterpret_cast<const char*>(frame.data()), std::streamsize(frame.size()));
-        off += sizeof(bh) + frame.size();
-        lo = hi;
+        EncBlock eb;
+        eb.frame = std::move(frame);
+        eb.bh = bh;
+        eb.ie = ie;   // ie.offset filled during the ordered flush below
+        return eb;
+    };
+
+    // Greedy block cut (serial, deterministic — the only cross-block dependency): accumulate
+    // records until the raw estimate exceeds the cap, then cut at the next target boundary.
+    // A single oversized target is its own block. Identical cut to the pre-parallel writer.
+    std::vector<std::pair<size_t, size_t>> bounds;
+    { size_t lo = 0;
+      while (lo < nA) {
+          size_t hi = lo, est = 0;
+          while (hi < nA) {
+              uint32_t pb = bytes_for_bits(B.span[hi]);
+              size_t nobs = obs_off[hi + 1] - obs_off[hi];
+              est += 12 + pb + nobs * 8;  // ~A scalars + presence + B scalars
+              ++hi;
+              bool at_boundary = (hi == nA) || (B.target_ord[hi] != B.target_ord[hi - 1]);
+              if (est >= opt.block_raw_cap && at_boundary) break;
+          }
+          bounds.emplace_back(lo, hi);
+          lo = hi;
+      } }
+
+    // Parallel encode+compress, flushed strictly in block order through a bounded window of
+    // K blocks. Byte-identical to the serial writer (blocks independent, zstd deterministic,
+    // frames written in order); peak stays ~K blocks so OPT-H's memory cap is preserved.
+#ifdef _OPENMP
+    const int K = std::max(1, omp_get_max_threads());
+#else
+    const int K = 1;
+#endif
+    const size_t win_sz = std::min(size_t(K), bounds.size() ? bounds.size() : size_t(1));
+    std::vector<EncBlock> win(win_sz);
+    for (size_t c = 0; c < bounds.size(); c += size_t(K)) {
+        const size_t ce = std::min(c + size_t(K), bounds.size());
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (size_t bi = c; bi < ce; ++bi)
+            win[bi - c] = encode_block(bounds[bi].first, bounds[bi].second);
+        for (size_t bi = c; bi < ce; ++bi) {
+            EncBlock& eb = win[bi - c];
+            eb.ie.offset = off;
+            index.push_back(eb.ie);
+            out.write(reinterpret_cast<const char*>(&eb.bh), sizeof(eb.bh));
+            out.write(reinterpret_cast<const char*>(eb.frame.data()), std::streamsize(eb.frame.size()));
+            off += sizeof(eb.bh) + eb.frame.size();
+            std::vector<uint8_t>().swap(eb.frame);
+        }
     }
 
     // ---- trailer index + dictionaries + footer (built in a small `tail` buffer — its
