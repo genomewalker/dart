@@ -197,6 +197,36 @@ inline std::vector<char> read_chunk(const char* base, uint64_t& off) {
     return out;
 }
 
+// pread the same self-delimiting chunk from a file descriptor at absolute offset `off`
+// (advances off), instead of dereferencing a whole-file mmap. Byte-identical decode to
+// read_chunk() — same [codec:1][raw:8][comp:8] header + zd() — but NFS/network-safe under
+// heavy concurrency: mmapping a 300-500 GB emi and faulting it from many threads SIGBUSes,
+// while pread() reads through the page cache with no faulting SIGBUS surface.
+inline void pread_exact(int fd, void* dst, size_t n, uint64_t off) {
+    char* p = static_cast<char*>(dst);
+    while (n) {
+        ssize_t r = ::pread(fd, p, n, static_cast<off_t>(off));
+        if (r < 0) { if (errno == EINTR) continue; throw std::runtime_error(std::string("pread: ") + std::strerror(errno)); }
+        if (r == 0) throw std::runtime_error("pread: unexpected EOF");
+        p += r; n -= static_cast<size_t>(r); off += static_cast<uint64_t>(r);
+    }
+}
+inline std::vector<char> pread_chunk(int fd, uint64_t& off) {
+    unsigned char hdr[17];
+    pread_exact(fd, hdr, sizeof(hdr), off);
+    uint8_t codec = hdr[0];
+    uint64_t raw, comp;
+    std::memcpy(&raw,  hdr + 1, 8);
+    std::memcpy(&comp, hdr + 9, 8);
+    off += 17;
+    if (raw == 0) return {};
+    std::vector<char> payload(comp);
+    pread_exact(fd, payload.data(), comp, off);
+    off += comp;
+    if (codec == static_cast<uint8_t>(Codec::NONE)) { payload.resize(raw); return payload; }
+    return zd(payload.data(), comp, raw);
+}
+
 // Materialize ONE read-aligned block's column chunks (hot then cold, exact chunk
 // order the reader's decode_block expects) and append them to block_bytes. Shared
 // by the in-RAM Writer and the streaming merge so block payload bytes are
@@ -284,6 +314,7 @@ public:
 
     const char* data() const { return data_; }
     size_t size() const { return size_; }
+    int fd() const { return fd_; }   // for NFS-safe pread() of block chunks (bypasses the mmap)
 
     // Drop every resident page of the mapping. MADV_DONTNEED on a read-only
     // MAP_PRIVATE file mapping unmaps the pages (a later access re-faults them from
@@ -658,10 +689,15 @@ private:
         uint64_t o = blocks_[bidx].chunks_offset;
         const BlockMeta& bm = blocks_[bidx];
         BlockDecoded d; d.n = bm.num_rows; d.first_read = bm.first_read_idx;
-        auto take_u32 = [&](std::vector<uint32_t>& v, uint32_t n){ auto c=detail::read_chunk(buf_.data(),o); v.assign((uint32_t*)c.data(),(uint32_t*)c.data()+n); };
-        auto take_f = [&](std::vector<float>& v, uint32_t n){ auto c=detail::read_chunk(buf_.data(),o); v.assign((float*)c.data(),(float*)c.data()+n); };
-        auto take_u16 = [&](std::vector<uint16_t>& v, uint32_t n){ auto c=detail::read_chunk(buf_.data(),o); v.assign((uint16_t*)c.data(),(uint16_t*)c.data()+n); };
-        auto take_str = [&](std::string& s){ auto c=detail::read_chunk(buf_.data(),o); s.assign(c.data(),c.size()); };
+        // pread (NOT the mmap): this runs in the 32-thread parallel record-build scan, and
+        // faulting the whole-emi network mmap from many threads SIGBUSes. o is an absolute
+        // file offset, so pread_chunk decodes byte-identically. (hot_block / construction stay
+        // on the mmap: single-threaded or low-contention, and empirically crash-free.)
+        const int efd = buf_.fd();
+        auto take_u32 = [&](std::vector<uint32_t>& v, uint32_t n){ auto c=detail::pread_chunk(efd,o); v.assign((uint32_t*)c.data(),(uint32_t*)c.data()+n); };
+        auto take_f = [&](std::vector<float>& v, uint32_t n){ auto c=detail::pread_chunk(efd,o); v.assign((float*)c.data(),(float*)c.data()+n); };
+        auto take_u16 = [&](std::vector<uint16_t>& v, uint32_t n){ auto c=detail::pread_chunk(efd,o); v.assign((uint16_t*)c.data(),(uint16_t*)c.data()+n); };
+        auto take_str = [&](std::string& s){ auto c=detail::pread_chunk(efd,o); s.assign(c.data(),c.size()); };
         take_u32(d.ref, d.n); take_f(d.bit, d.n); take_f(d.dmg, d.n);
         take_f(d.ev, d.n);
         take_u16(d.iq, d.n); take_u16(d.al, d.n); take_u16(d.qs, d.n); take_u16(d.qe, d.n);
