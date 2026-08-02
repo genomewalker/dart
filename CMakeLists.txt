@@ -237,6 +237,9 @@ set(DART_SUBCOMMAND_SOURCES
     src/cli/cmd_damage_info.cpp       # cmd_damage_info
     src/cli/cmd_damage_profile.cpp    # cmd_damage_profile
     src/cli/cmd_hits2emi.cpp          # hits2emi (TSV to columnar)
+    src/cli/cmd_hits2emi_stream.cpp   # hits2emi-stream (mmseqs DB chunks -> one .emi)
+    src/cli/cmd_emi_merge.cpp         # emi-merge (union resolved emis for joint EM)
+    src/cli/cmd_emi_verify.cpp        # emi-verify (no dup read,target pairs; count integrity)
     src/cli/cmd_simulate.cpp          # simulate (synthetic damage reads)
     src/cli/cmd_eval.cpp              # eval (benchmark accuracy vs truth TSV)
     src/cli/cmd_fit_calib.cpp         # fit-calib (f_true + f_0 coherent-LR model)

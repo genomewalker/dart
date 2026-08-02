@@ -29,6 +29,7 @@
 #include <vector>
 #include <algorithm>
 #include <functional>
+#include <thread>
 
 namespace dart {
 namespace emiv7 {
@@ -116,6 +117,60 @@ inline std::vector<char> encode_name_dict(const std::vector<std::string>& names,
     return sec;
 }
 
+// Parallel, arena-based twin of encode_name_dict(): names are given as a flat byte
+// `arena` plus an `off` table (name k = arena[off[k] .. off[k+1])). Front-coding
+// restarts at every block boundary (shared=0 forced by `i != s`), so blocks are
+// independent decode/encode units -> the zstd-19 per-block compression fans out
+// across threads. Output bytes are IDENTICAL to encode_name_dict() fed the same
+// names in the same order (same block boundaries, same front-coding, same level-19,
+// same use-if-smaller rule, same dir/body assembly order).
+inline std::vector<char> encode_name_dict_arena(const char* arena, const uint64_t* off,
+                                                uint32_t n, uint32_t block_size, int nthreads) {
+    const uint32_t nblk = (n && block_size) ? (n + block_size - 1) / block_size : 0;
+    std::vector<std::vector<char>> payload(nblk);
+    std::vector<uint32_t> rawsz(nblk, 0), compsz(nblk, 0);
+    auto do_blk = [&](uint32_t b) {
+        uint32_t s = b * block_size, e = std::min(s + block_size, n);
+        std::vector<char> raw;
+        std::string_view prev;
+        for (uint32_t i = s; i < e; ++i) {
+            std::string_view cur(arena + off[i], (size_t)(off[i + 1] - off[i]));
+            uint16_t shared = 0;
+            if (i != s) {
+                size_t m = std::min(prev.size(), cur.size());
+                while (shared < m && shared < 0xFFFF && prev[shared] == cur[shared]) shared++;
+            }
+            uint16_t suf = static_cast<uint16_t>(cur.size() - shared);
+            put(raw, shared); put(raw, suf);
+            raw.insert(raw.end(), cur.begin() + shared, cur.end());
+            prev = cur;
+        }
+        auto c = zc(raw.data(), raw.size(), 19);
+        bool use = c.size() < raw.size();
+        rawsz[b] = (uint32_t)raw.size();
+        compsz[b] = use ? (uint32_t)c.size() : (uint32_t)raw.size();
+        payload[b] = use ? std::move(c) : std::move(raw);
+    };
+    const int T = std::max(1, std::min<int>(nthreads, (int)std::max<uint32_t>(1, nblk)));
+    std::atomic<uint32_t> next{0};
+    std::vector<std::thread> pool;
+    for (int t = 0; t < T; ++t)
+        pool.emplace_back([&] { uint32_t b; while ((b = next.fetch_add(1)) < nblk) do_blk(b); });
+    for (auto& th : pool) th.join();
+    std::vector<char> body; std::vector<NameBlockDir> dir(nblk);
+    for (uint32_t b = 0; b < nblk; ++b) {
+        dir[b] = NameBlockDir{ body.size(), rawsz[b], compsz[b] };
+        body.insert(body.end(), payload[b].begin(), payload[b].end());
+    }
+    std::vector<char> sec;
+    put<uint32_t>(sec, n);
+    put<uint32_t>(sec, block_size);
+    put<uint32_t>(sec, nblk);
+    for (auto& d : dir) { put(sec, d.off); put(sec, d.raw); put(sec, d.comp); }
+    sec.insert(sec.end(), body.begin(), body.end());
+    return sec;
+}
+
 // Cache identity for the thread_local caches below. A `this` pointer is NOT usable
 // as a key: an object can be freed and a new one allocated at the same address, and
 // the cache would then serve the previous file's data. Values are never reused.
@@ -147,6 +202,31 @@ public:
         static thread_local uint32_t tblk = 0xFFFFFFFF;
         if (owner != uid_ || tblk != b) { decode_block(b, tnames); owner = uid_; tblk = b; }
         return tnames[i - b * block_size_];
+    }
+    // ---- bulk/parallel decode support (byte-for-byte the same names as name(),
+    // but never constructs a vector<std::string> and never touches the thread_local
+    // single-block cache). Contiguous block ranges on DISJOINT (arena,off) pairs are
+    // race-free, so a caller can decode the whole dict in parallel without triggering
+    // the one-block-cache thrash that per-name random access would cause. ----
+    uint32_t dict_size() const { return n_; }
+    uint32_t dict_block_size() const { return block_size_; }
+    uint32_t dict_blocks() const { return (uint32_t)dir_.size(); }
+    // Decode block b, appending each name's bytes to `arena` and pushing each name's
+    // END offset (arena.size() after the append) to `off`.
+    void decode_block_bytes(uint32_t b, std::vector<char>& arena, std::vector<uint64_t>& off) const {
+        const NameBlockDir& d = dir_[b];
+        std::vector<char> cache;
+        if (d.comp == d.raw) cache.assign(body_ + d.off, body_ + d.off + d.raw);
+        else cache = zd(body_ + d.off, d.comp, d.raw);
+        uint64_t o = 0; std::string prev;
+        while (o < cache.size()) {
+            uint16_t shared = get<uint16_t>(cache.data(), o);
+            uint16_t suf = get<uint16_t>(cache.data(), o);
+            prev.resize(shared);                 // keep shared-prefix bytes of previous name
+            prev.append(cache.data() + o, suf); o += suf;
+            arena.insert(arena.end(), prev.begin(), prev.end());
+            off.push_back((uint64_t)arena.size());
+        }
     }
 private:
     void decode_block(uint32_t b, std::vector<std::string>& out) const {
@@ -555,6 +635,8 @@ public:
     const EmiReadAnnot& annot(uint32_t read) const { return annots_[read]; }
     std::string read_name(uint32_t read) const { return read_dict_.name(read); }
     std::string ref_name(uint32_t ref) const { return ref_dict_.name(ref); }
+    const detail::NameDict& read_dict() const { return read_dict_; }
+    const detail::NameDict& ref_dict() const { return ref_dict_; }
 
     // ---- ColumnarIndexReader-compatible surface (annotate reads v7 directly) ----
     uint32_t num_row_groups() const { return h_.num_blocks; }

@@ -50,6 +50,8 @@ int cmd_profile(int argc, char* argv[]);
 int cmd_damage_annotate(int argc, char* argv[]);
 int cmd_damage_profile(int argc, char* argv[]);
 int cmd_hits2emi(int argc, char* argv[]);
+int cmd_hits2emi_stream(int argc, char* argv[]);
+int cmd_emi_merge(int argc, char* argv[]);
 int cmd_simulate(int argc, char* argv[]);
 
 }  // namespace cli
