@@ -2134,9 +2134,23 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         uint8_t  candidate_rank = 0;
     };
     std::vector<BestHitData> best_hits(n_reads);
-    // Per-read top-K-by-bits candidate POOL for --emit-multimap (metadata is only
-    // available here in the scan). gamma is joined post-EM, then filtered rank<K & gamma>floor.
-    std::vector<std::vector<BestHitData>> mm_pool;
+    // Per-read top-K-by-bits candidate POOL for --emit-multimap. Slim element: only the
+    // trim key (bits), the row locators (ref_idx/best_rg/best_row) and the post-EM gamma
+    // join are retained per candidate; every column-derived field (fident/evalue/qstart/
+    // tstart/qlen/tlen/damage_score) is re-fetched byte-identically in the annotation scan
+    // (which already re-visits these row groups). This drops the pooled element ~68->~28 B,
+    // turning the O(n_reads * soft_cap) resident pool from the peak-RSS driver (measured
+    // 150-260 GB at 98M reads) into a fraction of that. gamma is joined post-EM, then the
+    // pool is filtered rank<K & gamma>floor.
+    struct MmCand {
+        float    bits = 0.0f;                   // scan-time top-K-by-bits trim key
+        uint32_t ref_idx = 0;                   // finalize one-HSP-per-ref dedup + target_id
+        uint32_t best_rg = UINT32_MAX;
+        uint32_t best_row = UINT32_MAX;
+        float    gamma = 0.0f, gamma_ancient = 0.0f;  // EM-derived, joined post-EM
+        uint8_t  candidate_rank = 0;            // assigned 0..k-1 by gamma at finalize
+    };
+    std::vector<std::vector<MmCand>> mm_pool;
     if (emit_multimap) mm_pool.assign(n_reads, {});
     const bool need_unique_degree = !blast8_unique_file.empty();
     std::vector<uint32_t> read_degree;
@@ -2310,7 +2324,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         std::unordered_map<uint32_t, BestHitCandidate> local_best_unsorted;
         // --emit-multimap: collect EVERY passing (read,ref) candidate (not collapsed to
         // argmax) so the pool can keep the true top-K; merged into mm_pool after the loop.
-        std::vector<std::pair<uint32_t, BestHitData>> local_mm;
+        std::vector<std::pair<uint32_t, MmCand>> local_mm;
         if (local_sorted_hits) {
             local_best_sorted.reserve(std::max<uint32_t>(1, num_rows / 8));
         } else {
@@ -2381,12 +2395,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             const uint16_t aln_len_v = aln_len[i];
 
             if (emit_multimap) {
-                BestHitData d;
-                d.has = true; d.bits = bits; d.ref_idx = tidx;
-                d.damage_score = std::clamp(damage_score[i], 0.0f, 1.0f);
-                d.fident = fident; d.evalue = std::pow(10.0f, evalue_log10_row);
-                d.qstart_0 = qstart_0; d.tstart_0 = tstart_0; d.qlen = qlen_v; d.tlen = tlen_v;
-                d.aln_len_on_target = static_cast<uint32_t>(aln_len_v);
+                // Slim pooled candidate: only trim key + locators. The column-derived
+                // metadata (fident/evalue/qstart/tstart/qlen/tlen/damage_score) is re-read
+                // byte-identically from (best_rg,best_row) in the annotation scan below.
+                MmCand d;
+                d.bits = bits; d.ref_idx = tidx;
                 d.best_rg = rg_idx; d.best_row = i;
                 local_mm.emplace_back(ridx, d);
             }
@@ -2558,7 +2571,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 pool.push_back(kv.second);
                 if (pool.size() > soft_cap) {  // keep memory bounded; final top-K taken post-EM
                     std::sort(pool.begin(), pool.end(),
-                              [](const BestHitData& a, const BestHitData& b) { return a.bits > b.bits; });
+                              [](const MmCand& a, const MmCand& b) { return a.bits > b.bits; });
                     pool.resize(static_cast<size_t>(std::max(1, multimap_k)));
                 }
             }
@@ -3584,7 +3597,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         // from the kept candidates. best_rows was built pre-EM from the argmax; the gamma
         // top-K is only known now. mm_row_cand maps (rg,row)->candidate for the annotation
         // loop. best_rows / selected_row_groups are consumed ONLY in the scan below.
-        std::unordered_map<uint64_t, const BestHitData*> mm_row_cand;
+        std::unordered_map<uint64_t, const MmCand*> mm_row_cand;
         if (emit_multimap) {
             for (auto& rg : best_rows_by_rg) rg.clear();
             selected_row_groups.clear();
@@ -3596,8 +3609,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 auto& pool = mm_pool[r];
                 if (pool.empty()) continue;
                 std::sort(pool.begin(), pool.end(),
-                          [](const BestHitData& a, const BestHitData& b) { return a.gamma > b.gamma; });
-                std::vector<BestHitData> kept;
+                          [](const MmCand& a, const MmCand& b) { return a.gamma > b.gamma; });
+                std::vector<MmCand> kept;
                 std::unordered_set<uint32_t> seen_ref;
                 for (auto& c : pool) {
                     if (c.gamma <= floorv) break;                       // gamma-sorted desc
@@ -3620,22 +3633,35 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         }
 
         if (selected_best_hits > 0) {
-            reader.set_columns({dart::ColumnID::QALN, dart::ColumnID::TALN});
+            // --emit-multimap re-fetches the slim pool's column-derived metadata here (it was
+            // dropped from MmCand to bound peak RSS), so the selected scan must load those
+            // numeric columns alongside QALN/TALN. The non-multimap path keeps the lean
+            // QALN/TALN set (best_hits still carries full metadata).
+            if (emit_multimap)
+                reader.set_columns({dart::ColumnID::QALN, dart::ColumnID::TALN,
+                                    dart::ColumnID::DAMAGE_SCORE, dart::ColumnID::EVALUE_LOG10,
+                                    dart::ColumnID::IDENTITY_Q, dart::ColumnID::QSTART,
+                                    dart::ColumnID::TSTART, dart::ColumnID::TLEN,
+                                    dart::ColumnID::QLEN});
+            else
+                reader.set_columns({dart::ColumnID::QALN, dart::ColumnID::TALN});
 
             reader.parallel_scan_selected(selected_row_groups, [&](
                 uint32_t rg_idx, uint32_t num_rows,
                 const uint32_t*, const uint32_t*,
-                const float*, const float*, const float*,
+                const float*, const float* mm_damage_score, const float* mm_evalue_log10,
                 const uint16_t*, const uint16_t*,
                 const float*, const float*,
-                const uint16_t*, const uint16_t*,
-                const uint16_t*, const uint16_t*,
-                const uint16_t*, const uint16_t*,
-                const uint16_t*, const uint16_t*,
+                const uint16_t* mm_identity_q, const uint16_t*,
+                const uint16_t* mm_qstart, const uint16_t*,
+                const uint16_t* mm_tstart, const uint16_t*,
+                const uint16_t* mm_tlen, const uint16_t* mm_qlen,
                 const uint16_t*, const uint16_t*)
             {
                 const auto& rows = best_rows_by_rg[rg_idx];
                 if (rows.empty()) return;
+                if (emit_multimap && (!mm_damage_score || !mm_evalue_log10 || !mm_identity_q ||
+                                      !mm_qstart || !mm_tstart || !mm_tlen || !mm_qlen)) return;
 
                 // Parallel annotation within this row group.
                 // string_view references into the mmap are valid until MADV_DONTNEED fires
@@ -3659,7 +3685,27 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                             auto itc = mm_row_cand.find(
                                 (static_cast<uint64_t>(rg_idx) << 32) | row_in_group);
                             if (itc == mm_row_cand.end()) continue;
-                            mm_cand = *itc->second;
+                            const MmCand& mc = *itc->second;
+                            // Reconstruct the column-derived fields dropped from the slim pool,
+                            // using the SAME expressions as the pre-EM fill so emitted bytes are
+                            // identical. row_in_group indexes this row group's column arrays.
+                            mm_cand.has = true;
+                            mm_cand.bits = mc.bits;
+                            mm_cand.ref_idx = mc.ref_idx;
+                            mm_cand.best_rg = mc.best_rg;
+                            mm_cand.best_row = mc.best_row;
+                            mm_cand.gamma = mc.gamma;
+                            mm_cand.gamma_ancient = mc.gamma_ancient;
+                            mm_cand.candidate_rank = mc.candidate_rank;
+                            mm_cand.damage_score = std::clamp(mm_damage_score[row_in_group], 0.0f, 1.0f);
+                            mm_cand.fident = static_cast<float>(mm_identity_q[row_in_group]) / 65535.0f;
+                            mm_cand.evalue = std::pow(10.0f, mm_evalue_log10[row_in_group]);
+                            mm_cand.qstart_0 = (mm_qstart[row_in_group] > 0)
+                                ? static_cast<uint32_t>(mm_qstart[row_in_group] - 1) : 0u;
+                            mm_cand.tstart_0 = (mm_tstart[row_in_group] > 0)
+                                ? static_cast<uint32_t>(mm_tstart[row_in_group] - 1) : 0u;
+                            mm_cand.qlen = static_cast<uint32_t>(mm_qlen[row_in_group]);
+                            mm_cand.tlen = static_cast<uint32_t>(mm_tlen[row_in_group]);
                             hitp = &mm_cand;
                         }
                         BestHitData& hit = *hitp;
