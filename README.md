@@ -10,7 +10,7 @@ DART translates ancient DNA (aDNA) reads into proteins for functional annotation
 ## Overview
 
 <p align="center">
-<img src="docs/agp_pipeline.svg" width="700" alt="AGP pipeline: three-row overview">
+<img src="docs/agp_pipeline.svg" width="700" alt="DART pipeline: three-row overview">
 </p>
 
 The pipeline runs in three stages. **Pass 1** scans all reads to measure the sample's damage level. **Pass 2** translates reads into proteins using that damage estimate to rescue genes that would otherwise be missed. **Functional annotation** searches those proteins against databases and scores each hit for authentic ancient damage.
@@ -19,301 +19,160 @@ Post-mortem deamination converts cytosines to uracil (read as T), producing C→
 
 ---
 
+> **Status as of 2026-10-16** (`main`, unreleased since v1.1.0). Adds `ref-stats`, the joint EMI
+> pipeline (`hits2emi-stream`, `emi-merge`, `emi-verify`), `simulate`, `eval` and `fit-calib`.
+> EMI files are v7 (`hits2emi` writes it; older `.emi` files must be rebuilt). `predict` and
+> `damage-annotate` now require explicit choices for the damage profile, the EM null model and the
+> EM tape directory (see [Required choices](#required-choices)).
+
 ## Installation
 
-Requires C++20 compiler (GCC 10+ or Clang 12+), CMake 3.18+, zlib, and zstd.
-
-The easiest way to get all build dependencies is via conda:
+Requires a C++20 compiler (GCC 10+ or Clang 12+), CMake 3.18+, zlib, zstd, ISA-L, NASM and
+pkg-config. With conda:
 
 ```bash
 conda env create -f environment.yml
 conda activate dart
 ```
 
-Then build:
+Or with system packages: `apt install zlib1g-dev libzstd-dev libisal-dev nasm pkg-config`
+(macOS: `brew install zstd isa-l nasm pkg-config`). Then:
 
 ```bash
 git clone https://github.com/genomewalker/dart.git
 cd dart
-mkdir build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release ..
-make -j$(nproc)
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
 ```
+
+DART's damage estimates come from [libtaph](https://github.com/genomewalker/libtaph), pinned to an
+exact commit. If a local checkout exists at `$REPOS/libtaph` (or `-DLIBTAPH_LOCAL_PATH=...`), it
+must be at the pinned commit and clean, otherwise configure fails. With no local checkout, CMake
+fetches the pinned commit from GitHub. `dart --version` prints the libtaph SHA.
 
 ---
 
 ## Quick start
 
-### 5-minute tutorial run (recommended)
-
-DART ships a reproducible tutorial in `examples/tutorial/` with 50,000 synthetic KapK ancient reads and a matched reference protein subset:
+DART ships a reproducible tutorial: 50,000 synthetic ancient DNA reads and the matched reference
+proteins.
 
 ```bash
 cd examples/tutorial
 DART=../../build/dart DB=./ref_proteins.faa.gz bash run_tutorial.sh
 ```
 
-The four pipeline stages:
+It runs the four stages below in about 50 s and should end with:
 
-```bash
-# 1) Predict genes + AGD damage index
-dart predict -i reads.fq.gz -o out/predictions.gff \
-  --fasta-aa out/proteins.faa --damage-index out/predictions.agd --adaptive -t 8
 ```
-```
-DART v0.4.0
-Input: reads.fq.gz  |  Domain: gtdb  |  Threads: 8
-
-[Pass 1] Scanning for damage patterns...
-  Reads: 50000 | 5' damage: 28.6% | 3' damage: 26.3% | 4.1 s
-
-[Pass 2] Gene prediction...
-  Damage index: 192449 records
-  Sequences: 50000 | Genes: 192449 | 2.0 s (25062 seq/s)
-
-Done. Total runtime: 6.1 s
+Predicted genes:          147871
+MMseqs2 hits:             45714
+Damage-annotated reads:   8500
+Ancient (posterior≥0.5):  6704
 ```
 
 ```bash
-# 2) Search against reference proteins (VTML20 optimised for aDNA)
+# 1) Predict genes + damage index
+dart predict -i reads.fq.gz -o out/predictions.gff --fasta-aa out/proteins.faa \
+  --damage-index out/predictions.agd --allow-self-profile -t 16
+
+# 2) Search against reference proteins (VTML20 for short aDNA peptides)
 mmseqs easy-search out/proteins.faa ref_proteins.faa.gz out/hits.tsv out/tmp \
   --search-type 1 --min-length 12 -e 10.0 --min-seq-id 0.86 -c 0.65 --cov-mode 2 \
-  --sub-mat VTML20.out --seed-sub-mat VTML20.out \
+  --sub-mat data/VTML20.out --seed-sub-mat data/VTML20.out \
   -s 2 -k 6 --spaced-kmer-pattern 11011101 \
   --format-output "query,target,fident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits,qlen,tlen,qaln,taln" \
-  --threads 8
-```
-```
-[=================================================================] 185.1K  ~10 s
-Time for merging to hits.tsv: 0h 0m 0s 267ms
-```
+  --threads 16
 
-```bash
-# 3) Build EMI index
-dart hits2emi -i out/hits.tsv -o out/hits.emi --damage-index out/predictions.agd -t 8
-```
-```
-Lines: 46628 (scan: 3 ms), building dictionary...
-  Embedded per-read damage scores  |  d_max=25.1%  lambda=0.424
-  Dictionary: 133 ms (22367 reads, 13681 refs, 8 threads)
-Parsed: 46628 rows in 249 ms  |  Written: out/hits.emi  |  Total: 298 ms
-```
+# 3) Build the EMI v7 index
+dart hits2emi -i out/hits.tsv -o out/hits.emi --damage-index out/predictions.agd -t 16
 
-```bash
-# 4) Damage annotation
+# 4) EM assignment + damage annotation
 dart damage-annotate --emi out/hits.emi --damage-index out/predictions.agd \
-  -o out/annotated.tsv --gene-summary out/gene_summary.tsv --auto-calibrate-spurious -t 8
-```
-```
-Loaded damage index: 192449 records  |  d_max: 25.1%  |  lambda: 0.424
-EMI: 46628 alignments, 22367 reads, 13681 refs
-EM converged in 8 iterations
-  Unique mappers: 13011  |  Multi-mappers: 9356  |  Reassigned: 8.1%
-Reads with damage-consistent sites: 5962  |  Total sites: 6722
-Auto-calibration (n=397 genes): min_positional_score=0.786
-Gene summary: 591/7645 genes after filtering
-Summary: assigned_reads=21819, mismatch_reads=8624, reads_with_damage_sites=5962
-Runtime: 186 ms
+  -o out/annotated.tsv --gene-summary out/gene_summary.tsv \
+  --auto-calibrate-spurious --no-null --em-tape-dir out/em_tape -t 16
 ```
 
-Use `--fasta-aa-masked` instead of `--fasta-aa` to replace damage-induced stop codons with X so MMseqs2 can align across them.
+The step-by-step walkthrough with real output is on the wiki:
+[Quick Start Tutorial](https://github.com/genomewalker/dart/wiki/Quick-Start-Tutorial).
+Use `--fasta-aa-masked` instead of `--fasta-aa` to replace damage-induced stop codons with `X` so
+MMseqs2 can align across them.
 
-### Sample damage assessment only
+### Required choices
+
+| Command | You must pass | Why |
+|---------|---------------|-----|
+| `predict` | `--library-profile FILE` (fqdup library damage summary) or `--allow-self-profile` | Self-profiling is unreliable on deduplicated libraries |
+| `damage-annotate` | `--em-null-model FILE` (fit with `--fit-null-from decoys.tsv`) or `--no-null` | Without a null model, reads from proteins absent from the database are force-mapped to the nearest homolog |
+| `damage-annotate` (with `--no-null`) | `--em-tape-dir DIR` or `DART_EM_TAPE_DIR` | Without a null or calibration model, EM streams from an `O_DIRECT` tape; use node-local disk, not tmpfs. With `--em-null-model` EM runs in memory and needs no tape. |
+
+The tutorial uses `--allow-self-profile` and `--no-null` because it has no library profile and its
+reference contains exactly the proteins the reads hit.
+
+### Damage profile only
 
 ```bash
-dart sample-damage reads.fq.gz
+dart profile reads.fq.gz -o profile.json
 ```
-
-Output (JSON):
-```json
-{
-  "version": "0.4.0",
-  "input": "reads.fq.gz",
-  "domain": "gtdb",
-  "sequences": 50000,
-  "damage": {
-    "level": "HIGH DAMAGE",
-    "d_max": 16.3,
-    "lambda_5prime": 0.480,
-    "lambda_3prime": 0.480,
-    "damage_validated": true,
-    "library_type": "double-stranded"
-  }
-}
-```
-
-`d_max` values are reported as percentages (0–100).
 
 ---
 
 ## Commands
 
-### `dart predict`
+| Command | Purpose |
+|---------|---------|
+| `predict` | Gene prediction + damage index (`.agd`) from reads |
+| `profile` (`damage`) | Reference-free damage profile (JSON) |
+| `hits2emi` | MMseqs2 16-column TSV → EMI v7 |
+| `hits2emi-stream` | MMseqs2 result DBs → one EMI v7, streaming, for production-size searches |
+| `emi-merge` | Union EMI v7 files over the same reads for joint EM across databases |
+| `emi-verify` | Check EMI v7 invariants before annotation |
+| `damage-annotate` | EM read assignment, per-read damage posteriors, per-protein authentication |
+| `ref-stats` | Per-reference breadth, depth and identity for one sample (`--trim` for x-filter-comparable breadth) |
+| `damage-info` | Print the damage profile stored in an `.agd` |
+| `simulate` | Synthetic aDNA reads (Briggs model) with ground truth |
+| `eval` | Score `predict` against `simulate` truth |
+| `fit-calib` | Fit the coherent-LR EM calibration model from a labelled search |
+| `damage-profile` | Terminal nucleotide profiles of protein-mapped reads |
+| `validate` | Validate predictions against aMGSIM ground truth |
 
-Translates reads into proteins with damage-aware frame selection.
+Every flag is documented in the
+[Command Reference](https://github.com/genomewalker/dart/wiki/Command-Reference).
 
-```
-Usage: dart predict -i <input> -o <output> [options]
-
-Required:
-  -i, --input FILE       Input FASTQ/FASTA (gzip supported)
-  -o, --output FILE      Output GFF3
-
-Output:
-  --fasta-aa FILE        Protein sequences (observed translation)
-  --fasta-aa-masked FILE Protein sequences (damage stops masked as X)
-  --fasta-nt FILE        Nucleotide sequences
-  --damage-index FILE    Binary index for damage-annotate (.agd)
-  --summary FILE         Sample statistics (JSON)
-
-Parameters:
-  --adaptive             Adaptive damage correction (recommended)
-  --domain NAME          Taxonomic domain: gtdb, fungi, plant, protozoa,
-                         invertebrate, viral (default: gtdb)
-  --orf-min-aa N         Minimum protein length (default: 10)
-  -t, --threads N        Thread count (default: auto)
-```
-
-### `dart sample-damage`
-
-Estimates sample-wide damage rate without gene prediction.
-
-```
-Usage: dart sample-damage <input.fq> [options]
-
-Output fields:
-  damage.d_max               Maximum damage rate at read termini (percent, 0-100)
-  damage.lambda_5prime / lambda_3prime
-                             Exponential decay constants
-  damage.damage_validated    True if damage confirmed by stop codon signal
-  damage.library_type        single-stranded or double-stranded
-```
-
-### `dart hits2emi`
-
-Converts MMseqs2 hit TSV into DART EMI (columnar) with alignment strings required by `damage-annotate`.
-
-```
-Usage: dart hits2emi -i <hits.tsv[.gz]> -o <hits.emi> [options]
-
-Required:
-  -i, --tsv FILE         MMseqs2 16-column hits TSV (plain or gz)
-  -o, --output FILE      Output EMI file
-
-Options:
-  -t, --threads N        Thread count (default: all available)
-  -m, --memory SIZE      Memory budget with K/M/G/T suffix (default: 10% available RAM)
-  --streaming            Force streaming mode
-  --damage-index FILE    Optional AGD; embeds per-read damage probability into EMI
-  --d-max FLOAT          Store sample d_max in EMI metadata
-  --lambda FLOAT         Store decay lambda in EMI metadata
-```
-
-### `dart damage-annotate`
-
-Annotates database hits with per-protein damage evidence. Compares observed proteins to reference proteins to identify damage-consistent amino acid substitutions (R→W, H→Y, Q→*, etc.).
-
-```
-Usage: dart damage-annotate --emi <hits.emi> -o <output.tsv> [options]
-
-Required:
-  --emi FILE             EMI index from `dart hits2emi` (with qaln/taln)
-
-Optional:
-  -t, --threads INT      OpenMP threads for EMI scans
-  --protein-summary FILE Per-protein aggregated statistics
-  --protein-filtered FILE Per-protein subset that passes mapping-pattern filters
-  --combined-output FILE Per-target combined protein+gene summary
-  --blast8-unique FILE   BLAST8-like export with unique mappers only
-  --analysis-prefix STR  Output prefix: .reads.tsv, .protein.tsv, .blast8.unique.tsv,
-                         and .categories.tsv (if --map is provided)
-  --gene-summary FILE    Per-protein/gene mapping summary (coverage/diversity metrics)
-  --map FILE             Gene-to-group mapping TSV (gene_id<TAB>group)
-  --functional-summary FILE  Per-group stats TSV
-  --anvio-ko FILE        Gene-level group abundance for anvi-estimate-metabolism
-  --annotation-source STR  Source label for anvi output (default: DART)
-  --preset STR           Apply filter bundle: loose or strict
-  --min-reads INT        Minimum supporting reads (default: 3)
-  --min-breadth FLOAT    Minimum alignment breadth (default: 0.10)
-  --min-depth FLOAT      Minimum mean depth (default: 0.5; set to 0 for ancient DNA)
-  --prior-ancient FLOAT  Prior P(ancient) for Bayesian scorer (default: 0.10)
-  --auto-prior-ancient   Auto-calibrate prior from mean p_read (requires AGD index)
-  --min-damage-sites INT Min susceptible positions for site evidence (default: auto)
-  --threshold FLOAT      Classification threshold for is_damaged (default: 0.7)
-  --aln-min-identity F   Min alignment identity (default: 0)
-  --aln-min-bits F       Min alignment bit score (default: 0)
-  --aln-max-evalue F     Max alignment e-value (default: 1e10)
-  --no-em                Disable EM reassignment (enabled by default)
-  --em-iters INT         Max EM iterations (default: 100)
-  --em-lambda FLOAT      EM score temperature (default: 3.0)
-  --em-tol FLOAT         EM convergence tolerance (default: 1e-4)
-  --em-min-prob FLOAT    Min EM responsibility to keep a read (default: 1e-6)
-```
-
-Output columns: `p_read`, `ct_sites`, `ga_sites`, `posterior`, `damage_class`, `is_damaged`, `gamma`, `em_keep`. See [Output Formats](https://github.com/genomewalker/dart/wiki/Output-Formats) for full schema.
-
-#### Filtering presets
+### Per-sample coverage
 
 ```bash
-dart damage-annotate --emi hits.emi -o out.tsv --preset loose   # maximize recall
-dart damage-annotate --emi hits.emi -o out.tsv --preset strict  # maximize precision
+dart ref-stats --emi SAMPLE.emi --sample SAMPLE --out SAMPLE.cov.tsv --trim --threads 32
 ```
 
-| Parameter | default | `--preset loose` | `--preset strict` |
-|-----------|---------|-----------------|------------------|
-| `--min-reads` | 3 | 1 | 5 |
-| `--min-breadth` | 0.10 | 0 | 0.20 |
-| `--min-depth` | 0.5 | 0 | 1.0 |
-| `--min-positional-score` | 0 | 0 | auto-calibrated |
-| `--min-terminal-ratio` | 0 | 0 | auto-calibrated |
-| `--min-damage-sites` | auto | 1 | 5 |
+One row per reference: `sample_id ref_id ref_length n_reads n_alns breadth depth_mean avg_identity`.
+`breadth` is covered positions / reference length (0–1). Libraries are never pooled. A 189 GB EMI
+(15 B alignments, 52 M references) takes a few minutes and about 12 GB RSS on 32 threads; it reads
+the whole file through the page cache, so run one large library per node.
 
-Coverage filters (`--min-positional-score`, `--min-terminal-ratio`) and Bayesian scoring parameters are documented in the [wiki](https://github.com/genomewalker/dart/wiki/Methods-and-Model#coverage-quality-filters).
+### Production-scale EMI
 
-### `dart damage-profile`
-
-Computes position-wise damage profiles for proteins with sufficient coverage.
-
-```
-Usage: dart damage-profile -i <reads.fq> --hits <hits.tsv> -o <profile.tsv.gz>
-
-Options:
-  --aggregate        Position-wise summary across all proteins
-  --min-reads N      Minimum reads per protein (default: 10)
-```
-
-### `dart validate`
-
-Compares predictions against ground truth for benchmarking.
-
-```
-Usage: dart validate <fastq.gz> <aa-damage.tsv.gz> <predictions.gff> [proteins.faa] [--csv output.csv]
+```bash
+dart hits2emi-stream targetDB db1.emi 32 manifest.txt     # manifest: "queryDB resultDB" per line
+dart emi-merge joint.emi 32 db1.emi db2.emi
+dart emi-verify joint.emi                                  # must print VERIFY: PASS
 ```
 
 ---
 
-## Output formats
+## Interpreting results
 
-### GFF3
+- **Per read** (`-o`): `posterior` combines terminal (`p_read`), substitution and identity evidence;
+  `tier` says which evidence is present. EM columns (`gamma`, `em_keep`, `em_margin`,
+  `em_ambiguous`, `em_reject_reason`) say how confidently the read was assigned; ambiguous reads
+  do not count as damage evidence.
+- **Per protein** (`--protein-summary`): the ancient call is `auth_binom_call`, a binomial test of
+  damaged vs modern-rate reads. Trust it when `protein_auth_tier = detected`. A
+  `library_not_authenticatable` warning means the library has no usable damage rate, so no protein
+  can be called ancient.
 
-```
-read_001  AncientGenePredictor  gene  1  150  0.85  +  .  ID=gene1;frame=0;conf=0.88;damage_signal=0.41;damage_pct=15.3;p_damaged=0.72
-```
-
-| Attribute | Description |
-|-----------|-------------|
-| `p_damaged` | Per-read damage posterior from prediction |
-| `damage_pct` | Estimated damage percentage |
-| `conf` | Prediction confidence from length and coding score |
-| `frame` | Reading frame used for the prediction |
-
-### Damage Index (.agd)
-
-Binary format for O(1) per-read damage lookup. Contains sequence length, frame, strand, damage probability, and terminal codon information. Required by `damage-annotate`.
-
-### EMI (.emi) and Annotated TSV
-
-See [Output Formats](https://github.com/genomewalker/dart/wiki/Output-Formats) on the wiki for full column schemas.
+Full guide: [Interpreting Results](https://github.com/genomewalker/dart/wiki/Interpreting-Results).
+Column schemas: [Output Formats](https://github.com/genomewalker/dart/wiki/Output-Formats).
 
 ---
 
@@ -321,7 +180,7 @@ See [Output Formats](https://github.com/genomewalker/dart/wiki/Output-Formats) o
 
 ### Gene prediction
 
-Benchmarked on 18.3 million synthetic ancient DNA reads from the KapK community (10 samples, v1.0.4). A prediction is correct if it matches any reference protein at ≥90% sequence identity.
+Benchmarked on 18.3 million reads from 10 synthetic ancient DNA benchmark samples (v1.0.4). A prediction is correct if it matches any reference protein at ≥90% sequence identity.
 
 | Method | Recall | Precision | Avg Identity |
 |--------|--------|-----------|--------------|
@@ -342,7 +201,7 @@ v1.1.0 improves internal frame selection accuracy substantially through a contra
 | Medium | 52.1% | +18.3% | 93.3% | +7.8% | 69.1% | +15.1% |
 | High | 51.4% | +12.5% | 92.7% | +8.1% | 70.7% | +16.9% |
 
-MMseqs2 functional recall on the KapK-12-1-34 sample (4.4M reads, single sample): v1.1.0 = **62.6%** vs v1.0.4-adaptive = 63.0% (−0.4%), precision unchanged (92.7%). The marginal functional recall difference reflects fewer output candidates per read (3.5 vs 3.9) while the internal frame accuracy is +11–18% higher — correctly-ranked frames are less often diluted by wrong-frame candidates.
+MMseqs2 functional recall on one synthetic ancient DNA benchmark sample (4.4M reads): v1.1.0 = **62.6%** vs v1.0.4-adaptive = 63.0% (−0.4%), precision unchanged (92.7%). The marginal functional recall difference reflects fewer output candidates per read (3.5 vs 3.9) while the internal frame accuracy is +11–18% higher — correctly-ranked frames are less often diluted by wrong-frame candidates.
 
 <p align="center">
 <img src="docs/benchmark_comparison.png" width="700" alt="Method comparison: DART, BLASTX, FGS-rs">
@@ -350,7 +209,7 @@ MMseqs2 functional recall on the KapK-12-1-34 sample (4.4M reads, single sample)
 
 ### Damage classification
 
-Protein-level damage classification benchmarked on the same 10 KapK synthetic samples. Each protein is labelled ancient or modern based on the origin of its supporting reads (≥80% purity, ≥5 reads). Score: `assign_mean_posterior` from `damage-annotate`.
+Protein-level damage classification benchmarked on the same 10 synthetic ancient DNA benchmark samples. Each protein is labelled ancient or modern based on the origin of its supporting reads (≥80% purity, ≥5 reads). Score: `assign_mean_posterior` from `damage-annotate`.
 
 | Group | AUC-ROC |
 |-------|---------|
