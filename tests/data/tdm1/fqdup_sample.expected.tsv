@@ -1,5 +1,5 @@
 version	3
-d_max_combined	0.0136315245
+d_max_combined	0.175985411
 d_max_5prime	0.166116163
 d_max_3prime	0.165149897
 lambda_5prime	0.389055401
@@ -14,7 +14,7 @@ pi_shape_lambda	0
 pi_shape_baseline	0.5
 pi_shape_3p_lambda	0.66659998926381547
 pi_shape_3p_baseline	0.5
-pi_damaged_point	0.110160753
+pi_damaged_point	0.999000013
 library_type	2
 damage_validated	1
 damage_artifact	0
