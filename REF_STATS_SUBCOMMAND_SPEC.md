@@ -1,6 +1,10 @@
 # `dart ref-stats` — per-reference coverage stats subcommand (spec)
 
-**Status as of 2026-08-10.** Motivation: `convergence.env_coverage` breadth is wrong because the convergence
+**Status as of 2026-10-16.** Implemented: `--hits` path, untrimmed breadth (default) and `--trim`
+(commits 8e3d427, 3e480ef); validated on the r2s panel (see "Validation results" below). Not yet implemented:
+`--dcx/--ref-lengths`, `--threads`/sharding, `depth_std`/`depth_evenness`.
+
+**Spec written 2026-08-10.** Motivation: `convergence.env_coverage` breadth is wrong because the convergence
 side recomputed coverage from the tlen-less `.dcx` (`condnull/cov/cov_lib.py` → breadth = span **count**).
 DART already computes the correct per-reference stats (`src/reference_stats.cpp`, `ReferenceStats`:
 `breadth = nonzero_positions / ref_length`), but only inside `annotate` behind `--protein-summary` etc.
@@ -63,3 +67,31 @@ pooled `env_coverage` (no `sample_id`).
 ## Validation
 - breadth ∈ [0,1] for all rows; spot-check vs `public.r2s_coverage` (400-panel) which already has correct breadth.
 - F2D9T0 etc. sanity: breadth = covered/ref_length, not a residue count.
+
+## Validation results (2026-10-16)
+Input: the alignments behind `public.r2s_coverage` sample `kapk_r2s_transporters_v1`. That sample is read2Struct
+`map-transporters-new/112509/112509_mapping.db`, table `mm_data_filt` (513,455 alns, 904 targets), exported as the
+16-col FMT ordered by query.
+- Untrimmed `ref-stats` equals an independent SQL union of `[tstart, tend]` on all 904 targets. `n_reads` equals
+  the distinct query count on all 904.
+- Against `r2s_coverage` (400 proteins), `n_alns` is identical on 400/400 and `avg_identity` is within 1e-4.
+  Breadth, compared as covered-position count = round(breadth × ref_length):
+
+  | mode | exact vs r2s_coverage | rest |
+  |---|---|---|
+  | untrimmed (default) | 0/400 | higher on all; mean +0.12 breadth, Pearson 0.94 |
+  | `--trim` | 50/400 | +1 to +14 positions, never lower |
+
+- `r2s_coverage.breadth` is x-filter's `*_cov-stats.tsv.gz`, loaded unchanged by read2Struct (`map.py:506`). It
+  differs from ref-stats in two ways:
+  1. **Trim** (`x_filter/core_processing.py:652`, on by default, off with `--no-trim`). It zeroes
+     `ceil(mean alnLength) + 10` positions at each end but still divides by full length, and is skipped when the
+     trim reaches the length. `ref-stats --trim` mirrors this.
+  2. **Off-by-one interval** (`x_filter/core_processing.py:498-501`). It uses the 1-based `subjectStart` as a
+     0-based index and makes the end exclusive, clamped to `L-1`. This drops the first residue of every alignment
+     and the protein's last residue. `ref-stats` does **not** mimic this.
+- The trim plus x-filter's interval reproduces `r2s_coverage.breadth` exactly on 400/400 (SQL). So x-filter-era
+  breadth runs slightly low, and `ref-stats --trim` is the corrected equivalent.
+- Earlier check on the KapK `gold-1000000.tsv` subset (23.1M rows → 10.0M targets, 35 s, 2.1 GB RSS) showed
+  breadth/identity in [0,1]. Its breadth is not comparable to the panel (1–4 alns/protein vs 158–1862).
+- Outputs are in `/projects/caeg/scratch/kbd606/tmp/dart_refstats_20261016/`.
