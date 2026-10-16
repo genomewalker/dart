@@ -117,3 +117,15 @@ Driver: `dart_refstats_20261016/validate_e2e.sh`; summary in `e2e/summary.tsv`.
   has 3 decimals; EMI quantizes to 1/65535).
 - **Full library `LV7008956626/hits_v7.emi`:** 3.92 B alignments → 47.57 M targets in 9 min 41 s, 7.6 GB RSS
   at 32 threads. breadth/identity stay in [0,1].
+- **Performance (2026-10-16), after adding the sequential prefetch thread and parallel ordered write.**
+  Cold timings, NFS, 32 threads, dandycomp07fl:
+
+  | library | size | alignments | open / scan / write | wall | RSS |
+  |---|---|---|---|---|---|
+  | LV7008956626 (before) | 47 GB | 3.92 B | — | 9 min 41 s (175% CPU) | 7.6 GB |
+  | LV7008956626 | 47 GB | 3.92 B | 3.0 / 93.6 / 3.0 s | 1 min 48 s | 7.6 GB |
+  | LV7008956628 | 189 GB | 15.39 B | 2.8 / 195.4 / 15.9 s | 3 min 39 s | 11.6 GB |
+
+  The 626 output is byte-identical to the pre-change build's (2.53 GB, 47.57 M rows). The 628 output has
+  breadth/identity in [0,1], n_reads ≤ n_alns and no duplicate ref_id. The prefetch pulls the whole file
+  through the page cache, so run one library per node.
