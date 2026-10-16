@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <atomic>
+#include <string>
 #include <thread>
 #include <vector>
 #include <unordered_set>
@@ -20,6 +21,12 @@ namespace cli {
 using namespace dart::emiv7;
 
 int cmd_emi_verify(int argc, char* argv[]) {
+    if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
+        printf("usage: emi-verify <in.emi> [threads=8]\n\n"
+               "Check an EMI v7: degree CSR, totals vs header, footer magic, no duplicate\n"
+               "(read, target) pairs, canonical per-read order. Exits non-zero on any violation.\n");
+        return 0;
+    }
     if (argc < 2) { printf("usage: emi-verify <in.emi> [threads]\n"); return 2; }
     int nthreads = argc >= 3 ? atoi(argv[2]) : 8; if (nthreads < 1) nthreads = 1;
 

@@ -46,6 +46,14 @@ inline double ms(clk::time_point a, clk::time_point b) { return std::chrono::dur
 }  // namespace
 
 int cmd_hits2emi_stream(int argc, char* argv[]) {
+    if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
+        printf("usage: hits2emi-stream <targetDB> <out.emi> <threads> <manifest> [d_max=0.0] [lambda=0.3] [ring=0]\n\n"
+               "Stream N MMseqs2 (queryDB, resultDB) chunks that share one targetDB into one EMI v7.\n"
+               "  manifest  one 'queryDB resultDB' pair per line; <db>.lookup files give the names\n"
+               "  d_max, lambda  damage parameters for the per-alignment damage evidence\n"
+               "  ring      reorder window in blocks (0 = auto, 3*threads+4)\n");
+        return 0;
+    }
     if (argc < 5) { printf("usage: hits2emi-stream <targetDB> <out.emi> <threads> <manifest: 'qdb rdb' per line> [d_max=0.0] [lambda=0.3] [ring=0(auto)]\n"); return 2; }
     std::string tdb = argv[1], out = argv[2]; int nthreads = atoi(argv[3]); std::string manifest = argv[4];
     float d_max = (argc > 5) ? (float)atof(argv[5]) : 0.0f;

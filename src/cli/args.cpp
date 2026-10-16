@@ -33,6 +33,10 @@ void print_usage(const char* program_name) {
     std::cout << "                           Options: meta, gtdb, fungi, plant, protozoa,\n";
     std::cout << "                           invertebrate, mammal, vertebrate, viral\n";
     std::cout << "  --library-type <type>    Force library type: ds, ss, or auto (default)\n";
+    std::cout << "  --library-profile <file> Library damage summary (TDM1) written by fqdup; required\n";
+    std::cout << "                           unless --allow-self-profile is given\n";
+    std::cout << "  --allow-self-profile     Estimate the damage profile from -i instead (standalone\n";
+    std::cout << "                           use; unreliable on deduplicated libraries)\n";
     std::cout << "  --profile-input <file>   FASTQ to profile damage on (default: -i). ORF\n";
     std::cout << "                           prediction always runs on -i; only the damage\n";
     std::cout << "                           profile uses this file (e.g. merged pre-dedup reads)\n";
