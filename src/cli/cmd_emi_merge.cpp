@@ -102,6 +102,13 @@ inline Names decode_names(const detail::NameDict& d, int nthreads) {
 }  // namespace
 
 int cmd_emi_merge(int argc, char* argv[]) {
+    if (argc >= 2 && (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h")) {
+        printf("usage: emi-merge <out.emi> <threads> <in1.emi> <in2.emi> [in3.emi ...]\n\n"
+               "Union EMI v7 files over the same reads (e.g. one per target database) for joint EM.\n"
+               "Reads and references are unioned by name; duplicate (read, target) pairs keep the\n"
+               "best bit score. Check the result with `dart emi-verify`.\n");
+        return 0;
+    }
     if (argc < 5) { printf("usage: emi-merge <out.emi> <threads> <in1.emi> <in2.emi> [in3.emi ...]\n"); return 2; }
     std::string out = argv[1];
     int nthreads = atoi(argv[2]); if (nthreads < 1) nthreads = 1;

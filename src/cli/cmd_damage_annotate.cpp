@@ -1676,7 +1676,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cout << "Compares observed proteins against reference proteins to identify\n";
             std::cout << "damage-consistent amino acid substitutions with ~90% precision.\n\n";
             std::cout << "Required:\n";
-            std::cout << "  --emi, -i FILE    EMI v5 index with qaln/taln + damage evidence columns\n\n";
+            std::cout << "  --emi, -i FILE    EMI v7 index (dart hits2emi / hits2emi-stream)\n\n";
             std::cout << "Options:\n";
             std::cout << "  --d-max RATE      Override damage rate (default: estimated from data)\n";
             std::cout << "  --lambda FLOAT    Decay constant (default: 0.3)\n";
@@ -1717,7 +1717,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cout << "EM reassignment (multi-mapping resolution, enabled by default):\n";
             std::cout << "  --no-em           Disable EM (use best-hit only)\n";
             std::cout << "  --em-iters INT    Max EM iterations (default: 100)\n";
-            std::cout << "  --em-lambda FLOAT Temperature parameter (default: 3.0)\n";
+            std::cout << "  --em-lambda FLOAT Bit-score temperature, bits to nats (default: ln 2 = 0.693)\n";
             std::cout << "  --em-tol FLOAT    Convergence tolerance (default: 1e-4)\n";
             std::cout << "  --em-min-prob FLOAT     Min EM posterior to keep (default: 1e-6)\n";
             std::cout << "  --em-min-margin FLOAT   Min top1-top2 margin for damage/auth evidence (default: 0.5)\n";
@@ -1726,6 +1726,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cout << "                          off => damage-free mapping, gamma_ancient still emitted post-hoc)\n";
             std::cout << "  --no-null               Run EM without a null model, accepting that a flat targeted\n";
             std::cout << "                          database can force-map absent-protein reads to false annotations\n";
+            std::cout << "  --em-tape-dir DIR       O_DIRECT EM tape dir (or DART_EM_TAPE_DIR); needed when EM runs\n";
+            std::cout << "                          without --em-null-model/--em-calib-model/--em-audit. Use\n";
+            std::cout << "                          node-local disk, not tmpfs\n";
+            std::cout << "  --em-checkpoint FILE    EM iteration checkpoint (default: <tape dir>/dart_emtape_<pid>.ckpt)\n";
+            std::cout << "  --resume                Resume EM from the checkpoint when its fingerprint matches\n";
             std::cout << "\nNull/noise component (spurious short-peptide rejection, opt-in):\n";
             std::cout << "  --em-null-model FILE    Load empirical decoy Gumbel sidecar (bin lo hi mu beta n)\n";
             std::cout << "                          Enables the null column; reads dominated by it are rejected\n";
