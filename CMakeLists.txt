@@ -235,6 +235,7 @@ set(DART_SUBCOMMAND_SOURCES
     src/cli/cmd_sample_damage.cpp     # cmd_sample_damage
     src/cli/cmd_damage_annotate.cpp   # cmd_damage_annotate
     src/cli/cmd_damage_info.cpp       # cmd_damage_info
+    src/cli/cmd_ref_stats.cpp         # ref-stats (per-sample per-reference coverage/identity stats)
     src/cli/cmd_damage_profile.cpp    # cmd_damage_profile
     src/cli/cmd_hits2emi.cpp          # hits2emi (TSV to columnar)
     src/cli/cmd_hits2emi_stream.cpp   # hits2emi-stream (mmseqs DB chunks -> one .emi)
