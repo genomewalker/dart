@@ -15,9 +15,11 @@ dependencies:
   - zlib
   - libgomp  # OpenMP runtime
   - zstd     # Columnar compression (required)
+  - isa-l    # gzip codec for reading and writing (required)
+  - nasm     # Assembler for the bundled ISA-L build in rapidgzip (required)
+  - pkg-config
 
   # Recommended workflow tools
-  - pigz      # Fast parallel gzip (used for .gz input)
   - mmseqs2   # Protein search (use with VTML20 matrix)
 
   # Python for analysis scripts
