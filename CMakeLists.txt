@@ -368,6 +368,20 @@ if(BUILD_TESTING)
                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/orf_id_golden.tsv
     )
 
+    # TDM1 library profile contract: what fqdup writes (taph::write_damage_summary) is what
+    # `predict --library-profile` stamps into the .agd. Optional fqdup fixture in tests/data/tdm1.
+    add_executable(
+        dart-library-profile-roundtrip
+        tests/test_library_profile_roundtrip.cpp
+        src/damage_index_reader.cpp
+    )
+    target_link_libraries(dart-library-profile-roundtrip taph PkgConfig::ZSTD)
+    add_test(
+        NAME library_profile_roundtrip
+        COMMAND dart-library-profile-roundtrip $<TARGET_FILE:dart>
+                ${CMAKE_CURRENT_SOURCE_DIR}/tests/data
+    )
+
     # EMI v7 format round-trip: blocks, degree-CSR, hot/cold columns, var-length
     # qaln/taln, per-read random access, name-dict, and the two-Reader
     # cache-aliasing regression (thread_local caches keyed on a monotonic uid,
