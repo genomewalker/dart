@@ -46,6 +46,11 @@ struct Acc {
         for (uint64_t w : bits) c += static_cast<uint32_t>(__builtin_popcountll(w));
         return c;
     }
+    uint32_t covered(uint32_t lo, uint32_t hi) const {   // covered positions in [lo, hi)
+        uint32_t c = 0;
+        for (uint32_t p = lo; p < hi; ++p) c += (bits[p >> 6] >> (p & 63)) & 1ULL;
+        return c;
+    }
 };
 
 void print_usage(const char* prog) {
@@ -57,6 +62,8 @@ void print_usage(const char* prog) {
               << "  --sample ID       Sample/library id, written as first column (required)\n"
               << "  --out FILE        Output stats TSV (required)\n"
               << "  --min-breadth F   Only emit targets with breadth >= F (default 0)\n"
+              << "  --trim            x-filter breadth: ignore ceil(avg alnlen)+10 positions at each end,\n"
+              << "                    still divide by ref_length (default: untrimmed)\n"
               << "  -h, --help        Show this help\n";
 }
 
@@ -81,11 +88,13 @@ inline const char* field(const char* p, const char* end, int idx, size_t& len) {
 int cmd_ref_stats(int argc, char* argv[]) {
     std::string hits, sample, out;
     double min_breadth = 0.0;
+    bool trim = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--hits") && i + 1 < argc) hits = argv[++i];
         else if (!std::strcmp(argv[i], "--sample") && i + 1 < argc) sample = argv[++i];
         else if (!std::strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
         else if (!std::strcmp(argv[i], "--min-breadth") && i + 1 < argc) min_breadth = std::atof(argv[++i]);
+        else if (!std::strcmp(argv[i], "--trim")) trim = true;
         else if (!std::strcmp(argv[i], "-h") || !std::strcmp(argv[i], "--help")) { print_usage(argv[0]); return 0; }
     }
     if (hits.empty() || sample.empty() || out.empty()) { print_usage(argv[0]); return 1; }
@@ -145,6 +154,13 @@ int cmd_ref_stats(int argc, char* argv[]) {
         if (a.tlen == 0) continue;
         uint32_t cov = a.covered();
         double breadth = static_cast<double>(cov) / static_cast<double>(a.tlen);
+        if (trim) {   // x-filter trim_coverage_by_subject: skipped when the trim reaches tlen
+            const uint64_t t = (a.sum_alnlen + a.n_alns - 1) / a.n_alns + 10;
+            if (t < a.tlen) {
+                const uint32_t lo = static_cast<uint32_t>(t), hi = a.tlen - lo;
+                breadth = lo < hi ? static_cast<double>(a.covered(lo, hi)) / static_cast<double>(a.tlen) : 0.0;
+            }
+        }
         if (breadth < min_breadth) continue;
         double depth = cov > 0 ? static_cast<double>(a.sum_alnlen) / static_cast<double>(cov) : 0.0;
         double avg_id = a.n_alns > 0 ? a.sum_fident / static_cast<double>(a.n_alns) : 0.0;
