@@ -39,7 +39,15 @@ message(STATUS "DART Version: ${DART_VERSION}")
 # has to be able to say which damage estimator produced it; the guard below makes this SHA true (a
 # local checkout must be at exactly this revision AND clean; otherwise FetchContent checks out exactly
 # this revision), so stamping it is not a guess.
-set(LIBTAPH_PINNED_SHA "7540cc8646d9c59f9286c78c0af4020e5a93441d")
+# The SHA lives in LIBTAPH_PIN (shared convention with fqdup); change it with libtaph's
+# scripts/bump-libtaph.sh, which re-pins every consumer and runs their tests together.
+file(STRINGS "${CMAKE_SOURCE_DIR}/LIBTAPH_PIN" LIBTAPH_PINNED_SHA LIMIT_COUNT 1)
+string(STRIP "${LIBTAPH_PINNED_SHA}" LIBTAPH_PINNED_SHA)
+string(LENGTH "${LIBTAPH_PINNED_SHA}" _pin_len)
+if(NOT LIBTAPH_PINNED_SHA MATCHES "^[0-9a-f]+$" OR NOT _pin_len EQUAL 40)
+    message(FATAL_ERROR "LIBTAPH_PIN must hold one full 40-hex libtaph commit SHA, got '${LIBTAPH_PINNED_SHA}'")
+endif()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/LIBTAPH_PIN")
 
 # Generate version header
 configure_file(
