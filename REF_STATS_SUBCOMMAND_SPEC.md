@@ -1,8 +1,13 @@
 # `dart ref-stats` — per-reference coverage stats subcommand (spec)
 
-**Status as of 2026-10-16.** Implemented: `--hits` path, untrimmed breadth (default) and `--trim`
-(commits 8e3d427, 3e480ef); validated on the r2s panel (see "Validation results" below). Not yet implemented:
-`--dcx/--ref-lengths`, `--threads`/sharding, `depth_std`/`depth_evenness`.
+**Status as of 2026-10-16.** Implemented: `--hits` and `--emi` (EMI v7) inputs, `--threads`, untrimmed
+breadth (default) and `--trim`. Validated on the r2s panel and end to end (see "Validation results" below).
+Not yet implemented: `--dcx/--ref-lengths`, `depth_std`/`depth_evenness`.
+**Alignment length = target span `tend-tstart+1`** in both inputs. It drives `depth_mean` (target residues /
+covered) and the `--trim` length. Two things rule out mmseqs `alnlen` here: EMI `aln_len` is not it
+(hits2emi-stream stores max(q span, t span)+1, `mmseqs_db.hpp:76`), and damage-annotate reads EMI `aln_len`
+as on-target length, so the writer stays unchanged. The lines below that mention `alnlen`/`Σalnlen` are the
+original 2026-08-10 spec and are superseded by this paragraph.
 
 **Spec written 2026-08-10.** Motivation: `convergence.env_coverage` breadth is wrong because the convergence
 side recomputed coverage from the tlen-less `.dcx` (`condnull/cov/cov_lib.py` → breadth = span **count**).
@@ -95,3 +100,20 @@ Input: the alignments behind `public.r2s_coverage` sample `kapk_r2s_transporters
 - Earlier check on the KapK `gold-1000000.tsv` subset (23.1M rows → 10.0M targets, 35 s, 2.1 GB RSS) showed
   breadth/identity in [0,1]. Its breadth is not comparable to the panel (1–4 alns/protein vs 158–1862).
 - Outputs are in `/projects/caeg/scratch/kbd606/tmp/dart_refstats_20261016/`.
+- The panel numbers above were taken before the switch to target span (mean `alnLength` was used as the
+  `--trim` length). Exact `--trim` matches with target span are still 50/400.
+
+## End-to-end validation (2026-10-16)
+Pipeline: reads DB `q100000` → existing mmseqs result `res100000` vs `112509-db`
+(`faro-ancient-pilots/snipr/kapk-q000-subsets-20261003`). From it, `convertalis` gives `gold-100000.tsv`, and
+`hits2emi-stream` gives a v7 `.emi`. `dart predict` is upstream of the result DB, so it is not covered.
+Driver: `dart_refstats_20261016/validate_e2e.sh`; summary in `e2e/summary.tsv`.
+- **Writer:** `emi-verify` PASS. Rows 2,232,317 = 2,232,317, with 0 multiset differences on
+  (query, target, tstart, tend, tlen, qaln, taln) in both directions. Identity max |Δ| 2e-5.
+- **ref-stats vs an independent DuckDB oracle over the TSV:** `--hits`/`--emi` × plain/`--trim`, 1,957,244
+  targets each. 0 mismatches in ref_length, n_reads, n_alns, breadth, depth_mean and avg_identity. Max |Δ|
+  equals the half-unit of output precision.
+- **`--hits` vs `--emi`:** identical except avg_identity on 867 targets, at ±1 in the 4th decimal (TSV fident
+  has 3 decimals; EMI quantizes to 1/65535).
+- **Full library `LV7008956626/hits_v7.emi`:** 3.92 B alignments → 47.57 M targets in 9 min 41 s, 7.6 GB RSS
+  at 32 threads. breadth/identity stay in [0,1].
