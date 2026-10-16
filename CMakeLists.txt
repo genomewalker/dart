@@ -36,10 +36,10 @@ message(STATUS "DART Version: ${DART_VERSION}")
 
 # The pinned libtaph revision. Declared HERE, above configure_file, so it can be stamped into
 # version.h -- the guard that enforces it lives further down, where libtaph is added. A DART artifact
-# has to be able to say which damage estimator produced it; the guard below makes this SHA true (it
-# hard-fails unless the checkout is at exactly this revision AND clean), so stamping it is not a
-# guess.
-set(LIBTAPH_PINNED_SHA "be1f750637cbc3e9f9909f4075a3a7e3cee9a90d")
+# has to be able to say which damage estimator produced it; the guard below makes this SHA true (a
+# local checkout must be at exactly this revision AND clean; otherwise FetchContent checks out exactly
+# this revision), so stamping it is not a guess.
+set(LIBTAPH_PINNED_SHA "7540cc8646d9c59f9286c78c0af4020e5a93441d")
 
 # Generate version header
 configure_file(
@@ -124,9 +124,13 @@ set(TAPH_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 # build inputs are fully reachable from a commit -- protein_damage.hpp / damage_summary.hpp were
 # loose scratch files until 0b590e8.
 #
-# It is UNPUSHED (local main is ahead of origin), so the FetchContent path below CANNOT resolve it.
-# That is exactly why the else() branch is fatal rather than a fallback: silently building against
-# GitHub v1.2.1 would emit different numbers under the same version string. Fail loud, never drift.
+# 2026-10-16: re-pinned be1f750 -> 7540cc8. libtaph main was force-pushed and be1f750 is no longer
+# reachable from any GitHub ref; 7540cc8 is its rewritten counterpart with the byte-identical source
+# tree (fb1d5e3c), so the built code and damage numbers are unchanged.
+#
+# A local checkout (LIBTAPH_LOCAL_PATH) wins when present; otherwise FetchContent fetches exactly the
+# pinned commit from GitHub (CI, release, fresh clones). Never fall back to a tag or branch: building
+# against a different revision would emit different numbers under the same version string.
 set(LIBTAPH_LOCAL_PATH "$ENV{REPOS}/libtaph" CACHE PATH "Local libtaph checkout (overrides GitHub)")
 if(EXISTS "${LIBTAPH_LOCAL_PATH}/CMakeLists.txt")
     execute_process(
@@ -153,11 +157,13 @@ if(EXISTS "${LIBTAPH_LOCAL_PATH}/CMakeLists.txt")
     message(STATUS "Using local libtaph, pinned + clean: ${LIBTAPH_PINNED_SHA}")
     add_subdirectory("${LIBTAPH_LOCAL_PATH}" "${CMAKE_BINARY_DIR}/libtaph-local" EXCLUDE_FROM_ALL)
 else()
-    message(FATAL_ERROR
-        "No libtaph checkout at ${LIBTAPH_LOCAL_PATH}, and the pinned revision "
-        "${LIBTAPH_PINNED_SHA} is not on any remote -- FetchContent cannot reach it.\n"
-        "Falling back to a published tag here would silently build DIFFERENT damage estimates. "
-        "Set LIBTAPH_LOCAL_PATH to a checkout at the pinned SHA.")
+    message(STATUS "No libtaph checkout at ${LIBTAPH_LOCAL_PATH}; fetching pinned ${LIBTAPH_PINNED_SHA}")
+    FetchContent_Declare(
+        libtaph
+        GIT_REPOSITORY https://github.com/genomewalker/libtaph.git
+        GIT_TAG        ${LIBTAPH_PINNED_SHA}
+    )
+    FetchContent_MakeAvailable(libtaph)
 endif()
 
 # Find zlib for compressed file support
