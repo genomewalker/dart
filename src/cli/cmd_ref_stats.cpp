@@ -17,10 +17,14 @@
 #include "subcommand.hpp"
 #include "dart/emi_v7_io.hpp"
 
+#include <fcntl.h>
 #include <omp.h>
+#include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +33,7 @@
 #include <iostream>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -97,8 +102,28 @@ inline const char* field(const char* p, const char* end, int idx, size_t& len) {
     return nullptr;
 }
 
-// Writes one stats row; returns false when filtered out by min_breadth.
-bool write_row(std::ofstream& os, const std::string& sample, const std::string& ref, const Acc& a,
+// Streams a file sequentially into the page cache on a background thread until destroyed. The
+// EMI scan issues small per-column preads from many threads, which defeats NFS readahead
+// (cold 47 GB: 81 MB/s vs 532 MB/s sequential); reading ahead in order lets those preads hit cache.
+class Prefetch {
+public:
+    explicit Prefetch(const std::string& path) : th_([this, path] { run(path); }) {}
+    ~Prefetch() { stop_ = true; th_.join(); }
+private:
+    void run(const std::string& path) {
+        const int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) return;
+        std::vector<char> buf(16u << 20);
+        for (off_t off = 0; !stop_.load(std::memory_order_relaxed); off += static_cast<off_t>(buf.size()))
+            if (::pread(fd, buf.data(), buf.size(), off) <= 0) break;
+        ::close(fd);
+    }
+    std::atomic<bool> stop_{false};
+    std::thread th_;
+};
+
+// Appends one stats row; returns false when filtered out by min_breadth.
+bool append_row(std::string& out, const std::string& sample, const std::string& ref, const Acc& a,
                bool trim, double min_breadth) {
     uint32_t cov = a.covered();
     double breadth = static_cast<double>(cov) / static_cast<double>(a.tlen);
@@ -116,7 +141,7 @@ bool write_row(std::ofstream& os, const std::string& sample, const std::string& 
     int m = std::snprintf(buf, sizeof(buf), "%s\t%s\t%u\t%u\t%u\t%.4f\t%.3f\t%.4f\n",
                           sample.c_str(), ref.c_str(), a.tlen, a.n_reads, a.n_alns,
                           breadth, depth, avg_id);
-    os.write(buf, m);
+    out.append(buf, static_cast<size_t>(m));
     return true;
 }
 
@@ -146,7 +171,13 @@ int cmd_ref_stats(int argc, char* argv[]) {
 
     if (!emi.empty()) try {
         if (threads > 0) omp_set_num_threads(threads);
+        using clk = std::chrono::steady_clock;
+        auto secs = [](clk::time_point a) { return std::chrono::duration<double>(clk::now() - a).count(); };
+        const auto t0 = clk::now();
+        Prefetch prefetch(emi);
         dart::emiv7::Reader rd(emi);
+        std::cerr << "ref-stats: open " << secs(t0) << " s\n";
+        const auto t1 = clk::now();
         std::vector<Acc> acc(rd.num_refs());
         // ceiling: one lock per alignment row; contention grows with threads. upgrade: per-thread
         // ref-sharded buffers merged per block.
@@ -175,12 +206,31 @@ int cmd_ref_stats(int argc, char* argv[]) {
             }
             rows_per_block[b] = n;
         });
+        std::cerr << "ref-stats: scan " << secs(t1) << " s\n";
+        const auto t2 = clk::now();
         for (uint64_t r : rows_per_block) nrows += r;
-        for (uint32_t i = 0; i < acc.size(); ++i) {
-            if (acc[i].tlen == 0) continue;
-            ++ntargets;
-            emitted += write_row(os, sample, rd.ref_name(i), acc[i], trim, min_breadth);
+        // Parallel format, ordered write. Chunks follow the ref name-dict blocks so each thread
+        // decodes every name block once; a batch of chunks is formatted, then flushed in order.
+        const uint32_t nref = static_cast<uint32_t>(acc.size());
+        const uint32_t chunk = rd.ref_dict().dict_block_size();
+        const uint32_t nchunks = (nref + chunk - 1) / chunk;
+        constexpr uint32_t batch = 256;
+        std::vector<std::string> bufs(batch);
+        for (uint32_t c0 = 0; c0 < nchunks; c0 += batch) {
+            const uint32_t c1 = std::min(nchunks, c0 + batch);
+            #pragma omp parallel for schedule(dynamic, 1) reduction(+ : ntargets, emitted)
+            for (uint32_t c = c0; c < c1; ++c) {
+                std::string& s = bufs[c - c0];
+                s.clear();
+                for (uint32_t i = c * chunk, hi = std::min(nref, i + chunk); i < hi; ++i) {
+                    if (acc[i].tlen == 0) continue;
+                    ++ntargets;
+                    emitted += append_row(s, sample, rd.ref_name(i), acc[i], trim, min_breadth);
+                }
+            }
+            for (uint32_t c = c0; c < c1; ++c) os.write(bufs[c - c0].data(), static_cast<std::streamsize>(bufs[c - c0].size()));
         }
+        std::cerr << "ref-stats: write " << secs(t2) << " s\n";
     } catch (const std::exception& e) {
         std::cerr << "ref-stats: " << emi << ": " << e.what() << "\n";
         return 1;
@@ -223,11 +273,13 @@ int cmd_ref_stats(int argc, char* argv[]) {
             ++a.n_alns;
             ++nrows;
         }
+        std::string s;
         for (const auto& kv : acc) {
             if (kv.second.tlen == 0) continue;
             ++ntargets;
-            emitted += write_row(os, sample, kv.first, kv.second, trim, min_breadth);
+            emitted += append_row(s, sample, kv.first, kv.second, trim, min_breadth);
         }
+        os.write(s.data(), static_cast<std::streamsize>(s.size()));
     }
 
     std::cerr << "ref-stats " << sample << ": rows=" << nrows << " targets=" << ntargets
