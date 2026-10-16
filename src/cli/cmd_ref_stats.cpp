@@ -7,9 +7,12 @@
  * because both inputs carry tlen. Run once per library (no cross-lib pooling): lean tlen-bit bitset
  * for the covered union + running sums.
  *
- * --hits FMT (LOCKED, 0-based fields used): query=0, target=1, fident=2, alnlen=3, tstart=8, tend=9, tlen=13.
+ * --hits FMT (LOCKED, 0-based fields used): query=0, target=1, fident=2, tstart=8, tend=9, tlen=13.
  *   query,target,fident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits,qlen,tlen,qaln,taln
- * --emi: hits_v7.emi columns ref_idx, identity_q (fident*65535), aln_len, tstart, tend, tlen.
+ * --emi: hits_v7.emi columns ref_idx, identity_q (fident*65535), tstart, tend, tlen.
+ *
+ * Alignment length is the target span (tend-tstart+1) in both paths: EMI aln_len is not mmseqs
+ * alnLength (hits2emi-stream stores max(q span, t span)+1), and depth counts target residues.
  */
 #include "subcommand.hpp"
 #include "dart/emi_v7_io.hpp"
@@ -36,7 +39,7 @@ struct Acc {
     uint32_t tlen = 0;
     std::vector<uint64_t> bits;   // covered-position bitset (lazy, size tlen)
     double   sum_fident = 0.0;
-    uint64_t sum_alnlen = 0;
+    uint64_t sum_span = 0;        // aligned target residues (sum of clamped [tstart, tend] spans)
     uint32_t n_reads = 0;         // distinct queries
     uint32_t n_alns  = 0;
     uint64_t last_q  = 0;         // 1-based ordinal of the last query counted (0 = none)
@@ -47,6 +50,7 @@ struct Acc {
     void cover(uint32_t s0, uint32_t e0) {            // [s0, e0) 0-based, clamped to tlen
         if (e0 > tlen) e0 = tlen;
         if (s0 > tlen) s0 = tlen;
+        if (e0 > s0) sum_span += e0 - s0;
         for (uint32_t p = s0; p < e0; ++p) bits[p >> 6] |= (1ULL << (p & 63));
     }
     uint32_t covered() const {
@@ -71,7 +75,7 @@ void print_usage(const char* prog) {
               << "  --sample ID       Sample/library id, written as first column (required)\n"
               << "  --out FILE        Output stats TSV (required)\n"
               << "  --min-breadth F   Only emit targets with breadth >= F (default 0)\n"
-              << "  --trim            x-filter breadth: ignore ceil(avg alnlen)+10 positions at each end,\n"
+              << "  --trim            x-filter breadth: ignore ceil(avg target span)+10 positions at each end,\n"
               << "                    still divide by ref_length (default: untrimmed)\n"
               << "  --threads N       Threads for --emi block decode (default: all)\n"
               << "  -h, --help        Show this help\n";
@@ -99,14 +103,14 @@ bool write_row(std::ofstream& os, const std::string& sample, const std::string& 
     uint32_t cov = a.covered();
     double breadth = static_cast<double>(cov) / static_cast<double>(a.tlen);
     if (trim) {   // x-filter trim_coverage_by_subject: skipped when the trim reaches tlen
-        const uint64_t t = (a.sum_alnlen + a.n_alns - 1) / a.n_alns + 10;
+        const uint64_t t = (a.sum_span + a.n_alns - 1) / a.n_alns + 10;
         if (t < a.tlen) {
             const uint32_t lo = static_cast<uint32_t>(t), hi = a.tlen - lo;
             breadth = lo < hi ? static_cast<double>(a.covered(lo, hi)) / static_cast<double>(a.tlen) : 0.0;
         }
     }
     if (breadth < min_breadth) return false;
-    double depth = cov > 0 ? static_cast<double>(a.sum_alnlen) / static_cast<double>(cov) : 0.0;
+    double depth = cov > 0 ? static_cast<double>(a.sum_span) / static_cast<double>(cov) : 0.0;
     double avg_id = a.n_alns > 0 ? a.sum_fident / static_cast<double>(a.n_alns) : 0.0;
     char buf[512];
     int m = std::snprintf(buf, sizeof(buf), "%s\t%s\t%u\t%u\t%u\t%.4f\t%.3f\t%.4f\n",
@@ -151,7 +155,7 @@ int cmd_ref_stats(int argc, char* argv[]) {
         rd.parallel_scan([&](uint32_t b, uint32_t n, const uint32_t* read, const uint32_t* ref,
                              const float*, const float*, const float*,
                              const uint16_t*, const uint16_t*, const float*, const float*,
-                             const uint16_t* iq, const uint16_t* al, const uint16_t*, const uint16_t*,
+                             const uint16_t* iq, const uint16_t*, const uint16_t*, const uint16_t*,
                              const uint16_t* ts, const uint16_t* te, const uint16_t* tl, const uint16_t*,
                              const uint16_t*, const uint16_t*) {
             // Blocks are read-aligned, so a read's rows are contiguous here: n_reads counts each
@@ -166,10 +170,6 @@ int cmd_ref_stats(int argc, char* argv[]) {
                 a.ensure(tl[j]);
                 a.cover(ts[j] > 0 ? ts[j] - 1u : 0u, te[j]);   // 1-based inclusive -> [s-1, e)
                 a.sum_fident += iq[j] / 65535.0;
-                // ceiling: hits2emi-stream stores aln_len as max(q span, t span)+1 (mmseqs_db.hpp:76),
-                // not mmseqs alnLength, so gapped rows run short in depth_mean and the --trim length.
-                // upgrade: use get_taln(b, j).size() (decodes the cold aln strings).
-                a.sum_alnlen += al[j];
                 a.n_reads += first;
                 ++a.n_alns;
             }
@@ -198,10 +198,9 @@ int cmd_ref_stats(int argc, char* argv[]) {
             if (line.empty()) continue;
             const char* p = line.data();
             const char* end = p + line.size();
-            size_t l_t, l_fi, l_al, l_ts, l_te, l_tl;
+            size_t l_t, l_fi, l_ts, l_te, l_tl;
             const char* f_t  = field(p, end, 1, l_t);
             const char* f_fi = field(p, end, 2, l_fi);
-            const char* f_al = field(p, end, 3, l_al);
             const char* f_ts = field(p, end, 8, l_ts);
             const char* f_te = field(p, end, 9, l_te);
             const char* f_tl = field(p, end, 13, l_tl);
@@ -213,7 +212,6 @@ int cmd_ref_stats(int argc, char* argv[]) {
             const size_t l_q = static_cast<size_t>(f_t - p) - 1;
             if (q_ord == 0 || prev_q.compare(0, std::string::npos, p, l_q) != 0) { prev_q.assign(p, l_q); ++q_ord; }
             double fident = f_fi ? std::strtod(f_fi, nullptr) : 0.0;
-            uint32_t alnlen = f_al ? static_cast<uint32_t>(std::strtoul(f_al, nullptr, 10)) : (tend - tstart + 1);
 
             Acc& a = acc[std::string(f_t, l_t)];
             a.ensure(tlen);
@@ -221,7 +219,6 @@ int cmd_ref_stats(int argc, char* argv[]) {
             uint32_t s0 = tstart > 0 ? tstart - 1 : 0;
             a.cover(s0, tend);
             a.sum_fident += fident;
-            a.sum_alnlen += alnlen;
             if (a.last_q != q_ord) { a.last_q = q_ord; ++a.n_reads; }
             ++a.n_alns;
             ++nrows;
