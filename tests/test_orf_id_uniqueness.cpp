@@ -146,8 +146,11 @@ struct GffGene { std::string seq; char strand; int frame; };
 void check_predict_emits_distinct_ids(const char* dart_bin) {
     std::cout << "Running predict ORF-id uniqueness regression...\n";
 
-    char tmpl[] = "/projects/caeg/scratch/user/tmp/dart_orfid_XXXXXX";
-    const char* dir = mkdtemp(tmpl);
+    const char* base = std::getenv("TMPDIR");
+    std::string tmpl_s = std::string(base && *base ? base : "/tmp") + "/dart_orfid_XXXXXX";
+    std::vector<char> tmpl(tmpl_s.begin(), tmpl_s.end());
+    tmpl.push_back('\0');
+    const char* dir = mkdtemp(tmpl.data());
     if (!expect(dir != nullptr, "mkdtemp")) return;
 
     std::string reads = std::string(dir) + "/reads.fq";
