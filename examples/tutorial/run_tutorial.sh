@@ -8,7 +8,7 @@
 # (13,681 of 149,276) that are actually matched by these reads.
 #
 # Prerequisites:
-#   - agp built: cmake --build build -j8 && cp build/dart /usr/local/bin/
+#   - dart built: cmake --build build -j8 && cp build/dart /usr/local/bin/
 #   - mmseqs2 installed: conda install -c bioconda mmseqs2
 #     (VTML20.out substitution matrix is bundled in examples/tutorial/data/)
 #
@@ -21,6 +21,14 @@
 # To use your own protein database (e.g. KEGG, UniRef90):
 #   DB=/path/to/mmseqs2_db bash run_tutorial.sh [output_dir]
 #   (pre-index with: mmseqs createdb ref.faa ref_db && mmseqs createindex ref_db tmp)
+#
+# Standalone-run choices made explicit (damage-annotate and predict refuse to guess them):
+#   --allow-self-profile  predict estimates the damage profile from these reads; production runs
+#                         pass --library-profile from a library-level profile instead.
+#   --no-null             EM without a null model; the tutorial reference is the subset these
+#                         reads hit, so there are no absent proteins to guard against.
+#   EM tape dir           an O_DIRECT-capable local dir for the EM tape; defaults to
+#                         $OUT_DIR/em_tape, override with DART_EM_TAPE_DIR (not tmpfs).
 
 set -euo pipefail
 
@@ -31,6 +39,7 @@ THREADS=${THREADS:-8}
 
 TUTORIAL_DIR="$(cd "$(dirname "$0")" && pwd)"
 OUT_DIR="${1:-$TUTORIAL_DIR/output}"
+EM_TAPE_DIR="${DART_EM_TAPE_DIR:-$OUT_DIR/em_tape}"
 
 mkdir -p "$OUT_DIR" "$OUT_DIR/tmp"
 
@@ -49,7 +58,7 @@ echo "Step 1/4: Gene prediction..."
     -o "$OUT_DIR/predictions.gff" \
     --fasta-aa "$OUT_DIR/proteins.faa" \
     --damage-index "$OUT_DIR/predictions.agd" \
-    --adaptive \
+    --allow-self-profile \
     -t "$THREADS"
 echo ""
 
@@ -97,6 +106,8 @@ echo "Step 4/4: Damage annotation..."
     -o "$OUT_DIR/annotated.tsv" \
     --gene-summary "$OUT_DIR/gene_summary.tsv" \
     --auto-calibrate-spurious \
+    --no-null \
+    --em-tape-dir "$EM_TAPE_DIR" \
     -t "$THREADS" \
     -v
 echo ""

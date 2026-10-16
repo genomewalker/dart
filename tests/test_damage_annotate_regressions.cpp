@@ -90,7 +90,9 @@ static bool parse_table(const std::string& text, Table& t, std::string& err) {
     std::string line;
     bool have_header = false;
     while (std::getline(iss, line)) {
-        if (line.empty()) continue;
+        // Captured output interleaves stderr log lines (e.g. the libtaph gate warning); only
+        // tab-separated lines belong to the table.
+        if (line.find('\t') == std::string::npos) continue;
         if (!have_header) {
             t.header = split_tabs(line);
             have_header = true;
@@ -248,7 +250,7 @@ static bool test_em_target_gamma_consistency(const std::string& dart_bin, const 
     }
 
     std::string out;
-    std::string cmd = shell_quote(dart_bin) + " damage-annotate --emi " + shell_quote(emi_path) + " --em";
+    std::string cmd = shell_quote(dart_bin) + " damage-annotate --no-null --emi " + shell_quote(emi_path) + " --em";
     if (!run_command_capture(cmd, out, err)) {
         std::cerr << err << "\n";
         return false;
@@ -295,13 +297,13 @@ static bool test_max_dist_recomputes_metrics(const std::string& dart_bin, const 
     }
 
     std::string out1, out2;
-    std::string cmd1 = shell_quote(dart_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
+    std::string cmd1 = shell_quote(dart_bin) + " damage-annotate --no-null --emi " + shell_quote(emi_path) +
                        " --d-max 0.3 --lambda 0.3";
     if (!run_command_capture(cmd1, out1, err)) {
         std::cerr << err << "\n";
         return false;
     }
-    std::string cmd2 = shell_quote(dart_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
+    std::string cmd2 = shell_quote(dart_bin) + " damage-annotate --no-null --emi " + shell_quote(emi_path) +
                        " --d-max 0.3 --lambda 0.3 --max-dist 0";
     if (!run_command_capture(cmd2, out2, err)) {
         std::cerr << err << "\n";
@@ -355,14 +357,14 @@ static bool test_threshold_is_damaged(const std::string& dart_bin, const std::st
     }
 
     std::string out_lo, out_hi;
-    std::string cmd_hi = shell_quote(dart_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
+    std::string cmd_hi = shell_quote(dart_bin) + " damage-annotate --no-null --emi " + shell_quote(emi_path) +
                          " --damage-index " + shell_quote(agd_path) +
                          " --d-max 0.3 --no-identity --threshold 1.0";
     if (!run_command_capture(cmd_hi, out_hi, err)) {
         std::cerr << err << "\n";
         return false;
     }
-    std::string cmd_lo = shell_quote(dart_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
+    std::string cmd_lo = shell_quote(dart_bin) + " damage-annotate --no-null --emi " + shell_quote(emi_path) +
                          " --damage-index " + shell_quote(agd_path) +
                          " --d-max 0.3 --no-identity --threshold 0.0";
     if (!run_command_capture(cmd_lo, out_lo, err)) {
@@ -424,7 +426,7 @@ static bool test_protein_mapping_filters(const std::string& dart_bin, const std:
     const std::string protein_filtered = tmpdir + "/protein_filtered.tsv";
     const std::string combined_output = tmpdir + "/combined_output.tsv";
     std::string out;
-    std::string cmd = shell_quote(dart_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
+    std::string cmd = shell_quote(dart_bin) + " damage-annotate --no-null --emi " + shell_quote(emi_path) +
                       " --gene-summary " + shell_quote(gene_summary) +
                       " --protein-summary " + shell_quote(protein_summary) +
                       " --protein-filtered " + shell_quote(protein_filtered) +
@@ -506,7 +508,7 @@ static bool test_blast8_unique_export(const std::string& dart_bin, const std::st
 
     const std::string blast8_unique = tmpdir + "/blast8_unique.tsv";
     std::string out;
-    std::string cmd = shell_quote(dart_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
+    std::string cmd = shell_quote(dart_bin) + " damage-annotate --no-null --emi " + shell_quote(emi_path) +
                       " --blast8-unique " + shell_quote(blast8_unique);
     if (!run_command_capture(cmd, out, err)) {
         std::cerr << err << "\n";
@@ -557,7 +559,7 @@ static bool test_analysis_prefix_bundle(const std::string& dart_bin, const std::
 
     const std::string prefix = tmpdir + "/bundle";
     std::string out;
-    std::string cmd = shell_quote(dart_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
+    std::string cmd = shell_quote(dart_bin) + " damage-annotate --no-null --emi " + shell_quote(emi_path) +
                       " --map " + shell_quote(map_path) +
                       " --analysis-prefix " + shell_quote(prefix) +
                       " --min-reads 1 --min-breadth 0 --min-depth 0";
@@ -610,7 +612,7 @@ static bool test_analysis_explicit_named_outputs(const std::string& dart_bin, co
     const std::string blast8_out = tmpdir + "/my.unique.custom.blast8";
     const std::string categories_out = tmpdir + "/my.categories.custom.tsv";
     std::string out;
-    std::string cmd = shell_quote(dart_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
+    std::string cmd = shell_quote(dart_bin) + " damage-annotate --no-null --emi " + shell_quote(emi_path) +
                       " --map " + shell_quote(map_path) +
                       " --analysis-proteins " + shell_quote(proteins_out) +
                       " --analysis-blast8 " + shell_quote(blast8_out) +
@@ -676,7 +678,7 @@ static bool test_refine_damage_zero_mismatch_denominator(const std::string& dart
 
     std::string out;
     // Use d_max=1.0 so any downward refit proves zero-mismatch reads enter the denominator.
-    std::string cmd = shell_quote(dart_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
+    std::string cmd = shell_quote(dart_bin) + " damage-annotate --no-null --emi " + shell_quote(emi_path) +
                       " --d-max 1.0 --lambda 0.3 --refine-damage -v";
     if (!run_command_capture(cmd, out, err)) {
         std::cerr << err << "\n";
@@ -728,7 +730,7 @@ static bool test_ancient_threshold_cli_flag(const std::string& dart_bin, const s
 
     // Default threshold (0.60): site-only posterior ~0.38 -> Undetermined -> is_damaged=0
     std::string out_default, out_low;
-    std::string cmd_default = shell_quote(dart_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
+    std::string cmd_default = shell_quote(dart_bin) + " damage-annotate --no-null --emi " + shell_quote(emi_path) +
                               " --d-max 0.3 --no-identity";
     if (!run_command_capture(cmd_default, out_default, err)) {
         std::cerr << err << "\n";
@@ -737,7 +739,7 @@ static bool test_ancient_threshold_cli_flag(const std::string& dart_bin, const s
 
     // Lower ancient-threshold to 0.20 (and modern-threshold to 0.10 to satisfy ordering constraint):
     // same posterior should become damage_class="ancient"
-    std::string cmd_low = shell_quote(dart_bin) + " damage-annotate --emi " + shell_quote(emi_path) +
+    std::string cmd_low = shell_quote(dart_bin) + " damage-annotate --no-null --emi " + shell_quote(emi_path) +
                           " --d-max 0.3 --no-identity --ancient-threshold 0.20 --modern-threshold 0.10";
     if (!run_command_capture(cmd_low, out_low, err)) {
         std::cerr << err << "\n";
@@ -828,6 +830,8 @@ int main(int argc, char* argv[]) {
         return 2;
     }
     const std::string tmpdir = tmp;
+    // The EM tape needs an O_DIRECT-capable local dir; keep a caller's DART_EM_TAPE_DIR.
+    setenv("DART_EM_TAPE_DIR", (tmpdir + "/emtape").c_str(), 0);
 
     bool ok = true;
     ok = test_em_target_gamma_consistency(dart_bin, tmpdir) && ok;
