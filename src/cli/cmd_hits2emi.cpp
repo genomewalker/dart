@@ -1,9 +1,13 @@
 #include "subcommand.hpp"
 #include "dart/version.h"
 #include "dart/fast_columnar_writer.hpp"
+#include "dart/columnar_index.hpp"
+#include "dart/emi_v7_io.hpp"
 #include "dart/log_utils.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
@@ -111,6 +115,59 @@ static uint64_t parse_memory_arg(const std::string& raw) {
     return static_cast<uint64_t>(bytes_ld);
 }
 
+// Re-encode the v6 index FastColumnarWriter produced as EMI v7, the only format damage-annotate
+// and ref-stats read. Every per-row value (AGD damage score, alignment damage evidence, scores,
+// coordinates, qaln/taln) is carried over; aln_len becomes max(q span, t span)+1 so a TSV-built
+// emi matches the hits2emi-stream encoding of the same alignment.
+// ceiling: holds every row (with qaln/taln) in RAM for the v7 total-order sort;
+// upgrade: per-block streaming encode as in hits2emi-stream.
+static void write_v7_from_v6(const std::string& v6_path, const std::string& out_path) {
+    ColumnarIndexReader rd(v6_path);
+    if (!rd.is_valid()) throw std::runtime_error("cannot read intermediate index: " + v6_path);
+    rd.set_all_columns();
+
+    std::vector<std::vector<emiv7::Row>> per_rg(rd.num_row_groups());
+    rd.parallel_scan([&](uint32_t rg, uint32_t n, const uint32_t* read_idx, const uint32_t* ref_idx,
+                         const float* bit, const float* dmg, const float* ev,
+                         const uint16_t* dk, const uint16_t* dm, const float* la, const float* lm,
+                         const uint16_t* iq, const uint16_t*, const uint16_t* qs, const uint16_t* qe,
+                         const uint16_t* ts, const uint16_t* te, const uint16_t* tl, const uint16_t* ql,
+                         const uint16_t*, const uint16_t*) {
+        auto& rows = per_rg[rg];
+        rows.resize(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            emiv7::Row& r = rows[i];
+            r.read_idx = read_idx[i];
+            r.ref_idx = ref_idx[i];
+            r.bit_score = bit[i];
+            r.damage_score = dmg[i];
+            r.evalue_log10 = ev[i];
+            r.identity_q = iq[i];
+            r.qstart = qs[i]; r.qend = qe[i];
+            r.tstart = ts[i]; r.tend = te[i];
+            r.tlen = tl[i]; r.qlen = ql[i];
+            r.aln_len = static_cast<uint16_t>(std::min(
+                65535, std::max(std::abs(int(qe[i]) - int(qs[i])), std::abs(int(te[i]) - int(ts[i]))) + 1));
+            r.dmg_k = dk[i]; r.dmg_m = dm[i];
+            r.dmg_ll_a = la[i]; r.dmg_ll_m = lm[i];
+            r.qaln = std::string(rd.get_qaln(rg, i));
+            r.taln = std::string(rd.get_taln(rg, i));
+        }
+    });
+
+    std::vector<emiv7::Row> rows;
+    rows.reserve(rd.num_alignments());
+    for (auto& v : per_rg) {
+        std::move(v.begin(), v.end(), std::back_inserter(rows));
+        std::vector<emiv7::Row>().swap(v);
+    }
+    std::vector<std::string> read_names(rd.num_reads());
+    for (uint32_t r = 0; r < rd.num_reads(); ++r) read_names[r] = std::string(rd.read_name(r));
+    std::vector<emiv7::EmiReadAnnot> annots(rd.num_reads());
+    emiv7::Writer::write(out_path, std::move(rows), annots, read_names, rd.ref_names_pread(),
+                         emiv7::EMI_V7_BLOCK_TARGET_ROWS, rd.d_max(), rd.lambda());
+}
+
 }  // namespace
 
 int cmd_hits2emi(int argc, char* argv[]) {
@@ -149,7 +206,7 @@ int cmd_hits2emi(int argc, char* argv[]) {
             verbose = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             std::cout << "Usage: dart hits2emi -i <hits.tsv[.gz]> -o <output.emi> [options]\n\n";
-            std::cout << "Convert MMseqs2 hits to columnar EM index (DuckDB-style streaming).\n\n";
+            std::cout << "Convert MMseqs2 hits to a columnar EM index (EMI v7, read by damage-annotate and ref-stats).\n\n";
             std::cout << "Features:\n";
             std::cout << "  - Hybrid mode for plain files: mmap for small, streaming for large\n";
             std::cout << "  - Auto-detects gzip compression (.gz files, defaults to streaming)\n";
@@ -210,7 +267,10 @@ int cmd_hits2emi(int argc, char* argv[]) {
         config.force_streaming = force_streaming;
         config.damage_index_path = damage_index_file;
 
-        uint64_t n_rows = FastColumnarWriter::convert(tsv_file, output_file, config);
+        const std::string v6_path = output_file + ".v6.tmp";
+        uint64_t n_rows = FastColumnarWriter::convert(tsv_file, v6_path, config);
+        write_v7_from_v6(v6_path, output_file);
+        std::remove(v6_path.c_str());
 
         auto t_end = std::chrono::steady_clock::now();
         auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
