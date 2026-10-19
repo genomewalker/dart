@@ -324,6 +324,11 @@ if(BUILD_TESTING)
         COMMAND dart-damage-annotate-regressions $<TARGET_FILE:dart>
     )
 
+    add_test(
+        NAME cli_errors
+        COMMAND bash ${CMAKE_SOURCE_DIR}/tests/cli_errors.sh $<TARGET_FILE:dart>
+    )
+
     add_executable(
         dart-profile-regressions
         tests/test_profile_regressions.cpp

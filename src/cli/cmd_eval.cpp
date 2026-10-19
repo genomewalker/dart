@@ -1,7 +1,9 @@
 #include "cli/subcommand.hpp"
 #include <cstdint>
 #include <cstdio>
+#include <cerrno>
 #include <cstring>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 
@@ -55,7 +57,7 @@ static std::unordered_map<std::string, ReadTruth> load_truth(const char* path) {
     std::unordered_map<std::string, ReadTruth> truth;
     truth.reserve(12000000);
     FILE* f = fopen(path, "r");
-    if (!f) { fprintf(stderr, "eval: cannot open truth file: %s\n", path); return truth; }
+    if (!f) throw std::runtime_error(std::string("cannot open truth file: ") + path + ": " + std::strerror(errno));
     char buf[4096];
     char* fields[16];
     bool header = true;
@@ -92,7 +94,7 @@ static std::unordered_map<std::string, ReadPred> load_gff(const char* path) {
     std::unordered_map<std::string, ReadPred> preds;
     preds.reserve(12000000);
     FILE* f = fopen(path, "r");
-    if (!f) { fprintf(stderr, "eval: cannot open GFF: %s\n", path); return preds; }
+    if (!f) throw std::runtime_error(std::string("cannot open GFF: ") + path + ": " + std::strerror(errno));
     char buf[4096];
     char* fields[10];
     while (fgets(buf, sizeof(buf), f)) {
@@ -132,7 +134,7 @@ static std::unordered_map<std::string, std::string> load_proteins(const char* pa
     std::unordered_map<std::string, std::string> proteins;
     proteins.reserve(12000000);
     FILE* f = fopen(path, "r");
-    if (!f) { fprintf(stderr, "eval: cannot open proteins FASTA: %s\n", path); return proteins; }
+    if (!f) throw std::runtime_error(std::string("cannot open proteins FASTA: ") + path + ": " + std::strerror(errno));
     char buf[65536];
     std::string cur_rid;
     while (fgets(buf, sizeof(buf), f)) {
