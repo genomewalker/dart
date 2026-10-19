@@ -1016,8 +1016,8 @@ EMState squarem_em(
 // ---------------------------------------------------------------------------
 // compact_em_map (fusion dual-b8247d43): the SINGLE EM solver. Decode-once CSR
 // {ref_idx, base_a, base_m} where base = length_log_penalty + coverage_log_penalty +
-// real_log_density (+ frozen damage log(p_read)+ll_a / log(1-p_read)+ll_m), all
-// iteration-independent. Per-iter E-step adds only log(weights[ref]); fused per-ref
+// real_log_density, split into ancient/modern by em_base_pair (damage enters the
+// mapping only with use_damage), all iteration-independent. Per-iter E-step adds only log(weights[ref]); fused per-ref
 // s_t = Σγ; full SQUAREM; DETERMINISTIC-LANE M-step (fixed lanes, read-order per lane,
 // ascending-lane reduce) -> bitwise-identical across thread counts. Frozen-damage branch
 // (use_alignment_damage_likelihood): pi is post-hoc, only w_null rides the SQUAREM state.
@@ -1069,8 +1069,7 @@ EMState compact_em_map(AlignmentData& data, const EMParams& params,
                       + coverage_log_penalty(params, aln.ref_idx)
                       + real_log_density(params, static_cast<double>(aln.bit_score), aln.aln_len, score_scale);
             const double pr = std::clamp(static_cast<double>(aln.damage_score), eps, 1.0 - eps);
-            base_a[j] = bc + std::log(pr) + aln.damage_ll_a;
-            base_m[j] = bc + std::log(1.0 - pr) + aln.damage_ll_m;
+            em_base_pair(params, bc, pr, aln.damage_ll_a, aln.damage_ll_m, base_a[j], base_m[j]);
         }
     }
 
@@ -1214,7 +1213,8 @@ EMState compact_em_map(AlignmentData& data, const EMParams& params,
     // gamma is likewise at state.weights). When streaming, hand each read to finalize_cb
     // and hold no O(A) gamma; else fill state.gamma / state.gamma_ancient as before.
     // gamma_ancient: use_damage -> ga (joint); posthoc_gamma_ancient -> gamma * p_anc with
-    // p_anc = sigmoid(base_a - base_m) (bc cancels; == the CLI's post-hoc formula). ----
+    // p_anc = sigmoid(base_a - base_m) (bc cancels; == the CLI's post-hoc formula; the
+    // damage-free split in em_base_pair keeps this difference). ----
     {
         const double log_w_null_dyn = null_on ? std::log(std::max(state.weights[T], params.min_weight)) : 0.0;
         std::vector<double> ls, gbuf, gabuf;
@@ -1391,8 +1391,7 @@ static inline void tape_decode_read(
                   + coverage_log_penalty(params, aln.ref_idx)
                   + real_log_density(params, static_cast<double>(aln.bit_score), aln.aln_len, score_scale);
         const double pr = std::clamp(static_cast<double>(aln.damage_score), eps, 1.0 - eps);
-        basea_out[j] = bc + std::log(pr) + aln.damage_ll_a;
-        basem_out[j] = bc + std::log(1.0 - pr) + aln.damage_ll_m;
+        em_base_pair(params, bc, pr, aln.damage_ll_a, aln.damage_ll_m, basea_out[j], basem_out[j]);
     }
 }
 
@@ -1401,7 +1400,7 @@ static inline void tape_decode_read(
 // it re-reads the whole tape and drives finalize_cb, so it always re-runs, and a
 // resumed run is therefore bit-identical (final pass is a pure function of weights).
 static constexpr uint64_t TAPE_CKPT_MAGIC   = 0x5441504543484B31ULL;  // "TAPECHK1"
-static constexpr uint32_t TAPE_CKPT_VERSION = 1;
+static constexpr uint32_t TAPE_CKPT_VERSION = 2;  // 2: damage-free mapping base (em_base_pair)
 
 struct TapeCkptHeader {
     uint64_t magic;
