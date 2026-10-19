@@ -401,9 +401,10 @@ inline double real_log_density(const EMParams& params, double bit,
 
 // Ancient/modern log scores of one alignment from its damage-free base bc. With
 // use_damage the damage terms enter the mapping: base_a = bc + log(pr) + ll_a,
-// base_m = bc + log(1-pr) + ll_m. Without it bc is split by p_anc = sigmoid(d),
-// d = log(pr/(1-pr)) + ll_a - ll_m, so e^base_a + e^base_m = e^bc (the mapping sees
-// bc only) and base_a - base_m = d still gives the post-hoc p_anc.
+// base_m = bc + log(1-pr) + ll_m. Without it bc is split by p_anc = pr, so
+// e^base_a + e^base_m = e^bc (the mapping sees bc only) and base_a - base_m = logit(pr)
+// gives the post-hoc p_anc. ll_a/ll_m stay out of it: the AGD read posterior pr already
+// scores the terminal C->T sites the alignment likelihood would count again.
 inline void em_base_pair(const EMParams& params, double bc, double pr,
                          double ll_a, double ll_m, double& base_a, double& base_m) {
     if (params.use_damage) {
@@ -411,7 +412,7 @@ inline void em_base_pair(const EMParams& params, double bc, double pr,
         base_m = bc + std::log(1.0 - pr) + ll_m;
         return;
     }
-    const double d = std::log(pr) - std::log1p(-pr) + ll_a - ll_m;
+    const double d = std::log(pr) - std::log1p(-pr);
     const double sp = std::log1p(std::exp(-std::fabs(d)));
     base_a = bc + std::min(d, 0.0) - sp;
     base_m = bc + std::min(-d, 0.0) - sp;

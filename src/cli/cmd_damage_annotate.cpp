@@ -3276,22 +3276,13 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         // because damage never drove the mapping loop.
         if (em_params.posthoc_gamma_ancient) {
             const double eps = 1e-12;
-            const bool use_aln_dmg = emi_has_alignment_damage;
+            // p_anc = the AGD read posterior; the alignment damage likelihoods would count
+            // its terminal C->T sites a second time (see em_base_pair).
             const size_t A = aln_data.alignments.size();
             em_state.gamma_ancient.assign(A, 0.0);
             for (size_t j = 0; j < A; ++j) {
                 const auto& aln = aln_data.alignments[j];
-                const double ds = std::clamp(static_cast<double>(aln.damage_score), eps, 1.0 - eps);
-                double p_anc;
-                if (use_aln_dmg) {
-                    const double la = std::log(ds) + static_cast<double>(aln.damage_ll_a);
-                    const double lm = std::log(1.0 - ds) + static_cast<double>(aln.damage_ll_m);
-                    const double mx = std::max(la, lm);
-                    const double ea = std::exp(la - mx), em = std::exp(lm - mx);
-                    p_anc = ea / (ea + em);
-                } else {
-                    p_anc = ds;  // the AGD read posterior already carries the library prior
-                }
+                const double p_anc = std::clamp(static_cast<double>(aln.damage_score), eps, 1.0 - eps);
                 em_state.gamma_ancient[j] = em_state.gamma[j] * p_anc;
             }
         }
