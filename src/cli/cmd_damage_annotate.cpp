@@ -1444,8 +1444,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                    strcmp(argv[i], "--em-reject-llr") == 0 ||
                    strcmp(argv[i], "--em-calib-temperature") == 0 ||
                    strcmp(argv[i], "--preset") == 0) {
-            std::cerr << "Error: " << argv[i] << " was removed: it had no effect "
-                         "(compact_em_map is the sole EM solver). Drop it.\n";
+            std::cerr << "Error: " << argv[i] << " was removed in DART 2.0. Drop it; runs without it "
+                         "behave as before (see 'Removed in 2.0' in the Command Reference).\n";
             return 1;
         } else if (strcmp(argv[i], "--em-tape-dir") == 0 && i + 1 < argc) {
             em_tape_dir = argv[++i];
