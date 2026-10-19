@@ -124,7 +124,7 @@ int main() {
 
     // (d) DAMAGE-FREE MAPPING: one read, two refs with equal bits and lengths but
     // damage_ll_m differing by 3. use_damage off -> gamma 0.5/0.5 on both solvers and
-    // gamma_ancient = gamma * sigmoid(log(pr/(1-pr)) + ll_a - ll_m).
+    // gamma_ancient = gamma * pr (the alignment damage likelihoods do not enter it).
     AlignmentData d1;
     d1.num_reads = 1; d1.num_refs = 2;
     d1.read_offsets = {0, 2};
@@ -147,8 +147,7 @@ int main() {
     for (uint32_t j = 0; free_err == 0.0 && j < 2; ++j) {
         const auto& a = d1.alignments[j];
         const double pr = a.damage_score;
-        const double dd = std::log(pr / (1.0 - pr)) + a.damage_ll_a - a.damage_ll_m;
-        const double want_ga = 0.5 / (1.0 + std::exp(-dd));
+        const double want_ga = 0.5 * pr;
         for (const EMState* st : {&f_c, &f_t}) {
             free_err = std::max(free_err, std::fabs(st->gamma[j] - 0.5));
             free_err = std::max(free_err, std::fabs(st->gamma_ancient[j] - want_ga));
