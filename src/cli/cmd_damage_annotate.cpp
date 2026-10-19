@@ -1395,7 +1395,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     bool no_null = false;
     // Damage-free mapping (removes circularity: damage likelihoods must not both
     // pick the homolog and then be reused in gamma_ancient). OFF => mapping gamma
-    // is damage-free; gamma_ancient is still emitted post-hoc against frozen weights.
+    // is damage-free; gamma_ancient is emitted post-hoc against frozen weights when the
+    // damage index is pi DETECTED (see agd_read_prior).
     bool em_use_damage_mapping = false;
     // Soft multi-mapping emit (DCX 2.2): emit the top-K EM candidates per read (not just the
     // argmax) so downstream can distribute a read's SAAV evidence across homologs by gamma.
@@ -1710,7 +1711,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cout << "  --em-min-margin FLOAT   Min top1-top2 margin for damage/auth evidence (default: 0.5)\n";
             std::cout << "  --em-max-neff FLOAT     Max effective refs/read for damage/auth evidence (default: 2.0)\n";
             std::cout << "  --em-use-damage-mapping Let damage likelihoods influence the mapping (default: off;\n";
-            std::cout << "                          off => damage-free mapping, gamma_ancient still emitted post-hoc)\n";
+            std::cout << "                          off => damage-free mapping; gamma_ancient is emitted post-hoc\n";
+            std::cout << "                          only when --damage-index is pi DETECTED, else left empty)\n";
             std::cout << "  --no-null               Run EM without a null model, accepting that a flat targeted\n";
             std::cout << "                          database can force-map absent-protein reads to false annotations\n";
             std::cout << "  --em-tape-dir DIR       O_DIRECT EM tape dir (or DART_EM_TAPE_DIR); needed when EM runs\n";
@@ -2041,6 +2043,34 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     const uint32_t n_reads = reader.num_reads();
     const uint32_t n_refs = reader.num_refs();
 
+    // Per-read ancient prior for post-hoc gamma_ancient: the AGD p_damaged, used only when the
+    // library is pi DETECTED, where libtaph wrote its prior-aware read posterior. Otherwise the
+    // AGD byte is sigmoid(prior-free LLR) under an implicit 0.5 prior, so gamma_ancient is left
+    // empty instead of being reported from it.
+    const bool agd_read_prior = damage_index && damage_index->pi_detected();
+    std::vector<uint8_t> agd_dmg_q;
+    if (agd_read_prior) {
+        agd_dmg_q.assign(n_reads, 0);
+        uint64_t agd_missing = 0;
+        #pragma omp parallel for schedule(static) reduction(+:agd_missing)
+        for (uint32_t r = 0; r < n_reads; ++r) {
+            if (const AgdRecord* rec = damage_index->find(reader.read_name(r))) agd_dmg_q[r] = rec->p_damaged_q;
+            else ++agd_missing;
+        }
+        if (agd_missing > 0)
+            std::cerr << "Warning: " << agd_missing << " of " << n_reads
+                      << " EMI reads are missing from the damage index; their p_damaged is 0\n";
+    }
+    if (verbose) {
+        std::cerr << "Per-read ancient prior: "
+                  << (agd_read_prior ? "AGD p_damaged (library pi DETECTED)"
+                                     : "none; gamma_ancient left empty (library not pi DETECTED)")
+                  << "\n";
+    }
+    auto read_dmg = [&](const float* col, size_t i, uint32_t ridx) {
+        return agd_read_prior ? agd_dmg_q[ridx] * (1.0f / 255.0f) : std::clamp(col[i], 0.0f, 1.0f);
+    };
+
     if (verbose) {
         std::cerr << "EMI metadata:\n";
         std::cerr << "  Version: " << reader.version() << "\n";
@@ -2363,7 +2393,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 ca.read_idx = ridx;
                 ca.ref_idx = tidx;
                 ca.bit_score = bits;
-                const float ds = std::clamp(damage_score[i], 0.0f, 1.0f);
+                const float ds = read_dmg(damage_score, i, ridx);
                 ca.damage_score = ds;
                 const float ll_a = dmg_ll_a ? dmg_ll_a[i] : 0.0f;
                 const float ll_m = dmg_ll_m ? dmg_ll_m[i] : 0.0f;
@@ -2418,7 +2448,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     BestHitCandidate cand;
                     cand.bits = bits;
                     cand.bits_second = 0.0f;
-                    cand.damage_score = std::clamp(damage_score[i], 0.0f, 1.0f);
+                    cand.damage_score = read_dmg(damage_score, i, ridx);
                     cand.ref_idx = tidx;
                     cand.fident = fident;
                     cand.evalue = evalue;
@@ -2432,7 +2462,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     local_best_sorted.emplace_back(ridx, cand);
                 } else {
                     update_candidate(local_best_sorted.back().second,
-                                     bits, std::clamp(damage_score[i], 0.0f, 1.0f),
+                                     bits, read_dmg(damage_score, i, ridx),
                                      tidx, fident, evalue,
                                      qstart_0, tstart_0, qlen_v, tlen_v,
                                      static_cast<uint32_t>(aln_len_v), i);
@@ -2443,7 +2473,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     BestHitCandidate cand;
                     cand.bits = bits;
                     cand.bits_second = 0.0f;
-                    cand.damage_score = std::clamp(damage_score[i], 0.0f, 1.0f);
+                    cand.damage_score = read_dmg(damage_score, i, ridx);
                     cand.ref_idx = tidx;
                     cand.fident = fident;
                     cand.evalue = evalue;
@@ -2457,7 +2487,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     it->second = cand;
                 } else {
                     update_candidate(it->second,
-                                     bits, std::clamp(damage_score[i], 0.0f, 1.0f),
+                                     bits, read_dmg(damage_score, i, ridx),
                                      tidx, fident, evalue,
                                      qstart_0, tstart_0, qlen_v, tlen_v,
                                      static_cast<uint32_t>(aln_len_v), i);
@@ -2930,20 +2960,17 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
         // Post-hoc ancient responsibility is produced by the EM final pass itself when the
         // mapping is damage-free (gamma_ancient = gamma * P(ancient|aln) at frozen weights).
-        em_params.posthoc_gamma_ancient =
-            !em_use_damage_mapping &&
-            (emi_has_alignment_damage || (emi_has_damage_scores && em_damage_varies_within_read));
+        em_params.posthoc_gamma_ancient = !em_use_damage_mapping && agd_read_prior;
 
         // Streaming (transient-gamma) EM: iterations hold no O(alignments) gamma, the final
         // pass streams per-read gamma straight into the finalization below, and
         // compact_em_map releases aln_data.alignments after decode -> steady RSS ~20 B/aln
         // (vs 20+32). Gated to the production config where per-read finalization needs only
         // ref/gamma/gamma_ancient: no --em-audit, no calib densities, no null column,
-        // damage-free mapping, and — when post-hoc ancient is active — alignment-level damage
-        // likelihoods so p_anc = sigmoid(base_a - base_m) is EXACT (matches the legacy loop).
+        // damage-free mapping. Post-hoc p_anc = sigmoid(base_a - base_m) matches the legacy loop
+        // with or without DMG_LL columns (without them it is the AGD read posterior itself).
         const bool can_stream =
-            em_audit_file.empty() && !use_em_calib && !use_em_null && !em_params.use_damage &&
-            (!em_params.posthoc_gamma_ancient || emi_has_alignment_damage);
+            em_audit_file.empty() && !use_em_calib && !use_em_null && !em_params.use_damage;
         const float em_keep_thr = static_cast<float>(em_min_prob);
 
         // ---- Tape path: build the O_DIRECT hot tape by a streaming decode (scan-2) ----
@@ -2961,13 +2988,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             }
         } tape_guard;
         if (tape_path) {
-            if (!can_stream) {
-                std::cerr << "Error: EM tape path needs alignment-level damage likelihoods when "
-                             "post-hoc ancient responsibility is active (DAMAGE_SCORE varies within "
-                             "read but no DMG_LL columns). Re-run with an EMI carrying alignment "
-                             "damage likelihoods.\n";
-                return 1;
-            }
             if (em_tape_dir.empty()) { const char* e = std::getenv("DART_EM_TAPE_DIR"); if (e) em_tape_dir = e; }
             if (em_tape_dir.empty()) {
                 std::cerr << "Error: EM tape path needs a node-local scratch dir. Pass --em-tape-dir "
@@ -3095,7 +3115,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                                     + dart::coverage_log_penalty(em_params, ref)
                                     + dart::real_log_density(em_params, static_cast<double>(bits), aln_len_em, 1.0);
                     const double pr = std::clamp(
-                        static_cast<double>(std::clamp(damage_score[i], 0.0f, 1.0f)), eps_dec, 1.0 - eps_dec);
+                        static_cast<double>(read_dmg(damage_score, i, ridx)), eps_dec, 1.0 - eps_dec);
                     const double la = dmg_ll_a ? static_cast<double>(dmg_ll_a[i]) : 0.0;
                     const double lm = dmg_ll_m ? static_cast<double>(dmg_ll_m[i]) : 0.0;
                     double ba, bm;
@@ -3254,11 +3274,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         // varies, which would re-couple mapping and damage in the ancient channel.
         // Damage never re-enters the mapping/M-step; pi stays at its 0.10 prior
         // because damage never drove the mapping loop.
-        if (!em_use_damage_mapping &&
-            (emi_has_alignment_damage ||
-             (emi_has_damage_scores && em_damage_varies_within_read))) {
+        if (em_params.posthoc_gamma_ancient) {
             const double eps = 1e-12;
-            const double pi_a = std::clamp(em_state.pi, eps, 1.0 - eps);
             const bool use_aln_dmg = emi_has_alignment_damage;
             const size_t A = aln_data.alignments.size();
             em_state.gamma_ancient.assign(A, 0.0);
@@ -3273,8 +3290,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     const double ea = std::exp(la - mx), em = std::exp(lm - mx);
                     p_anc = ea / (ea + em);
                 } else {
-                    const double num = pi_a * ds;
-                    p_anc = num / (num + (1.0 - pi_a) * (1.0 - ds));
+                    p_anc = ds;  // the AGD read posterior already carries the library prior
                 }
                 em_state.gamma_ancient[j] = em_state.gamma[j] * p_anc;
             }
@@ -3643,7 +3659,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                             mm_cand.gamma = mc.gamma;
                             mm_cand.gamma_ancient = mc.gamma_ancient;
                             mm_cand.candidate_rank = mc.candidate_rank;
-                            mm_cand.damage_score = std::clamp(mm_damage_score[row_in_group], 0.0f, 1.0f);
+                            mm_cand.damage_score = read_dmg(mm_damage_score, row_in_group, ridx);
                             mm_cand.fident = static_cast<float>(mm_identity_q[row_in_group]) / 65535.0f;
                             mm_cand.evalue = std::pow(10.0f, mm_evalue_log10[row_in_group]);
                             mm_cand.qstart_0 = (mm_qstart[row_in_group] > 0)
@@ -4433,9 +4449,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         if (use_em) {
             if (s.read_idx < em_read_results.size()) {
                 const auto& em = em_read_results[s.read_idx];
-                *out << "\t" << std::scientific << std::setprecision(6) << em.gamma
-                     << "\t" << std::scientific << std::setprecision(6) << em.gamma_ancient
-                     << "\t" << (em.best_hit ? 1 : 0)
+                *out << "\t" << std::scientific << std::setprecision(6) << em.gamma << "\t";
+                if (damage_em_active) *out << std::scientific << std::setprecision(6) << em.gamma_ancient;
+                *out << "\t" << (em.best_hit ? 1 : 0)
                      << "\t" << (em.em_keep ? 1 : 0)
                      << "\t" << std::fixed << std::setprecision(6) << em.em_threshold
                      << "\t" << std::fixed << std::setprecision(4) << em.em_margin
@@ -4544,10 +4560,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             });
 
         dcx::Batch B;
-        B.col_flags = dcx::COL_GAMMA_ANCIENT | dcx::COL_EM_MARGIN |
+        B.col_flags = dcx::COL_EM_MARGIN |
                       dcx::COL_EM_REF_NEFF | dcx::COL_GAMMA_NULL |
                       dcx::COL_P_READ | dcx::COL_OBS_CODON |
                       dcx::COL_STRAND | dcx::COL_QID_DICT | dcx::COL_FIDENT;
+        if (damage_em_active) B.col_flags |= dcx::COL_GAMMA_ANCIENT;
         if (emit_multimap)
             B.col_flags |= dcx::COL_SOFT_MULTIMAP | dcx::COL_CANDIDATE_RANK;
         std::unordered_map<std::string, uint32_t> tord_map;
