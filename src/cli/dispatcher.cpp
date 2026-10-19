@@ -11,6 +11,7 @@
 #include "dart/version.h"
 #include <iostream>
 #include <cstring>
+#include <stdexcept>
 
 int main(int argc, char* argv[]) {
     auto& registry = dart::cli::SubcommandRegistry::instance();
@@ -36,8 +37,21 @@ int main(int argc, char* argv[]) {
     }
 
     // Dispatch to subcommand
+    // Uncaught exceptions (a file that cannot be opened, std::stoi on a non-number)
+    // would otherwise abort with a core dump; report them and exit 1.
     if (registry.has_command(first_arg)) {
-        return registry.run_command(first_arg, argc - 1, argv + 1);
+        try {
+            return registry.run_command(first_arg, argc - 1, argv + 1);
+        } catch (const std::invalid_argument& e) {
+            std::cerr << "dart " << first_arg << ": invalid numeric value (" << e.what()
+                      << "); check the option values.\n";
+        } catch (const std::out_of_range& e) {
+            std::cerr << "dart " << first_arg << ": value out of range (" << e.what() << ").\n";
+        } catch (const std::exception& e) {
+            std::cerr << "dart " << first_arg << ": " << e.what() << "\n";
+        }
+        std::cerr << "Run 'dart " << first_arg << " --help' for usage.\n";
+        return 1;
     }
 
     // Unknown command

@@ -1373,7 +1373,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // EM reassignment options (enabled by default for abundance estimation)
     bool use_em = true;
     bool em_streaming = false;       // Use streaming EM (O(num_refs) memory instead of O(num_alns))
-    size_t em_max_memory_mb = 4096;  // Max memory for EM (MB), 0 = no limit, auto-switch to streaming if exceeded
     // Node-local scratch dir for the O_DIRECT EM tape (production streaming path).
     // Must be fast local NVMe supporting O_DIRECT (NOT /tmp, NOT NFS). Env fallback
     // DART_EM_TAPE_DIR; when unset the tape path errors and asks for it explicitly.
@@ -1408,7 +1407,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // Null/noise component (spurious short-peptide rejection). Off by default.
     std::string em_null_model_file;  // load empirical decoy Gumbel (bin lo hi mu beta n)
     double em_null_tau = 0.5;        // reject read when gamma_null > tau
-    double em_null_fdr = -1.0;       // target FDR knob (requires decoy pass; -1 = off)
     std::string fit_null_from_file;  // decoy hits TSV to fit the null model from
     std::string null_out_file;       // output sidecar for the fitted null model
 
@@ -1433,10 +1431,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     double em_reject_llr = -5.0;   // f_0 >= e^5 (~150x) more likely than f_true → reject
 
     // Coverage-aware outer EM options
-    bool use_coverage_em = false;
-    uint32_t coverage_em_iters = 5;
-    float coverage_em_tau = 0.13f;
-    uint32_t coverage_em_bins = 6;
 
     // Bayesian scoring parameters
     float prior_ancient = 0.10f;     // Prior P(ancient) for Bayesian scorer
@@ -1448,9 +1442,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     float site_cap           = 3.0f;  // --site-cap
     float w0                 = 0.3f;  // --w0
     // Coverage EM tuning
-    float depth_gate_lo = 8.0f;       // --depth-gate-lo
-    float depth_gate_hi = 20.0f;      // --depth-gate-hi
-    float w_min         = 0.20f;      // --w-min
 
     // Alignment-level pre-filters (applied before any processing)
     float aln_min_identity = 0.0f;   // 0 = no filter
@@ -1554,29 +1545,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             em_reject_llr = std::stod(argv[++i]);
         } else if (strcmp(argv[i], "--em-null-tau") == 0 && i + 1 < argc) {
             em_null_tau = std::stod(argv[++i]);
-        } else if (strcmp(argv[i], "--em-null-fdr") == 0 && i + 1 < argc) {
-            em_null_fdr = std::stod(argv[++i]);
         } else if (strcmp(argv[i], "--fit-null-from") == 0 && i + 1 < argc) {
             fit_null_from_file = argv[++i];
         } else if (strcmp(argv[i], "--null-out") == 0 && i + 1 < argc) {
             null_out_file = argv[++i];
-        } else if (strcmp(argv[i], "--coverage-em") == 0) {
-            use_coverage_em = true;
         } else if (strcmp(argv[i], "--no-coverage-em") == 0) {
-            // Backward-compatible alias; coverage EM is now opt-in.
-            use_coverage_em = false;
-        } else if (strcmp(argv[i], "--coverage-em-iters") == 0 && i + 1 < argc) {
-            coverage_em_iters = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (strcmp(argv[i], "--coverage-em-tau") == 0 && i + 1 < argc) {
-            coverage_em_tau = std::stof(argv[++i]);
-        } else if (strcmp(argv[i], "--coverage-em-bins") == 0 && i + 1 < argc) {
-            coverage_em_bins = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (strcmp(argv[i], "--depth-gate-lo") == 0 && i + 1 < argc) {
-            depth_gate_lo = std::stof(argv[++i]);
-        } else if (strcmp(argv[i], "--depth-gate-hi") == 0 && i + 1 < argc) {
-            depth_gate_hi = std::stof(argv[++i]);
-        } else if (strcmp(argv[i], "--w-min") == 0 && i + 1 < argc) {
-            w_min = std::stof(argv[++i]);
+            // Kept for scripts: asks for the only behaviour there is.
         } else if (strcmp(argv[i], "--prior-ancient") == 0 && i + 1 < argc) {
             prior_ancient = std::stof(argv[++i]);
         } else if (strcmp(argv[i], "--min-damage-sites") == 0 && i + 1 < argc) {
@@ -1615,8 +1589,16 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cerr << "Error: --em-streaming was removed; compact_em_map is the sole "
                          "EM solver (in-memory CSR). Drop --em-streaming.\n";
             return 1;
-        } else if ((strcmp(argv[i], "--em-max-memory") == 0 || strcmp(argv[i], "-m") == 0) && i + 1 < argc) {
-            em_max_memory_mb = static_cast<size_t>(std::stoul(argv[++i]));
+        } else if (strcmp(argv[i], "--em-max-memory") == 0 || strcmp(argv[i], "-m") == 0 ||
+                   strcmp(argv[i], "--em-null-fdr") == 0 ||
+                   strcmp(argv[i], "--coverage-em") == 0 ||
+                   strncmp(argv[i], "--coverage-em-", 14) == 0 ||
+                   strcmp(argv[i], "--depth-gate-lo") == 0 ||
+                   strcmp(argv[i], "--depth-gate-hi") == 0 ||
+                   strcmp(argv[i], "--w-min") == 0) {
+            std::cerr << "Error: " << argv[i] << " was removed: it had no effect "
+                         "(compact_em_map is the sole EM solver). Drop it.\n";
+            return 1;
         } else if (strcmp(argv[i], "--em-tape-dir") == 0 && i + 1 < argc) {
             em_tape_dir = argv[++i];
         } else if (strcmp(argv[i], "--em-checkpoint") == 0 && i + 1 < argc) {
@@ -1740,18 +1722,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cout << "  --em-keep-llr FLOAT     Keep (assign) when log f_true - log f_0 >= this (default: 0.5)\n";
             std::cout << "  --em-reject-llr FLOAT   Reject (spurious) when llr <= this; between → abstain\n";
             std::cout << "                          (insufficient_information; excluded from assignment, not a rejection) (default: -5.0)\n";
-            std::cout << "  --em-null-fdr FLOAT     Target FDR to solve tau (requires a decoy pass; default off)\n";
             std::cout << "  --fit-null-from FILE    Fit the null from a 16-col decoy hits TSV, then exit\n";
             std::cout << "  --null-out FILE         Output path for the fitted null sidecar (with --fit-null-from)\n";
-            std::cout << "\nCoverage-aware EM (outer loop, opt-in):\n";
-            std::cout << "  --coverage-em            Enable coverage-aware outer EM loop (default: off)\n";
-            std::cout << "  --no-coverage-em         Explicitly disable coverage-aware outer EM (kept for scripts)\n";
-            std::cout << "  --coverage-em-iters INT  Max outer EM iterations (default: 5)\n";
-            std::cout << "  --coverage-em-tau FLOAT  KL penalty temperature (default: 0.13)\n";
-            std::cout << "  --coverage-em-bins INT   Coverage bins per protein (default: 6)\n";
-            std::cout << "  --depth-gate-lo FLOAT    Coverage depth gate lower bound (default: 8.0)\n";
-            std::cout << "  --depth-gate-hi FLOAT    Coverage depth gate upper bound (default: 20.0)\n";
-            std::cout << "  --w-min FLOAT            Coverage weight floor (default: 0.20)\n";
             std::cout << "\nBayesian scoring:\n";
             std::cout << "  --prior-ancient FLOAT    Prior P(ancient) for Bayesian scorer (default: 0.10)\n";
             std::cout << "  --auto-prior-ancient     Auto-calibrate prior from mean p_read distribution\n";
@@ -1773,9 +1745,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cout << "  --preset loose   Maximize recall: min-reads=1, breadth=0, depth=0, min-damage-sites=1\n";
             std::cout << "  --preset strict  Maximize precision: min-reads=5, breadth=0.2, depth=1.0,\n";
             std::cout << "                   auto-calibrate-spurious, min-damage-sites=5\n";
-            std::cout << "  --em-streaming    Use streaming EM (low memory, ~2.5x slower)\n";
-            std::cout << "  --em-max-memory, -m MB  Max EM memory in MB (default: 4096)\n";
-            std::cout << "                       Auto-switches to streaming if estimate exceeds limit\n";
             std::cout << "  --min-positional-score FLOAT  Min read start diversity (default: 0)\n";
             std::cout << "                       Filters spurious matches where all reads hit same position\n";
             std::cout << "                       Score = sqrt(diversity * span), range 0-1\n";
@@ -1891,10 +1860,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                       << "; reject tau=" << em_null_tau << "\n";
         }
     }
-    if (em_null_fdr >= 0.0 && !use_em_null) {
-        std::cerr << "Error: --em-null-fdr requires --em-null-model (and a decoy pass to solve tau).\n";
-        return 1;
-    }
 
     // Load the coherent-LR calibration model (f_true + f_0) if requested. This
     // supersedes --em-null-model: it carries its own f_0 and switches the real
@@ -1918,36 +1883,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                       << " bins, f_0 " << em_calib_model.null.mu.size() << " bins, censor="
                       << em_calib_model.censor << ") from " << em_calib_model_file << "\n";
         }
-    }
-    if (coverage_em_bins < 1) {
-        std::cerr << "Error: --coverage-em-bins must be >= 1\n";
-        return 1;
-    }
-    if (coverage_em_iters < 1) {
-        std::cerr << "Error: --coverage-em-iters must be >= 1\n";
-        return 1;
-    }
-    if (coverage_em_tau < 0.0f) {
-        std::cerr << "Error: --coverage-em-tau must be >= 0\n";
-        return 1;
-    }
-    // compact_em_map is the sole EM reassignment solver and ignores initial_weights /
-    // coverage reweighting; the coverage wrapper still calls squarem_em internally
-    // (coverage_em.cpp:712,800). Refuse rather than silently run a solver whose result
-    // does not reflect the requested coverage-aware objective.
-    if (use_coverage_em) {
-        std::cerr << "Error: --coverage-em is not supported: compact_em_map is the sole "
-                     "EM solver and does not honor coverage reweighting. Re-run without "
-                     "--coverage-em.\n";
-        return 1;
-    }
-    if (depth_gate_lo < 0.0f || depth_gate_hi <= depth_gate_lo) {
-        std::cerr << "Error: --depth-gate-lo must be >= 0 and < --depth-gate-hi\n";
-        return 1;
-    }
-    if (w_min < 0.0f || w_min > 1.0f) {
-        std::cerr << "Error: --w-min must be in [0, 1]\n";
-        return 1;
     }
     if (w0 < 0.0f || w0 > 1.0f) {
         std::cerr << "Error: --w0 must be in [0, 1]\n";
@@ -3295,9 +3230,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             }
             std::cerr << "  Runtime: "
                       << dart::log_utils::format_elapsed(em_start, em_end) << "\n";
-            if (use_coverage_em) {
-                std::cerr << "  Coverage stats: " << coverage_stats_map.size() << " proteins\n";
-            }
         }
 
         // The remaining per-read finalization runs only on the NON-streaming path. The
