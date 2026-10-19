@@ -1562,13 +1562,14 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 "  --min-positional-score FLOAT  Minimum start diversity score (default: 0)\n"
                 "  --min-terminal-ratio FLOAT    Minimum terminal/middle coverage ratio (default: 0)\n"
                 "  --min-distinct-starts INT     Minimum distinct starts for 3+ reads (default: 2)\n"
-                "  --min-informative-reads INT    Minimum informative reads (default: 3)\n"
+                "  --min-informative-reads INT   Minimum informative reads (default: 3)\n"
                 "  --max-single-molecule-frac FLOAT  Maximum single-molecule fraction (default: 0.5)\n"
                 "EM mode:\n"
                 "  --no-em                       Use best hits without EM\n"
                 "  --em-use-damage-mapping       Let damage evidence affect mapping (default: off)\n";
+            } else {
+                std::cout << "\nRun 'dart damage-annotate --help-all' for every option.\n";
             }
-            std::cout << "\nRun 'dart damage-annotate --help-all' for every option.\n";
             return 0;
         } else {
             std::cerr << "Unknown option: " << argv[i] << "\n";
