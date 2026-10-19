@@ -35,7 +35,9 @@
 #include <cmath>
 #include <charconv>
 #include <cctype>
+#include <cerrno>
 #include <cstring>
+#include <stdexcept>
 #include <cstdlib>
 #include <thread>
 #include <atomic>
@@ -272,10 +274,7 @@ std::unordered_map<std::string, GroundTruth> load_ground_truth(const std::string
     std::unordered_map<std::string, GroundTruth> gt_map;
 
     gzFile file = gzopen(path.c_str(), "r");
-    if (!file) {
-        std::cerr << "Error: Cannot open " << path << std::endl;
-        return gt_map;
-    }
+    if (!file) throw std::runtime_error("cannot open " + path + ": " + std::strerror(errno));
 
     char buffer[65536];
     bool first_line = true;
@@ -514,10 +513,7 @@ std::unordered_map<std::string, std::vector<Prediction>> load_predictions_gff(co
     if (!file) {
         // Try plain file
         std::ifstream plain(path);
-        if (!plain) {
-            std::cerr << "Error: Cannot open " << path << std::endl;
-            return pred_map;
-        }
+        if (!plain) throw std::runtime_error("cannot open " + path + ": " + std::strerror(errno));
 
         std::string line;
         while (std::getline(plain, line)) {
@@ -603,10 +599,7 @@ std::unordered_map<std::string, std::vector<std::pair<char, std::string>>> load_
     std::unordered_map<std::string, std::vector<std::pair<char, std::string>>> prot_map;
 
     std::ifstream file(path);
-    if (!file) {
-        std::cerr << "Warning: Cannot open protein file " << path << std::endl;
-        return prot_map;
-    }
+    if (!file) throw std::runtime_error("cannot open protein file " + path + ": " + std::strerror(errno));
 
     std::string line, current_id;
     char current_strand = '+';
@@ -1302,7 +1295,12 @@ static int validate_main(int argc, char* argv[]) {
 #ifdef DART_STANDALONE_VALIDATE
 // Standalone mode: provide main() directly
 int main(int argc, char* argv[]) {
-    return validate_main(argc, argv);
+    try {
+        return validate_main(argc, argv);
+    } catch (const std::exception& e) {
+        std::cerr << "validate: " << e.what() << "\n";
+        return 1;
+    }
 }
 #else
 // Subcommand mode: register with dispatcher
