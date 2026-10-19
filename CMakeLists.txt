@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(AncientGenePredictor VERSION 1.0.0 LANGUAGES CXX)
+project(AncientGenePredictor VERSION 2.0.0 LANGUAGES CXX)
 include(CTest)
 include(FetchContent)
 
@@ -328,6 +328,10 @@ if(BUILD_TESTING)
         NAME cli_errors
         COMMAND bash ${CMAKE_SOURCE_DIR}/tests/cli_errors.sh $<TARGET_FILE:dart>
     )
+
+    add_test(NAME gate_compact_em COMMAND gate-compact-em)
+    set_tests_properties(gate_compact_em PROPERTIES
+        ENVIRONMENT "GATE_TAPE_DIR=${CMAKE_BINARY_DIR}/gate_tape")
 
     add_executable(
         dart-profile-regressions
