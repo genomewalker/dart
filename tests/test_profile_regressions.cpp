@@ -18,6 +18,8 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
+#include <vector>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -299,8 +301,11 @@ int main(int argc, char* argv[]) {
     const std::string dart_bin     = argv[1];
     const std::string tutorial_fq  = argv[2];
 
-    char tmp_template[] = "/tmp/dart_profile_regress_XXXXXX";
-    char* tmp = mkdtemp(tmp_template);
+    const char* base = std::getenv("TMPDIR");
+    std::string pattern = std::string(base && *base ? base : ".") + "/dart_profile_regress_XXXXXX";
+    std::vector<char> tmp_template(pattern.begin(), pattern.end());
+    tmp_template.push_back('\0');
+    char* tmp = mkdtemp(tmp_template.data());
     if (!tmp) { std::cerr << "Failed to create temp dir\n"; return 2; }
     const std::string tmpdir = tmp;
 

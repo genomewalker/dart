@@ -8,12 +8,18 @@
 #include <zstd.h>
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
 #include <vector>
 
 using namespace dcx;
+
+static std::string test_path(const char* name) {
+    const char* base = std::getenv("TMPDIR");
+    return std::string(base && *base ? base : ".") + "/" + name;
+}
 
 static std::vector<uint8_t> slurp(const char* p) {
     std::ifstream f(p, std::ios::binary);
@@ -65,7 +71,8 @@ static DcxWriteOptions make_opts() {
 }
 
 int main() {
-    const char* path = "/tmp/dcx_roundtrip.dcx";
+    const std::string path_storage = test_path("dcx_roundtrip.dcx");
+    const char* path = path_storage.c_str();
     Batch B = make_batch();
     DcxWriteOptions opt = make_opts();
     assert(write_dcx(path, B, opt));
@@ -145,8 +152,9 @@ int main() {
     {
         Batch B2 = B; B2.best_codon.clear(); B2.best_post.clear();
         DcxWriteOptions o2 = opt; o2.col_flags = COL_STRAND;   // no OBS, no BEST
-        assert(write_dcx("/tmp/dcx_nocodon.dcx", B2, o2));
-        std::vector<uint8_t> g = slurp("/tmp/dcx_nocodon.dcx");
+        const std::string no_codon = test_path("dcx_nocodon.dcx");
+        assert(write_dcx(no_codon.c_str(), B2, o2));
+        std::vector<uint8_t> g = slurp(no_codon.c_str());
         BlockIndexEntry ie2 = read_at<BlockIndexEntry>(g, read_at<Footer>(g, g.size() - sizeof(Footer)).index_offset + sizeof(IndexHeader));
         BlockHeader bh2 = read_at<BlockHeader>(g, ie2.offset);
         std::vector<uint8_t> raw2(bh2.raw_sz);
@@ -159,7 +167,7 @@ int main() {
             if (e.column_id == uint16_t(ColumnId::RefAa)) has_refaa = true;
         }
         assert(!has_codon && has_refaa);
-        std::remove("/tmp/dcx_nocodon.dcx");
+        std::remove(no_codon.c_str());
     }
 
     // Grain-A auth SIDECAR (write_dcx_auth): grain-B stripped (n_records_b==0), grain-A
@@ -170,7 +178,8 @@ int main() {
         Ba.p_read = {0.9f, 0.3f};                 // COL_P_READ auth column
         DcxWriteOptions oa = opt;
         oa.col_flags = opt.col_flags | COL_P_READ;
-        const char* apath = "/projects/caeg/scratch/kbd606/tmp/convergence_v63_rebuild/dcx_auth_test.dcx.auth";
+        const std::string auth_storage = test_path("dcx_auth_test.dcx.auth");
+        const char* apath = auth_storage.c_str();
         assert(write_dcx_auth(apath, Ba, oa));
         std::vector<uint8_t> a = slurp(apath);
         FileHeader fha = read_at<FileHeader>(a, 0);
@@ -205,7 +214,8 @@ int main() {
         std::vector<uint64_t> kf = {2,2,2,1,0,  1,1,0,0,0};   // 2 targets x 5 tau, row-major
         std::vector<double>   ll = {5.189665109725213, 2.061107285416508};
         double tg_tau[5] = {0.3, 0.4, 0.5, 0.6, 0.7};
-        const char* sp = "/projects/caeg/scratch/kbd606/tmp/convergence_v63_rebuild/authstats_test.authstats";
+        const std::string stats_storage = test_path("authstats_test.authstats");
+        const char* sp = stats_storage.c_str();
         assert(write_auth_stats(sp, "Lx", tg_tau, 5, tg, Nv, kf, ll, 19));
         std::puts("DCX_AUTHSTATS_WRITE_OK");
     }
@@ -214,7 +224,7 @@ int main() {
     DcxWriteOptions bad = opt;
     std::memset(bad.calib_contract_id, 0, 16);
     bool threw = false;
-    try { write_dcx("/tmp/dcx_bad.dcx", B, bad); } catch (const std::runtime_error&) { threw = true; }
+    try { write_dcx(test_path("dcx_bad.dcx").c_str(), B, bad); } catch (const std::runtime_error&) { threw = true; }
     assert(threw);
 
     std::remove(path);
