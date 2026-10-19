@@ -3148,7 +3148,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                         ? static_cast<uint16_t>(std::min(aln_end - aln_start, 65535u)) : 0;
                     const uint32_t ref = ref_idx[i];
                     // Decode == tape_decode_read with score_scale=1 (normalize_scores_per_query is
-                    // always false here): bc = length_log_penalty(shell) + coverage(0) + lambda_b*bit.
+                    // always false here): bc = length_log_penalty(shell) + coverage(0) + lambda_b*bit,
+                    // split by em_base_pair (damage-free here: the tape path excludes
+                    // --em-use-damage-mapping).
                     const double bc = dart::length_log_penalty(shell, em_params, ref)
                                     + dart::coverage_log_penalty(em_params, ref)
                                     + dart::real_log_density(em_params, static_cast<double>(bits), aln_len_em, 1.0);
@@ -3156,9 +3158,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                         static_cast<double>(std::clamp(damage_score[i], 0.0f, 1.0f)), eps_dec, 1.0 - eps_dec);
                     const double la = dmg_ll_a ? static_cast<double>(dmg_ll_a[i]) : 0.0;
                     const double lm = dmg_ll_m ? static_cast<double>(dmg_ll_m[i]) : 0.0;
+                    double ba, bm;
+                    dart::em_base_pair(em_params, bc, pr, la, lm, ba, bm);
                     lref.push_back(ref);
-                    lba.push_back(bc + std::log(pr) + la);
-                    lbm.push_back(bc + std::log(1.0 - pr) + lm);
+                    lba.push_back(ba);
+                    lbm.push_back(bm);
                 }
                 if (lref.empty()) return;
                 const off_t o_ref = static_cast<off_t>(base) * static_cast<off_t>(sizeof(uint32_t));
