@@ -1499,6 +1499,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             analysis_categories_file = argv[++i];
         } else if ((strcmp(argv[i], "--library-type") == 0 || strcmp(argv[i], "--lib-type") == 0) && i + 1 < argc) {
             lib_type = argv[++i];
+            if (lib_type != "ss" && lib_type != "ds" && lib_type != "auto") {
+                std::cerr << "Error: --library-type must be ss, ds or auto, got '" << lib_type << "'\n";
+                return 1;
+            }
         } else if (strcmp(argv[i], "--damage-index") == 0 && i + 1 < argc) {
             damage_index_file = argv[++i];
         } else if (strcmp(argv[i], "--threshold") == 0 && i + 1 < argc) {
@@ -1673,7 +1677,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cout << "  --analysis-proteins FILE   Proteins output file\n";
             std::cout << "  --analysis-blast8 FILE     Unique BLAST8 output file\n";
             std::cout << "  --analysis-categories FILE Categories output file\n";
-            std::cout << "  --library-type TYPE     Library type: ss, ds, or auto (default: auto)\n";
+            std::cout << "  --library-type TYPE     Library type: ss, ds, or auto (default: auto = the damage\n";
+            std::cout << "                          index's type; guessed from 3'/5' damage when unknown)\n";
             std::cout << "  --sites FILE      Per-site damage calls TSV\n";
             std::cout << "  --corrected FILE  Reference-guided corrected proteins FASTA\n";
             std::cout << "  --dcx FILE        Single .dcx columnar interchange (grain A/B) for convergence-saav;\n";
@@ -4173,7 +4178,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // EM pi. Captured before the index is released.
     double  library_damage_prior = -1.0;
     uint8_t library_damage_state = 255;
+    uint8_t agd_library_type = 0;  // 0=unknown, 1=ss, 2=ds
     if (damage_index) {
+        agd_library_type    = damage_index->library_type();
         library_v5          = damage_index->pi_state() != 255;
         library_pi_detected = damage_index->pi_detected();
         library_pi_usable   = damage_index->pi_usable();
@@ -4885,6 +4892,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         use_both_ends = false;
     } else if (lib_type == "ds") {
         use_both_ends = true;
+    } else if (agd_library_type == 1 || agd_library_type == 2) {
+        use_both_ends = (agd_library_type == 2);
+        if (verbose) {
+            std::cerr << "Library type from damage index: " << (use_both_ends ? "dsDNA" : "ssDNA") << "\n";
+        }
     } else {
         size_t total_5 = 0, total_3 = 0;
         for (const auto& c : protein_agg_inputs) {

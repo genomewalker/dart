@@ -25,6 +25,7 @@ expect 1 "cannot open"            emi-merge out.emi 1 missing1.emi missing2.emi
 expect 1 "cannot open"            damage-annotate --emi missing.emi --no-null
 expect 1 "invalid numeric value"  damage-annotate --emi missing.emi --em-min-prob abc
 expect 1 "invalid numeric value"  damage-profile --min-reads abc
+expect 1 "must be ss, ds or auto" damage-annotate --emi missing.emi --library-type xx
 expect 1 "cannot open"            eval --truth missing.tsv missing.gff
 expect 1 "cannot open"            validate missing.fq.gz missing.tsv.gz missing.gff
 for f in --em-max-memory --em-null-fdr --coverage-em --coverage-em-iters --depth-gate-lo --w-min; do
