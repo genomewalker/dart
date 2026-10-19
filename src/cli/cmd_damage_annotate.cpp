@@ -175,8 +175,6 @@ struct ProteinDamageSummary {
     float damage_fraction;
     float max_p_damage;         // Highest p_damage among terminal sites
     float p_damaged;            // Overall probability read is damaged
-    float prior_damaged = 0.5f; // Empirical prior P(read ancient) = EM pi; threaded so
-                                // recompute_summary_site_metrics reuses the same prior
     std::vector<DamageSite> sites;  // Cleared+shrunk in callback after aggregation
     // Channel D: Oxidative damage tracking (G→T at DNA level)
     // Gly→Cys (GGN→TGN) and Gly→Trp indicate G→T at codon position 1
@@ -205,9 +203,6 @@ struct ProteinDamageSummary {
     float aa_sum_qA = 0.0f;
     float aa_sum_log_qA_hits = 0.0f;
     float aa_sum_exp_decay = 0.0f;
-    // Stored for corrected protein output (empty unless --corrected-proteins requested)
-    std::string qaln;
-    std::string taln;
     size_t qstart_0;
     size_t qlen = 0;  // Total read length (for Bayesian scoring)
     size_t tstart_0 = 0;  // 0-based target start position
@@ -564,7 +559,6 @@ static ProteinDamageSummary annotate_alignment(
         : 0.0f;
     out.max_p_damage = max_p_damage;
     out.p_damaged = p_damaged;
-    out.prior_damaged = PRIOR_DAMAGED;
     out.sites = std::move(sites);
     out.aa_m_opportunities = aa_m_opportunities;
     out.aa_k_hits = aa_k_hits;
@@ -578,107 +572,6 @@ static ProteinDamageSummary annotate_alignment(
     out.trp_to_gly = trp_to_gly;
     out.gly_total = gly_total;
     return out;
-}
-
-static void recompute_summary_site_metrics(ProteinDamageSummary& summary) {
-    constexpr float Q_BASELINE = 0.005f;
-    // Bayesian LLR parameters (must match compute_damage_summary)
-    constexpr float SEQ_ERROR_RATE = 0.01f;
-    constexpr float MIN_DAMAGE_RATE = 0.01f;       // Interior sites: LLR=0 (no evidence)
-    const float PRIOR_DAMAGED = std::clamp(summary.prior_damaged, 0.02f, 0.98f);
-
-    float llr_sum = 0.0f;
-    summary.ct_sites = 0;
-    summary.ga_sites = 0;
-    summary.high_conf_sites = 0;
-    summary.max_p_damage = 0.0f;
-    summary.aa_k_hits = 0;
-    summary.aa_sum_log_qA_hits = 0.0f;
-
-    for (const auto& s : summary.sites) {
-        if (s.damage_class == 'C') summary.ct_sites++;
-        else summary.ga_sites++;
-        if (s.high_confidence) summary.high_conf_sites++;
-        summary.max_p_damage = std::max(summary.max_p_damage, s.p_damage);
-        summary.aa_k_hits++;
-        summary.aa_sum_log_qA_hits += std::log((s.p_damage + Q_BASELINE) / Q_BASELINE);
-
-        // Bayesian LLR for each site
-        float p_site_given_damaged = std::max(s.p_damage, MIN_DAMAGE_RATE);
-        float llr = std::log(p_site_given_damaged / SEQ_ERROR_RATE);
-        llr = std::clamp(llr, -3.0f, 5.0f);
-        llr_sum += llr;
-    }
-
-    if (!summary.sites.empty()) {
-        float logit_prior = std::log(PRIOR_DAMAGED / (1.0f - PRIOR_DAMAGED));
-        float logit_posterior = logit_prior + llr_sum;
-        logit_posterior = std::clamp(logit_posterior, -10.0f, 10.0f);
-        summary.p_damaged = 1.0f / (1.0f + std::exp(-logit_posterior));
-    } else {
-        summary.p_damaged = 0.0f;
-    }
-}
-
-// Filter sites by distance from relevant terminus
-static void filter_sites_by_distance(ProteinDamageSummary& summary, int max_dist) {
-    if (max_dist < 0) return;
-
-    std::vector<DamageSite> filtered;
-    for (auto& site : summary.sites) {
-        size_t dist = (site.damage_class == 'C') ? site.dist_5prime : site.dist_3prime;
-        if (dist <= static_cast<size_t>(max_dist)) {
-            filtered.push_back(std::move(site));
-        }
-    }
-
-    summary.sites = std::move(filtered);
-    summary.damage_consistent = summary.sites.size();
-    recompute_summary_site_metrics(summary);
-    summary.non_damage_mismatches = summary.total_mismatches - summary.damage_consistent;
-    summary.damage_fraction = summary.total_mismatches > 0
-        ? static_cast<float>(summary.damage_consistent) / static_cast<float>(summary.total_mismatches)
-        : 0.0f;
-}
-
-// Generate corrected protein by replacing damage sites with reference AAs
-// Uses sorted index walk instead of hash set (sites are ordered by query_pos)
-static std::string generate_corrected_protein(
-    const std::string& qaln, const std::string& taln,
-    const std::vector<DamageSite>& sites,
-    size_t qstart)
-{
-    size_t site_idx = 0;
-    std::string corrected;
-    corrected.reserve(qaln.size());
-    size_t q_pos = qstart;
-
-    for (size_t i = 0; i < qaln.size() && i < taln.size(); ++i) {
-        char q_aa = qaln[i];
-        char t_aa = taln[i];
-
-        if (q_aa == '-') continue;
-        if (t_aa == '-') {
-            corrected += q_aa;
-            q_pos++;
-            continue;
-        }
-
-        // Advance site_idx to match current position
-        while (site_idx < sites.size() && sites[site_idx].query_pos < q_pos) {
-            site_idx++;
-        }
-
-        if (site_idx < sites.size() && sites[site_idx].query_pos == q_pos) {
-            corrected += t_aa;  // Replace with reference AA
-            site_idx++;
-        } else {
-            corrected += q_aa;  // Keep observed
-        }
-        q_pos++;
-    }
-
-    return corrected;
 }
 
 // Expected terminal/middle coverage ratio for a uniformly-sampled gene.
@@ -1328,26 +1221,16 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     std::string emi_file;
     std::string output_file;
     std::string sites_file;
-    std::string corrected_file;
     std::string dcx_file;              // .dcx columnar interchange (grain A/B for convergence)
     std::string library_label;         // per-library id stamped into the .dcx calib section
     std::string protein_summary_file;  // Per-protein aggregation
-    std::string protein_filtered_file; // Per-protein filtered subset
-    std::string combined_output_file;  // Combined per-target protein+gene summary
-    std::string blast8_unique_file;    // BLAST8-like export with unique mappers only
-    std::string analysis_prefix;       // Output bundle prefix
-    std::string analysis_proteins_file;   // Explicit name for analysis proteins output
-    std::string analysis_blast8_file;     // Explicit name for analysis blast8 unique output
-    std::string analysis_categories_file; // Explicit name for analysis categories output
     std::string damage_index_file;     // Binary damage index from predict
     float d_max = -1.0f;  // -1 means "estimate from data"
     float lambda = 0.3f;
     bool lambda_set_by_user = false;
     bool refine_damage = false;
-    int max_dist = -1;
     std::string lib_type = "auto";    // ss, ds, or auto-detect
-    float threshold = 0.7f;           // Classification threshold for is_damaged
-    bool use_identity = true;         // Identity evidence enabled by default (+7.6% AUC)
+    const float threshold = 0.7f;           // Classification threshold for is_damaged
     bool verbose = false;
 
     // Gene summary options (work with or without --em)
@@ -1372,7 +1255,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
     // EM reassignment options (enabled by default for abundance estimation)
     bool use_em = true;
-    bool em_streaming = false;       // Use streaming EM (O(num_refs) memory instead of O(num_alns))
     // Node-local scratch dir for the O_DIRECT EM tape (production streaming path).
     // Must be fast local NVMe supporting O_DIRECT (NOT /tmp, NOT NFS). Env fallback
     // DART_EM_TAPE_DIR; when unset the tape path errors and asks for it explicitly.
@@ -1380,15 +1262,15 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // EM fixed-point checkpoint (OPT-G). Iterations only; the final tape pass always re-runs.
     std::string em_checkpoint_path;  // --em-checkpoint; default <em_tape_dir>/dart_emtape_<pid>.ckpt
     bool em_resume = false;          // --resume: load the checkpoint when its fingerprint matches
-    uint32_t em_max_iters = 100;
+    const uint32_t em_max_iters = 100;
     // Raw-bit temperature for the legacy (non-calibrated) real component. mmseqs
     // bit scores are log2-odds; the principled bits→nats factor is ln2≈0.693.
     // The old 3.0 over-tempered ~4.3x and forced homolog near-ties to gamma≈1.
-    double em_lambda_b = M_LN2;
-    double em_tol = 1e-4;
+    const double em_lambda_b = M_LN2;
+    const double em_tol = 1e-4;
     double em_min_prob = 1e-6;       // absolute posterior threshold for keeping alignment
-    double em_min_margin = 0.5;      // auth evidence requires gamma_top1 - gamma_top2
-    double em_max_neff = 2.0;        // auth evidence requires exp(H(gamma)) <= cap
+    const double em_min_margin = 0.5;      // auth evidence requires gamma_top1 - gamma_top2
+    const double em_max_neff = 2.0;        // auth evidence requires exp(H(gamma)) <= cap
     // Fail-loud: a flat targeted DB can force-map absent-protein reads onto their
     // nearest wrong homolog. EM without a null model is refused unless the caller
     // opts in with --no-null (accept the risk explicitly).
@@ -1415,11 +1297,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // becomes the normalized true-hit density log f_true(bit|Lbin) and the null
     // f_0 lives on the raw-bit scale — a coherent likelihood ratio (lambda≡1).
     std::string em_calib_model_file;      // load a frozen calibration model
-    double em_calib_temperature = 1.0;    // frozen misspecification correction
-    // Full-population EM audit dump (sol verification requirement): every pre-em_keep
-    // hit-read with its densities/decision, truth-joinable. Independent of the em_keep-
-    // biased -o file.
-    std::string em_audit_file;
+    const double em_calib_temperature = 1.0;    // frozen misspecification correction
     // Posterior-identifiability abstention (sol): the 3-way call is on the per-read
     // density log-ratio LLR = log f_true - log f_0 of the best EM candidate, NOT on
     // gamma_null (which saturates to 1 via the EM w_null dynamics even for reads whose
@@ -1428,8 +1306,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     //   LLR >= keep_llr   → keep (assign);  LLR <= reject_llr → reject (spurious);
     //   between           → abstain (insufficient_information): excluded from
     //   assignment/auth but NOT counted as a contamination rejection.
-    double em_keep_llr = 0.5;      // f_true >= e^0.5 (~1.65x) as likely as f_0 → keep
-    double em_reject_llr = -5.0;   // f_0 >= e^5 (~150x) more likely than f_true → reject
+    const double em_keep_llr = 0.5;      // f_true >= e^0.5 (~1.65x) as likely as f_0 → keep
+    const double em_reject_llr = -5.0;   // f_0 >= e^5 (~150x) more likely than f_true → reject
 
     // Coverage-aware outer EM options
 
@@ -1445,9 +1323,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // Coverage EM tuning
 
     // Alignment-level pre-filters (applied before any processing)
-    float aln_min_identity = 0.0f;   // 0 = no filter
-    float aln_min_bits = 0.0f;       // 0 = no filter
-    float aln_max_evalue = 1e10f;    // very large = no filter
+    const float aln_min_identity = 0.0f;   // 0 = no filter
+    const float aln_min_bits = 0.0f;       // 0 = no filter
+    const float aln_max_evalue = 1e10f;    // very large = no filter
     int threads = 0;                 // 0 = OpenMP runtime default
 
     // Functional profiling options
@@ -1464,14 +1342,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--lambda") == 0 && i + 1 < argc) {
             lambda = std::stof(argv[++i]);
             lambda_set_by_user = true;
-        } else if (strcmp(argv[i], "--max-dist") == 0 && i + 1 < argc) {
-            max_dist = std::stoi(argv[++i]);
         } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             output_file = argv[++i];
         } else if (strcmp(argv[i], "--sites") == 0 && i + 1 < argc) {
             sites_file = argv[++i];
-        } else if (strcmp(argv[i], "--corrected") == 0 && i + 1 < argc) {
-            corrected_file = argv[++i];
         } else if (strcmp(argv[i], "--dcx") == 0 && i + 1 < argc) {
             dcx_file = argv[++i];
         } else if (strcmp(argv[i], "--emit-multimap") == 0) {
@@ -1484,20 +1358,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             library_label = argv[++i];
         } else if (strcmp(argv[i], "--protein-summary") == 0 && i + 1 < argc) {
             protein_summary_file = argv[++i];
-        } else if (strcmp(argv[i], "--protein-filtered") == 0 && i + 1 < argc) {
-            protein_filtered_file = argv[++i];
-        } else if (strcmp(argv[i], "--combined-output") == 0 && i + 1 < argc) {
-            combined_output_file = argv[++i];
-        } else if (strcmp(argv[i], "--blast8-unique") == 0 && i + 1 < argc) {
-            blast8_unique_file = argv[++i];
-        } else if (strcmp(argv[i], "--analysis-prefix") == 0 && i + 1 < argc) {
-            analysis_prefix = argv[++i];
-        } else if (strcmp(argv[i], "--analysis-proteins") == 0 && i + 1 < argc) {
-            analysis_proteins_file = argv[++i];
-        } else if (strcmp(argv[i], "--analysis-blast8") == 0 && i + 1 < argc) {
-            analysis_blast8_file = argv[++i];
-        } else if (strcmp(argv[i], "--analysis-categories") == 0 && i + 1 < argc) {
-            analysis_categories_file = argv[++i];
         } else if ((strcmp(argv[i], "--library-type") == 0 || strcmp(argv[i], "--lib-type") == 0) && i + 1 < argc) {
             lib_type = argv[++i];
             if (lib_type != "ss" && lib_type != "ds" && lib_type != "auto") {
@@ -1506,32 +1366,16 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             }
         } else if (strcmp(argv[i], "--damage-index") == 0 && i + 1 < argc) {
             damage_index_file = argv[++i];
-        } else if (strcmp(argv[i], "--threshold") == 0 && i + 1 < argc) {
-            threshold = std::stof(argv[++i]);
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             verbose = true;
-        } else if (strcmp(argv[i], "--use-identity") == 0) {
-            use_identity = true;
-        } else if (strcmp(argv[i], "--no-identity") == 0) {
-            use_identity = false;
         } else if (strcmp(argv[i], "--refine-damage") == 0) {
             refine_damage = true;
         } else if (strcmp(argv[i], "--em") == 0) {
             use_em = true;
         } else if (strcmp(argv[i], "--no-em") == 0) {
             use_em = false;
-        } else if (strcmp(argv[i], "--em-iters") == 0 && i + 1 < argc) {
-            em_max_iters = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (strcmp(argv[i], "--em-lambda") == 0 && i + 1 < argc) {
-            em_lambda_b = std::stod(argv[++i]);
-        } else if (strcmp(argv[i], "--em-tol") == 0 && i + 1 < argc) {
-            em_tol = std::stod(argv[++i]);
         } else if (strcmp(argv[i], "--em-min-prob") == 0 && i + 1 < argc) {
             em_min_prob = std::stod(argv[++i]);
-        } else if (strcmp(argv[i], "--em-min-margin") == 0 && i + 1 < argc) {
-            em_min_margin = std::stod(argv[++i]);
-        } else if (strcmp(argv[i], "--em-max-neff") == 0 && i + 1 < argc) {
-            em_max_neff = std::stod(argv[++i]);
         } else if (strcmp(argv[i], "--no-null") == 0) {
             no_null = true;
         } else if (strcmp(argv[i], "--em-use-damage-mapping") == 0) {
@@ -1540,14 +1384,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             em_null_model_file = argv[++i];
         } else if (strcmp(argv[i], "--em-calib-model") == 0 && i + 1 < argc) {
             em_calib_model_file = argv[++i];
-        } else if (strcmp(argv[i], "--em-calib-temperature") == 0 && i + 1 < argc) {
-            em_calib_temperature = std::stod(argv[++i]);
-        } else if (strcmp(argv[i], "--em-audit") == 0 && i + 1 < argc) {
-            em_audit_file = argv[++i];
-        } else if (strcmp(argv[i], "--em-keep-llr") == 0 && i + 1 < argc) {
-            em_keep_llr = std::stod(argv[++i]);
-        } else if (strcmp(argv[i], "--em-reject-llr") == 0 && i + 1 < argc) {
-            em_reject_llr = std::stod(argv[++i]);
         } else if (strcmp(argv[i], "--em-null-tau") == 0 && i + 1 < argc) {
             em_null_tau = std::stod(argv[++i]);
         } else if (strcmp(argv[i], "--fit-null-from") == 0 && i + 1 < argc) {
@@ -1570,24 +1406,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             site_cap = std::stof(argv[++i]);
         } else if (strcmp(argv[i], "--w0") == 0 && i + 1 < argc) {
             w0 = std::stof(argv[++i]);
-        } else if (strcmp(argv[i], "--preset") == 0 && i + 1 < argc) {
-            const char* preset = argv[++i];
-            if (strcmp(preset, "loose") == 0) {
-                min_reads = 1; min_breadth = 0.0f; min_depth = 0.0f;
-                min_distinct_starts = 0; min_damage_sites = 1;
-                // loose DISABLES the Q-CLUST single-molecule authentication gate (informative=1,
-                // frac=1.0) — it is an exploratory/recall preset, NOT an authentication preset.
-                // Passing under --preset loose does not mean a protein is authenticated as damaged.
-                min_informative_reads = 1; max_single_molecule_frac = 1.0f;
-                std::cerr << "  WARNING: --preset loose disables the Q-CLUST authentication gate; "
-                             "pass_mapping_filter=1 under loose is NOT an authentication verdict.\n";
-            } else if (strcmp(preset, "strict") == 0) {
-                min_reads = 5; min_breadth = 0.20f; min_depth = 1.0f;
-                auto_calibrate_spurious = true; min_damage_sites = 5;
-                min_informative_reads = 3; max_single_molecule_frac = 0.5f;
-            } else {
-                std::cerr << "Error: --preset must be 'loose' or 'strict'\n"; return 1;
-            }
         } else if (strcmp(argv[i], "--auto-prior-ancient") == 0) {
             auto_prior_ancient = true;
         } else if (strcmp(argv[i], "--em-streaming") == 0) {
@@ -1600,7 +1418,32 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                    strncmp(argv[i], "--coverage-em-", 14) == 0 ||
                    strcmp(argv[i], "--depth-gate-lo") == 0 ||
                    strcmp(argv[i], "--depth-gate-hi") == 0 ||
-                   strcmp(argv[i], "--w-min") == 0) {
+                   strcmp(argv[i], "--w-min") == 0 ||
+                   strcmp(argv[i], "--aln-min-identity") == 0 ||
+                   strcmp(argv[i], "--aln-min-bits") == 0 ||
+                   strcmp(argv[i], "--aln-max-evalue") == 0 ||
+                   strcmp(argv[i], "--analysis-prefix") == 0 ||
+                   strcmp(argv[i], "--analysis-proteins") == 0 ||
+                   strcmp(argv[i], "--analysis-blast8") == 0 ||
+                   strcmp(argv[i], "--analysis-categories") == 0 ||
+                   strcmp(argv[i], "--blast8-unique") == 0 ||
+                   strcmp(argv[i], "--combined-output") == 0 ||
+                   strcmp(argv[i], "--corrected") == 0 ||
+                   strcmp(argv[i], "--protein-filtered") == 0 ||
+                   strcmp(argv[i], "--max-dist") == 0 ||
+                   strcmp(argv[i], "--threshold") == 0 ||
+                   strcmp(argv[i], "--use-identity") == 0 ||
+                   strcmp(argv[i], "--no-identity") == 0 ||
+                   strcmp(argv[i], "--em-iters") == 0 ||
+                   strcmp(argv[i], "--em-lambda") == 0 ||
+                   strcmp(argv[i], "--em-tol") == 0 ||
+                   strcmp(argv[i], "--em-min-margin") == 0 ||
+                   strcmp(argv[i], "--em-max-neff") == 0 ||
+                   strcmp(argv[i], "--em-audit") == 0 ||
+                   strcmp(argv[i], "--em-keep-llr") == 0 ||
+                   strcmp(argv[i], "--em-reject-llr") == 0 ||
+                   strcmp(argv[i], "--em-calib-temperature") == 0 ||
+                   strcmp(argv[i], "--preset") == 0) {
             std::cerr << "Error: " << argv[i] << " was removed: it had no effect "
                          "(compact_em_map is the sole EM solver). Drop it.\n";
             return 1;
@@ -1637,12 +1480,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             user_set_terminal_ratio = true;
         } else if (strcmp(argv[i], "--auto-calibrate-spurious") == 0) {
             auto_calibrate_spurious = true;
-        } else if (strcmp(argv[i], "--aln-min-identity") == 0 && i + 1 < argc) {
-            aln_min_identity = std::stof(argv[++i]);
-        } else if (strcmp(argv[i], "--aln-min-bits") == 0 && i + 1 < argc) {
-            aln_min_bits = std::stof(argv[++i]);
-        } else if (strcmp(argv[i], "--aln-max-evalue") == 0 && i + 1 < argc) {
-            aln_max_evalue = std::stof(argv[++i]);
         } else if ((strcmp(argv[i], "--threads") == 0 || strcmp(argv[i], "-t") == 0) && i + 1 < argc) {
             threads = std::stoi(argv[++i]);
             if (threads < 1) {
@@ -1657,117 +1494,81 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             anvio_ko_file = argv[++i];
         } else if (strcmp(argv[i], "--annotation-source") == 0 && i + 1 < argc) {
             annotation_source = argv[++i];
-        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            std::cout << "Usage: dart damage-annotate --emi <hits.emi> [options]\n\n";
-            std::cout << "Post-mapping damage annotation using EMI alignments.\n";
-            std::cout << "Compares observed proteins against reference proteins to identify\n";
-            std::cout << "damage-consistent amino acid substitutions with ~90% precision.\n\n";
-            std::cout << "Required:\n";
-            std::cout << "  --emi, -i FILE    EMI v7 index (dart hits2emi / hits2emi-stream)\n\n";
-            std::cout << "Options:\n";
-            std::cout << "  --d-max RATE      Override damage rate (default: estimated from data)\n";
-            std::cout << "  --lambda FLOAT    Decay constant (default: 0.3)\n";
-            std::cout << "  --max-dist INT    Positional filter: max nt from relevant terminus (-1=off)\n";
-            std::cout << "  -o FILE           Per-read damage summary TSV (default: stdout)\n";
-            std::cout << "  --protein-summary FILE  Per-protein aggregated damage TSV\n";
-            std::cout << "  --protein-filtered FILE Per-protein filtered subset TSV\n";
-            std::cout << "  --combined-output FILE  Per-target combined protein+gene summary TSV\n";
-            std::cout << "  --blast8-unique FILE  BLAST8-like hits for unique mappers only\n";
-            std::cout << "  --analysis-prefix STR  Output prefix: <STR>.reads.tsv, <STR>.protein.tsv,\n";
-            std::cout << "                         <STR>.blast8.unique.tsv, and <STR>.categories.tsv when --map is provided\n";
-            std::cout << "  --analysis-proteins FILE   Proteins output file\n";
-            std::cout << "  --analysis-blast8 FILE     Unique BLAST8 output file\n";
-            std::cout << "  --analysis-categories FILE Categories output file\n";
-            std::cout << "  --library-type TYPE     Library type: ss, ds, or auto (default: auto = the damage\n";
-            std::cout << "                          index's type; guessed from 3'/5' damage when unknown)\n";
-            std::cout << "  --sites FILE      Per-site damage calls TSV\n";
-            std::cout << "  --corrected FILE  Reference-guided corrected proteins FASTA\n";
-            std::cout << "  --dcx FILE        Single .dcx columnar interchange (grain A/B) for convergence-saav;\n";
-            std::cout << "                    replaces the --sites + -o + --protein-summary TSV triplet. Requires EM.\n";
-            std::cout << "  --library-label STR  Per-library id stamped into the .dcx calib section (default: --dcx basename)\n";
-            std::cout << "  --damage-index FILE  Binary damage index (.agd) from predict\n";
-            std::cout << "                       Enables synonymous damage detection\n";
-            std::cout << "  --threshold FLOAT Damage classification threshold (default: 0.7)\n";
-            std::cout << "                       Adds is_damaged column (1 if posterior >= threshold)\n";
-            std::cout << "  --no-identity     Disable identity evidence (enabled by default)\n";
-            std::cout << "  --refine-damage       Jointly update d_max from EM assignments (Phase 2)\n";
-            std::cout << "  -v                Verbose output\n\n";
-            std::cout << "Gene summary (per-gene aggregation, works with or without --em):\n";
-            std::cout << "  --gene-summary FILE  Per-gene statistics TSV\n";
-            std::cout << "  --min-breadth FLOAT  Minimum breadth filter (default: 0.1)\n";
-            std::cout << "  --min-depth FLOAT    Minimum depth filter (default: 0.5)\n";
-            std::cout << "  --min-reads INT      Minimum read count (default: 3)\n\n";
-            std::cout << "Functional profiling (requires --map):\n";
-            std::cout << "  --map FILE           Gene-to-group mapping TSV (gene_id<TAB>group)\n";
-            std::cout << "  --functional-summary FILE  Per-function stats TSV\n";
-            std::cout << "  --anvio-ko FILE      Gene-level group abundance for anvi-estimate-metabolism\n";
-            std::cout << "  --annotation-source STR  Source label for anvi output (default: DART)\n\n";
-            std::cout << "EM reassignment (multi-mapping resolution, enabled by default):\n";
-            std::cout << "  --no-em           Disable EM (use best-hit only)\n";
-            std::cout << "  --em-iters INT    Max EM iterations (default: 100)\n";
-            std::cout << "  --em-lambda FLOAT Bit-score temperature, bits to nats (default: ln 2 = 0.693)\n";
-            std::cout << "  --em-tol FLOAT    Convergence tolerance (default: 1e-4)\n";
-            std::cout << "  --em-min-prob FLOAT     Min EM posterior to keep (default: 1e-6)\n";
-            std::cout << "  --em-min-margin FLOAT   Min top1-top2 margin for damage/auth evidence (default: 0.5)\n";
-            std::cout << "  --em-max-neff FLOAT     Max effective refs/read for damage/auth evidence (default: 2.0)\n";
-            std::cout << "  --em-use-damage-mapping Let damage likelihoods influence the mapping (default: off;\n";
-            std::cout << "                          off => damage-free mapping; gamma_ancient is emitted post-hoc\n";
-            std::cout << "                          only when --damage-index is pi DETECTED, else left empty)\n";
-            std::cout << "  --no-null               Run EM without a null model, accepting that a flat targeted\n";
-            std::cout << "                          database can force-map absent-protein reads to false annotations\n";
-            std::cout << "  --em-tape-dir DIR       O_DIRECT EM tape dir (or DART_EM_TAPE_DIR); needed when EM runs\n";
-            std::cout << "                          without --em-null-model/--em-calib-model/--em-audit. Use\n";
-            std::cout << "                          node-local disk, not tmpfs\n";
-            std::cout << "  --em-checkpoint FILE    EM iteration checkpoint (default: <tape dir>/dart_emtape_<pid>.ckpt)\n";
-            std::cout << "  --resume                Resume EM from the checkpoint when its fingerprint matches\n";
-            std::cout << "\nNull/noise component (spurious short-peptide rejection, opt-in):\n";
-            std::cout << "  --em-null-model FILE    Load empirical decoy Gumbel sidecar (bin lo hi mu beta n)\n";
-            std::cout << "                          Enables the null column; reads dominated by it are rejected\n";
-            std::cout << "  --em-null-tau FLOAT     Reject read when gamma_null > tau (default: 0.5)\n";
-            std::cout << "  --em-audit FILE         Dump EVERY pre-em_keep hit-read (query,aln_len,bit,\n";
-            std::cout << "                          log_f_true,log_f_0,llr,gamma_null,decision,target) for gate audit\n";
-            std::cout << "  --em-keep-llr FLOAT     Keep (assign) when log f_true - log f_0 >= this (default: 0.5)\n";
-            std::cout << "  --em-reject-llr FLOAT   Reject (spurious) when llr <= this; between → abstain\n";
-            std::cout << "                          (insufficient_information; excluded from assignment, not a rejection) (default: -5.0)\n";
-            std::cout << "  --fit-null-from FILE    Fit the null from a 16-col decoy hits TSV, then exit\n";
-            std::cout << "  --null-out FILE         Output path for the fitted null sidecar (with --fit-null-from)\n";
-            std::cout << "\nBayesian scoring:\n";
-            std::cout << "  --prior-ancient FLOAT    Prior P(ancient) for Bayesian scorer (default: 0.10)\n";
-            std::cout << "  --auto-prior-ancient     Auto-calibrate prior from mean p_read distribution\n";
-            std::cout << "                           Requires AGD index (--damage-index). Uses E[p_read]\n";
-            std::cout << "                           as an empirical Bayes estimate of fraction ancient.\n";
-            std::cout << "  --min-damage-sites INT   Min susceptible AA positions to use site evidence\n";
-            std::cout << "                           (default: auto = max(1, median_qlen/10))\n";
-            std::cout << "  --ancient-threshold FLOAT  Ancient posterior cutoff (default: 0.60)\n";
-            std::cout << "  --modern-threshold FLOAT   Modern posterior cutoff (default: 0.25)\n";
-            std::cout << "  --terminal-threshold FLOAT Min p_read for terminal evidence (default: 0.50)\n";
-            std::cout << "  --site-cap FLOAT           Max |logBF| from AA site evidence (default: 3.0)\n";
-            std::cout << "  --w0 FLOAT                 Absence-evidence tempering weight 0-1 (default: 0.30)\n";
-            std::cout << "\nBinomial provenance-LR authentication (PRIMARY per-protein ancient call):\n";
-            std::cout << "  --modern-damage-rate FLOAT  Modern/background damaged-read rate eps0 (default: 0.02)\n";
-            std::cout << "  --eps0 FLOAT                 Alias for --modern-damage-rate\n";
-            std::cout << "  --auth-alpha FLOAT          Level for the LR power gate + ancient call (default: 0.05)\n";
-            std::cout << "  --per-read-damage-threshold FLOAT  p_read cutoff for the per-read damaged call k (default: 0.50)\n";
-            std::cout << "\nPresets (applied immediately; individual flags after --preset override):\n";
-            std::cout << "  --preset loose   Maximize recall: min-reads=1, breadth=0, depth=0, min-damage-sites=1\n";
-            std::cout << "  --preset strict  Maximize precision: min-reads=5, breadth=0.2, depth=1.0,\n";
-            std::cout << "                   auto-calibrate-spurious, min-damage-sites=5\n";
-            std::cout << "  --min-positional-score FLOAT  Min read start diversity (default: 0)\n";
-            std::cout << "                       Filters spurious matches where all reads hit same position\n";
-            std::cout << "                       Score = sqrt(diversity * span), range 0-1\n";
-            std::cout << "  --min-distinct-starts INT  Min distinct query/target starts when n_reads>=3 (default: 2)\n";
-            std::cout << "  --min-terminal-ratio FLOAT  Min terminal/middle coverage ratio (default: 0)\n";
-            std::cout << "                       Filters matches with reads only in middle (spurious motif)\n";
-            std::cout << "  --auto-calibrate-spurious   Auto-derive thresholds from data\n";
-            std::cout << "                       Uses 5th percentile of well-supported proteins (n_reads>=10, n_unique_starts>=3)\n\n";
-            std::cout << "Alignment-level pre-filters (applied before any processing):\n";
-            std::cout << "  --aln-min-identity FLOAT  Min identity fraction (default: 0, no filter)\n";
-            std::cout << "  --aln-min-bits FLOAT      Min bit score (default: 0, no filter)\n";
-            std::cout << "  --aln-max-evalue FLOAT    Max e-value (default: 1e10, no filter)\n\n";
-            std::cout << "Parallelism:\n";
-            std::cout << "  --threads, -t INT    OpenMP threads for EMI scans (default: runtime default)\n\n";
-            std::cout << "Pipeline:\n";
-            std::cout << "  hits2emi -> damage-annotate\n";
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0 ||
+                   strcmp(argv[i], "--help-all") == 0) {
+            std::cout <<
+                "Usage: dart damage-annotate --emi <hits.emi> [options]\n"
+                "\n"
+                "Input:\n"
+                "  --emi, -i FILE          EMI v7 alignment index\n"
+                "  --damage-index FILE     AGD damage index from predict\n"
+                "  --library-type TYPE     ss, ds or auto (default: auto)\n"
+                "Null model (pick one):\n"
+                "  --no-null               Run without a null model\n"
+                "  --em-null-model FILE    Empirical decoy null model\n"
+                "  --em-calib-model FILE   Calibrated true-hit and null model\n"
+                "Output:\n"
+                "  -o FILE                 Per-read TSV (default: stdout)\n"
+                "  --protein-summary FILE  Per-protein damage TSV\n"
+                "  --gene-summary FILE     Per-gene statistics TSV\n"
+                "  --dcx FILE              Columnar alignment and site output (requires EM)\n"
+                "  --library-label STR     Library ID in DCX (default: DCX basename)\n"
+                "Running:\n"
+                "  --em-tape-dir DIR       Node-local disk for EM tape; or DART_EM_TAPE_DIR\n"
+                "  --threads, -t INT       OpenMP threads (default: runtime default)\n"
+                "  -v                      Verbose output\n";
+            if (strcmp(argv[i], "--help-all") == 0) {
+                std::cout <<
+                "\n"
+                "Damage:\n"
+                "  --sites FILE                  Per-site damage TSV\n"
+                "  --refine-damage               Update d_max from EM assignments\n"
+                "  --auto-prior-ancient          Estimate the ancient prior from AGD reads\n"
+                "  --prior-ancient FLOAT         Ancient prior (default: 0.10)\n"
+                "  --d-max RATE                  Damage rate (default: estimated from data)\n"
+                "  --lambda FLOAT                Decay constant (default: 0.3)\n"
+                "Multimapping:\n"
+                "  --emit-multimap               Emit multiple EM candidates per read\n"
+                "  --multimap-k INT              Maximum candidates per read (default: 5)\n"
+                "  --multimap-floor FLOAT        Minimum candidate gamma (default: 0.05)\n"
+                "Protein filters:\n"
+                "  --auto-calibrate-spurious     Estimate mapping thresholds from supported proteins\n"
+                "  --min-breadth FLOAT           Minimum breadth (default: 0.10)\n"
+                "  --min-depth FLOAT             Minimum depth (default: 0.5)\n"
+                "  --min-reads INT               Minimum reads (default: 3)\n"
+                "Functional profiling:\n"
+                "  --map FILE                    Gene-to-group TSV\n"
+                "  --functional-summary FILE     Per-function TSV (requires --map)\n"
+                "  --anvio-ko FILE               Gene-level group abundance (requires --map)\n"
+                "  --annotation-source STR       Anvi'o source label (default: DART)\n"
+                "Null-model fitting:\n"
+                "  --fit-null-from FILE          Fit a null model from decoy hits, then exit\n"
+                "  --null-out FILE               Fitted model (default: decoy hits + .null.tsv)\n"
+                "  --em-null-tau FLOAT           Null responsibility cutoff (default: 0.5)\n"
+                "Resume:\n"
+                "  --em-checkpoint FILE          EM checkpoint (default: tape dir/dart_emtape_<pid>.ckpt)\n"
+                "  --resume                      Resume a matching EM checkpoint\n"
+                "Model parameters (change only with a reason):\n"
+                "  --ancient-threshold FLOAT     Ancient posterior cutoff (default: 0.60)\n"
+                "  --modern-threshold FLOAT      Modern posterior cutoff (default: 0.25)\n"
+                "  --terminal-threshold FLOAT    Terminal read posterior cutoff (default: 0.50)\n"
+                "  --auth-alpha FLOAT            Protein authentication level (default: 0.05)\n"
+                "  --modern-damage-rate, --eps0 FLOAT  Modern damaged-read rate (default: 0.02)\n"
+                "  --per-read-damage-threshold FLOAT   Damaged-read cutoff (default: 0.50)\n"
+                "  --min-damage-sites INT        Minimum susceptible sites (default: auto)\n"
+                "  --site-cap FLOAT              Site log-Bayes-factor cap (default: 3.0)\n"
+                "  --w0 FLOAT                    Absence-evidence weight (default: 0.3)\n"
+                "  --em-min-prob FLOAT           Minimum EM posterior to keep (default: 1e-6)\n"
+                "  --min-positional-score FLOAT  Minimum start diversity score (default: 0)\n"
+                "  --min-terminal-ratio FLOAT    Minimum terminal/middle coverage ratio (default: 0)\n"
+                "  --min-distinct-starts INT     Minimum distinct starts for 3+ reads (default: 2)\n"
+                "  --min-informative-reads INT    Minimum informative reads (default: 3)\n"
+                "  --max-single-molecule-frac FLOAT  Maximum single-molecule fraction (default: 0.5)\n"
+                "EM mode:\n"
+                "  --no-em                       Use best hits without EM\n"
+                "  --em-use-damage-mapping       Let damage evidence affect mapping (default: off)\n";
+            }
+            std::cout << "\nRun 'dart damage-annotate --help-all' for every option.\n";
             return 0;
         } else {
             std::cerr << "Unknown option: " << argv[i] << "\n";
@@ -1836,14 +1637,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
     if (em_min_prob < 0.0 || em_min_prob > 1.0) {
         std::cerr << "Error: --em-min-prob must be in [0,1]\n";
-        return 1;
-    }
-    if (em_min_margin < 0.0 || em_min_margin > 1.0) {
-        std::cerr << "Error: --em-min-margin must be in [0,1]\n";
-        return 1;
-    }
-    if (em_max_neff < 1.0) {
-        std::cerr << "Error: --em-max-neff must be >= 1\n";
         return 1;
     }
     if (em_null_tau < 0.0 || em_null_tau > 1.0) {
@@ -1928,30 +1721,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         return 1;
     }
 
-    if (!analysis_proteins_file.empty()) {
-        protein_summary_file = analysis_proteins_file;
-    }
-    if (!analysis_blast8_file.empty()) {
-        blast8_unique_file = analysis_blast8_file;
-    }
-    if (!analysis_categories_file.empty()) {
-        functional_summary_file = analysis_categories_file;
-    }
-
-    if (!analysis_prefix.empty()) {
-        if (output_file.empty()) {
-            output_file = analysis_prefix + ".reads.tsv";
-        }
-        if (protein_summary_file.empty()) {
-            protein_summary_file = analysis_prefix + ".protein.tsv";
-        }
-        if (blast8_unique_file.empty()) {
-            blast8_unique_file = analysis_prefix + ".blast8.unique.tsv";
-        }
-        if (!map_file.empty() && functional_summary_file.empty()) {
-            functional_summary_file = analysis_prefix + ".categories.tsv";
-        }
-    }
 
     int runtime_threads = 1;
 #ifdef _OPENMP
@@ -1973,12 +1742,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cerr << "d_max: auto\n";
         }
         std::cerr << "lambda: " << lambda << "\n";
-        if (max_dist >= 0) {
-            std::cerr << "Positional filter: <=" << max_dist << " nt from terminus\n";
-        }
-        if (!analysis_prefix.empty()) {
-            std::cerr << "analysis-prefix: " << analysis_prefix << "\n";
-        }
         std::cerr << "threads: " << runtime_threads
 #ifdef _OPENMP
                   << "\n";
@@ -2079,9 +1842,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         std::cerr << "  References: " << n_refs << "\n";
         std::cerr << "  Sorted (read,score): "
                   << (reader.is_sorted_by_read_then_score() ? "yes" : "no") << "\n";
-        if (max_dist >= 0) {
-            std::cerr << "  Positional filter: <=" << max_dist << " nt from terminus\n";
-        }
         std::cerr << "\n";
     }
 
@@ -2127,19 +1887,14 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     };
     std::vector<std::vector<MmCand>> mm_pool;
     if (emit_multimap) mm_pool.assign(n_reads, {});
-    const bool need_unique_degree = !blast8_unique_file.empty();
-    std::vector<uint32_t> read_degree;
-    if (need_unique_degree) {
-        read_degree.assign(n_reads, 0);
-    }
     // Production streaming EM tape path (PI mandate 2026-07-23): when the config needs
-    // only ref/gamma/gamma_ancient per read (no --em-audit, no calib, no null column,
+    // only ref/gamma/gamma_ancient per read (no calib, no null column,
     // damage-free mapping) the EM runs off an O_DIRECT tape on node-local scratch, feeding
     // tape_em_core directly from streaming ingestion. Nothing O(alignments) is materialized
     // in RAM (kills the ~288 GB in-RAM transient measured on LV626), giving aln-independent
     // peak RSS for the 6-10B-aln production target. All predicates here are CLI-known, so the
     // O(A) em_alignments buffers below are skipped entirely on this path.
-    const bool tape_path = use_em && em_audit_file.empty() && !use_em_calib &&
+    const bool tape_path = use_em && !use_em_calib &&
                            !use_em_null && !em_use_damage_mapping;
     // read-major per-read degree (uint64 prefix: aln offsets exceed 2^32 at 6B+ alns) and
     // per-ref length (== build_alignment_data's ref_lengths). Tape path only.
@@ -2150,7 +1905,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         em_ref_lengths.assign(n_refs, 0);
     }
     std::vector<dart::CompactAlignment> em_alignments;
-    if (use_em && !em_streaming && !tape_path) {
+    if (use_em && !tape_path) {
         em_alignments.reserve(static_cast<size_t>(reader.num_alignments()));
     }
     std::mutex em_damage_stats_mutex;
@@ -2189,12 +1944,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
     size_t em_shard_count = 1;
 #ifdef _OPENMP
-    if (use_em && !em_streaming && !tape_path) {
+    if (use_em && !tape_path) {
         em_shard_count = static_cast<size_t>(std::max(1, omp_get_max_threads()));
     }
 #endif
     std::vector<std::vector<dart::CompactAlignment>> em_alignments_by_thread;
-    if (use_em && !em_streaming && !tape_path) {
+    if (use_em && !tape_path) {
         em_alignments_by_thread.resize(em_shard_count);
         const size_t reserve_per_shard =
             static_cast<size_t>(reader.num_alignments() / std::max<size_t>(1, em_shard_count) + 1);
@@ -2262,7 +2017,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         size_t local_filtered_evalue = 0;
 
         std::vector<dart::CompactAlignment> local_em;
-        if (use_em && !em_streaming && !tape_path) {
+        if (use_em && !tape_path) {
             local_em.reserve(num_rows);
         }
         uint64_t local_em_n = 0;
@@ -2306,10 +2061,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             local_best_unsorted.reserve(std::max<uint32_t>(1, num_rows / 4));
         }
 
-        std::unordered_map<uint32_t, uint32_t> local_degree_counts;
-        if (need_unique_degree) {
-            local_degree_counts.reserve(std::max<uint32_t>(1, num_rows / 8));
-        }
 
         auto update_candidate = [&](BestHitCandidate& cand,
                                     float bits,
@@ -2379,14 +2130,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 local_mm.emplace_back(ridx, d);
             }
 
-            if (need_unique_degree) {
-                auto it_deg = local_degree_counts.find(ridx);
-                if (it_deg == local_degree_counts.end()) {
-                    local_degree_counts.emplace(ridx, 1u);
-                } else {
-                    it_deg->second += 1u;
-                }
-            }
 
             if (use_em) {
                 dart::CompactAlignment ca{};
@@ -2426,7 +2169,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     const uint32_t ref_len =
                         (tlen[i] > 0) ? static_cast<uint32_t>(tlen[i]) : static_cast<uint32_t>(ca.aln_end);
                     if (ref_len > em_ref_lengths[tidx]) em_ref_lengths[tidx] = ref_len;
-                } else if (!em_streaming) {
+                } else {
                     local_em.push_back(ca);
                 }
                 local_em_n++;
@@ -2552,18 +2295,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             }
         }
 
-        if (need_unique_degree) {
-            for (const auto& kv : local_degree_counts) {
-                const uint32_t ridx = kv.first;
-                const uint32_t add = kv.second;
-                const size_t shard = static_cast<size_t>(ridx) & (kBestHitShards - 1);
-                std::lock_guard<std::mutex> lock(best_hit_mutexes[shard]);
-                read_degree[ridx] += add;
-            }
-        }
 
         if (use_em && local_em_has_rows) {
-            if (!em_streaming && !local_em.empty()) {
+            if (!local_em.empty()) {
                 size_t em_shard = 0;
 #ifdef _OPENMP
                 em_shard = static_cast<size_t>(omp_get_thread_num());
@@ -2617,7 +2351,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         }
     }
 
-    if (use_em && !em_streaming) {
+    if (use_em) {
         size_t em_total = 0;
         for (const auto& shard : em_alignments_by_thread) {
             em_total += shard.size();
@@ -2722,16 +2456,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         if (verbose) std::cerr << "\n";
     }
 
-    // Open BLAST8 output file if requested.
-    std::ofstream blast8_out;
-    size_t written_unique = 0;
-    if (!blast8_unique_file.empty()) {
-        blast8_out.open(blast8_unique_file);
-        if (!blast8_out.is_open()) {
-            std::cerr << "Error: Cannot open BLAST8 unique file: " << blast8_unique_file << "\n";
-            return 1;
-        }
-    }
 
     if (verbose) {
         size_t total = total_alignments.load(std::memory_order_relaxed);
@@ -2966,11 +2690,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         // pass streams per-read gamma straight into the finalization below, and
         // compact_em_map releases aln_data.alignments after decode -> steady RSS ~20 B/aln
         // (vs 20+32). Gated to the production config where per-read finalization needs only
-        // ref/gamma/gamma_ancient: no --em-audit, no calib densities, no null column,
+        // ref/gamma/gamma_ancient: no calib densities, no null column,
         // damage-free mapping. Post-hoc p_anc = sigmoid(base_a - base_m) matches the legacy loop
         // with or without DMG_LL columns (without them it is the AGD read posterior itself).
         const bool can_stream =
-            em_audit_file.empty() && !use_em_calib && !use_em_null && !em_params.use_damage;
+            !use_em_calib && !use_em_null && !em_params.use_damage;
         const float em_keep_thr = static_cast<float>(em_min_prob);
 
         // ---- Tape path: build the O_DIRECT hot tape by a streaming decode (scan-2) ----
@@ -3290,11 +3014,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         // Extract best assignments and build per-read lookup
         auto best = dart::reassign_reads(aln_data, em_state, 0.0);
 
-        // Full-population EM audit dump (sol verification requirement): one row per
-        // hit-read (deg>0), truth-joinable, carrying densities + the 3-way decision.
-        const bool do_audit = !em_audit_file.empty();
-        std::vector<std::string> audit_rows;
-        if (do_audit) audit_rows.reserve(n_reads);
 
         // Build per-read lookup: extract gamma for the best-hit target used in summaries,
         // while tracking whether EM would have reassigned this read elsewhere.
@@ -3400,29 +3119,17 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             // the EM w_null dynamics, so information-poor reads ABSTAIN rather than being
             // mislabeled contamination. Legacy/uncalibrated null keeps the original
             // gamma_null > tau reject (no abstain band; preserves the regression baseline).
-            const char* decision = "kept";
             if (em_params.use_null && end > start) {
                 if (have_llr) {
                     // Calibrated path only: 3-way LLR call. Abstained/rejected reads
                     // leave the assignment/auth pools (em_keep=false).
-                    if (llr <= em_reject_llr)     { decision = "reject";  reason |= 0x1; em_keep = false; }
-                    else if (llr < em_keep_llr)   { decision = "abstain"; reason |= 0x8; em_keep = false; }
-                } else if (gnull > em_null_tau)   { decision = "reject";  reason |= 0x1; }
+                    if (llr <= em_reject_llr)     { reason |= 0x1; em_keep = false; }
+                    else if (llr < em_keep_llr)   { reason |= 0x8; em_keep = false; }
+                } else if (gnull > em_null_tau)   { reason |= 0x1; }
                 // Legacy --em-null-model path preserves the original behavior exactly:
                 // reason 0x1 flags null-dominance downstream; em_keep is untouched here.
             }
 
-            if (do_audit && end > start) {
-                std::string qn(reader.read_name(r));
-                std::string tn = (em_best_ref < n_refs) ? std::string(reader.ref_name(em_best_ref)) : std::string("*");
-                char buf[512];
-                std::snprintf(buf, sizeof(buf),
-                    "%s\t%u\t%.1f\t%.4g\t%.4g\t%.4g\t%.6g\t%s\t%s\t%.4f\t%.4f",
-                    qn.c_str(), static_cast<unsigned>(em_best_aln), em_best_bit,
-                    log_ft, log_f0, llr, gnull, decision, tn.c_str(),
-                    best_hit_gamma, em_margin);
-                audit_rows.emplace_back(buf);
-            }
 
             em_read_results[r] = {
                 best_hit_gamma,
@@ -3437,24 +3144,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             };
         }
 
-        if (do_audit) {
-            std::ofstream af(em_audit_file);
-            if (!af) {
-                std::cerr << "Error: cannot open --em-audit " << em_audit_file << "\n";
-                return 1;
-            }
-            af << "query_id\taln_len\tbit\tlog_f_true\tlog_f_0\tllr\tgamma_null\t"
-                  "decision\tassigned_target\tbest_hit_gamma\tem_margin\n";
-            for (const auto& row : audit_rows) af << row << '\n';
-            size_t nk = 0, na = 0, nr = 0;
-            for (const auto& row : audit_rows) {
-                if (row.find("\tkept\t") != std::string::npos) ++nk;
-                else if (row.find("\tabstain\t") != std::string::npos) ++na;
-                else if (row.find("\treject\t") != std::string::npos) ++nr;
-            }
-            std::cerr << "  EM audit: " << audit_rows.size() << " hit-reads -> " << em_audit_file
-                      << " (kept=" << nk << " abstain=" << na << " reject=" << nr << ")\n";
-        }
         }  // end if(!can_stream) legacy per-read finalization
 
         if (verbose) {
@@ -3526,8 +3215,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         std::vector<std::pair<uint32_t, ProteinDamageSummary>> all_results;
 
         // Open per-site and corrected-protein output files before the parallel scan.
-        std::ofstream sites_out_f, corrected_out_f;
-        size_t written_sites = 0, written_corrected = 0;
+        std::ofstream sites_out_f;
+        size_t written_sites = 0;
         if (!sites_file.empty()) {
             sites_out_f.open(sites_file);
             if (!sites_out_f.is_open()) {
@@ -3537,13 +3226,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             sites_out_f << "query_id\ttarget_id\tquery_pos\ttarget_pos\t"
                            "target_aa\tquery_aa\tdamage_class\tconfidence\t"
                            "dist_5prime\tdist_3prime\tp_damage\n";
-        }
-        if (!corrected_file.empty()) {
-            corrected_out_f.open(corrected_file);
-            if (!corrected_out_f.is_open()) {
-                std::cerr << "Error: Cannot open corrected file: " << corrected_file << "\n";
-                return 1;
-            }
         }
 
         // --emit-multimap: finalize the soft top-K pool by gamma and REBUILD best_rows_by_rg
@@ -3622,11 +3304,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 #pragma omp parallel
                 {
                     std::vector<std::pair<uint32_t, ProteinDamageSummary>> local_results;
-                    std::ostringstream local_blast8;
                     std::ostringstream local_sites;
-                    std::ostringstream local_corrected;
                     std::vector<DcxReadRec> local_dcx;
-                    size_t local_corrected_count = 0;
 
                     #pragma omp for schedule(dynamic, 64) nowait
                     for (size_t i = 0; i < rows.size(); ++i) {
@@ -3675,35 +3354,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                         std::string query_id(reader.read_name(ridx));
                         std::string target_id(reader.ref_name(hit.ref_idx));
 
-                        // BLAST8 unique-mapper output.
-                        if (!blast8_unique_file.empty() && need_unique_degree &&
-                            ridx < read_degree.size() && read_degree[ridx] == 1) {
-                            int aln_len = 0, mismatches = 0, gapopen = 0;
-                            int q_aln_non_gap = 0, t_aln_non_gap = 0;
-                            bool in_gap_q = false, in_gap_t = false;
-                            const size_t n = std::min(qaln_sv.size(), taln_sv.size());
-                            for (size_t j = 0; j < n; ++j) {
-                                const char q = qaln_sv[j];
-                                const char t = taln_sv[j];
-                                aln_len++;
-                                if (q == '-') { if (!in_gap_q) { gapopen++; in_gap_q = true; } }
-                                else { in_gap_q = false; q_aln_non_gap++; }
-                                if (t == '-') { if (!in_gap_t) { gapopen++; in_gap_t = true; } }
-                                else { in_gap_t = false; t_aln_non_gap++; }
-                                if (q != '-' && t != '-' && q != t) mismatches++;
-                            }
-                            const int qstart1 = static_cast<int>(hit.qstart_0 + 1);
-                            const int sstart1 = static_cast<int>(hit.tstart_0 + 1);
-                            const int qend1 = (q_aln_non_gap > 0) ? (qstart1 + q_aln_non_gap - 1) : qstart1;
-                            const int send1 = (t_aln_non_gap > 0) ? (sstart1 + t_aln_non_gap - 1) : sstart1;
-                            local_blast8 << query_id << '\t' << target_id << '\t'
-                                << std::fixed << std::setprecision(3) << (hit.fident * 100.0f) << '\t'
-                                << aln_len << '\t' << mismatches << '\t' << gapopen << '\t'
-                                << qstart1 << '\t' << qend1 << '\t'
-                                << sstart1 << '\t' << send1 << '\t'
-                                << std::scientific << std::setprecision(2) << hit.evalue << '\t'
-                                << std::fixed << std::setprecision(1) << hit.bits << '\n';
-                        }
 
                         // Annotate (target_id not passed — not stored in struct).
                         auto summary = annotate_alignment(
@@ -3719,11 +3369,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
                         if (summary.total_mismatches > 0) {
                             summary.read_idx = ridx;
-                            if (!corrected_file.empty()) {
-                                summary.qaln = std::string(qaln_sv);
-                                summary.taln = std::string(taln_sv);
-                            }
-                            filter_sites_by_distance(summary, max_dist);
                             summary.qlen = hit.qlen;
                             summary.qstart_0 = hit.qstart_0;
                             summary.tstart_0 = hit.tstart_0;
@@ -3747,19 +3392,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                                 }
                             }
 
-                            // Write corrected proteins inline (before clearing sites).
-                            if (!summary.sites.empty() && corrected_out_f.is_open() &&
-                                !summary.qaln.empty()) {
-                                std::string corrected = generate_corrected_protein(
-                                    summary.qaln, summary.taln, summary.sites, summary.qstart_0);
-                                local_corrected << ">" << query_id
-                                    << " corrected_sites=" << summary.sites.size()
-                                    << " damage_frac=" << std::fixed << std::setprecision(3)
-                                    << summary.damage_fraction << "\n";
-                                for (size_t j = 0; j < corrected.size(); j += 60)
-                                    local_corrected << corrected.substr(j, 60) << "\n";
-                                ++local_corrected_count;
-                            }
 
                             // Write per-site output inline (before clearing sites).
                             if (sites_out_f.is_open()) {
@@ -3889,8 +3521,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                             summary.sites.clear();
                             summary.sites.shrink_to_fit();
                             // Return corrected-output strings (already written above).
-                            std::string{}.swap(summary.qaln);
-                            std::string{}.swap(summary.taln);
 
                             local_results.emplace_back(ridx, std::move(summary));
                         }
@@ -3901,14 +3531,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                         all_results.insert(all_results.end(),
                             std::make_move_iterator(local_results.begin()),
                             std::make_move_iterator(local_results.end()));
-                        if (!blast8_unique_file.empty()) {
-                            std::string s = local_blast8.str();
-                            if (!s.empty()) {
-                                blast8_out << s;
-                                written_unique += static_cast<size_t>(
-                                    std::count(s.begin(), s.end(), '\n'));
-                            }
-                        }
                         if (sites_out_f.is_open()) {
                             std::string s = local_sites.str();
                             if (!s.empty()) {
@@ -3916,10 +3538,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                                 written_sites += static_cast<size_t>(
                                     std::count(s.begin(), s.end(), '\n'));
                             }
-                        }
-                        if (corrected_out_f.is_open() && local_corrected_count > 0) {
-                            corrected_out_f << local_corrected.str();
-                            written_corrected += local_corrected_count;
                         }
                         if (emit_dcx && !local_dcx.empty()) {
                             dcx_recs.insert(dcx_recs.end(),
@@ -3932,17 +3550,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             });
         }
 
-        if (!blast8_unique_file.empty() && verbose) {
-            std::cerr << "Unique-mapper BLAST8 written to: " << blast8_unique_file
-                      << " (" << written_unique << " rows)\n";
-        }
         if (verbose && sites_out_f.is_open()) {
             std::cerr << "Site calls written to: " << sites_file
                       << " (" << written_sites << " sites)\n";
-        }
-        if (verbose && corrected_out_f.is_open()) {
-            std::cerr << "Corrected proteins written: " << written_corrected
-                      << " to " << corrected_file << "\n";
         }
 
         // Sort by read index for deterministic output order.
@@ -4161,7 +3771,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     score_params.channel_b_valid = (d_max > 0.0f);  // Trust site evidence if damage detected
     score_params.ancient_threshold = ancient_threshold;
     score_params.modern_threshold = modern_threshold;
-    score_params.use_identity = use_identity;
+    score_params.use_identity = true;
     score_params.k_identity = 20.0f;
     score_params.identity_baseline = 0.90f;
     score_params.d_max = d_max;  // For fixed-average site evidence formula
@@ -4252,7 +3862,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         std::cerr << "  Damage informative: " << (score_params.damage_informative ? "yes" : "no") << "\n";
         std::cerr << "  Damage detectability: " << std::fixed << std::setprecision(3)
                   << damage_detectability << "\n";
-        std::cerr << "  Identity evidence: " << (use_identity ? "enabled (k=20, baseline=0.90)" : "disabled") << "\n";
+        std::cerr << "  Identity evidence: enabled (k=20, baseline=0.90)\n";
     }
 
     // Phase 2: gamma-weighted MLE update of d_max (--refine-damage)
@@ -4700,7 +4310,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // vector before building gene_agg. Uses pre-aggregated site scalars (info_sum,
     // terminal_5, terminal_3) populated during annotation — no per-read sites heap.
     const bool need_protein_agg =
-        !protein_summary_file.empty() || !protein_filtered_file.empty() || !combined_output_file.empty();
+        !protein_summary_file.empty();
     std::vector<ProteinAggInput> protein_agg_inputs;
     if (need_protein_agg) {
         protein_agg_inputs.reserve(summaries.size());
@@ -4746,8 +4356,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
     const bool need_any_aggregation =
         !gene_summary_file.empty() || !functional_summary_file.empty() ||
-        !anvio_ko_file.empty() || !combined_output_file.empty() ||
-        !protein_summary_file.empty() || !protein_filtered_file.empty();
+        !anvio_ko_file.empty() || !protein_summary_file.empty();
 
     // 1. Build ReadRefEntry list (only em_keep reads), sort by ref_idx.
     // summaries must remain alive here: e.posterior/e.classification are read from
@@ -4936,7 +4545,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
 
     // 7. Open output files.
-    std::ofstream gf, pf_os, pff_os, cof_os, af_f;
+    std::ofstream gf, pf_os, af_f;
     if (!gene_summary_file.empty()) {
         gf.open(gene_summary_file);
         if (!gf.is_open()) {
@@ -4992,32 +4601,13 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         }
         pf_os << protein_header;
     }
-    if (!protein_filtered_file.empty()) {
-        pff_os.open(protein_filtered_file);
-        if (!pff_os.is_open()) {
-            std::cerr << "Error: Cannot open protein filtered file: " << protein_filtered_file << "\n";
-            return 1;
-        }
-        pff_os << protein_header;
-    }
-    if (!combined_output_file.empty()) {
-        cof_os.open(combined_output_file);
-        if (!cof_os.is_open()) {
-            std::cerr << "Error: Cannot open combined output file: " << combined_output_file << "\n";
-            return 1;
-        }
-        cof_os << "target_id\tgroup_id\tannotation_source\tgene_present\tprotein_present\t"
-                  "n_reads\teff_reads\tabundance\tbreadth\tmean_identity\tmean_posterior\t"
-                  "protein_n_damage_reads\tprotein_mean_p_damaged\tprotein_damage_confidence\tprotein_d_aa\t"
-                  "positional_score\tterminal_middle_ratio\tpass_mapping_filter\tfilter_fail\n";
-    }
 
     // 8. Functional accumulator (written after streaming pass).
     std::unordered_map<std::string, FunctionalAccumulator> func_acc;
 
     // 9. Main streaming pass: one ref at a time.
     constexpr size_t TERMINAL_CODONS_S = 3;
-    size_t gene_written = 0, protein_written = 0, filtered_written = 0, combined_written = 0;
+    size_t gene_written = 0, protein_written = 0;
 
     auto ri_cur = read_ref_entries.cbegin();
     // Binomial provenance-LR library constants (uniform across the library → computed once).
@@ -5313,8 +4903,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         const float abundance_adj    = assign_eff_reads * cov_weight;
         bool protein_passes = false;
         std::string filter_fail_p;
-
-        if ((pf_os.is_open() || pff_os.is_open() || cof_os.is_open()) && have_protein) {
+        if (pf_os.is_open() && have_protein) {
             const float mean_p  = pa.n_auth_reads > 0
                 ? (pa.sum_p_damaged / static_cast<float>(pa.n_auth_reads)) : 0.0f;
             const float frac    = pa.n_auth_reads > 0
@@ -5383,7 +4972,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             // Q-CLUST ship-gate: fail proteins whose per-opportunity binomial rests on too few
             // informative reads or is dominated by a single molecule (pooled-tail
             // anti-conservative regime). Override via --min-informative-reads /
-            // --max-single-molecule-frac; --preset loose disables it.
+            // --max-single-molecule-frac.
             if (result.n_informative_reads < min_informative_reads) add_fp("min_informative_reads");
             if (result.max_ni_frac > max_single_molecule_frac)      add_fp("single_molecule_dominated");
             protein_passes = filter_fail_p.empty();
@@ -5546,90 +5135,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 << '\t' << prov_call
                 << '\n';
             if (pf_os.is_open()) { pf_os << row.str(); ++protein_written; }
-            if (pff_os.is_open() && protein_passes) { pff_os << row.str(); ++filtered_written; }
         }
-
-        // --- Combined output ---
-        if (cof_os.is_open()) {
-            const bool gene_present    = (gene_acc.n_reads > 0);
-            const bool protein_present = have_protein;
-
-            std::string gene_fail_str;
-            if (gene_present && !gene_passes) {
-                auto add_gf = [&gene_fail_str](const char* t) {
-                    if (!gene_fail_str.empty()) gene_fail_str.push_back(',');
-                    gene_fail_str += t;
-                };
-                if (gene_acc.n_reads < min_reads)          add_gf("min_reads");
-                if (gene_breadth < min_breadth)            add_gf("min_breadth");
-                if (gene_abundance < min_depth)            add_gf("min_depth");
-                if (gene_pos_score < min_positional_score) add_gf("min_positional_score");
-                if (gene_term_ratio < min_terminal_ratio)  add_gf("min_terminal_ratio");
-            }
-            const std::string gene_filter_fail = gene_present
-                ? (gene_passes ? "." : gene_fail_str)
-                : "missing";
-            const std::string prot_filter_fail = protein_present
-                ? (filter_fail_p.empty() ? "." : filter_fail_p)
-                : "missing";
-
-            std::string comb_fail;
-            auto append_cf = [&comb_fail](const std::string& t) {
-                if (t.empty() || t == ".") return;
-                if (!comb_fail.empty()) comb_fail.push_back(',');
-                comb_fail += t;
-            };
-            if (!gene_present)    append_cf("no_gene");
-            if (!protein_present) append_cf("no_protein");
-            if (gene_filter_fail != "." && gene_filter_fail != "missing") append_cf(gene_filter_fail);
-            if (prot_filter_fail != "." && prot_filter_fail != "missing") append_cf(prot_filter_fail);
-            if (comb_fail.empty()) comb_fail = ".";
-
-            const bool pass_final = gene_present && protein_present && gene_passes && protein_passes;
-            const uint32_t comb_n_reads = protein_present ? static_cast<uint32_t>(pa.n_reads) : gene_acc.n_reads;
-            const float comb_pos_score  = protein_present ? pa.positional_score() : gene_pos_score;
-            const float comb_term_ratio = protein_present ? pa.terminal_middle_ratio() : gene_term_ratio;
-            const float protein_mean_p  = pa.n_auth_reads > 0
-                ? (pa.sum_p_damaged / static_cast<float>(pa.n_auth_reads)) : 0.0f;
-            ProteinDamageResult comb_result = protein_present
-                ? fit_protein_damage_binomial(pa.read_obs, modern_est.q_modern, 0.5, 2.0)
-                : ProteinDamageResult{};
-            const float protein_d_aa_c = protein_present ? [&]() {
-                const float obs = use_both_ends
-                    ? static_cast<float>(pa.terminal_5 + pa.terminal_3)
-                    : static_cast<float>(pa.terminal_5);
-                const float exp_val = static_cast<float>(pa.n_reads_eff) * n_ends_lib *
-                    3.0f * 0.25f * 0.70f;
-                return (exp_val > 0.0f) ? std::min(1.0f, obs / exp_val) : 0.0f;
-            }() : 0.0f;
-
-            std::string grp_id = ".";
-            auto gm_it = group_map.find(target_name);
-            if (gm_it != group_map.end()) grp_id = gm_it->second;
-
-            cof_os << target_name << '\t' << grp_id << '\t' << annotation_source
-                   << '\t' << (gene_present ? 1 : 0)
-                   << '\t' << (protein_present ? 1 : 0)
-                   << '\t' << comb_n_reads
-                   << '\t' << std::fixed << std::setprecision(2) << static_cast<float>(gene_acc.eff_reads())
-                   << '\t' << std::setprecision(4) << gene_abundance
-                   << '\t' << std::setprecision(4) << gene_breadth
-                   << '\t' << std::setprecision(4) << gene_acc.avg_fident()
-                   << '\t' << std::setprecision(4) << gene_acc.avg_posterior()
-                   << '\t' << static_cast<uint32_t>(pa.n_damage_reads)
-                   << '\t' << std::setprecision(4) << protein_mean_p
-                   // GATED to pass_final: the combined damage confidence is suppressed to 0 unless the
-                   // protein passes authentication, so the combined score cannot resurrect a failure.
-                   << '\t' << std::setprecision(4) << (pass_final ? static_cast<float>(comb_result.p_damaged) : 0.0f)
-                   << '\t' << std::setprecision(4) << protein_d_aa_c
-                   << '\t' << std::setprecision(4) << comb_pos_score
-                   << '\t' << std::setprecision(4) << comb_term_ratio
-                   << '\t' << (pass_final ? 1 : 0)
-                   << '\t' << comb_fail
-                   << '\n';
-            ++combined_written;
-        }
-
         ri_cur = ri_end;
         pi_cur = pi_end;
     }
@@ -5683,10 +5189,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cerr << "Gene summary written to: " << gene_summary_file << " (" << gene_written << " genes)\n";
         if (pf_os.is_open())
             std::cerr << "Protein summary written to: " << protein_summary_file << " (" << protein_written << " proteins)\n";
-        if (pff_os.is_open())
-            std::cerr << "Filtered proteins written to: " << protein_filtered_file << " (" << filtered_written << " proteins passed mapping filters)\n";
-        if (cof_os.is_open())
-            std::cerr << "Combined output written to: " << combined_output_file << " (" << combined_written << " targets)\n";
         if (af_f.is_open())
             std::cerr << "Anvi'o gene abundance written to: " << anvio_ko_file << "\n";
         std::cerr << "\nSummary: assigned_reads=" << assigned_kept_reads
