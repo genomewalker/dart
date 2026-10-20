@@ -30,6 +30,10 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <numeric>
+#ifdef _OPENMP
+#include <parallel/algorithm>
+#endif
 #include <iomanip>
 #include <unordered_set>
 #include <unordered_map>
@@ -3176,44 +3180,90 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                      "remove --no-em\n";
         return 1;
     }
-    struct AuthPick {
-        uint32_t ref = UINT32_MAX;
-        uint16_t gamma = 0, prior = 0;
-    };
-    std::vector<AuthPick> auth_picks(emit_dcx ? n_reads : 0);
+    // .dcx records go to an external sort keyed by target rank (target name byte order),
+    // so the hot loop compares integers, never names. Each thread stages into its own sink.
+    // Auth picks (the em_keep record of each read) are collected per thread and reduced
+    // after the loop.
+    struct AuthPick { uint32_t read, rank, ref; uint16_t gamma, prior; };
+    std::vector<uint32_t> ref_rank;
     std::unique_ptr<dcx::ExternalSort> dcx_sort;
-    std::mutex dcx_stage_mutex;
+    std::mutex dcx_pick_mutex;
+    std::vector<std::vector<AuthPick>> dcx_pick_lists;
+    std::atomic<bool> dcx_stage_failed{false};
     std::exception_ptr dcx_stage_error;
     if (emit_dcx) {
+        // Decode the reference names in bulk, one arena per dictionary block, and rank them.
+        const auto& dict = reader.ref_dict();
+        const uint32_t bs = dict.dict_block_size();
+        const uint32_t nblk = n_refs ? (n_refs + bs - 1) / bs : 0;
+        std::vector<std::vector<char>> arena(nblk);
+        std::vector<std::vector<uint64_t>> ends(nblk);
+        #pragma omp parallel for schedule(dynamic, 16)
+        for (uint32_t blk = 0; blk < nblk; ++blk) dict.decode_block_bytes(blk, arena[blk], ends[blk]);
+        std::vector<std::string_view> names(n_refs);
+        for (uint32_t blk = 0; blk < nblk; ++blk)
+            for (size_t k = 0; k < ends[blk].size(); ++k) {
+                const uint64_t from = k ? ends[blk][k - 1] : 0;
+                names[size_t(blk) * bs + k] = std::string_view(arena[blk].data() + from, ends[blk][k] - from);
+            }
+        std::vector<uint32_t> order(n_refs);
+        std::iota(order.begin(), order.end(), 0u);
+        auto by_name = [&](uint32_t a, uint32_t b) { return names[a] < names[b]; };
+#ifdef _OPENMP
+        __gnu_parallel::sort(order.begin(), order.end(), by_name);
+#else
+        std::sort(order.begin(), order.end(), by_name);
+#endif
+        ref_rank.assign(n_refs, 0);
+        uint32_t rank = 0;
+        for (size_t k = 0; k < order.size(); ++k) {
+            if (k > 0 && names[order[k]] != names[order[k - 1]]) ++rank;
+            ref_rank[order[k]] = rank;
+        }
         std::string run_dir = em_tape_dir;
         if (run_dir.empty()) {
             if (const char* dir = std::getenv("DART_EM_TAPE_DIR")) run_dir = dir;
         }
-        size_t budget = size_t(4) << 30;
+        size_t budget = size_t(8) << 30;
         if (const char* value = std::getenv("DART_DCX_SORT_BYTES")) budget = std::stoull(value);
         size_t fail_run = std::numeric_limits<size_t>::max();
         if (const char* value = std::getenv("DART_DCX_TEST_FAIL_RUN")) fail_run = std::stoull(value);
-        dcx_sort = std::make_unique<dcx::ExternalSort>(run_dir, budget,
-            static_cast<size_t>(std::min(4, runtime_threads)), fail_run);
+        dcx_sort = std::make_unique<dcx::ExternalSort>(run_dir, budget, runtime_threads, fail_run);
     }
-    auto stage_dcx = [&](std::vector<DcxReadRec>& records) {
-        std::lock_guard<std::mutex> lock(dcx_stage_mutex);
-        if (!dcx_stage_error) {
-            try {
-                for (auto& rec : records) {
-                    if (rec.em_keep) {
-                        AuthPick& pick = auth_picks[rec.read_idx];
-                        const uint16_t gamma = dcx::enc_unit(rec.gamma);
-                        if (pick.ref == UINT32_MAX || gamma > pick.gamma ||
-                            (gamma == pick.gamma && rec.target_id < reader.ref_name(pick.ref))) {
-                            pick = {rec.ref_idx, gamma, dcx::enc_unit(rec.p_read)};
-                        }
-                    }
-                    dcx_sort->append(std::move(rec));
-                }
-            } catch (...) { dcx_stage_error = std::current_exception(); }
+    // Names for a list of reference indices, decoding each dictionary block once.
+    auto ref_names_of = [&](const std::vector<uint32_t>& refs) {
+        const auto& dict = reader.ref_dict();
+        const uint32_t bs = dict.dict_block_size();
+        std::vector<uint32_t> blocks;
+        for (uint32_t r : refs) blocks.push_back(r / bs);
+        std::sort(blocks.begin(), blocks.end());
+        blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
+        std::vector<std::vector<char>> arena(blocks.size());
+        std::vector<std::vector<uint64_t>> ends(blocks.size());
+        #pragma omp parallel for schedule(dynamic, 16)
+        for (size_t k = 0; k < blocks.size(); ++k) dict.decode_block_bytes(blocks[k], arena[k], ends[k]);
+        std::vector<std::string> out;
+        out.reserve(refs.size());
+        for (uint32_t r : refs) {
+            const size_t k = size_t(std::lower_bound(blocks.begin(), blocks.end(), r / bs) - blocks.begin());
+            const size_t i = r % bs;
+            const uint64_t from = i ? ends[k][i - 1] : 0;
+            out.emplace_back(arena[k].data() + from, ends[k][i] - from);
         }
-        records.clear();
+        return out;
+    };
+    auto stage_dcx = [&](const DcxReadRec& rec, std::vector<AuthPick>& picks) {
+        if (dcx_stage_failed.load(std::memory_order_relaxed)) return;
+        try {
+            const uint32_t rank = ref_rank[rec.ref_idx];
+            if (rec.em_keep)
+                picks.push_back({rec.read_idx, rank, rec.ref_idx,
+                                 dcx::enc_unit(rec.gamma), dcx::enc_unit(rec.p_read)});
+            dcx_sort->local().append(rec, rank);
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(dcx_pick_mutex);
+            if (!dcx_stage_failed.exchange(true)) dcx_stage_error = std::current_exception();
+        }
     };
 
     // ── Annotation pass (runs after EM) ──────────────────────────────────────
@@ -3314,8 +3364,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 {
                     std::vector<std::pair<uint32_t, ProteinDamageSummary>> local_results;
                     std::ostringstream local_sites;
-                    std::vector<DcxReadRec> local_dcx;
-                    size_t local_dcx_bytes = 0;
+                    std::vector<AuthPick> local_picks;
 
                     #pragma omp for schedule(dynamic, 64) nowait
                     for (size_t i = 0; i < rows.size(); ++i) {
@@ -3454,7 +3503,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                             rec.ref_idx = hit.ref_idx;
                             rec.src_idx = (static_cast<uint64_t>(rg_idx) << 32) | uint64_t(row_in_group);
                             rec.query_id = query_id;
-                            rec.target_id = target_id;
                             rec.tstart = hit.tstart_0;
                             rec.strand = (query_id.find("_-_") != std::string::npos) ? 1 : 0;
                             const auto& em = em_read_results[ridx];
@@ -3523,12 +3571,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                                 for (uint32_t k = 0; k < rec.span; ++k)
                                     if (cover[k])
                                         rec.presence[k >> 3] |= uint8_t(1u << (k & 7));  // LSB-first
-                                local_dcx_bytes += dcx::record_memory(rec);
-                                local_dcx.push_back(std::move(rec));
-                                if (local_dcx.size() >= 256 || local_dcx_bytes >= (1u << 20)) {
-                                    stage_dcx(local_dcx);
-                                    local_dcx_bytes = 0;
-                                }
+                                stage_dcx(rec, local_picks);
                             }
                         }
 
@@ -3555,8 +3598,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                                     std::count(s.begin(), s.end(), '\n'));
                             }
                         }
-                        if (emit_dcx && !local_dcx.empty()) {
-                            stage_dcx(local_dcx);
+                        if (emit_dcx && !local_picks.empty()) {
+                            dcx_pick_lists.push_back(std::move(local_picks));
                         }
                     }
                 }
@@ -4094,29 +4137,38 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // Merge target-sorted runs and patch the scored per-read posterior. Full and
     // grain-A-only writers cut their blocks independently, as before.
     if (emit_dcx) {
-        std::unordered_map<uint32_t, float> post_by_read;
-        post_by_read.reserve(summaries.size() * 2);
+        std::vector<float> post_by_read(n_reads, 0.0f);
         // Deterministic per-read collapse. A multimapping read has one summary per candidate,
         // each with its own posterior; plain emplace() kept whichever appeared first in the
         // parallel-built summaries vector -> the kept value flipped between runs. Take the max
         // (order-independent) so the audit posterior is reproducible. posterior is audit-only
         // (convergence detect reads gamma/em_keep/p_damage, never posterior).
-        for (const auto& s : summaries) {
-            auto [it, ins] = post_by_read.try_emplace(s.read_idx, s.posterior);
-            if (!ins && s.posterior > it->second) it->second = s.posterior;
-        }
+        for (const auto& s : summaries)
+            post_by_read[s.read_idx] = std::max(post_by_read[s.read_idx], s.posterior);
         std::vector<std::string> a_targets;
+        std::vector<uint32_t> a_target_refs;
         std::vector<uint64_t> a_N, a_k;
         std::vector<double> a_logLR;
         static const double AUTH_TAU[5] = {0.3, 0.4, 0.5, 0.6, 0.7};
-        // Canonical read order preserves the old floating-point auth reduction.
+        // Per read keep the em_keep record with the highest quantized gamma, ties to the
+        // lower target rank; reduce in canonical read order so the floating-point sums
+        // match the old in-memory reduction.
+        std::vector<AuthPick> auth_picks;
+        for (auto& list : dcx_pick_lists) auth_picks.insert(auth_picks.end(), list.begin(), list.end());
+        std::vector<std::vector<AuthPick>>().swap(dcx_pick_lists);
+        std::sort(auth_picks.begin(), auth_picks.end(), [](const AuthPick& a, const AuthPick& b) {
+            if (a.read != b.read) return a.read < b.read;
+            if (a.gamma != b.gamma) return a.gamma > b.gamma;
+            return a.rank < b.rank;
+        });
         std::unordered_map<uint32_t, uint32_t> auth_target_ord;
-        for (const auto& pick : auth_picks) {
-            if (pick.ref == UINT32_MAX) continue;
+        for (size_t k = 0; k < auth_picks.size(); ++k) {
+            const AuthPick& pick = auth_picks[k];
+            if (k > 0 && auth_picks[k - 1].read == pick.read) continue;
             auto [it, inserted] = auth_target_ord.try_emplace(pick.ref, static_cast<uint32_t>(a_targets.size()));
             const uint32_t ix = it->second;
             if (inserted) {
-                a_targets.push_back(reader.ref_name(pick.ref));
+                a_target_refs.push_back(pick.ref);
                 a_N.push_back(0); a_logLR.push_back(0.0); a_k.insert(a_k.end(), 5, 0);
             }
             const double g = dcx::dec_unit(pick.gamma), pr = dcx::dec_unit(pick.prior);
@@ -4126,6 +4178,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             for (int j = 0; j < 5; ++j) if (pr > AUTH_TAU[j]) ++a_k[ix * 5 + j];
         }
         std::vector<AuthPick>().swap(auth_picks);
+        a_targets = ref_names_of(a_target_refs);
         uint32_t dcx_flags;
         dcx_flags = dcx::COL_EM_MARGIN |
                       dcx::COL_EM_REF_NEFF | dcx::COL_GAMMA_NULL |
@@ -4181,23 +4234,25 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
         const std::string auth_file = dcx_file + ".auth";
         std::vector<std::string> target_dict, query_dict;
+        std::vector<uint32_t> target_refs;
         std::vector<uint64_t> query_ord(n_reads, UINT64_MAX);
         uint64_t dcx_records = 0, dcx_observations = 0;
         try {
             dcx::StreamWriter full(dcx_file.c_str(), opt);
             dcx::StreamWriter auth(auth_file.c_str(), opt, true);
-            dcx_sort->finish([&](const DcxReadRec& rec) {
-                if (target_dict.empty() || target_dict.back() != rec.target_id)
-                    target_dict.push_back(rec.target_id);
+            uint32_t last_rank = UINT32_MAX;
+            dcx_sort->finish([&](const DcxReadRec& rec, uint32_t rank) {
+                if (rank != last_rank) { target_refs.push_back(rec.ref_idx); last_rank = rank; }
                 uint64_t& qord = query_ord[rec.read_idx];
                 if (qord == UINT64_MAX) { qord = query_dict.size(); query_dict.push_back(rec.query_id); }
-                const uint32_t tord = static_cast<uint32_t>(target_dict.size() - 1);
-                const auto pi = post_by_read.find(rec.read_idx);
-                const float posterior = pi == post_by_read.end() ? 0.0f : pi->second;
+                const uint32_t tord = static_cast<uint32_t>(target_refs.size() - 1);
+                const float posterior = post_by_read[rec.read_idx];
                 full.append(rec, tord, qord, posterior);
                 auth.append(rec, tord, qord, posterior);
                 ++dcx_records; dcx_observations += rec.ref_aa.size();
             });
+            target_dict = ref_names_of(target_refs);
+            std::vector<uint32_t>().swap(target_refs);
             full.close(target_dict, query_dict);
             auth.close(target_dict, query_dict);
             dcx_sort.reset();
