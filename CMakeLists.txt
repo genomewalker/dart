@@ -372,6 +372,13 @@ if(BUILD_TESTING)
         COMMAND dart-dcx-roundtrip
     )
 
+    add_executable(dart-dcx-streaming tests/test_dcx_streaming.cpp src/dart_columnar.cpp)
+    target_link_libraries(dart-dcx-streaming PkgConfig::ZSTD)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(dart-dcx-streaming OpenMP::OpenMP_CXX)
+    endif()
+    add_test(NAME dcx_streaming COMMAND dart-dcx-streaming)
+
     # ORF id uniqueness: the id grammar (legacy 3-field and current 4-field,
     # incl. a two-digit ordinal) plus an end-to-end check that `dart predict`
     # gives two same-frame ORFs of one read two distinct names.

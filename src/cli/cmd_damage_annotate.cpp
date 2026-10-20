@@ -21,6 +21,7 @@
 #include "dart/log_utils.hpp"
 #include "dart/mmap_array.hpp"
 #include "dart/damage_index.hpp"      // fnv1a_hash for the .dcx calib_contract_id
+#include "dart/dcx_external_sort.hpp"
 #include "dart/dart_columnar.hpp"     // .dcx interchange writer (--dcx)
 #include <iostream>
 #include <fstream>
@@ -129,35 +130,7 @@ struct DamageSite {
 // damage_class taken from the read's DamageSite at mismatch positions and left
 // at 0/None elsewhere — faithful to the format (bit k => covered) and lets
 // convergence compute depth while filtering mismatches itself (ref_aa<>obs_aa).
-struct DcxReadRec {
-    uint32_t read_idx = 0;               // for the posterior patch after scoring
-    std::string query_id, target_id;     // dict keys; strand derived from query_id
-    uint32_t tstart = 0, span = 0;       // 0-based target start; tend = tstart+span-1
-    float gamma = 0, gamma_ancient = 0, em_margin = 0, em_ref_neff = 0;
-    float fident = 0;                     // alignment identity [0,1] (COL_FIDENT); recruitment QC
-    float gamma_null = 0;                 // per-read null responsibility (spurious-hit mass)
-    float p_read = 0;                    // AGD reference-free per-read damage posterior (auth axis)
-    float posterior = 0;                 // filled post-scoring (identity-fused posterior; audit only)
-    uint8_t strand = 0;
-    uint8_t em_keep = 0;                  // real EM keep bit (SOFT weight, not a filter)
-    uint8_t candidate_rank = 0;           // DCX 2.2: EM candidate rank per read, 0=argmax (COL_CANDIDATE_RANK)
-    uint64_t src_idx = 0;                 // (rg_idx<<32)|row_in_group: globally-unique source ordinal.
-                                          // Sort tiebreak -> byte-deterministic dcx independent of the
-                                          // omp thread-completion order records are built in (two HSPs of
-                                          // one read to one target share (target_id,tstart,span,...) but
-                                          // never a source row, so this alone is a total order).
-    std::vector<uint8_t> presence;       // ceil(span/8), bit k => covered
-    std::vector<uint8_t> ref_aa, obs_aa, dcls;   // Grain B, covered positions
-    std::vector<float>   p_damage;
-    std::vector<uint16_t> dist5, dist3;
-    // RAW observed codon at the substitution -> the designed COL_OBS_CODON column
-    // (packed 0-63, A=0 C=1 G=2 T=3; 255 = not in the AGD terminal zone / unavailable).
-    // Lets convergence verify damage at the NUCLEOTIDE level (is the read codon a
-    // C->T/G->A deamination of a ref_aa-coding codon) vs only the AA-consistency in
-    // damage_class. Sourced from AgdRecord terminal codons indexed by dist5/dist3 (damage
-    // is terminal, so central positions carry no codon and don't need one).
-    std::vector<uint8_t> obs_codon;
-};
+using DcxReadRec = dcx::Record;
 
 struct ProteinDamageSummary {
     uint32_t read_idx = 0;
@@ -3195,18 +3168,53 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         }
     }
 
-    // .dcx interchange emit (--dcx): staged per accepted (em_keep=1) alignment
-    // during the annotate scan (qaln/taln only live there), then assembled into a
-    // Batch after the scoring loop patches in posteriors. Declared here so it
-    // outlives the annotate block. The grain-A EM columns are meaningless without
-    // EM, so require it.
+    // Stage covered alignments in bounded sort runs. Posteriors are filled after
+    // scoring, while auth picks are retained separately in read order.
     const bool emit_dcx = !dcx_file.empty();
     if (emit_dcx && !use_em) {
         std::cerr << "Error: --dcx requires EM (grain-A gamma/em_keep/posterior); "
                      "remove --no-em\n";
         return 1;
     }
-    std::vector<DcxReadRec> dcx_recs;
+    struct AuthPick {
+        uint32_t ref = UINT32_MAX;
+        uint16_t gamma = 0, prior = 0;
+    };
+    std::vector<AuthPick> auth_picks(emit_dcx ? n_reads : 0);
+    std::unique_ptr<dcx::ExternalSort> dcx_sort;
+    std::mutex dcx_stage_mutex;
+    std::exception_ptr dcx_stage_error;
+    if (emit_dcx) {
+        std::string run_dir = em_tape_dir;
+        if (run_dir.empty()) {
+            if (const char* dir = std::getenv("DART_EM_TAPE_DIR")) run_dir = dir;
+        }
+        size_t budget = size_t(4) << 30;
+        if (const char* value = std::getenv("DART_DCX_SORT_BYTES")) budget = std::stoull(value);
+        size_t fail_run = std::numeric_limits<size_t>::max();
+        if (const char* value = std::getenv("DART_DCX_TEST_FAIL_RUN")) fail_run = std::stoull(value);
+        dcx_sort = std::make_unique<dcx::ExternalSort>(run_dir, budget,
+            static_cast<size_t>(std::min(4, runtime_threads)), fail_run);
+    }
+    auto stage_dcx = [&](std::vector<DcxReadRec>& records) {
+        std::lock_guard<std::mutex> lock(dcx_stage_mutex);
+        if (!dcx_stage_error) {
+            try {
+                for (auto& rec : records) {
+                    if (rec.em_keep) {
+                        AuthPick& pick = auth_picks[rec.read_idx];
+                        const uint16_t gamma = dcx::enc_unit(rec.gamma);
+                        if (pick.ref == UINT32_MAX || gamma > pick.gamma ||
+                            (gamma == pick.gamma && rec.target_id < reader.ref_name(pick.ref))) {
+                            pick = {rec.ref_idx, gamma, dcx::enc_unit(rec.p_read)};
+                        }
+                    }
+                    dcx_sort->append(std::move(rec));
+                }
+            } catch (...) { dcx_stage_error = std::current_exception(); }
+        }
+        records.clear();
+    };
 
     // ── Annotation pass (runs after EM) ──────────────────────────────────────
     // Running EM first means summaries (~8 GB compact) never coexist with EM
@@ -3307,6 +3315,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     std::vector<std::pair<uint32_t, ProteinDamageSummary>> local_results;
                     std::ostringstream local_sites;
                     std::vector<DcxReadRec> local_dcx;
+                    size_t local_dcx_bytes = 0;
 
                     #pragma omp for schedule(dynamic, 64) nowait
                     for (size_t i = 0; i < rows.size(); ++i) {
@@ -3442,6 +3451,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
                             DcxReadRec rec;
                             rec.read_idx = ridx;
+                            rec.ref_idx = hit.ref_idx;
                             rec.src_idx = (static_cast<uint64_t>(rg_idx) << 32) | uint64_t(row_in_group);
                             rec.query_id = query_id;
                             rec.target_id = target_id;
@@ -3513,7 +3523,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                                 for (uint32_t k = 0; k < rec.span; ++k)
                                     if (cover[k])
                                         rec.presence[k >> 3] |= uint8_t(1u << (k & 7));  // LSB-first
+                                local_dcx_bytes += dcx::record_memory(rec);
                                 local_dcx.push_back(std::move(rec));
+                                if (local_dcx.size() >= 256 || local_dcx_bytes >= (1u << 20)) {
+                                    stage_dcx(local_dcx);
+                                    local_dcx_bytes = 0;
+                                }
                             }
                         }
 
@@ -3541,10 +3556,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                             }
                         }
                         if (emit_dcx && !local_dcx.empty()) {
-                            dcx_recs.insert(dcx_recs.end(),
-                                std::make_move_iterator(local_dcx.begin()),
-                                std::make_move_iterator(local_dcx.end()));
-                            local_dcx.clear();
+                            stage_dcx(local_dcx);
                         }
                     }
                 }
@@ -3554,6 +3566,14 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         if (verbose && sites_out_f.is_open()) {
             std::cerr << "Site calls written to: " << sites_file
                       << " (" << written_sites << " sites)\n";
+        }
+
+        if (dcx_stage_error) {
+            try { std::rethrow_exception(dcx_stage_error); }
+            catch (const std::exception& e) {
+                std::cerr << "Error: --dcx run generation failed: " << e.what() << "\n";
+                return 1;
+            }
         }
 
         // Sort by read index for deterministic output order.
@@ -4071,12 +4091,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
 
     // ── .dcx interchange emit (--dcx) ────────────────────────────────────────
-    // Assemble the staged grain-A/B records into a dcx::Batch and write one file.
-    // Records were staged during the annotate scan (all covered positions, EM
-    // stats) with posterior left blank; patch it in from the now-scored summaries,
-    // then sort by (target_id, tstart) so target_ord is dense/monotonic as the
-    // writer requires. Convergence reads grain-A (gamma/posterior/em_keep/tstart/
-    // tend) and grain-B (ref_aa/obs_aa/p_damage), filtering mismatches itself.
+    // Merge target-sorted runs and patch the scored per-read posterior. Full and
+    // grain-A-only writers cut their blocks independently, as before.
     if (emit_dcx) {
         std::unordered_map<uint32_t, float> post_by_read;
         post_by_read.reserve(summaries.size() * 2);
@@ -4089,135 +4105,37 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             auto [it, ins] = post_by_read.try_emplace(s.read_idx, s.posterior);
             if (!ins && s.posterior > it->second) it->second = s.posterior;
         }
-        for (auto& rec : dcx_recs) {
-            auto it = post_by_read.find(rec.read_idx);
-            rec.posterior = (it != post_by_read.end()) ? it->second : 0.0f;
-        }
-
-        // ── WRITE-TIME AUTH REDUCE (fusion dual-66c04a26 #1) ─────────────────
-        // Runs HERE, while dcx_recs is still READ-GROUPED — before the (target,tstart)
-        // sort below scatters each read's alignments by target (which is exactly why a
-        // reduce over the written target-sorted .dcx over-counts multi-mapped reads).
-        // Per read: EM-pick = max quantized gamma among em_keep, tie-break target_id ASC
-        // then ordinal (== struct_auth rn=1). Per target accumulate {N, logLR=Σ
-        // gamma*ln(clamp(p_read,eps,1-eps)/(1-clamp)), k@τ-grid}. Values are the writer's
-        // quantized dec_unit(enc_unit(.)) so the stats == any grain_a re-derive; logLR
-        // summed in canonical read_idx order. Written to <dcx>.authstats after the label
-        // is resolved (below). p_read is always present here (COL_P_READ is set).
         std::vector<std::string> a_targets;
-        std::vector<uint64_t> a_N, a_k;          // a_k row-major: [target*5 + j]
+        std::vector<uint64_t> a_N, a_k;
         std::vector<double> a_logLR;
         static const double AUTH_TAU[5] = {0.3, 0.4, 0.5, 0.6, 0.7};
-        {
-            const double AEPS = 1e-6;
-            struct Best { double g, pr; const std::string* tgt; uint64_t ord; };
-            std::unordered_map<uint32_t, Best> best;
-            best.reserve(dcx_recs.size());
-            for (uint64_t i = 0; i < dcx_recs.size(); ++i) {
-                const DcxReadRec& r = dcx_recs[i];
-                if (!r.em_keep) continue;
-                double g = dcx::dec_unit(dcx::enc_unit(r.gamma));
-                double pr = dcx::dec_unit(dcx::enc_unit(r.p_read));
-                auto it = best.find(r.read_idx);
-                if (it == best.end()) { best.emplace(r.read_idx, Best{g, pr, &r.target_id, i}); continue; }
-                Best& b = it->second;
-                bool better = g > b.g
-                           || (g == b.g && r.target_id < *b.tgt)
-                           || (g == b.g && r.target_id == *b.tgt && i < b.ord);
-                if (better) { b = Best{g, pr, &r.target_id, i}; }
+        // Canonical read order preserves the old floating-point auth reduction.
+        std::unordered_map<uint32_t, uint32_t> auth_target_ord;
+        for (const auto& pick : auth_picks) {
+            if (pick.ref == UINT32_MAX) continue;
+            auto [it, inserted] = auth_target_ord.try_emplace(pick.ref, static_cast<uint32_t>(a_targets.size()));
+            const uint32_t ix = it->second;
+            if (inserted) {
+                a_targets.push_back(reader.ref_name(pick.ref));
+                a_N.push_back(0); a_logLR.push_back(0.0); a_k.insert(a_k.end(), 5, 0);
             }
-            std::vector<uint32_t> rids; rids.reserve(best.size());
-            for (auto& kv : best) rids.push_back(kv.first);
-            std::sort(rids.begin(), rids.end());          // canonical read_idx order
-            std::unordered_map<std::string, uint32_t> tix;
-            for (uint32_t rid : rids) {
-                const Best& b = best[rid];
-                auto ti = tix.find(*b.tgt);
-                uint32_t ix;
-                if (ti == tix.end()) {
-                    ix = uint32_t(a_targets.size()); tix.emplace(*b.tgt, ix);
-                    a_targets.push_back(*b.tgt); a_N.push_back(0); a_logLR.push_back(0.0);
-                    a_k.insert(a_k.end(), 5, 0);
-                } else ix = ti->second;
-                a_N[ix] += 1;
-                double pc = std::min(std::max(b.pr, AEPS), 1.0 - AEPS);
-                a_logLR[ix] += b.g * std::log(pc / (1.0 - pc));
-                for (int j = 0; j < 5; ++j) if (b.pr > AUTH_TAU[j]) a_k[ix * 5 + j] += 1;
-            }
+            const double g = dcx::dec_unit(pick.gamma), pr = dcx::dec_unit(pick.prior);
+            ++a_N[ix];
+            const double pc = std::min(std::max(pr, 1e-6), 1.0 - 1e-6);
+            a_logLR[ix] += g * std::log(pc / (1.0 - pc));
+            for (int j = 0; j < 5; ++j) if (pr > AUTH_TAU[j]) ++a_k[ix * 5 + j];
         }
-
-        // Total order -> byte-deterministic dcx. (target_id,tstart) alone leaves ties that
-        // std::sort (unstable) resolved by omp thread-completion order (records are merged
-        // per-thread under an omp critical at the parallel record-build), so reruns diverged:
-        // two HSPs of one read to one target share (target_id,tstart,span,strand,read_idx,
-        // candidate_rank) yet carry different scores, and swapped between runs. src_idx
-        // (source row ordinal) is globally unique -> a genuine total order. (target_id,tstart)
-        // stays primary to keep each target's records contiguous (dcx blocks split on target).
-        // Detection is order-independent, so this changes bytes only, never results.
-        std::sort(dcx_recs.begin(), dcx_recs.end(),
-            [](const DcxReadRec& a, const DcxReadRec& b) {
-                if (a.target_id != b.target_id) return a.target_id < b.target_id;
-                if (a.tstart != b.tstart)       return a.tstart < b.tstart;
-                return a.src_idx < b.src_idx;
-            });
-
-        dcx::Batch B;
-        B.col_flags = dcx::COL_EM_MARGIN |
+        std::vector<AuthPick>().swap(auth_picks);
+        uint32_t dcx_flags;
+        dcx_flags = dcx::COL_EM_MARGIN |
                       dcx::COL_EM_REF_NEFF | dcx::COL_GAMMA_NULL |
                       dcx::COL_P_READ | dcx::COL_OBS_CODON |
                       dcx::COL_STRAND | dcx::COL_QID_DICT | dcx::COL_FIDENT;
-        if (damage_em_active) B.col_flags |= dcx::COL_GAMMA_ANCIENT;
+        if (damage_em_active) dcx_flags |= dcx::COL_GAMMA_ANCIENT;
         if (emit_multimap)
-            B.col_flags |= dcx::COL_SOFT_MULTIMAP | dcx::COL_CANDIDATE_RANK;
-        std::unordered_map<std::string, uint32_t> tord_map;
-        std::unordered_map<std::string, uint64_t> qord_map;
-        for (auto& rec : dcx_recs) {
-            uint32_t tord;
-            auto ti = tord_map.find(rec.target_id);
-            if (ti != tord_map.end()) tord = ti->second;
-            else { tord = uint32_t(B.target_dict.size());
-                   tord_map.emplace(rec.target_id, tord);
-                   B.target_dict.push_back(rec.target_id); }
-            uint64_t qord;
-            auto qi = qord_map.find(rec.query_id);
-            if (qi != qord_map.end()) qord = qi->second;
-            else { qord = uint64_t(B.query_dict.size());
-                   qord_map.emplace(rec.query_id, qord);
-                   B.query_dict.push_back(rec.query_id); }
-
-            B.query_ord.push_back(qord);
-            B.target_ord.push_back(tord);
-            B.tstart.push_back(rec.tstart);
-            B.span.push_back(rec.span);
-            B.gamma.push_back(rec.gamma);
-            B.posterior.push_back(rec.posterior);
-            B.em_keep.push_back(rec.em_keep);       // real EM keep bit (soft weight)
-            B.strand.push_back(rec.strand);
-            B.gamma_ancient.push_back(rec.gamma_ancient);
-            B.em_margin.push_back(rec.em_margin);
-            B.em_ref_neff.push_back(rec.em_ref_neff);
-            B.gamma_null.push_back(rec.gamma_null);
-            B.p_read.push_back(rec.p_read);
-            B.fident.push_back(rec.fident);
-            if (emit_multimap) B.candidate_rank.push_back(rec.candidate_rank);
-            B.presence.insert(B.presence.end(), rec.presence.begin(), rec.presence.end());
-            B.ref_aa.insert(B.ref_aa.end(), rec.ref_aa.begin(), rec.ref_aa.end());
-            B.obs_aa.insert(B.obs_aa.end(), rec.obs_aa.begin(), rec.obs_aa.end());
-            B.obs_codon.insert(B.obs_codon.end(), rec.obs_codon.begin(), rec.obs_codon.end());
-            B.p_damage.insert(B.p_damage.end(), rec.p_damage.begin(), rec.p_damage.end());
-            B.dist5.insert(B.dist5.end(), rec.dist5.begin(), rec.dist5.end());
-            B.dist3.insert(B.dist3.end(), rec.dist3.begin(), rec.dist3.end());
-            B.damage_class.insert(B.damage_class.end(), rec.dcls.begin(), rec.dcls.end());
-            // OPT-H2: this record's grain-B payload is now fully copied into B; free it so
-            // peak stays at ~one Batch (B) instead of dcx_recs + B simultaneously. Byte
-            // output is unchanged — B already holds the data. dcx_recs is unused hereafter.
-            rec.presence = {}; rec.ref_aa = {}; rec.obs_aa = {}; rec.obs_codon = {};
-            rec.p_damage = {}; rec.dist5 = {}; rec.dist3 = {}; rec.dcls = {};
-            rec.query_id = {}; rec.target_id = {};
-        }
-
+            dcx_flags |= dcx::COL_SOFT_MULTIMAP | dcx::COL_CANDIDATE_RANK;
         dcx::DcxWriteOptions opt;
-        opt.col_flags = B.col_flags;
+        opt.col_flags = dcx_flags;
         opt.sample_flags = 0;   // grain-B target_pos is 0-based (DART convention)
         // Test-only: force a small block cap so a modest input spans >1 .dcx block,
         // exercising the writer's block loop and the reader's cross-block walk.
@@ -4261,27 +4179,30 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         std::memcpy(opt.calib_contract_id, &h0, 8);
         std::memcpy(opt.calib_contract_id + 8, &h1, 8);
 
-        bool dcx_ok = false;
+        const std::string auth_file = dcx_file + ".auth";
+        std::vector<std::string> target_dict, query_dict;
+        std::vector<uint64_t> query_ord(n_reads, UINT64_MAX);
+        uint64_t dcx_records = 0, dcx_observations = 0;
         try {
-            dcx_ok = dcx::write_dcx(dcx_file.c_str(), B, opt);
+            dcx::StreamWriter full(dcx_file.c_str(), opt);
+            dcx::StreamWriter auth(auth_file.c_str(), opt, true);
+            dcx_sort->finish([&](const DcxReadRec& rec) {
+                if (target_dict.empty() || target_dict.back() != rec.target_id)
+                    target_dict.push_back(rec.target_id);
+                uint64_t& qord = query_ord[rec.read_idx];
+                if (qord == UINT64_MAX) { qord = query_dict.size(); query_dict.push_back(rec.query_id); }
+                const uint32_t tord = static_cast<uint32_t>(target_dict.size() - 1);
+                const auto pi = post_by_read.find(rec.read_idx);
+                const float posterior = pi == post_by_read.end() ? 0.0f : pi->second;
+                full.append(rec, tord, qord, posterior);
+                auth.append(rec, tord, qord, posterior);
+                ++dcx_records; dcx_observations += rec.ref_aa.size();
+            });
+            full.close(target_dict, query_dict);
+            auth.close(target_dict, query_dict);
+            dcx_sort.reset();
         } catch (const std::exception& e) {
             std::cerr << "Error: --dcx write failed: " << e.what() << "\n";
-            return 1;
-        }
-        if (!dcx_ok) {
-            std::cerr << "Error: --dcx write_dcx returned false for " << dcx_file << "\n";
-            return 1;
-        }
-        // DUAL-EMIT the grain-A auth sidecar (<dcx>.auth) so convergence protein_auth
-        // (fold-gap) reads a small grain-A-only file instead of inflating the full .dcx.
-        const std::string auth_file = dcx_file + ".auth";
-        try {
-            if (!dcx::write_dcx_auth(auth_file.c_str(), B, opt)) {
-                std::cerr << "Error: --dcx auth sidecar write returned false for " << auth_file << "\n";
-                return 1;
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "Error: --dcx auth sidecar write failed: " << e.what() << "\n";
             return 1;
         }
         // EMIT the write-time auth-stats table (<dcx>.authstats) computed above.
@@ -4297,11 +4218,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             return 1;
         }
         if (verbose) {
-            std::cerr << ".dcx written to: " << dcx_file << " (" << B.target_ord.size()
-                      << " alignments, " << B.ref_aa.size() << " covered positions, "
-                      << B.target_dict.size() << " targets)\n";
+            std::cerr << ".dcx written to: " << dcx_file << " (" << dcx_records
+                      << " alignments, " << dcx_observations << " covered positions, "
+                      << target_dict.size() << " targets)\n";
             std::cerr << ".dcx auth sidecar: " << auth_file << " (grain-A only, "
-                      << B.target_ord.size() << " alignments)\n";
+                      << dcx_records << " alignments)\n";
             std::cerr << ".dcx authstats: " << authstats_file << " (write-time reduce, "
                       << a_targets.size() << " targets)\n";
         }

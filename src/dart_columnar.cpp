@@ -14,6 +14,8 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
+#include <future>
+#include <deque>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -90,8 +92,11 @@ void push_col(std::vector<ColumnDirEntry>& dir, std::vector<uint8_t>& payload,
 
 }  // namespace
 
-bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
-    const size_t nA = B.target_ord.size();
+
+namespace {
+struct EncBlock { std::vector<uint8_t> frame; BlockHeader bh; BlockIndexEntry ie; };
+EncBlock encode_block(const Batch& B, const DcxWriteOptions& opt, size_t lo, size_t hi,
+                      const std::vector<size_t>& pres_off, const std::vector<size_t>& obs_off) {
     const uint32_t cf = opt.col_flags | B.col_flags;
     const bool has_ga = cf & COL_GAMMA_ANCIENT;
     const bool has_em = cf & COL_EM_MARGIN;
@@ -105,52 +110,6 @@ bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
     const bool has_crank = cf & COL_CANDIDATE_RANK;
     const bool has_fident = cf & COL_FIDENT;
 
-    // Per-record presence byte offset and popcount (also the Grain B offset).
-    std::vector<size_t> pres_off(nA + 1, 0), obs_off(nA + 1, 0);
-    for (size_t r = 0; r < nA; ++r) {
-        uint32_t pb = bytes_for_bits(B.span[r]);
-        pres_off[r + 1] = pres_off[r] + pb;
-        obs_off[r + 1] = obs_off[r] + popcount_bytes(&B.presence[pres_off[r]], pb);
-    }
-    // ref_aa is the mandatory Grain-B count reference (v2: residues, not codons).
-    if (obs_off[nA] != B.ref_aa.size())
-        throw std::runtime_error("dcx: Σpopcount(presence) != ref_aa size — desynced observation grain");
-    if (B.obs_aa.size() != B.ref_aa.size())
-        throw std::runtime_error("dcx: obs_aa size != ref_aa size — desynced observation grain");
-    if (has_best && (B.best_codon.size() != B.ref_aa.size() || B.best_post.size() != B.ref_aa.size()))
-        throw std::runtime_error("dcx: COL_BEST_CODON set but best_codon/best_post size != ref_aa size");
-    if (has_obs && B.obs_codon.size() != B.ref_aa.size())
-        throw std::runtime_error("dcx: obs_codon size != ref_aa size — desynced observation grain");
-    if (has_strand && B.strand.size() != nA)
-        throw std::runtime_error("dcx: strand size != n_records_a");
-    if (has_pread && B.p_read.size() != nA)
-        throw std::runtime_error("dcx: p_read size != n_records_a");
-    if (has_crank && B.candidate_rank.size() != nA)
-        throw std::runtime_error("dcx: candidate_rank size != n_records_a");
-    bool calibed = false;
-    for (int i = 0; i < 16; ++i) calibed |= (opt.calib_contract_id[i] != 0);
-    if (!calibed)
-        throw std::runtime_error("dcx: p_damage emitted without calib_contract_id — uncalibrated write");
-
-    // OPT-H: stream blocks straight to disk instead of buffering the whole file in RAM
-    // (peak was O(total compressed output)). The byte layout is IDENTICAL — same header,
-    // same blocks, same trailer, in the same order — only WHEN bytes are written changes.
-    // The FileHeader is written twice: a zero placeholder now, then the real one via
-    // seekp(0) at the end, once n_blocks / n_records are known (as the old code patched
-    // file.data() in place).
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    if (!out) return false;
-    size_t off = 0;
-    { const std::vector<uint8_t> hdr0(sizeof(FileHeader), 0);
-      out.write(reinterpret_cast<const char*>(hdr0.data()), std::streamsize(hdr0.size()));
-      off += hdr0.size(); }
-    std::vector<BlockIndexEntry> index;
-
-    // encode_block: pure per-block encode + zstd compress. Depends only on the block's
-    // own records (delta encoders reset per block) + read-only offsets, so blocks are
-    // independent and can be compressed in parallel, then flushed in order (below).
-    struct EncBlock { std::vector<uint8_t> frame; BlockHeader bh; BlockIndexEntry ie; };
-    auto encode_block = [&](size_t lo, size_t hi) -> EncBlock {
         const size_t nblk = hi - lo;
         const size_t b_lo = obs_off[lo], b_hi = obs_off[hi];
         const size_t nB = b_hi - b_lo;
@@ -261,7 +220,151 @@ bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
         eb.bh = bh;
         eb.ie = ie;   // ie.offset filled during the ordered flush below
         return eb;
+}
+
+bool finish_dcx(std::ofstream& out, size_t off, const std::vector<BlockIndexEntry>& index,
+                const std::vector<std::string>& target_dict, const std::vector<std::string>& query_dict,
+                const DcxWriteOptions& opt, uint32_t cf, uint64_t nA, uint64_t nB) {
+    // ---- trailer index + dictionaries + footer (built in a small `tail` buffer — its
+    // size is O(n_blocks + dict) not O(records) — then streamed once) ----
+    std::vector<uint8_t> file;   // OPT-H: now holds ONLY the trailer, not the blocks
+    const uint64_t index_offset = off;
+    IndexHeader ih{};
+    std::memcpy(ih.magic, INDEX_MAGIC, 4);
+    ih.version = VERSION_MAJOR;
+    ih.n_blocks = uint32_t(index.size());
+    const uint64_t entries_end = index_offset + sizeof(IndexHeader) + index.size() * sizeof(BlockIndexEntry);
+    // dictionaries land right after the entries; record their offsets up front.
+    auto dict_bytes = [](const std::vector<std::string>& d) {
+        size_t n = 4; for (auto& s : d) n += 4 + s.size(); return n;
     };
+    ih.tgt_dict_offset = entries_end;
+    ih.tgt_dict_bytes = dict_bytes(target_dict);
+    uint64_t after_dicts = entries_end + ih.tgt_dict_bytes;
+    if (cf & COL_QID_DICT) {
+        ih.qid_dict_offset = after_dicts;
+        ih.qid_dict_bytes = dict_bytes(query_dict);
+        after_dicts += ih.qid_dict_bytes;
+    }
+    ih.calib_offset = after_dicts;
+    ih.calib_bytes = 2 + opt.calib_model.size() + 2 + opt.library_label.size()
+                     + 4 + opt.calib_contract_blob.size();
+
+    std::vector<uint8_t> idx_bytes;
+    put_bytes(idx_bytes, &ih, sizeof(ih));
+    put_bytes(idx_bytes, index.data(), index.size() * sizeof(BlockIndexEntry));
+    const uint32_t idx_adler = adler32(idx_bytes.data(), idx_bytes.size());
+    file.insert(file.end(), idx_bytes.begin(), idx_bytes.end());
+
+    auto put_dict = [&](const std::vector<std::string>& d) {
+        put_u32(file, uint32_t(d.size()));
+        for (auto& s : d) { put_u32(file, uint32_t(s.size())); put_bytes(file, s.data(), s.size()); }
+    };
+    put_dict(target_dict);
+    if (cf & COL_QID_DICT) put_dict(query_dict);
+
+    // calib section: u16 model_len | model | u16 label_len | label | u32 blob_len | blob
+    put_u16(file, uint16_t(opt.calib_model.size()));
+    put_bytes(file, opt.calib_model.data(), opt.calib_model.size());
+    put_u16(file, uint16_t(opt.library_label.size()));
+    put_bytes(file, opt.library_label.data(), opt.library_label.size());
+    put_u32(file, uint32_t(opt.calib_contract_blob.size()));
+    put_bytes(file, opt.calib_contract_blob.data(), opt.calib_contract_blob.size());
+
+    Footer ft{};
+    ft.index_offset = index_offset;
+    ft.index_adler32 = idx_adler;
+    ft.reserved = 0;
+    std::memcpy(ft.magic, FOOTER_MAGIC, 4);
+    ft.footer_bytes = uint32_t(sizeof(Footer));
+    put_bytes(file, &ft, sizeof(ft));
+
+    // ---- patch FileHeader ----
+    FileHeader fh{};
+    std::memcpy(fh.magic, FILE_MAGIC, 8);
+    fh.version_major = VERSION_MAJOR;
+    // v2.2 (soft multi-mapping) only when the capability is actually emitted; a non-multimap
+    // write stays v2.1 so it is byte-identical to the pre-2.2 writer.
+    fh.version_minor = (cf & COL_SOFT_MULTIMAP) ? uint8_t(2) : VERSION_MINOR;
+    fh.header_bytes = uint16_t(sizeof(FileHeader));
+    fh.col_flags = cf; fh.codec = CODEC_ZSTD;
+    fh.sample_flags = opt.sample_flags;
+    std::memcpy(fh.calib_contract_id, opt.calib_contract_id, 16);
+    fh.n_blocks = uint32_t(index.size());
+    fh.n_records_a = nA; fh.n_records_b = nB;
+    fh.first_block_offset = sizeof(FileHeader);
+
+    // OPT-H: stream the trailer, then seekp(0) and overwrite the placeholder FileHeader
+    // with the real one (identical bytes to the old in-place file.data() patch).
+    out.write(reinterpret_cast<const char*>(file.data()), std::streamsize(file.size()));
+    off += file.size();
+    (void)off;
+    out.seekp(0);
+    out.write(reinterpret_cast<const char*>(&fh), sizeof(fh));
+    return bool(out);
+}
+
+} // namespace
+
+bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
+    const size_t nA = B.target_ord.size();
+    const uint32_t cf = opt.col_flags | B.col_flags;
+    const bool has_ga = cf & COL_GAMMA_ANCIENT;
+    const bool has_em = cf & COL_EM_MARGIN;
+    const bool has_neff = cf & COL_EM_REF_NEFF;
+    const bool has_gnull = cf & COL_GAMMA_NULL;
+    const bool has_pread = cf & COL_P_READ;
+    const bool dist3_derived = cf & COL_DIST3_DERIVED;
+    const bool has_strand = cf & COL_STRAND;
+    const bool has_obs = cf & COL_OBS_CODON;
+    const bool has_best = cf & COL_BEST_CODON;
+    const bool has_crank = cf & COL_CANDIDATE_RANK;
+    const bool has_fident = cf & COL_FIDENT;
+
+    // Per-record presence byte offset and popcount (also the Grain B offset).
+    std::vector<size_t> pres_off(nA + 1, 0), obs_off(nA + 1, 0);
+    for (size_t r = 0; r < nA; ++r) {
+        uint32_t pb = bytes_for_bits(B.span[r]);
+        pres_off[r + 1] = pres_off[r] + pb;
+        obs_off[r + 1] = obs_off[r] + popcount_bytes(&B.presence[pres_off[r]], pb);
+    }
+    // ref_aa is the mandatory Grain-B count reference (v2: residues, not codons).
+    if (obs_off[nA] != B.ref_aa.size())
+        throw std::runtime_error("dcx: Σpopcount(presence) != ref_aa size — desynced observation grain");
+    if (B.obs_aa.size() != B.ref_aa.size())
+        throw std::runtime_error("dcx: obs_aa size != ref_aa size — desynced observation grain");
+    if (has_best && (B.best_codon.size() != B.ref_aa.size() || B.best_post.size() != B.ref_aa.size()))
+        throw std::runtime_error("dcx: COL_BEST_CODON set but best_codon/best_post size != ref_aa size");
+    if (has_obs && B.obs_codon.size() != B.ref_aa.size())
+        throw std::runtime_error("dcx: obs_codon size != ref_aa size — desynced observation grain");
+    if (has_strand && B.strand.size() != nA)
+        throw std::runtime_error("dcx: strand size != n_records_a");
+    if (has_pread && B.p_read.size() != nA)
+        throw std::runtime_error("dcx: p_read size != n_records_a");
+    if (has_crank && B.candidate_rank.size() != nA)
+        throw std::runtime_error("dcx: candidate_rank size != n_records_a");
+    bool calibed = false;
+    for (int i = 0; i < 16; ++i) calibed |= (opt.calib_contract_id[i] != 0);
+    if (!calibed)
+        throw std::runtime_error("dcx: p_damage emitted without calib_contract_id — uncalibrated write");
+
+    // OPT-H: stream blocks straight to disk instead of buffering the whole file in RAM
+    // (peak was O(total compressed output)). The byte layout is IDENTICAL — same header,
+    // same blocks, same trailer, in the same order — only WHEN bytes are written changes.
+    // The FileHeader is written twice: a zero placeholder now, then the real one via
+    // seekp(0) at the end, once n_blocks / n_records are known (as the old code patched
+    // file.data() in place).
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    size_t off = 0;
+    { const std::vector<uint8_t> hdr0(sizeof(FileHeader), 0);
+      out.write(reinterpret_cast<const char*>(hdr0.data()), std::streamsize(hdr0.size()));
+      off += hdr0.size(); }
+    std::vector<BlockIndexEntry> index;
+
+    // encode_block: pure per-block encode + zstd compress. Depends only on the block's
+    // own records (delta encoders reset per block) + read-only offsets, so blocks are
+    // independent and can be compressed in parallel, then flushed in order (below).
 
     // Greedy block cut (serial, deterministic — the only cross-block dependency): accumulate
     // records until the raw estimate exceeds the cap, then cut at the next target boundary.
@@ -296,7 +399,7 @@ bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
         const size_t ce = std::min(c + size_t(K), bounds.size());
         #pragma omp parallel for schedule(dynamic, 1)
         for (size_t bi = c; bi < ce; ++bi)
-            win[bi - c] = encode_block(bounds[bi].first, bounds[bi].second);
+            win[bi - c] = encode_block(B, opt, bounds[bi].first, bounds[bi].second, pres_off, obs_off);
         for (size_t bi = c; bi < ce; ++bi) {
             EncBlock& eb = win[bi - c];
             eb.ie.offset = off;
@@ -308,83 +411,122 @@ bool write_dcx(const char* path, const Batch& B, const DcxWriteOptions& opt) {
         }
     }
 
-    // ---- trailer index + dictionaries + footer (built in a small `tail` buffer — its
-    // size is O(n_blocks + dict) not O(records) — then streamed once) ----
-    std::vector<uint8_t> file;   // OPT-H: now holds ONLY the trailer, not the blocks
-    const uint64_t index_offset = off;
-    IndexHeader ih{};
-    std::memcpy(ih.magic, INDEX_MAGIC, 4);
-    ih.version = VERSION_MAJOR;
-    ih.n_blocks = uint32_t(index.size());
-    const uint64_t entries_end = index_offset + sizeof(IndexHeader) + index.size() * sizeof(BlockIndexEntry);
-    // dictionaries land right after the entries; record their offsets up front.
-    auto dict_bytes = [](const std::vector<std::string>& d) {
-        size_t n = 4; for (auto& s : d) n += 4 + s.size(); return n;
-    };
-    ih.tgt_dict_offset = entries_end;
-    ih.tgt_dict_bytes = dict_bytes(B.target_dict);
-    uint64_t after_dicts = entries_end + ih.tgt_dict_bytes;
-    if (cf & COL_QID_DICT) {
-        ih.qid_dict_offset = after_dicts;
-        ih.qid_dict_bytes = dict_bytes(B.query_dict);
-        after_dicts += ih.qid_dict_bytes;
+    return finish_dcx(out, off, index, B.target_dict, B.query_dict, opt, cf, nA, B.ref_aa.size());
+}
+
+struct StreamWriter::Impl {
+    DcxWriteOptions opt;
+    bool auth_only, closed = false;
+    std::ofstream out;
+    Batch current;
+    size_t estimate = 0, offset = sizeof(FileHeader), workers = 1;
+    uint64_t nA = 0, nB = 0;
+    std::vector<BlockIndexEntry> index;
+    std::deque<std::future<EncBlock>> pending;
+
+    Impl(const char* path, const DcxWriteOptions& options, bool auth)
+        : opt(options), auth_only(auth), out(path, std::ios::binary | std::ios::trunc) {
+        bool calibrated = false;
+        for (uint8_t b : opt.calib_contract_id) calibrated |= b != 0;
+        if (!calibrated) throw std::runtime_error("dcx: missing calib_contract_id");
+        if (!out) throw std::runtime_error(std::string("dcx: cannot open ") + path);
+        FileHeader placeholder{};
+        out.write(reinterpret_cast<const char*>(&placeholder), sizeof(placeholder));
+#ifdef _OPENMP
+        workers = static_cast<size_t>(std::max(1, omp_get_max_threads()));
+#endif
+        current.col_flags = opt.col_flags;
     }
-    ih.calib_offset = after_dicts;
-    ih.calib_bytes = 2 + opt.calib_model.size() + 2 + opt.library_label.size()
-                     + 4 + opt.calib_contract_blob.size();
 
-    std::vector<uint8_t> idx_bytes;
-    put_bytes(idx_bytes, &ih, sizeof(ih));
-    put_bytes(idx_bytes, index.data(), index.size() * sizeof(BlockIndexEntry));
-    const uint32_t idx_adler = adler32(idx_bytes.data(), idx_bytes.size());
-    file.insert(file.end(), idx_bytes.begin(), idx_bytes.end());
+    void flush_one() {
+        EncBlock block = pending.front().get();
+        pending.pop_front();
+        block.ie.offset = offset;
+        index.push_back(block.ie);
+        out.write(reinterpret_cast<const char*>(&block.bh), sizeof(block.bh));
+        out.write(reinterpret_cast<const char*>(block.frame.data()), block.frame.size());
+        offset += sizeof(block.bh) + block.frame.size();
+        if (!out) throw std::runtime_error("dcx: block write failed");
+    }
 
-    auto put_dict = [&](const std::vector<std::string>& d) {
-        put_u32(file, uint32_t(d.size()));
-        for (auto& s : d) { put_u32(file, uint32_t(s.size())); put_bytes(file, s.data(), s.size()); }
-    };
-    put_dict(B.target_dict);
-    if (cf & COL_QID_DICT) put_dict(B.query_dict);
+    void submit() {
+        if (current.target_ord.empty()) return;
+        if (pending.size() >= workers) flush_one();
+        pending.emplace_back(std::async(std::launch::async,
+            [batch = std::move(current), options = opt]() {
+                const size_t n = batch.target_ord.size();
+                std::vector<size_t> presence(n + 1), observations(n + 1);
+                for (size_t i = 0; i < n; ++i) {
+                    const size_t bytes = bytes_for_bits(batch.span[i]);
+                    presence[i + 1] = presence[i] + bytes;
+                    observations[i + 1] = observations[i] +
+                        (bytes ? popcount_bytes(batch.presence.data() + presence[i], bytes) : 0);
+                }
+                if (observations.back() != batch.ref_aa.size())
+                    throw std::runtime_error("dcx: presence/observation count mismatch");
+                return encode_block(batch, options, 0, n, presence, observations);
+            }));
+        current = Batch{};
+        current.col_flags = opt.col_flags;
+        estimate = 0;
+    }
+};
 
-    // calib section: u16 model_len | model | u16 label_len | label | u32 blob_len | blob
-    put_u16(file, uint16_t(opt.calib_model.size()));
-    put_bytes(file, opt.calib_model.data(), opt.calib_model.size());
-    put_u16(file, uint16_t(opt.library_label.size()));
-    put_bytes(file, opt.library_label.data(), opt.library_label.size());
-    put_u32(file, uint32_t(opt.calib_contract_blob.size()));
-    put_bytes(file, opt.calib_contract_blob.data(), opt.calib_contract_blob.size());
+StreamWriter::StreamWriter(const char* path, const DcxWriteOptions& opt, bool auth_only)
+    : impl_(std::make_unique<Impl>(path, opt, auth_only)) {}
+StreamWriter::~StreamWriter() = default;
 
-    Footer ft{};
-    ft.index_offset = index_offset;
-    ft.index_adler32 = idx_adler;
-    ft.reserved = 0;
-    std::memcpy(ft.magic, FOOTER_MAGIC, 4);
-    ft.footer_bytes = uint32_t(sizeof(Footer));
-    put_bytes(file, &ft, sizeof(ft));
+void StreamWriter::append(const Record& rec, uint32_t target, uint64_t query, float posterior) {
+    Impl& w = *impl_;
+    if (w.closed) throw std::runtime_error("dcx: append after close");
+    if (!w.current.target_ord.empty() && w.current.target_ord.back() != target &&
+        w.estimate >= w.opt.block_raw_cap) w.submit();
+    Batch& b = w.current;
+    const uint32_t cf = w.opt.col_flags;
+    b.query_ord.push_back(query); b.target_ord.push_back(target);
+    b.tstart.push_back(rec.tstart); b.span.push_back(w.auth_only ? 0 : rec.span);
+    b.gamma.push_back(rec.gamma); b.posterior.push_back(posterior);
+    b.em_keep.push_back(rec.em_keep);
+    if (cf & COL_STRAND) b.strand.push_back(rec.strand);
+    if (cf & COL_GAMMA_ANCIENT) b.gamma_ancient.push_back(rec.gamma_ancient);
+    if (cf & COL_EM_MARGIN) b.em_margin.push_back(rec.em_margin);
+    if (cf & COL_EM_REF_NEFF) b.em_ref_neff.push_back(rec.em_ref_neff);
+    if (cf & COL_GAMMA_NULL) b.gamma_null.push_back(rec.gamma_null);
+    if (cf & COL_P_READ) b.p_read.push_back(rec.p_read);
+    if (cf & COL_CANDIDATE_RANK) b.candidate_rank.push_back(rec.candidate_rank);
+    if (cf & COL_FIDENT) b.fident.push_back(rec.fident);
+    size_t observations = 0, bytes = 0;
+    if (!w.auth_only) {
+        bytes = bytes_for_bits(rec.span);
+        observations = rec.ref_aa.size();
+        if (rec.presence.size() != bytes || rec.obs_aa.size() != observations ||
+            rec.p_damage.size() != observations || rec.dist5.size() != observations ||
+            rec.dcls.size() != observations ||
+            (!(cf & COL_DIST3_DERIVED) && rec.dist3.size() != observations) ||
+            ((cf & COL_OBS_CODON) && rec.obs_codon.size() != observations) ||
+            ((cf & COL_BEST_CODON) && (rec.best_codon.size() != observations || rec.best_post.size() != observations)))
+            throw std::runtime_error("dcx: record column length mismatch");
+        auto append = [](auto& to, const auto& from) { to.insert(to.end(), from.begin(), from.end()); };
+        append(b.presence, rec.presence); append(b.ref_aa, rec.ref_aa); append(b.obs_aa, rec.obs_aa);
+        append(b.damage_class, rec.dcls); append(b.p_damage, rec.p_damage); append(b.dist5, rec.dist5);
+        if (!(cf & COL_DIST3_DERIVED)) append(b.dist3, rec.dist3);
+        if (cf & COL_OBS_CODON) append(b.obs_codon, rec.obs_codon);
+        if (cf & COL_BEST_CODON) { append(b.best_codon, rec.best_codon); append(b.best_post, rec.best_post); }
+    }
+    w.estimate += 12 + bytes + observations * 8;
+    ++w.nA; w.nB += observations;
+}
 
-    // ---- patch FileHeader ----
-    FileHeader fh{};
-    std::memcpy(fh.magic, FILE_MAGIC, 8);
-    fh.version_major = VERSION_MAJOR;
-    // v2.2 (soft multi-mapping) only when the capability is actually emitted; a non-multimap
-    // write stays v2.1 so it is byte-identical to the pre-2.2 writer.
-    fh.version_minor = (cf & COL_SOFT_MULTIMAP) ? uint8_t(2) : VERSION_MINOR;
-    fh.header_bytes = uint16_t(sizeof(FileHeader));
-    fh.col_flags = cf; fh.codec = CODEC_ZSTD;
-    fh.sample_flags = opt.sample_flags;
-    std::memcpy(fh.calib_contract_id, opt.calib_contract_id, 16);
-    fh.n_blocks = uint32_t(index.size());
-    fh.n_records_a = nA; fh.n_records_b = B.ref_aa.size();
-    fh.first_block_offset = sizeof(FileHeader);
-
-    // OPT-H: stream the trailer, then seekp(0) and overwrite the placeholder FileHeader
-    // with the real one (identical bytes to the old in-place file.data() patch).
-    out.write(reinterpret_cast<const char*>(file.data()), std::streamsize(file.size()));
-    off += file.size();
-    (void)off;
-    out.seekp(0);
-    out.write(reinterpret_cast<const char*>(&fh), sizeof(fh));
-    return bool(out);
+void StreamWriter::close(const std::vector<std::string>& targets, const std::vector<std::string>& queries) {
+    Impl& w = *impl_;
+    if (w.closed) throw std::runtime_error("dcx: already closed");
+    w.submit();
+    while (!w.pending.empty()) w.flush_one();
+    if (!finish_dcx(w.out, w.offset, w.index, targets, queries, w.opt, w.opt.col_flags, w.nA, w.nB))
+        throw std::runtime_error("dcx: trailer write failed");
+    w.out.close();
+    if (!w.out) throw std::runtime_error("dcx: close failed");
+    w.closed = true;
 }
 
 // write_dcx_auth — the GRAIN-A AUTH SIDECAR (fold-gap fast path; fusion dual-f6f6aa14).
