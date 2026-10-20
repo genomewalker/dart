@@ -4165,7 +4165,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         for (size_t k = 0; k < auth_picks.size(); ++k) {
             const AuthPick& pick = auth_picks[k];
             if (k > 0 && auth_picks[k - 1].read == pick.read) continue;
-            auto [it, inserted] = auth_target_ord.try_emplace(pick.ref, static_cast<uint32_t>(a_targets.size()));
+            auto [it, inserted] = auth_target_ord.try_emplace(pick.ref, static_cast<uint32_t>(a_target_refs.size()));
             const uint32_t ix = it->second;
             if (inserted) {
                 a_target_refs.push_back(pick.ref);
