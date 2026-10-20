@@ -2577,7 +2577,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 if (pool.size() > soft_cap) {  // keep memory bounded; final top-K taken post-EM
                     std::sort(pool.begin(), pool.end(),
                               [](const MmCand& a, const MmCand& b) { return a.bits > b.bits; });
-                    pool.resize(static_cast<size_t>(std::max(1, multimap_k)));
+                    // Preserve the intended 8*K pre-EM candidate reservoir. Shrinking to K
+                    // here discards candidates before gamma exists and makes the later
+                    // gamma-ranked top-K depend on row-group ingestion order.
+                    pool.resize(soft_cap);
                 }
             }
         }
