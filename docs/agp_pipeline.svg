@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg width="700" height="318" viewBox="0 0 700 318" xmlns="http://www.w3.org/2000/svg">
+  <desc>DART workflow: damage profile, damage-aware translation, protein search, EM assignment and damage authentication.</desc>
   <defs>
     <style>
       text { font-family: -apple-system, Helvetica, Arial, sans-serif; }
@@ -34,7 +35,7 @@
   <!-- ═══════════════════════════════════════════════════════
        ROW 1  left → right   PASS 1: DAMAGE DETECTION
        ═══════════════════════════════════════════════════════ -->
-  <text x="10" y="13" class="ph" fill="#1565C0">PASS 1  ·  DAMAGE DETECTION</text>
+  <text x="10" y="13" class="ph" fill="#1565C0">PROFILE SOURCE / SELF-PROFILING</text>
 
   <rect x="8"   y="18" width="76"  height="54" rx="4" class="file"/>
   <text x="46"  y="37" class="nt" fill="#546E7A">Reads</text>
@@ -52,14 +53,14 @@
   <text x="303" y="60" class="ns">terminus vs. interior rate</text>
 
   <rect x="380" y="18" width="110" height="54" rx="4" class="p1"/>
-  <text x="435" y="37" class="nt" fill="#1565C0">Confirm real damage</text>
-  <text x="435" y="49" class="ns">both signals must agree</text>
-  <text x="435" y="60" class="ns">C→T vs. composition</text>
+  <text x="435" y="37" class="nt" fill="#1565C0">Library evidence state</text>
+  <text x="435" y="49" class="ns">DETECTED / advisory / abstain</text>
+  <text x="435" y="60" class="ns">or load fqdup TDM1 sidecar</text>
 
   <rect x="502" y="18" width="186" height="54" rx="4" class="out"/>
   <text x="595" y="35" class="nt" fill="#00695C">Damage profile</text>
   <text x="595" y="47" class="ns">d_max · λ · library type</text>
-  <text x="595" y="58" class="ns">damage confirmed flag</text>
+  <text x="595" y="58" class="ns">library state and prior</text>
 
   <line x1="84"  y1="45" x2="95"  y2="45" class="arr"/>
   <line x1="226" y1="45" x2="237" y2="45" class="arr"/>
@@ -85,11 +86,11 @@
 
   <rect x="266" y="140" width="65" height="22" rx="2" class="sub"/>
   <text x="298" y="149" class="nt" fill="#4A148C" style="font-size:7px">Frame scoring</text>
-  <text x="298" y="158" class="ns" style="font-size:6px">select best frame</text>
+  <text x="298" y="158" class="ns" style="font-size:6px">rank candidate ORFs</text>
 
   <rect x="337" y="140" width="66" height="22" rx="2" class="sub"/>
   <text x="370" y="149" class="nt" fill="#4A148C" style="font-size:7px">Damage-aware</text>
-  <text x="370" y="158" class="ns" style="font-size:6px">stops × (1−p_dmg)</text>
+  <text x="370" y="158" class="ns" style="font-size:6px">damage-aware coding score</text>
 
   <rect x="409" y="140" width="63" height="22" rx="2" class="sub"/>
   <text x="440" y="149" class="nt" fill="#4A148C" style="font-size:7px">Stop rescue</text>
@@ -97,7 +98,7 @@
 
   <rect x="8"   y="120" width="182" height="54" rx="4" class="file"/>
   <text x="99"  y="138" class="nt" fill="#546E7A">Predicted proteins</text>
-  <text x="99"  y="150" class="ns">stops → X where damaged</text>
+  <text x="99"  y="150" class="ns">observed / masked FASTA</text>
   <text x="99"  y="161" class="ns">ready for database search</text>
 
   <line x1="515" y1="147" x2="479" y2="147" class="arr"/>
@@ -129,19 +130,19 @@
   <text x="168" y="295" class="ns">per-read identity</text>
 
   <rect x="218" y="254" width="122" height="54" rx="4" class="p3"/>
-  <text x="279" y="271" class="nt" fill="#1B5E20">Attach damage data</text>
-  <text x="279" y="282" class="ns">embed p_damage into hits</text>
-  <text x="279" y="293" class="ns">resolve multi-mappers</text>
+  <text x="279" y="271" class="nt" fill="#1B5E20">Build EMI v7</text>
+  <text x="279" y="282" class="ns">alignment damage fields</text>
+  <text x="279" y="293" class="ns">keep AGD for annotation</text>
 
   <rect x="350" y="254" width="130" height="54" rx="4" class="p3"/>
-  <text x="415" y="271" class="nt" fill="#1B5E20">Score authenticity</text>
-  <text x="415" y="282" class="ns">R→W, H→Y, Q→* subs</text>
-  <text x="415" y="293" class="ns">fuse evidence sources</text>
+  <text x="415" y="271" class="nt" fill="#1B5E20">Assign and score</text>
+  <text x="415" y="282" class="ns">damage-free EM by default</text>
+  <text x="415" y="293" class="ns">read scores / protein test</text>
 
   <rect x="490" y="254" width="158" height="54" rx="4" class="out"/>
   <text x="569" y="271" class="nt" fill="#00695C">Annotated proteins</text>
-  <text x="569" y="282" class="ns">ancient damage probability</text>
-  <text x="569" y="293" class="ns">per-protein classification</text>
+  <text x="569" y="282" class="ns">library-gated evidence</text>
+  <text x="569" y="293" class="ns">auth_binom_call and tier</text>
 
   <line x1="118" y1="281" x2="127" y2="281" class="arr"/>
   <line x1="208" y1="281" x2="217" y2="281" class="arr"/>
