@@ -1,11 +1,20 @@
 #include "dart/dcx_external_sort.hpp"
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <random>
 
 static void require(bool ok, const char* message) {
     if (!ok) throw std::runtime_error(message);
+}
+
+// The .dcx order by target name. Targets in records() are target_0..target_6, so the
+// sort rank of a record is its ref_idx.
+static bool record_less(const dcx::Record& a, const dcx::Record& b) {
+    if (a.target_id != b.target_id) return a.target_id < b.target_id;
+    if (a.tstart != b.tstart) return a.tstart < b.tstart;
+    return a.src_idx < b.src_idx;
 }
 
 static std::string bytes(const std::string& path) {
@@ -68,7 +77,7 @@ static dcx::Batch batch(const std::vector<dcx::Record>& sorted, uint32_t flags) 
 
 static void check(const std::string& dir, const std::vector<dcx::Record>& input, uint32_t flags, size_t budget) {
     auto ordered = input;
-    std::sort(ordered.begin(), ordered.end(), dcx::record_less);
+    std::sort(ordered.begin(), ordered.end(), record_less);
     const dcx::Batch expected = batch(ordered, flags);
     dcx::DcxWriteOptions opt;
     opt.col_flags = flags; opt.block_raw_cap = 256;
@@ -77,15 +86,17 @@ static void check(const std::string& dir, const std::vector<dcx::Record>& input,
     require(dcx::write_dcx_auth((dir + "/legacy.auth").c_str(), expected, opt), "legacy auth failed");
     {
         dcx::ExternalSort sort(dir + "/runs", budget, 2);
-        for (const auto& r : input) sort.append(r);
+        for (const auto& r : input) sort.local().append(r, r.ref_idx);
         dcx::StreamWriter full((dir + "/stream.dcx").c_str(), opt);
         dcx::StreamWriter auth((dir + "/stream.auth").c_str(), opt, true);
         std::map<std::string, uint64_t> qids;
         std::vector<std::string> targets, queries;
         size_t n = 0;
-        sort.finish([&](const dcx::Record& r) {
-            require(!dcx::record_less(r, ordered.at(n)), "merge order mismatch");
-            require(!dcx::record_less(ordered.at(n), r), "merge tie mismatch");
+        sort.finish([&](const dcx::Record& merged, uint32_t) {
+            dcx::Record r = merged;
+            r.target_id = "target_" + std::to_string(r.ref_idx);
+            require(!record_less(r, ordered.at(n)), "merge order mismatch");
+            require(!record_less(ordered.at(n), r), "merge tie mismatch");
             if (targets.empty() || targets.back() != r.target_id) targets.push_back(r.target_id);
             auto [q, inserted] = qids.try_emplace(r.query_id, queries.size());
             if (inserted) queries.push_back(r.query_id);
@@ -121,13 +132,13 @@ int main() {
         bool failed = false;
         try {
             dcx::ExternalSort sort(dir + "/runs", 2048, 2, 1);
-            for (const auto& r : input) sort.append(r);
-            sort.finish([](const dcx::Record&) {});
+            for (const auto& r : input) sort.local().append(r, r.ref_idx);
+            sort.finish([](const dcx::Record&, uint32_t) {});
         } catch (const std::runtime_error&) { failed = true; }
         require(failed, "failure injection did not fire");
         require(std::filesystem::is_empty(dir + "/runs"), "error-exit runs leaked");
         std::filesystem::remove_all(dir);
-        std::cout << "dcx streaming: byte identity, multi-pass merge and cleanup PASS\n";
+        std::cout << "dcx streaming: byte identity, many-run merge and cleanup PASS\n";
     } catch (const std::exception& e) {
         std::cerr << e.what() << '\n'; return 1;
     }
