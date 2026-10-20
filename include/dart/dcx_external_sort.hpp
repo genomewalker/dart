@@ -143,28 +143,39 @@ public:
     }
     size_t runs() const { return runs_.size(); }
 
-    // Spill what is left, then k-way merge every run in key order. consume() sees each
-    // record once, decoded into a reused Record.
+    // k-way merge of every run in key order; consume() sees each record once, decoded
+    // into a reused Record. If nothing was spilled, the sinks are merged in memory and no
+    // run directory is needed; otherwise what is left in memory is spilled first.
     template<class Consume>
     void finish(Consume consume) {
         std::vector<Sink*> left;
         for (auto& s : sinks_) left.push_back(&s);
+        const bool in_memory = runs_.empty();
         std::exception_ptr error;
         #pragma omp parallel for schedule(dynamic, 1)
         for (size_t k = 0; k < left.size(); ++k) {
-            try { left[k]->spill(); }
-            catch (...) {
+            try {
+                if (in_memory) std::sort(left[k]->keys_.begin(), left[k]->keys_.end(), key_less);
+                else left[k]->spill();
+            } catch (...) {
                 #pragma omp critical(dcx_sort_finish)
                 if (!error) error = std::current_exception();
             }
         }
         if (error) std::rethrow_exception(error);
+        // A file run is read sequentially; an in-memory sink is walked through its sorted keys.
         struct Cursor {
             const char* base = nullptr; size_t size = 0, pos = 0, released = 0;
+            const std::vector<Key>* keys = nullptr; size_t next_key = 0;
             Header h{};
         };
-        std::vector<Cursor> cur(runs_.size());
-        for (size_t i = 0; i < runs_.size(); ++i) {
+        std::vector<Cursor> cur(in_memory ? left.size() : runs_.size());
+        if (in_memory)
+            for (size_t i = 0; i < left.size(); ++i) {
+                cur[i].base = left[i]->arena_.data();
+                cur[i].keys = &left[i]->keys_;
+            }
+        for (size_t i = 0; i < (in_memory ? 0 : runs_.size()); ++i) {
             const int fd = ::open(runs_[i].c_str(), O_RDONLY);
             if (fd < 0) throw std::runtime_error("dcx sort: cannot open run");
             struct stat st{};
@@ -179,6 +190,12 @@ public:
             ::close(fd);
         }
         auto load = [&](Cursor& c) {
+            if (c.keys) {
+                if (c.next_key >= c.keys->size()) return false;
+                c.pos = (*c.keys)[c.next_key++].off;
+                std::memcpy(&c.h, c.base + c.pos, sizeof(Header));
+                return true;
+            }
             if (c.pos >= c.size) return false;
             std::memcpy(&c.h, c.base + c.pos, sizeof(Header));
             return true;
@@ -199,7 +216,7 @@ public:
             c.pos = decode(c.base + c.pos, rec) - c.base;
             consume(rec, c.h.rank);
             // Drop pages already merged so resident memory stays near the read-ahead window.
-            if (c.pos - c.released >= release_step) {
+            if (!c.keys && c.pos - c.released >= release_step) {
                 const size_t page = size_t(::sysconf(_SC_PAGESIZE));
                 const size_t upto = c.pos / page * page;
                 ::madvise(const_cast<char*>(c.base) + c.released, upto - c.released, MADV_DONTNEED);
@@ -207,7 +224,7 @@ public:
             }
             if (load(c)) heap.push(i);
         }
-        for (auto& c : cur) if (c.base) ::munmap(const_cast<char*>(c.base), c.size);
+        for (auto& c : cur) if (c.base && !c.keys) ::munmap(const_cast<char*>(c.base), c.size);
     }
 
 private:
@@ -241,7 +258,8 @@ private:
     std::string new_run(size_t& index) {
         std::lock_guard<std::mutex> lock(dir_mutex_);
         if (directory_.empty()) {
-            if (base_.empty()) throw std::runtime_error("dcx sort: run files need --em-tape-dir or DART_EM_TAPE_DIR");
+            if (base_.empty()) throw std::runtime_error("dcx sort: the .dcx records exceed the in-memory budget; pass "
+                                         "--em-tape-dir or set DART_EM_TAPE_DIR to a node-local disk");
             if (base_ == "/tmp" || base_.compare(0, 5, "/tmp/") == 0)
                 throw std::runtime_error("dcx sort: use node-local disk, not /tmp");
             std::filesystem::create_directories(base_);
