@@ -75,7 +75,8 @@ static dcx::Batch batch(const std::vector<dcx::Record>& sorted, uint32_t flags) 
     return b;
 }
 
-static void check(const std::string& dir, const std::vector<dcx::Record>& input, uint32_t flags, size_t budget) {
+static void check(const std::string& dir, const std::vector<dcx::Record>& input, uint32_t flags, size_t budget,
+                  const std::string& run_dir) {
     auto ordered = input;
     std::sort(ordered.begin(), ordered.end(), record_less);
     const dcx::Batch expected = batch(ordered, flags);
@@ -85,7 +86,7 @@ static void check(const std::string& dir, const std::vector<dcx::Record>& input,
     require(dcx::write_dcx((dir + "/legacy.dcx").c_str(), expected, opt), "legacy write failed");
     require(dcx::write_dcx_auth((dir + "/legacy.auth").c_str(), expected, opt), "legacy auth failed");
     {
-        dcx::ExternalSort sort(dir + "/runs", budget, 2);
+        dcx::ExternalSort sort(run_dir, budget, 2);
         for (const auto& r : input) sort.local().append(r, r.ref_idx);
         dcx::StreamWriter full((dir + "/stream.dcx").c_str(), opt);
         dcx::StreamWriter auth((dir + "/stream.auth").c_str(), opt, true);
@@ -125,9 +126,10 @@ int main() {
             dcx::COL_GAMMA_ANCIENT | dcx::COL_EM_MARGIN | dcx::COL_EM_REF_NEFF | dcx::COL_GAMMA_NULL |
             dcx::COL_OBS_CODON | dcx::COL_BEST_CODON | dcx::COL_CANDIDATE_RANK | dcx::COL_SOFT_MULTIMAP | dcx::COL_FIDENT;
         for (uint32_t cf : {uint32_t(0), flags, flags | dcx::COL_DIST3_DERIVED}) {
-            check(dir, input, cf, size_t(1) << 28);
-            check(dir, input, cf, 2048);
-            check(dir, {}, cf, 2048);
+            check(dir, input, cf, size_t(1) << 28, dir + "/runs");
+            check(dir, input, cf, size_t(1) << 28, "");   // fits in memory: no run directory needed
+            check(dir, input, cf, 2048, dir + "/runs");
+            check(dir, {}, cf, 2048, dir + "/runs");
         }
         bool failed = false;
         try {
@@ -136,6 +138,13 @@ int main() {
             sort.finish([](const dcx::Record&, uint32_t) {});
         } catch (const std::runtime_error&) { failed = true; }
         require(failed, "failure injection did not fire");
+        bool refused = false;
+        try {
+            dcx::ExternalSort sort("", 2048, 2);
+            for (const auto& r : input) sort.local().append(r, r.ref_idx);
+            sort.finish([](const dcx::Record&, uint32_t) {});
+        } catch (const std::runtime_error&) { refused = true; }
+        require(refused, "spilling without a run directory must fail");
         require(std::filesystem::is_empty(dir + "/runs"), "error-exit runs leaked");
         std::filesystem::remove_all(dir);
         std::cout << "dcx streaming: byte identity, many-run merge and cleanup PASS\n";
