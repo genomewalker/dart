@@ -403,6 +403,23 @@ if(BUILD_TESTING)
         NAME emi_v7_roundtrip
         COMMAND dart-emi-v7-roundtrip
     )
+
+    # Decoy null model: .null sidecar round trip and corruption, predict decoy file,
+    # hits2emi --decoy-hits / dart null, damage-annotate auto-discovery and refusal.
+    add_executable(
+        dart-null-model-tests
+        tests/test_null_model.cpp
+        ${DART_CORE_SOURCES}
+    )
+    target_link_libraries(dart-null-model-tests ${ZLIB_LIBRARIES} ${ISAL_LIB} PkgConfig::ZSTD taph)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(dart-null-model-tests OpenMP::OpenMP_CXX)
+    endif()
+    add_test(
+        NAME null_model
+        COMMAND dart-null-model-tests $<TARGET_FILE:dart>
+                ${CMAKE_CURRENT_SOURCE_DIR}/examples/tutorial
+    )
 endif()
 
 # Install

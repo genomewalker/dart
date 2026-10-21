@@ -111,8 +111,13 @@ void test_output_options() {
            .add("--fasta-aa").add("out_aa.fa")
            .add("--fasta-aa-masked").add("out_aa_masked.fa")
            .add("--summary").add("summary.json")
-           .add("--damage-index").add("out.agd");
+           .add("--damage-index").add("out.agd")
+           .add("--decoy-every").add("7");
     auto opts = dart::cli::parse_args(builder.argc(), builder.argv());
+    assert(opts.decoy_every == 7);
+    assert(dart::cli::decoy_fasta_path("proteins.faa") == "proteins.decoy.faa");
+    assert(dart::cli::decoy_fasta_path("proteins.faa.gz") == "proteins.decoy.faa.gz");
+    assert(dart::cli::decoy_fasta_path("dir.x/proteins") == "dir.x/proteins.decoy");
     assert(opts.fasta_nt == "out_nt.fa");
     assert(opts.fasta_nt_corrected == "out_nt_corr.fa");
     assert(opts.fasta_aa == "out_aa.fa");
