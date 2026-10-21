@@ -13,8 +13,9 @@ The current main branch uses EMI v7. Damage-aware prediction requires an fqdup l
 
 ## Workflow
 
-1. Run `predict` to write GFF3, protein FASTA and an AGD damage index.
-2. Search the proteins with MMseqs2 and convert the hits to EMI v7.
+1. Run `predict` to write GFF3, protein FASTA, reversed decoy peptides and an AGD damage index.
+2. Search the proteins and the decoys with MMseqs2; `hits2emi` converts the hits to EMI v7 and
+   fits the null model from the decoy hits into `<emi>.null`.
 3. Run `damage-annotate` for read assignments, damage scores and protein summaries.
 4. Optionally run `ref-stats` for coverage of the input library.
 
@@ -56,17 +57,20 @@ cd examples/tutorial
 DART=../../build/dart DB=./ref_proteins.faa.gz bash run_tutorial.sh
 ```
 
-For your own inputs you need two things the tutorial skips: a damage profile measured with
-[fqdup](https://github.com/genomewalker/fqdup) on the reads before deduplication, and a null model
-fitted from a decoy search, so reads from proteins missing from your database are not forced onto
-the nearest homolog.
+For your own inputs you need one thing the tutorial skips: a damage profile measured with
+[fqdup](https://github.com/genomewalker/fqdup) on the reads before deduplication. The null model
+that keeps reads from proteins missing from your database off the nearest homolog is built into
+the pipeline: `predict` writes reversed decoy peptides next to `--fasta-aa`, you search them with
+the same MMseqs2 options, `hits2emi --decoy-hits` fits the null into `hits.emi.null`, and
+`damage-annotate` finds that file by itself.
 
 ```bash
 mkdir -p out
 # 0) Damage profile from the merged reads, before deduplication
 fqdup profile -i merged.fq.gz --damage-summary out/library.tdmg
 
-# 1) Predict genes + damage index
+# 1) Predict genes + damage index. Also writes out/proteins.decoy.faa: the reversed
+#    proteins of every 10th read (--decoy-every), ids prefixed DECOY_
 dart predict -i reads.fq.gz -o out/predictions.gff --fasta-aa out/proteins.faa \
   --damage-index out/predictions.agd --library-profile out/library.tdmg -t 16
 
@@ -79,21 +83,25 @@ SEARCH=(--search-type 1 --min-length 12 -e 10.0 --min-seq-id 0.86 -c 0.65 --cov-
   --threads 16)
 mmseqs easy-search out/proteins.faa ref_proteins.faa.gz out/hits.tsv out/tmp "${SEARCH[@]}"
 
-# 3) Build the EMI v7 index
-dart hits2emi -i out/hits.tsv -o out/hits.emi --damage-index out/predictions.agd -t 16
+# 3) Search the decoy peptides with the same options (null model input)
+mmseqs easy-search out/proteins.decoy.faa ref_proteins.faa.gz out/decoy_hits.tsv out/tmp "${SEARCH[@]}"
 
-# 4) Null model: search the same proteins against the reversed reference proteins
-#    with the same options, then fit the null from those decoy hits
-seqkit seq -r ref_proteins.faa.gz > out/decoy_proteins.faa
-mmseqs easy-search out/proteins.faa out/decoy_proteins.faa out/decoy_hits.tsv out/tmp "${SEARCH[@]}"
-dart damage-annotate --fit-null-from out/decoy_hits.tsv --null-out out/null.tsv
+# 4) Build the EMI v7 index and fit the null from the decoy hits into out/hits.emi.null
+dart hits2emi -i out/hits.tsv -o out/hits.emi --damage-index out/predictions.agd \
+  --decoy-hits out/decoy_hits.tsv -t 16
 
-# 5) EM assignment + damage annotation
+# 5) EM assignment + damage annotation (picks up out/hits.emi.null by itself)
 dart damage-annotate --emi out/hits.emi --damage-index out/predictions.agd \
-  --em-null-model out/null.tsv \
   -o out/annotated.tsv --gene-summary out/gene_summary.tsv \
   --auto-calibrate-spurious -t 16
 ```
+
+One null per database and search configuration is enough for a batch of samples:
+`dart null -o db.null --db-label mydb sampleA/decoy_hits.tsv sampleB/hits.emi.null ...` pools
+decoy hits and sidecars into one file, and `damage-annotate --em-null-model db.null` uses it.
+`dart damage-info hits.emi.null` prints the fitted bins and the provenance (dart version, inputs,
+decoy counts). Refit when the database, the search options, the library type or the read length
+range changes.
 
 The workflow and output interpretation are on the wiki:
 [Quick Start Tutorial](https://github.com/genomewalker/dart/wiki/Quick-Start-Tutorial).
@@ -105,10 +113,14 @@ MMseqs2 can align across them.
 | Command | You must pass | Why |
 |---------|---------------|-----|
 | `predict` | `--library-profile FILE` (binary TDM1 sidecar) or `--allow-self-profile` when damage detection is on | Self-profiling is unreliable on deduplicated libraries |
-| `damage-annotate` | `--em-null-model FILE`, `--em-calib-model FILE`, or `--no-null` when EM is on | Without a null model, reads from proteins absent from the database are force-mapped to the nearest homolog |
+| `damage-annotate` | a null model when EM is on: `<emi>.null` next to the EMI (written by `hits2emi --decoy-hits`), `--em-null-model FILE`, `--em-calib-model FILE`, or `--no-null` | Without a null model, reads from proteins absent from the database are force-mapped to the nearest homolog |
 | `damage-annotate` (with `--no-null`) | `--em-tape-dir DIR` or `DART_EM_TAPE_DIR` | With no audit, null/calibration model or damage-in-mapping flag, EM input uses an `O_DIRECT` tape; supply node-local disk supporting it. Other configurations do not require this tape. |
 
-The tutorial opts into self-profiling and null-free EM for its bundled inputs. These choices do not establish that an arbitrary reference database contains every source protein. `predict --no-damage` does not require a profile; `damage-annotate --no-em` bypasses the EM null-model choice.
+The tutorial opts into self-profiling for its bundled inputs. Its reference database is the 13,681
+proteins the reads come from, too few for chance hits: the decoy search yields a handful of hits,
+no null bin reaches two decoy queries, and `hits2emi` and `damage-annotate` both say so and run EM
+with the null coordinate off. A real database fills the bins. `predict --no-damage` does not require
+a profile; `damage-annotate --no-em` bypasses the EM null-model choice.
 
 ### Damage profile only
 
@@ -121,6 +133,20 @@ JSON and `.tdmg` for the same reads and options. The `.tdmg` is what `predict --
 reads.
 
 ### Changes in v2.0.0
+
+**Null model by default.** `predict --fasta-aa X` also writes `X` with `.decoy` before the
+extension: the reversed proteins of every 10th read (`--decoy-every N`, 0 disables), ids prefixed
+`DECOY_`. Search that file with the real search's options and pass the hits to
+`hits2emi --decoy-hits`, which fits the Gumbel-per-length-bin null and writes it as the binary
+sidecar `<emi>.null` with its provenance (dart version, inputs with size and mtime, decoy counts,
+`--db-label`). `damage-annotate` loads `<emi>.null` when it exists, after `--em-null-model` and
+`--em-calib-model`; `--no-null` is unchanged and is now the only way to run EM without a null.
+`dart null` pools decoy hits and sidecars into one null for a batch of samples, and
+`dart damage-info FILE.null` prints one. `damage-annotate --fit-null-from/--null-out` are gone; the
+TSV sidecar they wrote still loads through `--em-null-model` with a deprecation warning. The fit is
+on the raw bit scale and is scaled by the EM's bit-to-nat lambda at load, so the model equals the
+old fitter's at the same lambda, except that the old reader dropped the first row of a headerless
+decoy file and the new one does not.
 
 **Per-bin damaged fraction.** A length bin's `pi_damaged`, `pi_lo` and `pi_hi` used to need
 `w_length > 0.5`, which amounted to a coin flip because `w_length` reads 0.500 to 0.502 in
@@ -183,13 +209,14 @@ reported on stderr as `EM training set`.
 |---------|---------|
 | `predict` | Gene prediction + damage index (`.agd`) from reads |
 | `profile` (`damage`) | Reference-free damage profile (JSON) |
-| `hits2emi` | MMseqs2 16-column TSV → EMI v7 |
+| `hits2emi` | MMseqs2 16-column TSV → EMI v7; `--decoy-hits` fits the null model into `<emi>.null` |
+| `null` | Fit or pool the decoy null model (`.null`) shared by the runs of one database |
 | `hits2emi-stream` | MMseqs2 result DBs → one EMI v7, streaming, for production-size searches |
 | `emi-merge` | Union EMI v7 files over the same reads for joint EM across databases |
 | `emi-verify` | Check EMI v7 invariants before annotation |
 | `damage-annotate` | EM read assignment, per-read damage posteriors, per-protein authentication |
 | `ref-stats` | Per-reference breadth, depth and identity for one sample (`--trim` for x-filter-comparable breadth) |
-| `damage-info` | Print the damage profile stored in an `.agd` |
+| `damage-info` | Print the damage profile stored in an `.agd`, or a `.null` null model with its provenance |
 | `simulate` | Synthetic aDNA reads (Briggs model) with ground truth |
 | `eval` | Score `predict` against `simulate` truth |
 | `fit-calib` | Fit the coherent-LR EM calibration model from a labelled search |
