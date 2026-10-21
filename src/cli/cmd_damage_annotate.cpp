@@ -1419,6 +1419,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cerr << "Error: " << argv[i] << " was removed in DART 2.0. Drop it; runs without it "
                          "behave as before (see 'Removed in 2.0' in the Command Reference).\n";
             return 1;
+        } else if (strcmp(argv[i], "--fit-null-from") == 0 || strcmp(argv[i], "--null-out") == 0) {
+            std::cerr << "Error: " << argv[i] << " was removed in DART 2.0. Fit the null model with "
+                         "'dart hits2emi --decoy-hits decoy_hits.tsv' or 'dart null'; damage-annotate "
+                         "loads <emi>.null by itself.\n";
+            return 1;
         } else if (strcmp(argv[i], "--em-tape-dir") == 0 && i + 1 < argc) {
             em_tape_dir = argv[++i];
         } else if (strcmp(argv[i], "--em-checkpoint") == 0 && i + 1 < argc) {

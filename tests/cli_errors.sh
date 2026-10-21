@@ -37,6 +37,7 @@ removed=(
     --max-dist --threshold --use-identity --no-identity
     --em-iters --em-lambda --em-tol --em-min-margin --em-max-neff --em-audit
     --em-keep-llr --em-reject-llr --em-calib-temperature --preset
+    --fit-null-from --null-out
 )
 for f in "${removed[@]}"; do
     expect 1 "was removed" damage-annotate "$f" 1
@@ -53,7 +54,7 @@ advanced=(
     --emit-multimap --multimap-k --multimap-floor
     --auto-calibrate-spurious --min-breadth --min-depth --min-reads
     --map --functional-summary --anvio-ko --annotation-source
-    --fit-null-from --null-out --em-null-tau --em-checkpoint --resume
+    --em-null-tau --em-checkpoint --resume
     --ancient-threshold --modern-threshold --terminal-threshold --auth-alpha
     --modern-damage-rate --eps0 --per-read-damage-threshold --min-damage-sites
     --site-cap --w0 --em-min-prob --min-positional-score --min-terminal-ratio
