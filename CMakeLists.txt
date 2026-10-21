@@ -105,23 +105,6 @@ if(USE_OPENMP)
     endif()
 endif()
 
-# rapidgzip (via indexed_bzip2) — in-process parallel gzip decompression.
-# Replaces the pigz subprocess; no PATH dependency, true multi-threaded inflate.
-# WITH_ISAL ON: rapidgzip inflates via ISA-L igzip (hardware-accelerated), matching
-# fqdup's decompression backend. pigz is no longer used at all (removed from
-# sequence_io.cpp); the reader path is rapidgzip(ISA-L) -> zlib.
-set(LIBRAPIDARCHIVE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(LIBRAPIDARCHIVE_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
-set(LIBRAPIDARCHIVE_WITH_ISAL   ON  CACHE BOOL "" FORCE)
-FetchContent_Declare(
-    librapidarchive
-    GIT_REPOSITORY https://github.com/mxmlnkn/indexed_bzip2.git
-    GIT_TAG        master
-    GIT_SHALLOW    TRUE
-    UPDATE_DISCONNECTED TRUE
-)
-FetchContent_MakeAvailable(librapidarchive)
-
 # libtaph: reference-free ancient DNA damage estimation and library-type classification
 set(TAPH_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 # The damage estimates in every DART artifact come from libtaph, so the libtaph revision IS a build
@@ -177,7 +160,7 @@ endif()
 # Find zlib for compressed file support
 find_package(ZLIB REQUIRED)
 
-# ISA-L: igzip is DART's gzip codec for BOTH read (via rapidgzip) and write. No pigz
+# ISA-L: igzip is DART's gzip codec for BOTH read and write. No pigz
 # subprocess anywhere -- SequenceWriter/GeneWriter/FastaWriter compress with isal_deflate
 # in-process, matching fqdup's backend. Required: a mislabeled or missing isa-l is a
 # silent regression to no compression, so fail loud.
@@ -262,8 +245,7 @@ set(DART_SUBCOMMAND_SOURCES
 
 # Main executable with subcommands
 add_executable(dart ${DART_CORE_SOURCES} ${DART_SUBCOMMAND_SOURCES})
-target_link_libraries(dart ${ZLIB_LIBRARIES} ${ISAL_LIB} PkgConfig::ZSTD rapidgzip::rapidgzip taph)
-target_compile_definitions(dart PRIVATE HAVE_RAPIDGZIP)
+target_link_libraries(dart ${ZLIB_LIBRARIES} ${ISAL_LIB} PkgConfig::ZSTD taph)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(dart OpenMP::OpenMP_CXX)
 endif()
