@@ -94,33 +94,31 @@ class SequenceReader::Impl {
 public:
     std::ifstream file_;
     gzFile gz_file_ = nullptr;
-    std::unique_ptr<GzLineReader> rg_reader_;  // rapidgzip (ISA-L) backend — preferred
+    std::unique_ptr<GzLineReader> rg_reader_;  // ISA-L igzip backend
     Format format_ = Format::UNKNOWN;
     bool is_gzipped_ = false;
     char buffer_[65536];  // Line buffer (separate from I/O buffer)
     std::string lookahead_line_;  // For FASTA multi-line handling
     bool has_lookahead_ = false;
 
-    bool open(const std::string& filename, bool serial_gz = false) {
-        auto open_gz = serial_gz ? make_igzip_reader : make_gz_reader;
+    bool open(const std::string& filename) {
         // Check if gzipped
         if (filename.size() > 3 &&
             filename.substr(filename.size() - 3) == ".gz") {
             is_gzipped_ = true;
 
-            // rapidgzip (parallel) by default; single-threaded ISA-L when serial_gz is set.
-            rg_reader_ = open_gz(filename);
+            rg_reader_ = make_gz_reader(filename);
             if (rg_reader_) {
                 // Detect format from first line, then reopen to reset to BOF.
                 std::string first_line;
                 if (rg_reader_->readline(first_line) && !first_line.empty())
                     format_ = first_line[0] == '>' ? Format::FASTA :
                               first_line[0] == '@' ? Format::FASTQ : Format::UNKNOWN;
-                rg_reader_ = open_gz(filename);
+                rg_reader_ = make_gz_reader(filename);
                 return bool(rg_reader_);
             }
 
-            // rapidgzip (ISA-L) is the decompression path. If it could not open the
+            // ISA-L is the decompression path. If it could not open the
             // stream, fall back to zlib -- never a subprocess.
             gz_file_ = gzopen(filename.c_str(), "rb");
             if (!gz_file_) return false;
@@ -244,13 +242,6 @@ public:
 SequenceReader::SequenceReader(const std::string& filename)
     : impl_(std::make_unique<Impl>()) {
     if (!impl_->open(filename)) {
-        throw std::runtime_error("Failed to open file: " + filename);
-    }
-}
-
-SequenceReader::SequenceReader(const std::string& filename, bool serial_gz)
-    : impl_(std::make_unique<Impl>()) {
-    if (!impl_->open(filename, serial_gz)) {
         throw std::runtime_error("Failed to open file: " + filename);
     }
 }

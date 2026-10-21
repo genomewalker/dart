@@ -1,11 +1,9 @@
 // sequence_io_backend.cpp
-// Implements make_gz_reader() and make_igzip_reader() — the only translation unit that
-// includes rapidgzip headers, isolating its ODR-visible symbols from all other TUs.
-
-#ifdef HAVE_RAPIDGZIP
-#include <rapidgzip/rapidgzip.hpp>
-#include <filereader/Standard.hpp>
-#endif
+// Implements make_gz_reader(): single-threaded ISA-L igzip.
+//
+// rapidgzip was removed 2026-10-21, as fqdup removed it on 2026-07-16: its parallel decode
+// raced on large gz over NFS and silently truncated a 30 GB fqdup input (115,146,482 reads
+// lost, no error), and its chunk cache added ~0.7 GB to dart profile on a 2M-read library.
 
 #include "dart/gz_reader_base.hpp"
 #include <isa-l/igzip_lib.h>
@@ -116,29 +114,9 @@ private:
     bool              eof_;
 };
 
-#ifdef HAVE_RAPIDGZIP
-class GzLineReaderRapidgzip : public BufferedGzLineReader {
-public:
-    explicit GzLineReaderRapidgzip(const std::string& path) {
-        reader_ = std::make_unique<rapidgzip::ParallelGzipReader<>>(
-            std::make_unique<rapidgzip::StandardFileReader>(path),
-            0,          // threads: 0 = auto-detect from hardware_concurrency
-            GZBUF_SIZE
-        );
-    }
-
-protected:
-    size_t decompress(char* out, size_t n) override { return reader_->read(out, n); }
-
-private:
-    std::unique_ptr<rapidgzip::ParallelGzipReader<>> reader_;
-};
-#endif  // HAVE_RAPIDGZIP
-
-// Single-threaded ISA-L inflate, as fqdup reads gz (fqdup src/fastq_io_backend.cpp). It holds
-// two 4 MB buffers, where rapidgzip's parallel chunk cache added ~0.7 GB to dart profile on a
-// 2M-read input. It handles multi-member files and treats a stream that stops mid-member as an
-// error, not an EOF.
+// Single-threaded ISA-L inflate, as fqdup reads gz (fqdup src/fastq_io_backend.cpp). Two 4 MB
+// buffers; handles multi-member files and treats a stream that stops mid-member as an error,
+// not an EOF.
 class GzLineReaderIgzip : public BufferedGzLineReader {
 public:
     explicit GzLineReaderIgzip(const std::string& path)
@@ -212,16 +190,6 @@ static bool is_gzip(const std::string& path) {
 namespace dart {
 
 std::unique_ptr<GzLineReader> make_gz_reader(const std::string& path) {
-#ifdef HAVE_RAPIDGZIP
-    if (is_gzip(path))
-        return std::make_unique<GzLineReaderRapidgzip>(path);
-#else
-    (void)path;
-#endif
-    return nullptr;  // caller falls back to zlib
-}
-
-std::unique_ptr<GzLineReader> make_igzip_reader(const std::string& path) {
     if (is_gzip(path))
         return std::make_unique<GzLineReaderIgzip>(path);
     return nullptr;  // caller falls back to zlib

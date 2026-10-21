@@ -945,7 +945,7 @@ namespace dart {
 /**
  * @brief Streaming gzip reader using ring buffer
  *
- * Prefers rapidgzip (parallel, in-process) when available; falls back to zlib.
+ * Decodes gz with ISA-L igzip; falls back to zlib for non-gzip input.
  */
 class GzipStreamReader {
 public:
@@ -953,7 +953,6 @@ public:
 
     explicit GzipStreamReader(const std::string& path) {
         buffer_.resize(CHUNK_SIZE);
-        // Try rapidgzip first (faster, parallel, no PATH dependency).
         rg_reader_ = dart::make_gz_reader(path);
         if (rg_reader_) return;
 

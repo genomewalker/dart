@@ -23,8 +23,7 @@ namespace {
 
 class SequenceSeqReader : public taph::SeqReader {
 public:
-    // ISA-L like fqdup: rapidgzip's parallel chunk cache cost ~0.7 GB here for no speed gain.
-    explicit SequenceSeqReader(const std::string& path) : reader_(path, true) {}
+    explicit SequenceSeqReader(const std::string& path) : reader_(path) {}
     bool next(std::string& seq) override {
         if (!reader_.read_next(rec_)) return false;
         seq = std::move(rec_.sequence);
