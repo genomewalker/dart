@@ -422,11 +422,22 @@ inline void em_base_pair(const EMParams& params, double bc, double pr,
 // Empirical null model I/O (decoy Gumbel per aligned-length bin)
 // -------------------------------------------------------------------------
 struct NullModel {
-    std::vector<float> mu;    // per-bin location (on lambda_b*bit scale)
-    std::vector<float> beta;  // per-bin scale
-    std::vector<uint32_t> n;  // per-bin decoy query count used for the fit
+    std::vector<float> mu;      // per-bin location (raw bit scale in a .null sidecar; lambda scale once loaded)
+    std::vector<float> beta;    // per-bin scale
+    std::vector<uint32_t> n;    // per-bin decoy query count used for the fit
+    std::vector<double> sum;    // per-bin sum of the best decoy bit score (raw scale), for pooling
+    std::vector<double> sum_sq; // per-bin sum of squares
     bool valid() const { return !mu.empty() && mu.size() == beta.size(); }
+    void scale(double k) { for (auto& x : mu) x = static_cast<float>(x * k); for (auto& x : beta) x = static_cast<float>(x * k); }
 };
+
+// Fit from per-bin moments (n, sum, sum_sq) by method-of-moments Gumbel:
+//   beta = sqrt(6)*sd/pi,  mu = mean - 0.5772*beta,  sd from the n-1 sample variance.
+// Bins with n < min_n (or sd = 0) take the fit pooled over every bin.
+NullModel fit_null_model_moments(const std::vector<uint32_t>& n,
+                                 const std::vector<double>& sum,
+                                 const std::vector<double>& sum_sq,
+                                 uint32_t min_n = 200);
 
 // Fit the empirical null from per-query MAX (lambda_b * bit_score) values,
 // grouped by aligned-length bin, via method-of-moments Gumbel:
@@ -436,11 +447,7 @@ struct NullModel {
 NullModel fit_null_model(
     const std::vector<std::vector<double>>& per_bin_scores,
     uint32_t min_n = 200);
-
-// Write/read the sidecar TSV: header + one row per bin
-//   bin lo hi mu beta n
-bool write_null_model(const std::string& path, const NullModel& m);
-bool read_null_model(const std::string& path, NullModel& m);
+// Sidecar I/O lives in dart/null_model.hpp.
 
 // -------------------------------------------------------------------------
 // Coherent-LR calibration model I/O (f_true + f_0, frozen once, loaded by EM)

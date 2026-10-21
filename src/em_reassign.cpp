@@ -109,44 +109,40 @@ AlignmentData build_alignment_data(
 // Empirical null model: fit / write / read
 // ---------------------------------------------------------------------------
 
-// Method-of-moments Gumbel from a set of scores (needs n>=2 with sd>0).
-static bool fit_gumbel_mom(const std::vector<double>& xs, float& mu, float& beta) {
-    const size_t n = xs.size();
+// Method-of-moments Gumbel from (n, sum, sum_sq); n-1 sample variance.
+static bool fit_gumbel_mom(uint32_t n, double sum, double sum_sq, float& mu, float& beta) {
     if (n < 2) return false;
-    double mean = 0.0;
-    for (double x : xs) mean += x;
-    mean /= static_cast<double>(n);
-    double var = 0.0;
-    for (double x : xs) { const double d = x - mean; var += d * d; }
-    var /= static_cast<double>(n - 1);  // sample variance
-    const double sd = std::sqrt(var);
-    if (!(sd > 0.0)) return false;
-    const double b = std::sqrt(6.0) * sd / M_PI;
+    const double mean = sum / n;
+    const double var = (sum_sq - n * mean * mean) / (n - 1.0);
+    if (!(var > 0.0)) return false;
+    const double b = std::sqrt(6.0) * std::sqrt(var) / M_PI;
     beta = static_cast<float>(b);
     mu = static_cast<float>(mean - 0.5772156649015329 * b);
     return true;
 }
 
-NullModel fit_null_model(
-    const std::vector<std::vector<double>>& per_bin_scores,
-    uint32_t min_n)
+NullModel fit_null_model_moments(const std::vector<uint32_t>& n,
+                                 const std::vector<double>& sum,
+                                 const std::vector<double>& sum_sq,
+                                 uint32_t min_n)
 {
     NullModel m;
-    const int nbins = static_cast<int>(per_bin_scores.size());
+    const int nbins = static_cast<int>(n.size());
     m.mu.assign(nbins, 0.0f);
     m.beta.assign(nbins, 0.0f);
-    m.n.assign(nbins, 0u);
+    m.n = n;
+    m.sum = sum;
+    m.sum_sq = sum_sq;
 
     // Pooled fallback fit across every bin (used for sparse bins).
-    std::vector<double> pooled;
-    for (const auto& v : per_bin_scores) pooled.insert(pooled.end(), v.begin(), v.end());
+    uint32_t pn = 0; double ps = 0.0, pss = 0.0;
+    for (int b = 0; b < nbins; ++b) { pn += n[b]; ps += sum[b]; pss += sum_sq[b]; }
     float pooled_mu = 0.0f, pooled_beta = 0.0f;
-    const bool pooled_ok = fit_gumbel_mom(pooled, pooled_mu, pooled_beta);
+    const bool pooled_ok = fit_gumbel_mom(pn, ps, pss, pooled_mu, pooled_beta);
 
     for (int b = 0; b < nbins; ++b) {
-        m.n[b] = static_cast<uint32_t>(per_bin_scores[b].size());
         float bmu = 0.0f, bbeta = 0.0f;
-        if (per_bin_scores[b].size() >= min_n && fit_gumbel_mom(per_bin_scores[b], bmu, bbeta)) {
+        if (n[b] >= min_n && fit_gumbel_mom(n[b], sum[b], sum_sq[b], bmu, bbeta)) {
             m.mu[b] = bmu;
             m.beta[b] = bbeta;
         } else if (pooled_ok) {
@@ -157,39 +153,18 @@ NullModel fit_null_model(
     return m;
 }
 
-bool write_null_model(const std::string& path, const NullModel& m) {
-    std::ofstream out(path);
-    if (!out) return false;
-    out << "bin\tlo\thi\tmu\tbeta\tn\n";
-    const int nbins = static_cast<int>(m.mu.size());
-    for (int b = 0; b < nbins && b < kNumNullBins; ++b) {
-        const uint16_t lo = kNullBinEdges[b];
-        const uint16_t hi = kNullBinEdges[b + 1];
-        out << b << '\t' << lo << '\t' << hi << '\t'
-            << m.mu[b] << '\t' << m.beta[b] << '\t'
-            << (b < static_cast<int>(m.n.size()) ? m.n[b] : 0u) << '\n';
+NullModel fit_null_model(
+    const std::vector<std::vector<double>>& per_bin_scores,
+    uint32_t min_n)
+{
+    const size_t nbins = per_bin_scores.size();
+    std::vector<uint32_t> n(nbins, 0u);
+    std::vector<double> sum(nbins, 0.0), sum_sq(nbins, 0.0);
+    for (size_t b = 0; b < nbins; ++b) {
+        n[b] = static_cast<uint32_t>(per_bin_scores[b].size());
+        for (double x : per_bin_scores[b]) { sum[b] += x; sum_sq[b] += x * x; }
     }
-    return static_cast<bool>(out);
-}
-
-bool read_null_model(const std::string& path, NullModel& m) {
-    std::ifstream in(path);
-    if (!in) return false;
-    m.mu.clear(); m.beta.clear(); m.n.clear();
-    std::string line;
-    bool first = true;
-    while (std::getline(in, line)) {
-        if (line.empty()) continue;
-        if (first) { first = false; if (line.rfind("bin", 0) == 0) continue; }
-        std::istringstream ss(line);
-        int bin; double lo, hi, mu, beta; long n = 0;
-        if (!(ss >> bin >> lo >> hi >> mu >> beta)) continue;
-        ss >> n;
-        m.mu.push_back(static_cast<float>(mu));
-        m.beta.push_back(static_cast<float>(beta));
-        m.n.push_back(static_cast<uint32_t>(std::max(0L, n)));
-    }
-    return m.valid();
+    return fit_null_model_moments(n, sum, sum_sq, min_n);
 }
 
 // ---------------------------------------------------------------------------

@@ -8,6 +8,7 @@
 
 #include "subcommand.hpp"
 #include "dart/version.h"
+#include "dart/null_model.hpp"
 #include "dart/damage_subs.hpp"
 #include "dart/damage_stats.hpp"
 #include "dart/damage_index_reader.hpp"
@@ -1265,10 +1266,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     double multimap_floor = 0.05;    // AND gamma > floor
 
     // Null/noise component (spurious short-peptide rejection). Off by default.
-    std::string em_null_model_file;  // load empirical decoy Gumbel (bin lo hi mu beta n)
+    std::string em_null_model_file;  // .null sidecar (or deprecated TSV); default <emi>.null when present
     double em_null_tau = 0.5;        // reject read when gamma_null > tau
-    std::string fit_null_from_file;  // decoy hits TSV to fit the null model from
-    std::string null_out_file;       // output sidecar for the fitted null model
 
     // Coherent-LR calibration (f_true + f_0). When loaded, the real EM component
     // becomes the normalized true-hit density log f_true(bit|Lbin) and the null
@@ -1363,10 +1362,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             em_calib_model_file = argv[++i];
         } else if (strcmp(argv[i], "--em-null-tau") == 0 && i + 1 < argc) {
             em_null_tau = std::stod(argv[++i]);
-        } else if (strcmp(argv[i], "--fit-null-from") == 0 && i + 1 < argc) {
-            fit_null_from_file = argv[++i];
-        } else if (strcmp(argv[i], "--null-out") == 0 && i + 1 < argc) {
-            null_out_file = argv[++i];
         } else if (strcmp(argv[i], "--no-coverage-em") == 0) {
             // Kept for scripts: asks for the only behaviour there is.
         } else if (strcmp(argv[i], "--prior-ancient") == 0 && i + 1 < argc) {
@@ -1518,9 +1513,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 "  --functional-summary FILE     Per-function TSV (requires --map)\n"
                 "  --anvio-ko FILE               Gene-level group abundance (requires --map)\n"
                 "  --annotation-source STR       Anvi'o source label (default: DART)\n"
-                "Null-model fitting:\n"
-                "  --fit-null-from FILE          Fit a null model from decoy hits, then exit\n"
-                "  --null-out FILE               Fitted model (default: decoy hits + .null.tsv)\n"
+                "Null model:\n"
+                "  --em-null-model FILE          .null sidecar from hits2emi --decoy-hits or dart null\n"
+                "                                (default: <emi>.null when it exists)\n"
                 "  --em-null-tau FLOAT           Null responsibility cutoff (default: 0.5)\n"
                 "Resume:\n"
                 "  --em-checkpoint FILE          EM checkpoint (default: tape dir/dart_emtape_<pid>.ckpt)\n"
@@ -1555,59 +1550,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Fit-null mode: read a 16-col decoy hits TSV, fit the per-length-bin Gumbel
-    // to the per-query MAX (lambda_b * bit_score), write the sidecar, and exit.
-    // -----------------------------------------------------------------------
-    if (!fit_null_from_file.empty()) {
-        if (null_out_file.empty()) {
-            null_out_file = fit_null_from_file + ".null.tsv";
-        }
-        dart::MappedTSV tsv(fit_null_from_file.c_str());
-        if (!tsv.valid()) {
-            std::cerr << "Error: cannot open decoy hits TSV: " << fit_null_from_file << "\n";
-            return 1;
-        }
-        // Per query: track (max bit_score, aln_len at that max). Grouped by query id.
-        struct QMax { float bits; uint16_t aln_len; };
-        std::unordered_map<std::string, QMax> qmax;
-        std::mutex qmax_mutex;
-        dart::partitioned_parse_tsv(tsv, [&](const dart::TSVLine& line) {
-            if (line.n_fields < 12) return;
-            // Skip header rows (query...) defensively.
-            if (line.fields[0].size() >= 5 &&
-                std::strncmp(line.fields[0].data(), "query", 5) == 0) return;
-            const std::string q(line.fields[0]);
-            const uint32_t alnlen = dart::fast_stou(line.fields[3]);
-            const float bits = dart::fast_stof(line.fields[11]);
-            std::lock_guard<std::mutex> lk(qmax_mutex);
-            auto it = qmax.find(q);
-            if (it == qmax.end() || bits > it->second.bits) {
-                qmax[q] = {bits, static_cast<uint16_t>(std::min(alnlen, 65535u))};
-            }
-        }, /*skip_header=*/true, /*min_fields=*/12);
-
-        std::vector<std::vector<double>> per_bin(dart::kNumNullBins);
-        for (const auto& kv : qmax) {
-            const int b = dart::null_length_bin(kv.second.aln_len);
-            per_bin[b].push_back(static_cast<double>(em_lambda_b) *
-                                 static_cast<double>(kv.second.bits));
-        }
-        dart::NullModel model = dart::fit_null_model(per_bin, /*min_n=*/200);
-        if (!dart::write_null_model(null_out_file, model)) {
-            std::cerr << "Error: failed to write null model to " << null_out_file << "\n";
-            return 1;
-        }
-        std::cerr << "Fitted null model from " << qmax.size()
-                  << " decoy queries -> " << null_out_file << "\n";
-        for (int b = 0; b < dart::kNumNullBins; ++b) {
-            std::cerr << "  bin " << b << " [" << dart::kNullBinEdges[b] << ","
-                      << dart::kNullBinEdges[b + 1] << ") n=" << model.n[b]
-                      << " mu=" << model.mu[b] << " beta=" << model.beta[b] << "\n";
-        }
-        return 0;
-    }
-
     if (emi_file.empty()) {
         std::cerr << "Error: No EMI index specified (--emi).\n";
         std::cerr << "Run 'dart damage-annotate --help' for usage.\n";
@@ -1626,17 +1568,32 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // use_em_null gates the whole null path; disabled → zero behavior change.
     dart::NullModel em_null_model;
     bool use_em_null = false;
+    std::string em_null_source = "--em-null-model";
+    if (em_null_model_file.empty() && !no_null && em_calib_model_file.empty()) {
+        const std::string sidecar = dart::null_sidecar_path(emi_file);
+        if (std::ifstream(sidecar).good()) { em_null_model_file = sidecar; em_null_source = "sidecar next to the EMI"; }
+    }
     if (!em_null_model_file.empty()) {
-        if (!dart::read_null_model(em_null_model_file, em_null_model)) {
-            std::cerr << "Error: cannot read --em-null-model " << em_null_model_file << "\n";
+        dart::NullProvenance em_null_prov;
+        std::string null_err;
+        if (!dart::read_null_model(em_null_model_file, em_null_model, &em_null_prov, &null_err)) {
+            std::cerr << "Error: cannot read null model " << em_null_model_file << ": " << null_err << "\n";
             return 1;
         }
-        use_em_null = em_null_model.valid();
-        if (use_em_null && verbose) {
-            std::cerr << "Loaded null model (" << em_null_model.mu.size()
-                      << " bins) from " << em_null_model_file
-                      << "; reject tau=" << em_null_tau << "\n";
+        if (em_null_prov.legacy_tsv) {
+            std::cerr << "Warning: " << em_null_model_file << " is the deprecated TSV null sidecar; "
+                         "refit with dart null or hits2emi --decoy-hits to get the binary .null format.\n";
+        } else {
+            em_null_model.scale(em_lambda_b);   // sidecar is on the raw bit scale
         }
+        use_em_null = em_null_model.valid();
+        const int fitted = dart::fitted_bins(em_null_model);
+        std::cerr << "Null model: " << em_null_model_file << " (" << em_null_source << ", "
+                  << fitted << "/" << em_null_model.mu.size() << " bins fitted; reject tau=" << em_null_tau << ")\n";
+        if (fitted == 0)
+            std::cerr << "Warning: no null bin is fitted (fewer than two decoy queries with hits): chance hits\n"
+                         "  are too rare at this database size and search stringency to model; EM runs with the\n"
+                         "  null coordinate off, the same as --no-null.\n";
     }
 
     // Load the coherent-LR calibration model (f_true + f_0) if requested. This
@@ -2510,10 +2467,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // wrong homolog and emitted as a false annotation. Refuse EM without a null
     // model unless the caller accepts the risk with --no-null.
     if (use_em && !use_em_null && !no_null) {
-        std::cerr << "Error: refusing EM annotation without --em-null-model FILE; "
+        std::cerr << "Error: refusing EM annotation without a null model; "
                      "a flat targeted database can force-map absent-protein reads to "
-                     "false annotations. Pass --em-null-model FILE, or --no-null to "
-                     "accept this explicitly.\n";
+                     "false annotations. Search the decoy peptides predict wrote next to "
+                     "--fasta-aa and pass them to hits2emi --decoy-hits (annotate then finds "
+                     "<emi>.null), pass --em-null-model FILE, or --no-null to accept this explicitly.\n";
         return 1;
     }
     if (use_em && em_aln_count > 0) {
