@@ -7,7 +7,7 @@
 
 DART predicts protein-coding ORFs from ancient DNA reads, writes a damage index, and annotates protein-search alignments. Gene prediction, reference assignment and protein authentication are separate steps.
 
-> Status as of 2026-10-19: checked against DART main `eb64e70`.
+> Status as of 2026-10-21: checked against the v2.0.0 release branch (libtaph `c3b3a5d`).
 
 The current main branch uses EMI v7. Damage-aware prediction requires an fqdup library damage summary or explicit self-profiling. `--em-use-damage-mapping` controls the joint damage E-step; protein authentication uses library-level damage information and assigned read evidence.
 
@@ -120,16 +120,51 @@ dart profile -i merged.fq.gz -o profile.json --damage-summary library.tdmg -t 16
 JSON and `.tdmg` for the same reads and options. The `.tdmg` is what `predict --library-profile`
 reads.
 
-A few JSON fields changed in v2.0.0:
+### Changes in v2.0.0
 
-- Each length bin in `channels.bulk_damage.bins` has a `pi_authentic` flag. It is true when the
-  bin has a damaged-fraction interval and `tau_discriminator` is DETECTED. The tau cutoffs were
-  set on three labelled libraries, so treat the flag as provisional.
-- `tau_discriminator.point` and `burial_fingerprint.tau_hat` are null unless tau is DETECTED.
-- `w_length` is deprecated. It is still written, but it reads about 0.5 in every library and
-  nothing uses it. Use `tau_discriminator`.
-- If `channels.bulk_damage.converged` or a bin's `profile_converged` is false, treat tau and
-  the short-bin interval as approximate.
+**Per-bin damaged fraction.** A length bin's `pi_damaged`, `pi_lo` and `pi_hi` used to need
+`w_length > 0.5`, which amounted to a coin flip because `w_length` reads 0.500 to 0.502 in
+every library. A bin now gets an interval when the damaged-read d_max clears the largest per-bin
+δ by 1.96 standard errors. In our test set one library gained intervals and its library-level
+`pi` narrowed from [0.35, 0.80] to [0.55, 0.59]. No library lost an interval it had before.
+
+**`pi_authentic`.** New in each bin of `channels.bulk_damage.bins`: true when the bin has an
+interval and `tau_discriminator` is DETECTED. The tau cutoffs (35 and 80 bp) were set on three
+labelled libraries, so the flag is provisional. Check tau on libraries whose damage status you
+already know before relying on it.
+
+**`w_length` is deprecated.** It is still written but carries no information, since the longest
+bin's profile curve is flat and swamps the slope's error. Use `tau_discriminator`. The
+preservation terms that read it now use 0, so `qc.preservation.f_coh`, `evidence` and `score`
+drop by up to 0.074, 0.27 and 0.18 against earlier builds. No call, d_max source, tau state or
+interval count changes. Preservation is diagnostic only and its tier is null.
+
+**tau length only when tau is detected.** `tau_discriminator.point` and
+`burial_fingerprint.tau_hat` are null unless `tau_discriminator.state` is DETECTED. Without a
+detection the curve is flat from 10 to 400 bp, and the reported length moved by more than 100 bp
+between fits that agreed on everything else.
+
+**Faster bulk fit.** The bulk damage fit now uses SQUAREM acceleration and needs a half to a
+third of the sweeps on most libraries. Of the 7 test runs that used to stop at the 500-sweep cap,
+6 now converge, and no final likelihood went down. On synthetic libraries built to mimic a
+pervasive artifact, SQUAREM still stopped at the cap in 8 of 12, so expect some capped fits on
+libraries like that.
+
+**Capped fits give approximate curves.** tau and the short-bin pi interval read per-bin
+profile-likelihood curves, and those are approximate when the main fit stops at the cap. One
+test library still does; its likelihood is within 1e-5 of a 20,000-sweep reference. If
+`channels.bulk_damage.converged` or a bin's `profile_converged` is false, treat tau and the
+short-bin interval as approximate.
+
+**gzip input.** All dart commands decode `.gz` with single-threaded ISA-L, as fqdup does. The
+parallel rapidgzip decoder is gone: fqdup dropped it after it silently truncated a large input
+on network storage. A `.gz` that ends mid-stream is now an error. `dart profile` peak memory on
+a 2M-read library fell from 1.21 GB to 0.53 GB at `-t 32`.
+
+**`.dcx` sort scratch.** `damage-annotate --dcx` sorts in memory up to 8 GiB and spills sorted
+runs past that to `--em-tape-dir` (or `DART_EM_TAPE_DIR`). That directory must be on node-local
+disk: NFS, tmpfs and `/tmp` are refused. The `dcx_streaming` test spills under `$TMPDIR`, so run
+`ctest` with `TMPDIR` on node-local disk.
 
 ---
 
