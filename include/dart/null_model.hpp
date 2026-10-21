@@ -49,10 +49,13 @@ struct DecoyStats {
 
 // One decoy hits file (16-column MMseqs2 TSV, plain or .gz). Rule: when the file has any
 // query id starting with DECOY_, only those rows are decoys; otherwise every row is.
+// A first line whose query field is "query" (an MMseqs2 header) is skipped.
 // Returns the number of decoy queries taken from this file; *skipped gets the number of
-// unprefixed queries ignored. Appends the file to prov.inputs and adds its hits to prov.
+// unprefixed queries ignored and *by_prefix whether the DECOY_ rule selected the rows.
+// Appends the file to prov.inputs and adds its hits to prov.
 uint64_t accumulate_decoy_hits(const std::string& path, DecoyStats& stats,
-                               NullProvenance& prov, uint64_t* skipped = nullptr);
+                               NullProvenance& prov, uint64_t* skipped = nullptr,
+                               bool* by_prefix = nullptr);
 
 NullModel fit_null_model(const DecoyStats& s, uint32_t min_n = 200);
 
@@ -69,10 +72,14 @@ bool is_null_sidecar(const std::string& path);   // leading "DNUL"
 
 inline std::string null_sidecar_path(const std::string& emi_path) { return emi_path + ".null"; }
 
-// Bins with a positive Gumbel scale: own fit (n >= min_n) or the pooled fallback. Zero
-// means no decoy bin had the two queries a fit needs; annotate then runs EM with the
-// null coordinate off (read_null_log_density returns -inf), the same as --no-null.
-int fitted_bins(const NullModel& m);
+// How each bin got its Gumbel: its own fit (n >= min_n), the fit pooled over every bin, or
+// none (beta 0: fewer than two queries or zero variance in the pool). With no fitted bin
+// annotate runs EM in memory with the null coordinate off (read_null_log_density returns
+// -inf), which gives the output of --no-null without the tape.
+struct NullFitCounts { int own = 0, pooled = 0, unfit = 0; };
+NullFitCounts null_fit_counts(const NullModel& m, uint32_t min_n = 200);
+inline int fitted_bins(const NullModel& m) { const NullFitCounts c = null_fit_counts(m); return c.own + c.pooled; }
+std::string null_fit_summary(const NullModel& m);   // "k own, p pooled, u unfit of 6 bins"
 
 void print_null_model(std::ostream& os, const NullModel& m, const NullProvenance& prov);
 

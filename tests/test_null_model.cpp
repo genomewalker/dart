@@ -193,7 +193,8 @@ void test_hits2emi_and_annotate(const std::string& dart, const std::string& tut,
     expect(lines.size() > 1000, "tutorial hits present");
     // Real hits as-is; decoys: every 7th query renamed DECOY_, bit score halved.
     std::ofstream real(dir + "/real.tsv"), decoy(dir + "/decoy.tsv");
-    std::string last_q; size_t qi = 0;
+    decoy << "query\ttarget\tfident\talnlen\tmismatch\tgapopen\tqstart\tqend\ttstart\ttend\tevalue\tbits\tqlen\ttlen\tqaln\ttaln\n";
+    std::string last_q; size_t qi = 0; uint64_t decoy_rows = 0;
     for (const auto& l : lines) {
         if (l.empty() || l.rfind("query", 0) == 0) continue;
         real << l << "\n";
@@ -208,6 +209,7 @@ void test_hits2emi_and_annotate(const std::string& dart, const std::string& tut,
         f[11] = std::to_string(std::strtod(f[11].c_str(), nullptr) * 0.5);
         for (size_t i = 0; i < f.size(); ++i) decoy << (i ? "\t" : "") << f[i];
         decoy << "\n";
+        ++decoy_rows;
     }
     real.close(); decoy.close();
     const std::string agd = tut + "/expected/predictions.agd";
@@ -220,6 +222,7 @@ void test_hits2emi_and_annotate(const std::string& dart, const std::string& tut,
     dart::NullModel mb; dart::NullProvenance pb; std::string err;
     expect(dart::read_null_model(b + ".null", mb, &pb, &err), "sidecar reads: " + err);
     expect(pb.db_label == "tutorial" && pb.n_decoy_queries > 0 && pb.inputs.size() == 1, "sidecar provenance");
+    expect(pb.n_decoy_hits == decoy_rows, "the header line is not counted as a decoy hit (" + std::to_string(pb.n_decoy_hits) + " vs " + std::to_string(decoy_rows) + ")");
     expect(run(dart + " null -o " + dir + "/n.null --db-label tutorial " + dir + "/decoy.tsv", dir + "/null.log") == 0, "dart null exits 0");
     dart::NullModel mn; dart::NullProvenance pn;
     expect(dart::read_null_model(dir + "/n.null", mn, &pn, &err), "dart null sidecar reads: " + err);
