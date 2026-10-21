@@ -82,9 +82,11 @@ int cmd_null(int argc, char* argv[]) {
                 std::cerr << in << ": pooled " << p.n_decoy_queries << " decoy queries from sidecar\n";
             } else {
                 uint64_t skipped = 0;
-                const uint64_t taken = accumulate_decoy_hits(in, stats, prov, &skipped);
+                bool by_prefix = false;
+                const uint64_t taken = accumulate_decoy_hits(in, stats, prov, &skipped, &by_prefix);
                 std::cerr << in << ": " << taken << " decoy queries taken"
-                          << (skipped ? " (" + std::to_string(skipped) + " queries without the DECOY_ prefix ignored)" : " (no DECOY_ prefix: every query taken as a decoy)")
+                          << (by_prefix ? " (DECOY_ rows" + (skipped ? "; " + std::to_string(skipped) + " queries without the prefix ignored" : std::string()) + ")"
+                                        : " (no DECOY_ prefix in the file: every query taken as a decoy)")
                           << "\n";
             }
         }

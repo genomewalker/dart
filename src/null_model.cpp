@@ -81,14 +81,19 @@ void DecoyStats::add(const NullModel& m) {
 }
 
 uint64_t accumulate_decoy_hits(const std::string& path, DecoyStats& stats,
-                               NullProvenance& prov, uint64_t* skipped) {
+                               NullProvenance& prov, uint64_t* skipped, bool* by_prefix) {
     std::unordered_map<std::string, QMax> prefixed, plain;
     uint64_t hits = 0;
     ChunkedFileReader reader(path);
     std::string field;
+    bool first = true;
     while (true) {
         std::string_view line = reader.next_line();
         if (line.empty()) break;
+        if (first) {
+            first = false;
+            if (line.size() >= 6 && line.compare(0, 6, "query\t") == 0) continue;   // MMseqs2 header
+        }
         const char* p = line.data();
         const char* end = p + line.size();
         const char* f[13];
@@ -119,6 +124,7 @@ uint64_t accumulate_decoy_hits(const std::string& path, DecoyStats& stats,
     }
     const auto& take = prefixed.empty() ? plain : prefixed;
     if (skipped) *skipped = prefixed.empty() ? 0 : plain.size();
+    if (by_prefix) *by_prefix = !prefixed.empty();
     reduce_into(take, stats);
     stats.n_hits += hits;
     prov.n_decoy_queries += take.size();
@@ -252,10 +258,20 @@ bool read_null_model(const std::string& path, NullModel& m, NullProvenance* prov
     return true;
 }
 
-int fitted_bins(const NullModel& m) {
-    int k = 0;
-    for (float b : m.beta) k += (b > 0.0f);
-    return k;
+NullFitCounts null_fit_counts(const NullModel& m, uint32_t min_n) {
+    NullFitCounts c;
+    for (size_t b = 0; b < m.beta.size(); ++b) {
+        if (!(m.beta[b] > 0.0f)) ++c.unfit;
+        else if (b < m.n.size() && m.n[b] >= min_n) ++c.own;
+        else ++c.pooled;
+    }
+    return c;
+}
+
+std::string null_fit_summary(const NullModel& m) {
+    const NullFitCounts c = null_fit_counts(m);
+    return std::to_string(c.own) + " own, " + std::to_string(c.pooled) + " pooled, " +
+           std::to_string(c.unfit) + " unfit of " + std::to_string(m.beta.size()) + " bins";
 }
 
 void print_null_model(std::ostream& os, const NullModel& m, const NullProvenance& prov) {
@@ -270,7 +286,7 @@ void print_null_model(std::ostream& os, const NullModel& m, const NullProvenance
         os << "db label: " << (prov.db_label.empty() ? "-" : prov.db_label) << "\n";
         for (const auto& in : prov.inputs) os << "input: " << in.path << " size=" << in.size << " mtime=" << in.mtime << "\n";
     }
-    os << "fitted bins: " << fitted_bins(m) << "/" << m.mu.size() << "\n";
+    os << "fit: " << null_fit_summary(m) << "\n";
     os << "bin\tlo\thi\tn\tmu\tbeta\n";
     for (size_t b = 0; b < m.mu.size(); ++b)
         os << b << '\t' << kNullBinEdges[b] << '\t' << kNullBinEdges[b + 1] << '\t' << m.n[b] << '\t'

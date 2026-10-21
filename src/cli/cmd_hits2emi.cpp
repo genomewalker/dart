@@ -293,7 +293,8 @@ int cmd_hits2emi(int argc, char* argv[]) {
             prov.dart_version = DART_VERSION;
             prov.db_label = db_label;
             uint64_t skipped = 0;
-            const uint64_t taken = dart::accumulate_decoy_hits(decoy_hits_file, stats, prov, &skipped);
+            bool by_prefix = false;
+            const uint64_t taken = dart::accumulate_decoy_hits(decoy_hits_file, stats, prov, &skipped, &by_prefix);
             const std::string null_path = null_out_file.empty() ? dart::null_sidecar_path(output_file) : null_out_file;
             std::string err;
             const dart::NullModel null_model = dart::fit_null_model(stats);
@@ -301,18 +302,20 @@ int cmd_hits2emi(int argc, char* argv[]) {
                 throw std::runtime_error(err);
             const int fitted = dart::fitted_bins(null_model);
             std::cerr << "Null model: " << taken << " decoy queries (" << prov.n_decoy_hits << " hits"
-                      << (skipped ? ", " + std::to_string(skipped) + " queries without the DECOY_ prefix ignored" : "")
+                      << (by_prefix ? "" : "; no DECOY_ prefix in the file, every query taken as a decoy")
+                      << (skipped ? "; " + std::to_string(skipped) + " queries without the DECOY_ prefix ignored" : "")
                       << ") from " << decoy_hits_file << " -> " << null_path
-                      << " (" << fitted << "/" << dart::kNumNullBins << " bins fitted)\n";
+                      << " (" << dart::null_fit_summary(null_model) << ")\n";
             for (int b = 0; b < dart::kNumNullBins; ++b)
                 if (stats.n[b] < 200)
                     std::cerr << "  bin " << b << " [" << dart::kNullBinEdges[b] << "," << dart::kNullBinEdges[b + 1]
                               << ") has " << stats.n[b] << " decoy queries (< 200): "
                               << (null_model.beta[b] > 0.0f ? "pooled fit used" : "unfit") << "\n";
             if (fitted == 0)
-                std::cerr << "Warning: no null bin fitted: fewer than two decoy queries with hits. Chance hits are too\n"
-                             "  rare at this database size and search stringency to model; damage-annotate will run EM\n"
-                             "  with the null coordinate off, the same as --no-null.\n";
+                std::cerr << "Warning: no null bin fitted (the decoy hits give no finite Gumbel: fewer than two queries\n"
+                             "  or zero variance). Chance hits are too rare at this database size and search stringency\n"
+                             "  to model; damage-annotate will run EM in memory with the null coordinate off, which gives\n"
+                             "  the output of --no-null.\n";
         }
 
         auto t_end = std::chrono::steady_clock::now();

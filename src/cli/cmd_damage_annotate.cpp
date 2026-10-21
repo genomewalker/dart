@@ -1594,11 +1594,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         use_em_null = em_null_model.valid();
         const int fitted = dart::fitted_bins(em_null_model);
         std::cerr << "Null model: " << em_null_model_file << " (" << em_null_source << ", "
-                  << fitted << "/" << em_null_model.mu.size() << " bins fitted; reject tau=" << em_null_tau << ")\n";
+                  << dart::null_fit_summary(em_null_model) << "; reject tau=" << em_null_tau << ")\n";
         if (fitted == 0)
-            std::cerr << "Warning: no null bin is fitted (fewer than two decoy queries with hits): chance hits\n"
-                         "  are too rare at this database size and search stringency to model; EM runs with the\n"
-                         "  null coordinate off, the same as --no-null.\n";
+            std::cerr << "Warning: no null bin is fitted (the decoy hits gave no finite Gumbel: fewer than two\n"
+                         "  queries or zero variance): chance hits are too rare at this database size and search\n"
+                         "  stringency to model. EM runs in memory with the null coordinate off, which gives the\n"
+                         "  output of --no-null without its tape.\n";
     }
 
     // Load the coherent-LR calibration model (f_true + f_0) if requested. This
