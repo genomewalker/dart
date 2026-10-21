@@ -6,6 +6,7 @@
 #include "subcommand.hpp"
 #include "dart/damage_index.hpp"
 #include "dart/damage_index_reader.hpp"
+#include "dart/null_model.hpp"
 #include "dart/version.h"
 
 #include <cstring>
@@ -17,8 +18,9 @@
 namespace {
 
 void print_usage(const char* prog) {
-    std::cerr << "Usage: " << prog << " damage-info <file.agd> [options]\n\n"
-              << "Display damage profile information from AGD index file.\n\n"
+    std::cerr << "Usage: " << prog << " damage-info <file.agd | file.null> [options]\n\n"
+              << "Display damage profile information from an AGD index file, or the table and\n"
+              << "provenance of a .null sidecar (hits2emi --decoy-hits / dart null).\n\n"
               << "Options:\n"
               << "  --json           Output as JSON (default: human-readable)\n"
               << "  -o, --output F   Write to file instead of stdout\n"
@@ -116,6 +118,22 @@ int cmd_damage_info(int argc, char* argv[]) {
         std::cerr << "Error: AGD file required\n\n";
         print_usage(argv[0]);
         return 1;
+    }
+
+    if (dart::is_null_sidecar(agd_file)) {
+        dart::NullModel m; dart::NullProvenance prov; std::string err;
+        if (!dart::read_null_model(agd_file, m, &prov, &err)) {
+            std::cerr << "Error: " << err << "\n";
+            return 1;
+        }
+        if (!output_file.empty()) {
+            std::ofstream ofs(output_file);
+            if (!ofs) { std::cerr << "Error: Cannot open output file: " << output_file << "\n"; return 1; }
+            dart::print_null_model(ofs, m, prov);
+        } else {
+            dart::print_null_model(std::cout, m, prov);
+        }
+        return 0;
     }
 
     dart::DamageIndexReader reader(agd_file, false);

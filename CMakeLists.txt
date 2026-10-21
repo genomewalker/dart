@@ -217,6 +217,7 @@ set(DART_CORE_SOURCES
     src/damage_index_reader.cpp
     src/reference_stats.cpp
     src/em_reassign.cpp
+    src/null_model.cpp
     src/em_index.cpp
     src/columnar_index.cpp
     src/coverage_em.cpp
@@ -241,6 +242,7 @@ set(DART_SUBCOMMAND_SOURCES
     src/cli/cmd_simulate.cpp          # simulate (synthetic damage reads)
     src/cli/cmd_eval.cpp              # eval (benchmark accuracy vs truth TSV)
     src/cli/cmd_fit_calib.cpp         # fit-calib (f_true + f_0 coherent-LR model)
+    src/cli/cmd_null.cpp              # null (fit / pool the decoy null sidecar)
 )
 
 # Main executable with subcommands
