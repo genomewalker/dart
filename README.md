@@ -170,7 +170,7 @@ disk: NFS, tmpfs and `/tmp` are refused. The `dcx_streaming` test spills under `
 Pass 2 trained on the first 50,000 eligible reads each thread happened to see, so two runs at
 `-t 32` differed in about 0.05% of gene calls and in output order, and `-t 1` differed from
 both. The training set is now up to 50,000 reads that are 60 to 200 bp after clipping, every
-k-th such read across the whole input with k from the profile's read count, collected in file
+k-th such read across the whole input (k = their count / 50,000), collected in file
 order on one thread; genes are written in input order. Repeated runs at `-t 32` and a run at
 `-t 1` are byte-identical. The sample costs one extra single-threaded decode of the input,
 reported on stderr as `EM training set`.
