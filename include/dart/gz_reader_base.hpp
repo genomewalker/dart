@@ -36,4 +36,8 @@ public:
 // Returns nullptr when HAVE_RAPIDGZIP is not defined; caller falls back to zlib.
 std::unique_ptr<GzLineReader> make_gz_reader(const std::string& path);
 
+// Single-threaded ISA-L igzip reader, the decoder fqdup uses. Bounded memory (two 4 MB
+// buffers). Returns nullptr for a non-gzip file; caller falls back to zlib.
+std::unique_ptr<GzLineReader> make_igzip_reader(const std::string& path);
+
 }  // namespace dart
