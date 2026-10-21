@@ -421,26 +421,35 @@ int cmd_predict(int argc, char* argv[]) {
             // sidecar override above is authoritative.
 
             // Periodic-codon EM training set (feeds Pass-2 gene prediction, NOT the damage
-            // gate): the first EM_MAX_SEQS reads of prof_in that are 60..200 bp after the
-            // same clean + clip + length gate profile_reads applies. Read in file order on
-            // one thread so the set, and with it every Pass-2 score, is the same at any -t.
-            // ceiling: a library with few 60..200 bp reads decodes the whole file once more,
-            // single-threaded; upgrade: capture inside profile_reads with a read ordinal.
+            // gate): every k-th read of prof_in that is 60..200 bp after the same clean +
+            // clip + length gate profile_reads applies, k from the profile's read count so
+            // the sample spans the whole file (a head sample is one genome in a simulated or
+            // concatenated input). One ordered single-threaded decode of prof_in, so the
+            // set, and with it every Pass-2 score, is the same at any -t.
             const size_t EM_MAX_SEQS = 50000;
+            const size_t em_stride = std::max<size_t>(1, static_cast<size_t>(pres.reads_scanned) / EM_MAX_SEQS);
             std::vector<std::string> em_training_seqs;
             em_training_seqs.reserve(EM_MAX_SEQS);
             {
+                auto em_start = std::chrono::steady_clock::now();
                 const bool em_clip  = pres.stubs.adapter_clipped || pres.stubs.adapter3_clipped;
                 const auto em_stub5 = taph::encode_stub_codes(pres.stubs.stubs5);
                 const auto em_stub3 = taph::encode_stub_codes(pres.stubs.stubs3);
                 dart::SequenceReader em_reader(prof_in);
                 dart::SequenceRecord rec;
+                size_t eligible = 0;
                 while (em_training_seqs.size() < EM_MAX_SEQS && em_reader.read_next(rec)) {
                     std::string seq = dart::SequenceUtils::clean(rec.sequence);
                     if (em_clip) seq = taph::clip_adapters(seq, em_stub5, em_stub3, 0);
                     if (seq.size() < static_cast<size_t>(cfg.min_read_len)) continue;
-                    if (seq.size() >= 60 && seq.size() <= 200) em_training_seqs.push_back(std::move(seq));
+                    if (seq.size() < 60 || seq.size() > 200) continue;
+                    if (eligible++ % em_stride == 0) em_training_seqs.push_back(std::move(seq));
                 }
+                std::cerr << "  EM training set: " << em_training_seqs.size() << " reads, every "
+                          << em_stride << "th of " << eligible << " eligible, "
+                          << std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - em_start).count() / 1000.0
+                          << " s\n";
             }
             if (!em_training_seqs.empty()) {
                 dart::codon::DamageParams em_dmg;
