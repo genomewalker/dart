@@ -96,6 +96,7 @@ struct ThreadOutputBuffer {
     std::ostringstream fasta_aa;
     std::ostringstream fasta_aa_corrected;
     std::ostringstream fasta_aa_masked;
+    std::ostringstream fasta_aa_decoy;
     std::vector<std::tuple<std::string, Gene, std::string>> damage_records;
     size_t gene_count = 0;
 
@@ -110,6 +111,8 @@ struct ThreadOutputBuffer {
         fasta_aa_corrected.clear();
         fasta_aa_masked.str("");
         fasta_aa_masked.clear();
+        fasta_aa_decoy.str("");
+        fasta_aa_decoy.clear();
         damage_records.clear();
         gene_count = 0;
     }
@@ -161,6 +164,14 @@ struct ThreadOutputBuffer {
                  << " stop_fix=" << gene.stop_restorations
                  << " corr_score=" << gene.orf_rank
                  << "\n" << gene.protein << "\n";
+    }
+
+    // Decoy peptide for the null model: the same protein reversed, id prefixed DECOY_.
+    // Reversal keeps length and composition; the chance-score distribution depends on both.
+    void write_fasta_aa_decoy(const std::string& seq_id, const Gene& gene, int gene_num) {
+        fasta_aa_decoy << ">DECOY_" << seq_id << "_" << (gene.is_forward ? "+" : "-") << "_" << gene.frame
+                       << "_" << gene_num << "\n"
+                       << std::string(gene.protein.rbegin(), gene.protein.rend()) << "\n";
     }
 
     // Format FASTA entry for Bayesian-corrected protein (ancestor AAs at damage stops)
@@ -269,10 +280,13 @@ int cmd_predict(int argc, char* argv[]) {
         OutputFile fasta_aa_file;
         OutputFile fasta_aa_corrected_file;
         OutputFile fasta_aa_masked_file;
+        OutputFile fasta_aa_decoy_file;
 
         // Flags to check if outputs are enabled
         bool write_fasta_nt = !opts.fasta_nt.empty();
         bool write_fasta_aa = !opts.fasta_aa.empty();
+        const bool write_fasta_aa_decoy = write_fasta_aa && opts.decoy_every > 0;
+        const std::string fasta_aa_decoy_path = dart::cli::decoy_fasta_path(opts.fasta_aa);
         bool write_fasta_aa_corrected = !opts.fasta_aa_corrected.empty();
         bool write_fasta_aa_masked = !opts.fasta_aa_masked.empty();
 
@@ -292,6 +306,12 @@ int cmd_predict(int argc, char* argv[]) {
             fasta_aa_file.open(opts.fasta_aa);
             if (!fasta_aa_file) {
                 throw std::runtime_error("Cannot open FASTA AA file: " + opts.fasta_aa);
+            }
+        }
+        if (write_fasta_aa_decoy) {
+            fasta_aa_decoy_file.open(fasta_aa_decoy_path);
+            if (!fasta_aa_decoy_file) {
+                throw std::runtime_error("Cannot open decoy FASTA AA file: " + fasta_aa_decoy_path);
             }
         }
         if (write_fasta_aa_corrected) {
@@ -547,6 +567,7 @@ int cmd_predict(int argc, char* argv[]) {
             // Process batch in parallel - format output to thread-local buffers.
             // schedule(static) with no chunk size: each thread gets one contiguous block,
             // in tid order, so the tid-order flush below writes reads in input order.
+            const size_t batch_base = total_seqs.load();   // input ordinal of batch[0]
             #pragma omp parallel for schedule(static)
             for (size_t i = 0; i < batch.size(); ++i) {
                 std::string seq = dart::SequenceUtils::clean(batch[i].sequence);
@@ -665,6 +686,8 @@ int cmd_predict(int argc, char* argv[]) {
                     buf.write_gff(id, gene, gene_num);
                     if (write_fasta_nt) buf.write_fasta_nt(id, gene, gene_num);
                     if (write_fasta_aa) buf.write_fasta_aa(id, gene, gene_num);
+                    if (write_fasta_aa_decoy && (batch_base + i) % static_cast<size_t>(opts.decoy_every) == 0)
+                        buf.write_fasta_aa_decoy(id, gene, gene_num);
                     if (write_fasta_aa_corrected) buf.write_fasta_aa_corrected(id, gene, gene_num);
                     if (write_fasta_aa_masked) buf.write_fasta_aa_masked(id, gene, gene_num);
                     if (damage_index_writer) {
@@ -686,6 +709,9 @@ int cmd_predict(int argc, char* argv[]) {
                 }
                 if (write_fasta_aa) {
                     fasta_aa_file << buf.fasta_aa.str();
+                }
+                if (write_fasta_aa_decoy) {
+                    fasta_aa_decoy_file << buf.fasta_aa_decoy.str();
                 }
                 if (write_fasta_aa_corrected) {
                     fasta_aa_corrected_file << buf.fasta_aa_corrected.str();

@@ -21,6 +21,9 @@ void print_usage(const char* program_name) {
     std::cout << "  --fasta-nt <file>        Output nucleotide FASTA\n";
     std::cout << "  --fasta-nt-corrected <file> Output damage-corrected nucleotide FASTA\n";
     std::cout << "  --fasta-aa <file>        Output amino acid FASTA (observed, stops as *)\n";
+    std::cout << "  --decoy-every <N>        With --fasta-aa, also write the reversed proteins of every N-th\n";
+    std::cout << "                           read to <aa>.decoy.<ext> as DECOY_ queries for the null model\n";
+    std::cout << "                           (default: 10; 0 = off)\n";
     std::cout << "  --fasta-aa-masked <file> Search-optimized: terminal damage stops as X\n";
     std::cout << "  --summary <file>         Output sample statistics (JSON format)\n";
     std::cout << "  --damage-index <file>    Output binary damage index (.agd) for damage-annotate\n";
@@ -116,6 +119,9 @@ Options parse_args(int argc, char* argv[]) {
             opts.fasta_aa_corrected = require_value(arg);
         } else if (arg == "--fasta-aa") {
             opts.fasta_aa = require_value(arg);
+        } else if (arg == "--decoy-every") {
+            opts.decoy_every = parse_int(arg, require_value(arg));
+            if (opts.decoy_every < 0) throw ParseArgsExit(1, "Error: --decoy-every must be >= 0");
         } else if (arg == "--fasta-aa-masked") {
             opts.fasta_aa_masked = require_value(arg);
         } else if (arg == "--summary") {
@@ -178,6 +184,15 @@ Options parse_args(int argc, char* argv[]) {
     }
 
     return opts;
+}
+
+std::string decoy_fasta_path(const std::string& fasta_aa) {
+    std::string base = fasta_aa, gz;
+    if (base.size() > 3 && base.compare(base.size() - 3, 3, ".gz") == 0) { gz = ".gz"; base.resize(base.size() - 3); }
+    const size_t slash = base.rfind('/');
+    const size_t dot = base.rfind('.');
+    if (dot == std::string::npos || (slash != std::string::npos && dot < slash)) return base + ".decoy" + gz;
+    return base.substr(0, dot) + ".decoy" + base.substr(dot) + gz;
 }
 
 }  // namespace cli
