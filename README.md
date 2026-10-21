@@ -166,6 +166,13 @@ runs past that to `--em-tape-dir` (or `DART_EM_TAPE_DIR`). That directory must b
 disk: NFS, tmpfs and `/tmp` are refused. The `dcx_streaming` test spills under `$TMPDIR`, so run
 `ctest` with `TMPDIR` on node-local disk.
 
+**`predict` output no longer depends on the thread count.** The periodic-codon model behind
+Pass 2 trained on the first 50,000 eligible reads each thread happened to see, so two runs at
+`-t 32` differed in about 0.05% of gene calls and in output order, and `-t 1` differed from
+both. The training set is now the first 50,000 input reads that are 60 to 200 bp after
+clipping, taken in file order, and genes are written in input order. Repeated runs at `-t 32`
+and a run at `-t 1` are byte-identical.
+
 ---
 
 ## Commands

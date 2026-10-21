@@ -403,19 +403,7 @@ int cmd_predict(int argc, char* argv[]) {
                 };
             };
 
-            // Side channel: capture 60..200 bp clipped reads for the periodic-codon EM
-            // model (feeds Pass-2 gene prediction, NOT the damage gate). Per-thread
-            // buffers, flattened in tid order after the pass — no locks.
-            const size_t EM_MAX_SEQS = 50000;
-            std::vector<std::vector<std::string>> em_by_thread(std::max(1, num_threads));
-            taph::PerReadHook em_hook =
-                [&](int tid, const std::string& seq, int /*L*/) {
-                    if (seq.size() >= 60 && seq.size() <= 200 &&
-                        em_by_thread[tid].size() < EM_MAX_SEQS)
-                        em_by_thread[tid].push_back(seq);
-                };
-
-            taph::ProfileResult pres = taph::profile_reads(make_reader, cfg, em_hook);
+            taph::ProfileResult pres = taph::profile_reads(make_reader, cfg);
             sample_profile = std::move(pres.profile);
 
             // Single-engine override: the fqdup-fit sidecar is authoritative for the damage
@@ -432,16 +420,27 @@ int cmd_predict(int argc, char* argv[]) {
             // gate when a sidecar was present (the production path). The single-engine
             // sidecar override above is authoritative.
 
-            // Train periodic model from the hook-captured EM sequences (flattened in
-            // tid order, capped at EM_MAX_SEQS). Feeds Pass-2 gene prediction.
+            // Periodic-codon EM training set (feeds Pass-2 gene prediction, NOT the damage
+            // gate): the first EM_MAX_SEQS reads of prof_in that are 60..200 bp after the
+            // same clean + clip + length gate profile_reads applies. Read in file order on
+            // one thread so the set, and with it every Pass-2 score, is the same at any -t.
+            // ceiling: a library with few 60..200 bp reads decodes the whole file once more,
+            // single-threaded; upgrade: capture inside profile_reads with a read ordinal.
+            const size_t EM_MAX_SEQS = 50000;
             std::vector<std::string> em_training_seqs;
             em_training_seqs.reserve(EM_MAX_SEQS);
-            for (auto& v : em_by_thread) {
-                for (auto& s : v) {
-                    if (em_training_seqs.size() >= EM_MAX_SEQS) break;
-                    em_training_seqs.push_back(std::move(s));
+            {
+                const bool em_clip  = pres.stubs.adapter_clipped || pres.stubs.adapter3_clipped;
+                const auto em_stub5 = taph::encode_stub_codes(pres.stubs.stubs5);
+                const auto em_stub3 = taph::encode_stub_codes(pres.stubs.stubs3);
+                dart::SequenceReader em_reader(prof_in);
+                dart::SequenceRecord rec;
+                while (em_training_seqs.size() < EM_MAX_SEQS && em_reader.read_next(rec)) {
+                    std::string seq = dart::SequenceUtils::clean(rec.sequence);
+                    if (em_clip) seq = taph::clip_adapters(seq, em_stub5, em_stub3, 0);
+                    if (seq.size() < static_cast<size_t>(cfg.min_read_len)) continue;
+                    if (seq.size() >= 60 && seq.size() <= 200) em_training_seqs.push_back(std::move(seq));
                 }
-                if (em_training_seqs.size() >= EM_MAX_SEQS) break;
             }
             if (!em_training_seqs.empty()) {
                 dart::codon::DamageParams em_dmg;
@@ -528,8 +527,10 @@ int cmd_predict(int argc, char* argv[]) {
                 buf.clear();
             }
 
-            // Process batch in parallel - format output to thread-local buffers
-            #pragma omp parallel for schedule(dynamic, 100)
+            // Process batch in parallel - format output to thread-local buffers.
+            // schedule(static) with no chunk size: each thread gets one contiguous block,
+            // in tid order, so the tid-order flush below writes reads in input order.
+            #pragma omp parallel for schedule(static)
             for (size_t i = 0; i < batch.size(); ++i) {
                 std::string seq = dart::SequenceUtils::clean(batch[i].sequence);
                 // Clip adapter stubs before ORF enumeration AND per-read authentication, on
