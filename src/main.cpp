@@ -403,7 +403,13 @@ int cmd_predict(int argc, char* argv[]) {
                 };
             };
 
-            taph::ProfileResult pres = taph::profile_reads(make_reader, cfg);
+            // Count the EM-eligible reads (60..200 bp after the profile gate) during the
+            // profile pass; per-thread counters summed afterwards, so the total is exact at any -t.
+            std::vector<size_t> em_eligible_by_thread(std::max(1, num_threads), 0);
+            taph::PerReadHook em_count = [&](int tid, const std::string&, int L) {
+                if (L >= 60 && L <= 200) ++em_eligible_by_thread[tid];
+            };
+            taph::ProfileResult pres = taph::profile_reads(make_reader, cfg, em_count);
             sample_profile = std::move(pres.profile);
 
             // Single-engine override: the fqdup-fit sidecar is authoritative for the damage
@@ -422,12 +428,14 @@ int cmd_predict(int argc, char* argv[]) {
 
             // Periodic-codon EM training set (feeds Pass-2 gene prediction, NOT the damage
             // gate): every k-th read of prof_in that is 60..200 bp after the same clean +
-            // clip + length gate profile_reads applies, k from the profile's read count so
+            // clip + length gate profile_reads applies, k = eligible count / EM_MAX_SEQS so
             // the sample spans the whole file (a head sample is one genome in a simulated or
             // concatenated input). One ordered single-threaded decode of prof_in, so the
             // set, and with it every Pass-2 score, is the same at any -t.
             const size_t EM_MAX_SEQS = 50000;
-            const size_t em_stride = std::max<size_t>(1, static_cast<size_t>(pres.reads_scanned) / EM_MAX_SEQS);
+            size_t em_eligible_total = 0;
+            for (size_t n : em_eligible_by_thread) em_eligible_total += n;
+            const size_t em_stride = std::max<size_t>(1, em_eligible_total / EM_MAX_SEQS);
             std::vector<std::string> em_training_seqs;
             em_training_seqs.reserve(EM_MAX_SEQS);
             {
