@@ -34,6 +34,8 @@ public:
      * Open a sequence file (auto-detects format)
      */
     explicit SequenceReader(const std::string& filename);
+    // serial_gz: decode gz with single-threaded ISA-L instead of rapidgzip.
+    SequenceReader(const std::string& filename, bool serial_gz);
     ~SequenceReader();
 
     /**
