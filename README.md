@@ -7,7 +7,7 @@
 
 DART predicts protein-coding ORFs from ancient DNA reads, writes a damage index, and annotates protein-search alignments. Gene prediction, reference assignment and protein authentication are separate steps.
 
-> Status as of 2026-10-22: checked against the v2.0.0 release branch (libtaph `c3b3a5d`); a null model now runs the EM on the tape path.
+> Status as of 2026-10-22: checked against the v2.0.0 release branch (libtaph `c3b3a5d`); a null model now runs the EM on the tape path. The decoy null now rejects reads by their chance probability (`null_p`, `--null-p-max`, sidecar version 2); the 0.01 default is under review.
 
 The current main branch uses EMI v7. Damage-aware prediction requires an fqdup library damage summary or explicit self-profiling. `--em-use-damage-mapping` controls the joint damage E-step; protein authentication uses library-level damage information and assigned read evidence.
 
@@ -89,7 +89,7 @@ mmseqs easy-search out/proteins.decoy.faa ref_proteins.faa.gz out/decoy_hits.tsv
 
 # 4) Build the EMI v7 index and fit the null from the decoy hits into out/hits.emi.null
 dart hits2emi -i out/hits.tsv -o out/hits.emi --damage-index out/predictions.agd \
-  --decoy-hits out/decoy_hits.tsv -t 16
+  --decoy-hits out/decoy_hits.tsv --decoy-fasta out/proteins.decoy.faa -t 16
 
 # 5) EM assignment + damage annotation (picks up out/hits.emi.null by itself)
 dart damage-annotate --emi out/hits.emi --damage-index out/predictions.agd \
@@ -105,6 +105,17 @@ decoys.
 `dart damage-info hits.emi.null` prints the fitted bins and the provenance (dart version, inputs,
 decoy counts). Refit when the database, the search options, the library type or the read length
 range changes.
+
+The null rejects reads by chance probability. For each read's best hit, `null_p` is the
+probability that a decoy query gets its best hit in the same aligned-length bin with at least
+that bit score: `w_b · (1 − exp(−exp(−(bits − mu_b)/beta_b)))`, where `w_b` is the share of submitted
+decoys whose best hit landed in bin `b`. A read with `null_p > --null-p-max` (default 0.01) gets
+reject bit `1`, is ambiguous, and leaves the authentication and modern-baseline pools. Give the
+decoy count with `--decoy-fasta` (or `--decoys-submitted N`; `dart null` takes the latter); without
+it `w_b` is per decoy with a hit, which overstates chance. At the end damage-annotate prints one
+`null reject:` line per bin with the reads, the share flagged and `S*`, the bit score below which
+that bin's reads are flagged (`NA` where `w_b ≤ --null-p-max`, so the bin never flags). Check these
+lines: on short peptides the 7-12 aa bins can flag most reads.
 
 The workflow and output interpretation are on the wiki:
 [Quick Start Tutorial](https://github.com/genomewalker/dart/wiki/Quick-Start-Tutorial).
@@ -153,6 +164,11 @@ TSV sidecar they wrote still loads through `--em-null-model` with a deprecation 
 on the raw bit scale and is scaled by the EM's bit-to-nat lambda at load, so the model equals the
 old fitter's at the same lambda, except that the old reader dropped the first row of a headerless
 decoy file and the new one does not.
+Reject bit `1` on the uncalibrated path now comes from `null_p > --null-p-max`; the old
+`gamma_null > --em-null-tau` test could not fire there (the unnormalised real term outscores the
+Gumbel density by about 29 nats) and stays only for `--em-calib-model`. The per-read table gains
+`null_p` after `gamma_null`. Sidecars are written as version 2, which adds the decoys submitted;
+version 1 still loads, with the count unknown.
 
 **Per-bin damaged fraction.** A length bin's `pi_damaged`, `pi_lo` and `pi_hi` used to need
 `w_length > 0.5`, which amounted to a coin flip because `w_length` reads 0.500 to 0.502 in

@@ -1267,7 +1267,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
     // Null/noise component (spurious short-peptide rejection). Off by default.
     std::string em_null_model_file;  // .null sidecar (or deprecated TSV); default <emi>.null when present
-    double em_null_tau = 0.5;        // reject read when gamma_null > tau
+    double em_null_tau = 0.5;        // calibrated path: reject read when gamma_null > tau
+    double null_p_max = 0.01;        // uncalibrated path: reject read when null_p > this
+    bool null_p_max_set = false;
 
     // Coherent-LR calibration (f_true + f_0). When loaded, the real EM component
     // becomes the normalized true-hit density log f_true(bit|Lbin) and the null
@@ -1362,6 +1364,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             em_calib_model_file = argv[++i];
         } else if (strcmp(argv[i], "--em-null-tau") == 0 && i + 1 < argc) {
             em_null_tau = std::stod(argv[++i]);
+        } else if (strcmp(argv[i], "--null-p-max") == 0 && i + 1 < argc) {
+            null_p_max = std::stod(argv[++i]);
+            null_p_max_set = true;
         } else if (strcmp(argv[i], "--no-coverage-em") == 0) {
             // Kept for scripts: asks for the only behaviour there is.
         } else if (strcmp(argv[i], "--prior-ancient") == 0 && i + 1 < argc) {
@@ -1521,7 +1526,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 "Null model:\n"
                 "  --em-null-model FILE          .null sidecar from hits2emi --decoy-hits or dart null\n"
                 "                                (default: <emi>.null when it exists)\n"
-                "  --em-null-tau FLOAT           Null responsibility cutoff (default: 0.5)\n"
+                "  --null-p-max P                Reject a read when the chance that a decoy scores as\n"
+                "                                high in its aligned-length bin exceeds P (default: 0.01)\n"
+                "  --em-null-tau FLOAT           Null responsibility cutoff, calibrated null column only\n"
+                "                                (--em-calib-model; default: 0.5)\n"
                 "Resume:\n"
                 "  --em-checkpoint FILE          EM checkpoint (default: tape dir/dart_emtape_<pid>.ckpt)\n"
                 "  --resume                      Resume a matching EM checkpoint\n"
@@ -1568,6 +1576,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         std::cerr << "Error: --em-null-tau must be in [0,1]\n";
         return 1;
     }
+    if (!(null_p_max >= 0.0 && null_p_max <= 1.0)) {
+        std::cerr << "Error: --null-p-max must be in [0,1]\n";
+        return 1;
+    }
 
     // Load the empirical null model (Gumbel per length bin) if requested.
     // use_em_null gates the whole null path; disabled → zero behavior change.
@@ -1578,8 +1590,13 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         const std::string sidecar = dart::null_sidecar_path(emi_file);
         if (std::ifstream(sidecar).good()) { em_null_model_file = sidecar; em_null_source = "sidecar next to the EMI"; }
     }
+    // null_p (the per-read chance rule) reads the model on the scale it was loaded at:
+    // em_null_model.mu = raw bits * null_p_scale. N is its decoy denominator.
+    dart::NullProvenance em_null_prov;
+    double null_p_scale = 1.0;
+    uint64_t null_p_n = 0;
+    bool null_p_per_submitted = false;
     if (!em_null_model_file.empty()) {
-        dart::NullProvenance em_null_prov;
         std::string null_err;
         if (!dart::read_null_model(em_null_model_file, em_null_model, &em_null_prov, &null_err)) {
             std::cerr << "Error: cannot read null model " << em_null_model_file << ": " << null_err << "\n";
@@ -1591,10 +1608,13 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         } else {
             em_null_model.scale(em_lambda_b);   // sidecar is on the raw bit scale
         }
+        null_p_scale = em_lambda_b;   // the legacy TSV is already on the lambda scale
+        null_p_n = dart::null_decoy_denominator(em_null_model, em_null_prov, &null_p_per_submitted);
         use_em_null = em_null_model.valid();
         const int fitted = dart::fitted_bins(em_null_model);
         std::cerr << "Null model: " << em_null_model_file << " (" << em_null_source << ", "
-                  << dart::null_fit_summary(em_null_model) << "; reject tau=" << em_null_tau << ")\n";
+                  << dart::null_fit_summary(em_null_model) << "; reject null_p > " << null_p_max
+                  << (null_p_per_submitted ? " per submitted decoy" : " per decoy with a hit") << ")\n";
         if (fitted == 0)
             std::cerr << "Warning: no null bin is fitted (the decoy hits gave no finite Gumbel: fewer than two\n"
                          "  queries or zero variance): chance hits are too rare at this database size and search\n"
@@ -1618,12 +1638,16 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         em_null_model.beta = em_calib_model.null.beta;
         em_null_model.n = em_calib_model.null.n;
         use_em_null = true;
+        null_p_scale = 1.0;   // the calibration f_0 is on the raw bit scale
+        null_p_n = dart::null_decoy_denominator(em_null_model, dart::NullProvenance{}, &null_p_per_submitted);
         if (verbose) {
             std::cerr << "Loaded calibration model (f_true " << em_calib_model.true_bins.size()
                       << " bins, f_0 " << em_calib_model.null.mu.size() << " bins, censor="
                       << em_calib_model.censor << ") from " << em_calib_model_file << "\n";
         }
     }
+    if (null_p_max_set && !use_em_null)
+        std::cerr << "Warning: --null-p-max has no effect without a null model (--em-null-model or <emi>.null)\n";
     if (w0 < 0.0f || w0 > 1.0f) {
         std::cerr << "Error: --w0 must be in [0, 1]\n";
         return 1;
@@ -1801,6 +1825,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         uint32_t qlen = 0;
         uint32_t tlen = 0;
         uint32_t aln_len_on_target = 0;
+        uint16_t aln_len = 0;  // raw EMI ALN_LEN of the best hit: the null bin (the fit binned on it)
         uint32_t best_rg = UINT32_MAX;
         uint32_t best_row = UINT32_MAX;
         // Soft multi-mapping (--emit-multimap): the EM mapping responsibility for THIS
@@ -2203,6 +2228,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 hit.qlen = cand.qlen;
                 hit.tlen = cand.tlen;
                 hit.aln_len_on_target = cand.aln_len_on_target;
+                // aln_len_on_target is still the raw aln_len_v here (the annotation scan clips it later).
+                hit.aln_len = static_cast<uint16_t>(std::min(cand.aln_len_on_target, 65535u));
                 hit.best_rg = cand.best_rg;
                 hit.best_row = cand.best_row;
             } else {
@@ -2455,8 +2482,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         float em_ref_neff = 1.0f;       // Effective number of references: 1 / sum_j gamma_j^2
         float gamma_null = 0.0f;        // null-component responsibility (spurious-hit mass)
         uint8_t em_reject_reason = 0;   // 0=keep, bit0=null_dominated, bit1=low_margin, bit2=high_neff
+        float null_p = std::numeric_limits<float>::quiet_NaN();  // chance probability of the best hit
     };
     std::vector<EmReadResult> em_read_results(n_reads);
+    // Null chance rule, per null bin: reads with a best hit and reads flagged by null_p.
+    std::array<uint64_t, dart::kNumNullBins> null_bin_reads{}, null_bin_flagged{};
+    bool null_p_ran = false;
     // True when damage-aware EM was active and gamma_ancient was actually populated.
     // Used by --refine-damage to avoid falling back to total gamma for modern reads.
     // Atomic because it may be set inside the parallel streaming_em_finalize callback.
@@ -2912,7 +2943,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 uint8_t reason = 0;
                 if (em_margin < static_cast<float>(em_min_margin)) reason |= 0x2;
                 if (em_ref_neff > static_cast<float>(em_max_neff)) reason |= 0x4;
-                if (!tape_gnull.empty() && gnull > em_null_tau) reason |= 0x1;
+                // Bit 0x1 on this (uncalibrated) path comes from null_p, set after the EM.
                 em_read_results[r] = {
                     best_hit_gamma, best_hit_gamma_ancient, bitscore_best_matches_em,
                     em_keep, em_keep_thr, em_margin, em_ref_neff,
@@ -3091,17 +3122,15 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             // 3-way decision (sol). With calibrated densities the floor is on the LLR
             // (identifiability), which — unlike gamma_null — does not saturate to 1 via
             // the EM w_null dynamics, so information-poor reads ABSTAIN rather than being
-            // mislabeled contamination. Legacy/uncalibrated null keeps the original
-            // gamma_null > tau reject (no abstain band; preserves the regression baseline).
-            if (em_params.use_null && end > start) {
+            // mislabeled contamination. Without an LLR the calibrated path keeps
+            // gamma_null > tau. The uncalibrated null gets bit 0x1 from null_p after the EM
+            // (gamma_null cannot reach tau there: the real term is unnormalised).
+            if (em_params.use_null && use_em_calib && end > start) {
                 if (have_llr) {
-                    // Calibrated path only: 3-way LLR call. Abstained/rejected reads
-                    // leave the assignment/auth pools (em_keep=false).
+                    // Abstained/rejected reads leave the assignment/auth pools (em_keep=false).
                     if (llr <= em_reject_llr)     { reason |= 0x1; em_keep = false; }
                     else if (llr < em_keep_llr)   { reason |= 0x8; em_keep = false; }
                 } else if (gnull > em_null_tau)   { reason |= 0x1; }
-                // Legacy --em-null-model path preserves the original behavior exactly:
-                // reason 0x1 flags null-dominance downstream; em_keep is untouched here.
             }
 
 
@@ -3119,6 +3148,25 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         }
 
         }  // end if(!can_stream) legacy per-read finalization
+
+        // Chance probability of each read's best hit under the decoy null, the same on the
+        // tape and in-RAM paths. On the uncalibrated path it alone sets reject bit 0x1.
+        if (use_em_null && null_p_n > 0) {
+            null_p_ran = true;
+            for (uint32_t r = 0; r < n_reads; ++r) {
+                const auto& bh = best_hits[r];
+                if (!bh.has) continue;
+                const double p = dart::null_chance_p(em_null_model, null_p_scale, null_p_n, bh.bits, bh.aln_len);
+                auto& er = em_read_results[r];
+                er.null_p = static_cast<float>(p);
+                const int b = dart::null_length_bin(bh.aln_len);
+                ++null_bin_reads[b];
+                if (!use_em_calib && p > null_p_max) {
+                    er.em_reject_reason |= 0x1;
+                    ++null_bin_flagged[b];
+                }
+            }
+        }
 
         if (verbose) {
             // Filtering stats
@@ -3673,6 +3721,36 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         min_damage_sites = 3;  // fallback if no summaries
     }
 
+    if (null_p_ran && !use_em_calib) {
+        // Flagged reads whose best hit has no mismatch get no table row but still leave the
+        // modern-baseline pool through em_reject_reason; count them apart.
+        uint64_t flagged = 0, flagged_no_row = 0, with_hit = 0;
+        for (uint32_t r = 0; r < n_reads; ++r) {
+            if (!(em_read_results[r].null_p > null_p_max)) continue;
+            ++flagged;
+            if (summary_index_by_read[r] < 0) ++flagged_no_row;
+        }
+        for (int b = 0; b < dart::kNumNullBins; ++b) {
+            with_hit += null_bin_reads[b];
+            const double s = dart::null_chance_bits_at(em_null_model, null_p_scale, null_p_n, b, null_p_max);
+            std::ostringstream line;
+            line << "null reject: bin " << dart::kNullBinEdges[b] << "-";
+            if (b + 1 < dart::kNumNullBins) line << (dart::kNullBinEdges[b + 1] - 1); else line << "inf";
+            line << " reads=" << null_bin_reads[b] << " flagged=" << null_bin_flagged[b] << " ("
+                 << std::fixed << std::setprecision(2)
+                 << (null_bin_reads[b] ? 100.0 * null_bin_flagged[b] / null_bin_reads[b] : 0.0)
+                 << "%) bits at null_p=" << std::defaultfloat << null_p_max << ": ";
+            if (std::isfinite(s)) line << std::fixed << std::setprecision(1) << s; else line << "NA";
+            std::cerr << line.str() << "\n";
+        }
+        std::ostringstream total;
+        total << "null reject: " << flagged << " of " << with_hit << " reads with a best hit flagged ("
+              << std::fixed << std::setprecision(2) << (with_hit ? 100.0 * flagged / with_hit : 0.0)
+              << "%); " << flagged_no_row << " of them have no mismatch (no table row) and leave the"
+              << " modern-baseline pool";
+        std::cerr << total.str() << "\n";
+    }
+
     if (verbose) {
         std::cerr << "Reads with mismatches: " << summaries.size() << "\n";
         std::cerr << "Reads with damage-consistent sites: " << proteins_with_damage << "\n";
@@ -4024,7 +4102,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             "damage_informative\t"
             "ox_hits\tox_total\tox_fraction";
     if (use_em) {
-        *out << "\tgamma\tgamma_ancient\tbest_hit\tem_keep\tem_keep_threshold\tem_margin\tem_ref_neff\tem_ambiguous\tgamma_null\tem_reject_reason";
+        *out << "\tgamma\tgamma_ancient\tbest_hit\tem_keep\tem_keep_threshold\tem_margin\tem_ref_neff\tem_ambiguous\tgamma_null\tnull_p\tem_reject_reason";
     }
     *out << "\n";
 
@@ -4120,10 +4198,13 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                      << "\t" << (((em.em_reject_reason != 0) ||
                                   (em.em_margin < static_cast<float>(em_min_margin)) ||
                                   (em.em_ref_neff > static_cast<float>(em_max_neff))) ? 1 : 0)
-                     << "\t" << std::scientific << std::setprecision(6) << em.gamma_null
+                     << "\t" << std::scientific << std::setprecision(6) << em.gamma_null;
+                char np[32] = "NA";
+                if (std::isfinite(em.null_p)) std::snprintf(np, sizeof np, "%.3g", em.null_p);
+                *out << "\t" << np
                      << "\t" << static_cast<int>(em.em_reject_reason);
             } else {
-                *out << "\t.\t.\t.\t.\t.\t.\t.\t.\t.\t.";
+                *out << "\t.\t.\t.\t.\t.\t.\t.\t.\t.\t.\t.";
             }
         }
         *out << "\n";
