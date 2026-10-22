@@ -25,10 +25,11 @@
 # Standalone-run choices made explicit (damage-annotate and predict refuse to guess them):
 #   --allow-self-profile  predict estimates the damage profile from these reads; production runs
 #                         pass --library-profile from a library-level profile instead.
-#   null model            predict writes proteins.decoy.faa (reversed proteins of every 10th
-#                         read, ids prefixed DECOY_); the decoys are searched with the same
+#   --decoy-every 10      predict also writes proteins.decoy.faa (reversed proteins of every
+#                         10th read, ids prefixed DECOY_); the decoys are searched with the same
 #                         MMseqs2 parameters and `hits2emi --decoy-hits` fits the null into
-#                         hits.emi.null, which damage-annotate picks up by itself.
+#                         hits.emi.null, which damage-annotate picks up by itself. Off by
+#                         default: for a study, fit one null from a few samples and reuse it.
 
 set -euo pipefail
 
@@ -58,6 +59,7 @@ echo "Step 1/5: Gene prediction (+ decoy peptides)..."
     --fasta-aa "$OUT_DIR/proteins.faa" \
     --damage-index "$OUT_DIR/predictions.agd" \
     --allow-self-profile \
+    --decoy-every 10 \
     -t "$THREADS"
 echo ""
 
