@@ -1422,6 +1422,11 @@ static uint64_t tape_ckpt_fingerprint(const std::string& input_fingerprint,
     h = tape_ckpt_fnv1a(&nl, 1, h);
     h = tape_ckpt_fnv1a(&params.lambda_null, sizeof(double), h);
     h = tape_ckpt_fnv1a(&params.log_w_null, sizeof(double), h);
+    if (null_on) {   // the null column's Gumbel table changes the converged weights
+        h = tape_ckpt_fnv1a(&params.alpha_null, sizeof(double), h);
+        for (float v : params.null_mu) h = tape_ckpt_fnv1a(&v, sizeof(float), h);
+        for (float v : params.null_beta) h = tape_ckpt_fnv1a(&v, sizeof(float), h);
+    }
     return h;
 }
 
@@ -1461,7 +1466,8 @@ TapeEMResult tape_em_core(
     double* const lane_s = lane_s_buf.get();
     // gn_s: written by lane l over r in [lane_lo[l], lane_lo[l+1]) and read ascending in
     // m_step, so first-touch on the same partition. Zeroed ONCE: deg==0 reads never assign
-    // gn_s[r] and must stay 0.0 across all E-steps. null is OFF on the production CLI path.
+    // gn_s[r] and must stay 0.0 across all E-steps. The CLI passes null_lp whenever a null
+    // model is loaded (one double per read gathered while the tape is written).
     std::unique_ptr<double[]> gn_s_buf(null_on ? new double[R] : nullptr);
     double* const gn_s = gn_s_buf.get();
     if (null_on) {

@@ -246,6 +246,8 @@ int main(int argc, char** argv) {
     if (argc < 3) { std::cerr << "usage: " << argv[0] << " <dart> <examples/tutorial>\n"; return 2; }
     const std::string dart = argv[1], tut = argv[2];
     const std::string dir = make_tmpdir();
+    // damage-annotate with a null runs on the EM tape; keep a caller's DART_EM_TAPE_DIR.
+    setenv("DART_EM_TAPE_DIR", (dir + "/emtape").c_str(), 0);
     test_roundtrip(dir);
     test_predict_decoys(dart, tut, dir);
     test_hits2emi_and_annotate(dart, tut, dir);
