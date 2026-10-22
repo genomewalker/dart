@@ -2,8 +2,9 @@
 //
 //   1. .null sidecar round trip: write -> read preserves every field, rewrite is byte-identical,
 //      a bad magic, a truncated file and an unknown version are refused with a message;
-//   2. `dart predict --fasta-aa X` writes the reversed proteins of every 10th input read to the
-//      decoy file with the DECOY_ prefix, and nothing else; --decoy-every 0 writes no file;
+//   2. `dart predict --fasta-aa X --decoy-every 10` writes the reversed proteins of every 10th
+//      input read to the decoy file with the DECOY_ prefix, and nothing else; without the flag
+//      no decoy file is written;
 //   3. `dart hits2emi` with and without --decoy-hits writes byte-identical EMIs, the sidecar
 //      exists only with the flag, and `dart null` on the same decoy hits fits the same bins;
 //   4. `dart damage-annotate` finds <emi>.null by itself and gives the same output as
@@ -146,7 +147,7 @@ void test_roundtrip(const std::string& dir) {
 void test_predict_decoys(const std::string& dart, const std::string& tut, const std::string& dir) {
     std::cout << "predict decoys... " << std::flush;
     const std::string faa = dir + "/p.faa";
-    const std::string cmd = dart + " predict -i " + tut + "/reads.fq.gz -o " + dir + "/p.gff --fasta-aa " + faa + " --allow-self-profile -t 4";
+    const std::string cmd = dart + " predict -i " + tut + "/reads.fq.gz -o " + dir + "/p.gff --fasta-aa " + faa + " --allow-self-profile --decoy-every 10 -t 4";
     expect(run(cmd, dir + "/predict.log") == 0, "predict exits 0");
     const std::string decoy = dir + "/p.decoy.faa";
     expect(exists(decoy), "decoy file p.decoy.faa written");
@@ -179,11 +180,11 @@ void test_predict_decoys(const std::string& dart, const std::string& tut, const 
     expect(bad_ordinal == 0, "every decoy comes from a read with ordinal % 10 == 0 (" + std::to_string(bad_ordinal) + " do not)");
     expect(missing == 0, "every protein of an ordinal % 10 == 0 read has a decoy (" + std::to_string(missing) + " missing)");
     expect(dec.size() == decoy_ids.size(), "decoy ids are unique");
-    // --decoy-every 0: no decoy file.
+    // Default (no --decoy-every): no decoy file.
     const std::string faa0 = dir + "/p0.faa";
-    expect(run(dart + " predict -i " + tut + "/reads.fq.gz -o " + dir + "/p0.gff --fasta-aa " + faa0 + " --allow-self-profile --decoy-every 0 -t 4", dir + "/predict0.log") == 0, "predict --decoy-every 0 exits 0");
-    expect(!exists(dir + "/p0.decoy.faa"), "--decoy-every 0 writes no decoy file");
-    expect(slurp(faa0) == slurp(faa), "--decoy-every 0 leaves the protein file unchanged");
+    expect(run(dart + " predict -i " + tut + "/reads.fq.gz -o " + dir + "/p0.gff --fasta-aa " + faa0 + " --allow-self-profile -t 4", dir + "/predict0.log") == 0, "predict without --decoy-every exits 0");
+    expect(!exists(dir + "/p0.decoy.faa"), "no decoy file without --decoy-every");
+    expect(slurp(faa0) == slurp(faa), "--decoy-every leaves the protein file unchanged");
     std::cout << (failures ? "FAILED\n" : "ok\n");
 }
 

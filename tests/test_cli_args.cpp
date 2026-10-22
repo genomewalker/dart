@@ -115,6 +115,8 @@ void test_output_options() {
            .add("--decoy-every").add("7");
     auto opts = dart::cli::parse_args(builder.argc(), builder.argv());
     assert(opts.decoy_every == 7);
+    assert(dart::cli::parse_args(ArgvBuilder().add("agp").add("-i").add("x.fa").argc(),
+                                 ArgvBuilder().add("agp").add("-i").add("x.fa").argv()).decoy_every == 0);
     assert(dart::cli::decoy_fasta_path("proteins.faa") == "proteins.decoy.faa");
     assert(dart::cli::decoy_fasta_path("proteins.faa.gz") == "proteins.decoy.faa.gz");
     assert(dart::cli::decoy_fasta_path("dir.x/proteins") == "dir.x/proteins.decoy");

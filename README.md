@@ -13,7 +13,8 @@ The current main branch uses EMI v7. Damage-aware prediction requires an fqdup l
 
 ## Workflow
 
-1. Run `predict` to write GFF3, protein FASTA, reversed decoy peptides and an AGD damage index.
+1. Run `predict` to write GFF3, protein FASTA and an AGD damage index, plus reversed decoy
+   peptides with `--decoy-every 10`.
 2. Search the proteins and the decoys with MMseqs2; `hits2emi` converts the hits to EMI v7 and
    fits the null model from the decoy hits into `<emi>.null`.
 3. Run `damage-annotate` for read assignments, damage scores and protein summaries.
@@ -60,19 +61,19 @@ DART=../../build/dart DB=./ref_proteins.faa.gz bash run_tutorial.sh
 For your own inputs you need one thing the tutorial skips: a damage profile measured with
 [fqdup](https://github.com/genomewalker/fqdup) on the reads before deduplication. The null model
 that keeps reads from proteins missing from your database off the nearest homolog is built into
-the pipeline: `predict` writes reversed decoy peptides next to `--fasta-aa`, you search them with
-the same MMseqs2 options, `hits2emi --decoy-hits` fits the null into `hits.emi.null`, and
-`damage-annotate` finds that file by itself.
+the pipeline: `predict --decoy-every 10` writes reversed decoy peptides next to `--fasta-aa`, you
+search them with the same MMseqs2 options, `hits2emi --decoy-hits` fits the null into
+`hits.emi.null`, and `damage-annotate` finds that file by itself.
 
 ```bash
 mkdir -p out
 # 0) Damage profile from the merged reads, before deduplication
 fqdup profile -i merged.fq.gz --damage-summary out/library.tdmg
 
-# 1) Predict genes + damage index. Also writes out/proteins.decoy.faa: the reversed
-#    proteins of every 10th read (--decoy-every), ids prefixed DECOY_
+# 1) Predict genes + damage index. --decoy-every 10 also writes out/proteins.decoy.faa:
+#    the reversed proteins of every 10th read, ids prefixed DECOY_
 dart predict -i reads.fq.gz -o out/predictions.gff --fasta-aa out/proteins.faa \
-  --damage-index out/predictions.agd --library-profile out/library.tdmg -t 16
+  --damage-index out/predictions.agd --library-profile out/library.tdmg --decoy-every 10 -t 16
 
 # 2) Search against reference proteins. VTML20 suits short aDNA peptides; the matrix
 #    ships in examples/tutorial/data/ of the DART source tree
@@ -96,9 +97,11 @@ dart damage-annotate --emi out/hits.emi --damage-index out/predictions.agd \
   --auto-calibrate-spurious -t 16
 ```
 
-One null per database and search configuration is enough for a batch of samples:
-`dart null -o db.null --db-label mydb sampleA/decoy_hits.tsv sampleB/hits.emi.null ...` pools
-decoy hits and sidecars into one file, and `damage-annotate --em-null-model db.null` uses it.
+One null per database and search configuration is enough for a study: run `--decoy-every 10`
+and the decoy search on a few representative samples, pool them with
+`dart null -o study.null --db-label mydb sampleA/decoy_hits.tsv sampleB/decoy_hits.tsv ...`,
+and pass `--em-null-model study.null` to every `damage-annotate`; the other samples need no
+decoys.
 `dart damage-info hits.emi.null` prints the fitted bins and the provenance (dart version, inputs,
 decoy counts). Refit when the database, the search options, the library type or the read length
 range changes.
@@ -134,9 +137,9 @@ reads.
 
 ### Changes in v2.0.0
 
-**Null model by default.** `predict --fasta-aa X` also writes `X` with `.decoy` before the
-extension: the reversed proteins of every 10th read (`--decoy-every N`, 0 disables), ids prefixed
-`DECOY_`. Search that file with the real search's options and pass the hits to
+**Decoy null model.** `predict --fasta-aa X --decoy-every N` also writes `X` with `.decoy`
+before the extension: the reversed proteins of every N-th read, ids prefixed `DECOY_` (off by
+default, since not every predict run feeds a search; 10 is a good value). Search that file with the real search's options and pass the hits to
 `hits2emi --decoy-hits`, which fits the Gumbel-per-length-bin null and writes it as the binary
 sidecar `<emi>.null` with its provenance (dart version, inputs with size and mtime, decoy counts,
 `--db-label`). `damage-annotate` loads `<emi>.null` when it exists, after `--em-null-model` and
