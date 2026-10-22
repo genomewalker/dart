@@ -1598,8 +1598,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         if (fitted == 0)
             std::cerr << "Warning: no null bin is fitted (the decoy hits gave no finite Gumbel: fewer than two\n"
                          "  queries or zero variance): chance hits are too rare at this database size and search\n"
-                         "  stringency to model. EM runs in memory with the null coordinate off, which gives the\n"
-                         "  output of --no-null without its tape.\n";
+                         "  stringency to model. The null coordinate stays off and the output equals --no-null.\n";
     }
 
     // Load the coherent-LR calibration model (f_true + f_0) if requested. This
@@ -1829,14 +1828,15 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     std::vector<std::vector<MmCand>> mm_pool;
     if (emit_multimap) mm_pool.assign(n_reads, {});
     // Production streaming EM tape path (PI mandate 2026-07-23): when the config needs
-    // only ref/gamma/gamma_ancient per read (no calib, no null column,
-    // damage-free mapping) the EM runs off an O_DIRECT tape on node-local scratch, feeding
-    // tape_em_core directly from streaming ingestion. Nothing O(alignments) is materialized
-    // in RAM (kills the ~288 GB in-RAM transient measured on LV626), giving aln-independent
-    // peak RSS for the 6-10B-aln production target. All predicates here are CLI-known, so the
-    // O(A) em_alignments buffers below are skipped entirely on this path.
-    const bool tape_path = use_em && !use_em_calib &&
-                           !use_em_null && !em_use_damage_mapping;
+    // only ref/gamma/gamma_ancient per read (no calib, damage-free mapping) the EM runs
+    // off an O_DIRECT tape on node-local scratch, feeding tape_em_core directly from
+    // streaming ingestion. Nothing O(alignments) is materialized in RAM (kills the ~288 GB
+    // in-RAM transient measured on LV626), giving aln-independent peak RSS for the 6-10B-aln
+    // production target. The decoy null rides along as one double per read (the best null
+    // log-density over the read's alignments, computed while the tape is written), so a
+    // null model keeps the tape. All predicates here are CLI-known, so the O(A)
+    // em_alignments buffers below are skipped entirely on this path.
+    const bool tape_path = use_em && !use_em_calib && !em_use_damage_mapping;
     // read-major per-read degree (uint64 prefix: aln offsets exceed 2^32 at 6B+ alns) and
     // per-ref length (== build_alignment_data's ref_lengths). Tape path only.
     std::vector<uint64_t> em_read_deg;    // [n_reads+1], prefix-summed into read_offsets
@@ -2635,11 +2635,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         // pass streams per-read gamma straight into the finalization below, and
         // compact_em_map releases aln_data.alignments after decode -> steady RSS ~20 B/aln
         // (vs 20+32). Gated to the production config where per-read finalization needs only
-        // ref/gamma/gamma_ancient: no calib densities, no null column,
-        // damage-free mapping. Post-hoc p_anc = sigmoid(base_a - base_m) matches the legacy loop
-        // with or without DMG_LL columns (without them it is the AGD read posterior itself).
+        // ref/gamma/gamma_ancient (+ the per-read null responsibility on the tape path): no
+        // calib densities, damage-free mapping. Post-hoc p_anc = sigmoid(base_a - base_m)
+        // matches the legacy loop with or without DMG_LL columns (without them it is the AGD
+        // read posterior itself).
         const bool can_stream =
-            !use_em_calib && !use_em_null && !em_params.use_damage;
+            !use_em_calib && !em_params.use_damage && (!use_em_null || tape_path);
         const float em_keep_thr = static_cast<float>(em_min_prob);
 
         // ---- Tape path: build the O_DIRECT hot tape by a streaming decode (scan-2) ----
@@ -2647,7 +2648,15 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         // needs only ref/gamma/gamma_ancient per read, and gamma_ancient is derived in-core
         // (posthoc: gamma*sigmoid(base_a-base_m)), so NO raw {bit,aln_len,ds} tape is needed —
         // only the 3 SoA hot streams tape_em_core consumes. Nothing O(alignments) in RAM.
+        // With a null model the tape writer also keeps, per read, the best null log-density
+        // over the read's kept alignments (what read_null_log_density returns on the in-RAM
+        // CSR); tape_em_core scores the null column from it and returns gamma_null per read.
         std::string tape_dir_path, p_tape_ref, p_tape_ba, p_tape_bm, em_input_fp;
+        std::vector<double> tape_null_lp, tape_gnull;
+        if (tape_path && use_em_null) {
+            tape_null_lp.assign(n_reads, -std::numeric_limits<double>::infinity());
+            tape_gnull.assign(n_reads, 0.0);
+        }
         struct TapeDirGuard {
             std::string dir, a, b, c;
             ~TapeDirGuard() {
@@ -2775,6 +2784,16 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     const uint32_t aln_end = std::min(tstart_0 + static_cast<uint32_t>(aln_len[i]), 65535u);
                     const uint16_t aln_len_em = (aln_end > aln_start)
                         ? static_cast<uint16_t>(std::min(aln_end - aln_start, 65535u)) : 0;
+                    if (!tape_null_lp.empty()) {
+                        // Same function as the in-RAM path, one alignment at a time; the
+                        // per-read max is order-exact, so scan order cannot change it.
+                        dart::Alignment na{};
+                        na.bit_score = bits;
+                        na.aln_len = aln_len_em;
+                        const double lp = dart::read_null_log_density(em_params, &na, 1);
+                        double& slot = tape_null_lp[ridx];   // read-major: this rg owns ridx
+                        if (lp > slot) slot = lp;
+                    }
                     const uint32_t ref = ref_idx[i];
                     // Decode == tape_decode_read with score_scale=1 (normalize_scores_per_query is
                     // always false here): bc = length_log_penalty(shell) + coverage(0) + lambda_b*bit,
@@ -2846,9 +2865,14 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 double best_g = -1.0;
                 float top1 = 0.0f, top2 = 0.0f;
                 double sum_sq = 0.0;
+                // Tape path with a null: tape_em_core stores gamma_null[r] before calling us.
+                // Margin/neff use the real responsibilities renormalized by 1/(1-gamma_null),
+                // exactly as the legacy loop below; best-hit gamma and the pool stay raw.
+                const double gnull = tape_gnull.empty() ? 0.0 : tape_gnull[r];
+                const double real_norm = (gnull < 1.0 - 1e-9) ? (1.0 / (1.0 - gnull)) : 0.0;
                 for (uint32_t j = 0; j < deg; ++j) {
-                    const double g = gamma[j];
-                    if (g > best_g) { best_g = g; em_best_ref = ref[j]; }
+                    const double g = gamma[j] * real_norm;
+                    if (gamma[j] > best_g) { best_g = gamma[j]; em_best_ref = ref[j]; }
                     sum_sq += g * g;
                     if (g > static_cast<double>(top1)) { top2 = top1; top1 = static_cast<float>(g); }
                     else if (g > static_cast<double>(top2)) { top2 = static_cast<float>(g); }
@@ -2888,25 +2912,30 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 uint8_t reason = 0;
                 if (em_margin < static_cast<float>(em_min_margin)) reason |= 0x2;
                 if (em_ref_neff > static_cast<float>(em_max_neff)) reason |= 0x4;
+                if (!tape_gnull.empty() && gnull > em_null_tau) reason |= 0x1;
                 em_read_results[r] = {
                     best_hit_gamma, best_hit_gamma_ancient, bitscore_best_matches_em,
-                    em_keep, em_keep_thr, em_margin, em_ref_neff, 0.0f, reason
+                    em_keep, em_keep_thr, em_margin, em_ref_neff,
+                    static_cast<float>(gnull), reason
                 };
             };
             if (tape_path) {
                 // Stream-solve directly off the O_DIRECT hot tape: base_a/base_m live on
                 // scratch NVMe, not RAM, so peak RSS is O(num_refs) + fixed I/O buffers,
-                // INDEPENDENT of alignment count. null off => null_lp/gnull_out null.
+                // INDEPENDENT of alignment count. With a null model the per-read null
+                // log-density gathered by the tape writer feeds the null column.
                 dart::TapeEMResult res = dart::tape_em_core(
                     p_tape_ref, p_tape_ba, p_tape_bm, read_offsets.data(),
                     n_reads, n_refs, static_cast<uint64_t>(em_aln_count), em_params,
-                    nullptr, nullptr, finalize_cb,
-                    em_checkpoint_path, em_resume, em_input_fp);
+                    tape_null_lp.empty() ? nullptr : tape_null_lp.data(),
+                    tape_gnull.empty() ? nullptr : tape_gnull.data(),
+                    finalize_cb, em_checkpoint_path, em_resume, em_input_fp);
                 em_state.weights = std::move(res.weights);
                 em_state.pi = res.pi;
                 em_state.w_null = res.w_null;
                 em_state.log_likelihood = res.log_likelihood;
                 em_state.iterations = res.iterations;
+                if (!tape_gnull.empty()) em_state.gamma_null = std::move(tape_gnull);
             } else {
                 em_state = dart::compact_em_map(aln_data, em_params, finalize_cb);
             }

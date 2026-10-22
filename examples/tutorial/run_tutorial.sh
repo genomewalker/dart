@@ -30,6 +30,8 @@
 #                         MMseqs2 parameters and `hits2emi --decoy-hits` fits the null into
 #                         hits.emi.null, which damage-annotate picks up by itself. Off by
 #                         default: for a study, fit one null from a few samples and reuse it.
+#   EM tape dir           an O_DIRECT-capable local dir for the EM tape; defaults to
+#                         $OUT_DIR/em_tape, override with DART_EM_TAPE_DIR (not tmpfs).
 
 set -euo pipefail
 
@@ -40,6 +42,7 @@ THREADS=${THREADS:-8}
 
 TUTORIAL_DIR="$(cd "$(dirname "$0")" && pwd)"
 OUT_DIR="${1:-$TUTORIAL_DIR/output}"
+EM_TAPE_DIR="${DART_EM_TAPE_DIR:-$OUT_DIR/em_tape}"
 
 mkdir -p "$OUT_DIR" "$OUT_DIR/tmp"
 
@@ -124,6 +127,7 @@ echo "Step 5/5: Damage annotation..."
     -o "$OUT_DIR/annotated.tsv" \
     --gene-summary "$OUT_DIR/gene_summary.tsv" \
     --auto-calibrate-spurious \
+    --em-tape-dir "$EM_TAPE_DIR" \
     -t "$THREADS" \
     -v
 echo ""

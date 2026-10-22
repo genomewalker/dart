@@ -7,7 +7,7 @@
 
 DART predicts protein-coding ORFs from ancient DNA reads, writes a damage index, and annotates protein-search alignments. Gene prediction, reference assignment and protein authentication are separate steps.
 
-> Status as of 2026-10-21: checked against the v2.0.0 release branch (libtaph `c3b3a5d`).
+> Status as of 2026-10-22: checked against the v2.0.0 release branch (libtaph `c3b3a5d`); a null model now runs the EM on the tape path.
 
 The current main branch uses EMI v7. Damage-aware prediction requires an fqdup library damage summary or explicit self-profiling. `--em-use-damage-mapping` controls the joint damage E-step; protein authentication uses library-level damage information and assigned read evidence.
 
@@ -117,7 +117,7 @@ MMseqs2 can align across them.
 |---------|---------------|-----|
 | `predict` | `--library-profile FILE` (binary TDM1 sidecar) or `--allow-self-profile` when damage detection is on | Self-profiling is unreliable on deduplicated libraries |
 | `damage-annotate` | a null model when EM is on: `<emi>.null` next to the EMI (written by `hits2emi --decoy-hits`), `--em-null-model FILE`, `--em-calib-model FILE`, or `--no-null` | Without a null model, reads from proteins absent from the database are force-mapped to the nearest homolog |
-| `damage-annotate` (with `--no-null`) | `--em-tape-dir DIR` or `DART_EM_TAPE_DIR` | With no audit, null/calibration model or damage-in-mapping flag, EM input uses an `O_DIRECT` tape; supply node-local disk supporting it. Other configurations do not require this tape. |
+| `damage-annotate` (EM on) | `--em-tape-dir DIR` or `DART_EM_TAPE_DIR` | Without `--em-calib-model` and `--em-use-damage-mapping`, EM input uses an `O_DIRECT` tape, with or without a null model (the null adds one double per read); supply node-local disk supporting it. Only the calibrated and damage-in-mapping configurations run EM in memory. |
 
 The tutorial opts into self-profiling for its bundled inputs. Its reference database is the 13,681
 proteins the reads come from, too few for chance hits: the decoy search yields a handful of hits,
@@ -144,6 +144,9 @@ default, since not every predict run feeds a search; 10 is a good value). Search
 sidecar `<emi>.null` with its provenance (dart version, inputs with size and mtime, decoy counts,
 `--db-label`). `damage-annotate` loads `<emi>.null` when it exists, after `--em-null-model` and
 `--em-calib-model`; `--no-null` is unchanged and is now the only way to run EM without a null.
+A null model keeps the EM on its streaming tape: the writer keeps one double per read (the best
+null log-density over the read's alignments) and nothing per alignment, so a null run needs the
+same `--em-tape-dir` as a `--no-null` run and no more memory.
 `dart null` pools decoy hits and sidecars into one null for a batch of samples, and
 `dart damage-info FILE.null` prints one. `damage-annotate --fit-null-from/--null-out` are gone; the
 TSV sidecar they wrote still loads through `--em-null-model` with a deprecation warning. The fit is
