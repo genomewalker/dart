@@ -114,6 +114,7 @@ echo "Step 4/5: Building EMI index and null model..."
     -o "$OUT_DIR/hits.emi" \
     --damage-index "$OUT_DIR/predictions.agd" \
     --decoy-hits "$OUT_DIR/decoy_hits.tsv" \
+    --decoy-fasta "$OUT_DIR/proteins.decoy.faa" \
     -t "$THREADS"
 echo ""
 

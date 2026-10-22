@@ -28,6 +28,7 @@ struct NullProvenance {
     uint64_t created_utc = 0;
     uint64_t n_decoy_queries = 0;
     uint64_t n_decoy_hits = 0;
+    uint64_t n_decoy_submitted = 0;   // decoys searched, with or without a hit; 0 = unknown (version 1)
     std::string db_label;
     std::vector<Input> inputs;
     bool legacy_tsv = false;   // set by read_null_model for the deprecated TSV sidecar; not written
@@ -82,5 +83,22 @@ inline int fitted_bins(const NullModel& m) { const NullFitCounts c = null_fit_co
 std::string null_fit_summary(const NullModel& m);   // "k own, p pooled, u unfit of 6 bins"
 
 void print_null_model(std::ostream& os, const NullModel& m, const NullProvenance& prov);
+
+// Number of FASTA records ('>' lines) in a plain or .gz file.
+uint64_t count_fasta_records(const std::string& path);
+
+// Denominator of the per-read chance probability: decoys submitted when the sidecar
+// records it, else decoy queries with a hit, else the sum of the per-bin counts.
+// *submitted says which of the first two was used.
+uint64_t null_decoy_denominator(const NullModel& m, const NullProvenance& prov, bool* submitted = nullptr);
+
+// P(a decoy query gets its best hit in the aligned-length bin of aln_len with a score >= bits):
+// w_b * (1 - exp(-exp(-z))), w_b = n_b / n_decoys, z = (scale*bits - mu_b) / beta_b.
+// m.mu/m.beta are raw bits times scale (annotate multiplies the sidecar by lambda_b at load).
+// NaN when the bin is unfit (beta 0) or n_decoys is 0.
+double null_chance_p(const NullModel& m, double scale, uint64_t n_decoys, float bits, uint16_t aln_len);
+
+// Raw bit score at which null_chance_p in bin b falls to p; NaN when p >= w_b or the bin is unfit.
+double null_chance_bits_at(const NullModel& m, double scale, uint64_t n_decoys, int b, double p);
 
 }  // namespace dart

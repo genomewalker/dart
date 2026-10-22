@@ -54,7 +54,7 @@ advanced=(
     --emit-multimap --multimap-k --multimap-floor
     --auto-calibrate-spurious --min-breadth --min-depth --min-reads
     --map --functional-summary --anvio-ko --annotation-source
-    --em-null-tau --em-checkpoint --resume
+    --null-p-max --em-null-tau --em-checkpoint --resume
     --ancient-threshold --modern-threshold --terminal-threshold --auth-alpha
     --modern-damage-rate --eps0 --per-read-damage-threshold --min-damage-sites
     --site-cap --w0 --em-min-prob --min-positional-score --min-terminal-ratio

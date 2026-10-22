@@ -186,12 +186,18 @@ int cmd_hits2emi(int argc, char* argv[]) {
     std::string decoy_hits_file;
     std::string null_out_file;
     std::string db_label;
+    std::string decoy_fasta_file;
+    uint64_t decoys_submitted = 0;
 
     for (int i = 1; i < argc; ++i) {
         if ((strcmp(argv[i], "--tsv") == 0 || strcmp(argv[i], "-i") == 0) && i + 1 < argc) {
             tsv_file = argv[++i];
         } else if (strcmp(argv[i], "--decoy-hits") == 0 && i + 1 < argc) {
             decoy_hits_file = argv[++i];
+        } else if (strcmp(argv[i], "--decoy-fasta") == 0 && i + 1 < argc) {
+            decoy_fasta_file = argv[++i];
+        } else if (strcmp(argv[i], "--decoys-submitted") == 0 && i + 1 < argc) {
+            decoys_submitted = std::stoull(argv[++i]);
         } else if (strcmp(argv[i], "--null-out") == 0 && i + 1 < argc) {
             null_out_file = argv[++i];
         } else if (strcmp(argv[i], "--db-label") == 0 && i + 1 < argc) {
@@ -239,6 +245,9 @@ int cmd_hits2emi(int argc, char* argv[]) {
             std::cout << "  --decoy-hits <file>    Hits of the decoy peptides predict wrote next to --fasta-aa,\n";
             std::cout << "                         searched with the real search's parameters. Fits the null\n";
             std::cout << "                         model and writes <output>.null; damage-annotate finds it\n";
+            std::cout << "  --decoy-fasta <file>   The decoy FASTA that was searched; its record count is stored\n";
+            std::cout << "                         as the decoys submitted (the null_p denominator)\n";
+            std::cout << "  --decoys-submitted <N> Decoys submitted to the search (wins over --decoy-fasta)\n";
             std::cout << "  --null-out <file>      Where the null sidecar goes (default: <output>.null)\n";
             std::cout << "  --db-label <str>       Database label recorded in the null sidecar\n";
             std::cout << "  -v, --verbose          Verbose output\n";
@@ -295,6 +304,8 @@ int cmd_hits2emi(int argc, char* argv[]) {
             uint64_t skipped = 0;
             bool by_prefix = false;
             const uint64_t taken = dart::accumulate_decoy_hits(decoy_hits_file, stats, prov, &skipped, &by_prefix);
+            prov.n_decoy_submitted = decoys_submitted ? decoys_submitted
+                : (decoy_fasta_file.empty() ? 0 : dart::count_fasta_records(decoy_fasta_file));
             const std::string null_path = null_out_file.empty() ? dart::null_sidecar_path(output_file) : null_out_file;
             std::string err;
             const dart::NullModel null_model = dart::fit_null_model(stats);
@@ -305,7 +316,8 @@ int cmd_hits2emi(int argc, char* argv[]) {
                       << (by_prefix ? "" : "; no DECOY_ prefix in the file, every query taken as a decoy")
                       << (skipped ? "; " + std::to_string(skipped) + " queries without the DECOY_ prefix ignored" : "")
                       << ") from " << decoy_hits_file << " -> " << null_path
-                      << " (" << dart::null_fit_summary(null_model) << ")\n";
+                      << " (" << dart::null_fit_summary(null_model) << "; decoys submitted: "
+                      << (prov.n_decoy_submitted ? std::to_string(prov.n_decoy_submitted) : "unknown") << ")\n";
             for (int b = 0; b < dart::kNumNullBins; ++b)
                 if (stats.n[b] < 200)
                     std::cerr << "  bin " << b << " [" << dart::kNullBinEdges[b] << "," << dart::kNullBinEdges[b + 1]

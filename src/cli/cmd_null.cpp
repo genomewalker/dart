@@ -25,6 +25,9 @@ static void null_usage() {
               << "such row is taken as all-decoy, and the count taken is printed either way.\n\n"
               << "Options:\n"
               << "  -o, --output FILE   Sidecar to write (default: <INPUT>.null with a single input)\n"
+              << "  --decoys-submitted N  Decoys submitted to the search(es), with or without a hit; the\n"
+              << "                      null_p denominator. Without it, pooled sidecars sum theirs (unknown\n"
+              << "                      if any input lacks it) and hits TSVs leave it unknown\n"
               << "  --db-label STR      Database label recorded in the sidecar; damage-annotate warns\n"
               << "                      when its own --db-label differs\n"
               << "  -h, --help          Show this help\n";
@@ -33,9 +36,12 @@ static void null_usage() {
 int cmd_null(int argc, char* argv[]) {
     std::string out, db_label;
     std::vector<std::string> inputs;
+    uint64_t decoys_submitted = 0;
     for (int i = 1; i < argc; ++i) {
         if ((strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) && i + 1 < argc) {
             out = argv[++i];
+        } else if (strcmp(argv[i], "--decoys-submitted") == 0 && i + 1 < argc) {
+            decoys_submitted = std::stoull(argv[++i]);
         } else if (strcmp(argv[i], "--db-label") == 0 && i + 1 < argc) {
             db_label = argv[++i];
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -65,6 +71,7 @@ int cmd_null(int argc, char* argv[]) {
     NullProvenance prov;
     prov.dart_version = DART_VERSION;
     prov.db_label = db_label;
+    bool submitted_known = true;   // pooled sum is valid only if every input records its count
     try {
         for (const auto& in : inputs) {
             if (is_null_sidecar(in)) {
@@ -78,12 +85,15 @@ int cmd_null(int argc, char* argv[]) {
                 stats.n_hits += p.n_decoy_hits;
                 prov.n_decoy_queries += p.n_decoy_queries;
                 prov.n_decoy_hits += p.n_decoy_hits;
+                prov.n_decoy_submitted += p.n_decoy_submitted;
+                if (p.n_decoy_submitted == 0) submitted_known = false;
                 prov.inputs.insert(prov.inputs.end(), p.inputs.begin(), p.inputs.end());
                 std::cerr << in << ": pooled " << p.n_decoy_queries << " decoy queries from sidecar\n";
             } else {
                 uint64_t skipped = 0;
                 bool by_prefix = false;
                 const uint64_t taken = accumulate_decoy_hits(in, stats, prov, &skipped, &by_prefix);
+                submitted_known = false;
                 std::cerr << in << ": " << taken << " decoy queries taken"
                           << (by_prefix ? " (DECOY_ rows" + (skipped ? "; " + std::to_string(skipped) + " queries without the prefix ignored" : std::string()) + ")"
                                         : " (no DECOY_ prefix in the file: every query taken as a decoy)")
@@ -98,6 +108,7 @@ int cmd_null(int argc, char* argv[]) {
         std::cerr << "Error: no decoy queries in the inputs\n";
         return 1;
     }
+    prov.n_decoy_submitted = decoys_submitted ? decoys_submitted : (submitted_known ? prov.n_decoy_submitted : 0);
     const NullModel m = fit_null_model(stats);
     std::string err;
     if (!write_null_model(out, m, prov, &err)) { std::cerr << "Error: " << err << "\n"; return 1; }

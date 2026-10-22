@@ -17,7 +17,7 @@ namespace {
 
 constexpr char kMagic[4]    = {'D', 'N', 'U', 'L'};
 constexpr char kMagicEnd[4] = {'L', 'U', 'N', 'D'};
-constexpr uint16_t kVersion = 1;
+constexpr uint16_t kVersion = 2;   // 2 adds n_decoy_submitted after n_decoy_hits; 1 still reads
 constexpr const char* kPrefix = "DECOY_";
 constexpr size_t kPrefixLen = 6;
 
@@ -165,6 +165,7 @@ bool write_null_model(const std::string& path, const NullModel& m,
     put<uint64_t>(b, prov.created_utc ? prov.created_utc : static_cast<uint64_t>(std::time(nullptr)));
     put<uint64_t>(b, prov.n_decoy_queries);
     put<uint64_t>(b, prov.n_decoy_hits);
+    put<uint64_t>(b, prov.n_decoy_submitted);
     put_str(b, prov.db_label);
     put<uint16_t>(b, static_cast<uint16_t>(std::min<size_t>(prov.inputs.size(), 65535)));
     for (size_t i = 0; i < prov.inputs.size() && i < 65535; ++i) {
@@ -223,8 +224,8 @@ bool read_null_model(const std::string& path, NullModel& m, NullProvenance* prov
     Cursor c{buf.data() + 4, buf.data() + buf.size() - 4};
     const uint16_t version = c.get<uint16_t>();
     c.get<uint16_t>();   // flags
-    if (version != kVersion) {
-        if (err) *err = path + ": null sidecar version " + std::to_string(version) + ", this build reads version " + std::to_string(kVersion);
+    if (version < 1 || version > kVersion) {
+        if (err) *err = path + ": null sidecar version " + std::to_string(version) + ", this build reads versions 1-" + std::to_string(kVersion);
         return false;
     }
     const uint16_t nb = c.get<uint16_t>();
@@ -246,6 +247,7 @@ bool read_null_model(const std::string& path, NullModel& m, NullProvenance* prov
     p.created_utc = c.get<uint64_t>();
     p.n_decoy_queries = c.get<uint64_t>();
     p.n_decoy_hits = c.get<uint64_t>();
+    if (version >= 2) p.n_decoy_submitted = c.get<uint64_t>();
     p.db_label = c.get_str();
     const uint16_t ni = c.get<uint16_t>();
     for (uint16_t i = 0; i < ni && c.ok; ++i) {
@@ -283,6 +285,7 @@ void print_null_model(std::ostream& os, const NullModel& m, const NullProvenance
         std::strftime(buf, sizeof buf, "%Y-%m-%d %H:%M:%S UTC", std::gmtime(&t));
         os << "created: " << buf << "\n";
         os << "decoy queries: " << prov.n_decoy_queries << " (" << prov.n_decoy_hits << " hits)\n";
+        os << "decoys submitted: " << (prov.n_decoy_submitted ? std::to_string(prov.n_decoy_submitted) : "unknown") << "\n";
         os << "db label: " << (prov.db_label.empty() ? "-" : prov.db_label) << "\n";
         for (const auto& in : prov.inputs) os << "input: " << in.path << " size=" << in.size << " mtime=" << in.mtime << "\n";
     }
@@ -291,6 +294,51 @@ void print_null_model(std::ostream& os, const NullModel& m, const NullProvenance
     for (size_t b = 0; b < m.mu.size(); ++b)
         os << b << '\t' << kNullBinEdges[b] << '\t' << kNullBinEdges[b + 1] << '\t' << m.n[b] << '\t'
            << std::setprecision(6) << m.mu[b] << '\t' << m.beta[b] << '\n';
+}
+
+uint64_t count_fasta_records(const std::string& path) {
+    ChunkedFileReader reader(path);
+    uint64_t n = 0;
+    while (true) {
+        const std::string_view line = reader.next_line();
+        if (line.data() == nullptr) break;   // a blank line is an empty view into the buffer, EOF is {}
+        if (!line.empty() && line[0] == '>') ++n;
+    }
+    return n;
+}
+
+uint64_t null_decoy_denominator(const NullModel& m, const NullProvenance& prov, bool* submitted) {
+    if (submitted) *submitted = prov.n_decoy_submitted > 0;
+    if (prov.n_decoy_submitted > 0) return prov.n_decoy_submitted;
+    if (prov.n_decoy_queries > 0) return prov.n_decoy_queries;
+    uint64_t n = 0;
+    for (uint32_t v : m.n) n += v;
+    return n;
+}
+
+namespace {
+bool chance_bin(const NullModel& m, uint64_t n_decoys, int b, double& w) {
+    if (b < 0 || b >= static_cast<int>(m.beta.size()) || b >= static_cast<int>(m.n.size())) return false;
+    if (!(m.beta[b] > 0.0f) || n_decoys == 0) return false;
+    w = static_cast<double>(m.n[b]) / static_cast<double>(n_decoys);
+    return true;
+}
+}  // namespace
+
+double null_chance_p(const NullModel& m, double scale, uint64_t n_decoys, float bits, uint16_t aln_len) {
+    const int b = null_length_bin(aln_len);
+    double w = 0.0;
+    if (!chance_bin(m, n_decoys, b, w)) return std::numeric_limits<double>::quiet_NaN();
+    const double z = (scale * static_cast<double>(bits) - m.mu[b]) / m.beta[b];
+    const double tail = (z <= -40.0) ? 1.0 : -std::expm1(-std::exp(-z));
+    return w * tail;
+}
+
+double null_chance_bits_at(const NullModel& m, double scale, uint64_t n_decoys, int b, double p) {
+    double w = 0.0;
+    if (!chance_bin(m, n_decoys, b, w) || !(p < w) || !(p > 0.0)) return std::numeric_limits<double>::quiet_NaN();
+    const double z = -std::log(-std::log1p(-p / w));
+    return (m.mu[b] + m.beta[b] * z) / scale;
 }
 
 }  // namespace dart
