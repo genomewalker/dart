@@ -202,7 +202,8 @@ both. The training set is now up to 50,000 reads that are 60 to 200 bp after cli
 k-th such read across the whole input (k = their count / 50,000), collected in file
 order on one thread; genes are written in input order. Repeated runs at `-t 32` and a run at
 `-t 1` are byte-identical. The sample costs one extra single-threaded decode of the input,
-reported on stderr as `EM training set`.
+reported on stderr as `EM training set`. Gene calls therefore differ from earlier versions on
+every library; rerun `predict` before comparing or pooling libraries across versions.
 
 ---
 
