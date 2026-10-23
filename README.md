@@ -7,7 +7,7 @@
 
 DART predicts protein-coding ORFs from ancient DNA reads, writes a damage index, and annotates protein-search alignments. Gene prediction, reference assignment and protein authentication are separate steps.
 
-> Status as of 2026-10-22: checked against the v2.0.0 release branch (libtaph `c3b3a5d`); a null model now runs the EM on the tape path. The decoy null now rejects reads by their chance probability (`null_p`, `--null-p-max`, sidecar version 2); the 0.01 default is under review.
+> Status as of 2026-10-23: checked against the v2.0.0 release branch (libtaph `c3b3a5d`); a null model now runs the EM on the tape path. The decoy null now rejects reads by their chance probability (`null_p`, `--null-p-max`, sidecar version 2); the default `--null-p-max` is 0.05.
 
 The current main branch uses EMI v7. Damage-aware prediction requires an fqdup library damage summary or explicit self-profiling. `--em-use-damage-mapping` controls the joint damage E-step; protein authentication uses library-level damage information and assigned read evidence.
 
@@ -109,14 +109,15 @@ range changes.
 The null rejects reads by chance probability. For each read's best hit, `null_p` is the
 probability that a decoy query gets its best hit in the same aligned-length bin with at least
 that bit score: `w_b · (1 − exp(−exp(−(bits − mu_b)/beta_b)))`, where `w_b` is the share of submitted
-decoys whose best hit landed in bin `b`. A read with `null_p > --null-p-max` (default 0.01) gets
+decoys whose best hit landed in bin `b`. A read with `null_p > --null-p-max` (default 0.05) gets
 reject bit `1` and is ambiguous: it leaves the authentication evidence but stays in the
 modern-baseline pool, so `q_modern` and the other reads' posteriors do not move. Give the
 decoy count with `--decoy-fasta` (or `--decoys-submitted N`; `dart null` takes the latter); without
 it `w_b` is per decoy with a hit, which overstates chance. At the end damage-annotate prints one
 `null reject:` line per bin with the reads, the share flagged and `S*`, the bit score below which
 that bin's reads are flagged (`NA` where `w_b ≤ --null-p-max`, so the bin never flags). Check these
-lines: on short peptides the 7-12 aa bins can flag most reads.
+lines: only a bin holding more than `--null-p-max` of the decoys can flag, which at 0.05 on a
+large protein database is usually just the 10-12 aa bin. A smaller value flags more reads.
 
 The workflow and output interpretation are on the wiki:
 [Quick Start Tutorial](https://github.com/genomewalker/dart/wiki/Quick-Start-Tutorial).

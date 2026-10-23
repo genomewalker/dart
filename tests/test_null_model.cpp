@@ -364,7 +364,7 @@ void test_hits2emi_and_annotate(const std::string& dart, const std::string& tut,
     const std::string so = dir + "/so.emi";
     expect(run(dart + " damage-annotate --emi " + so + " -o " + dir + "/tape.tsv" + common, dir + "/tape.log") == 0, "annotate (tape) exits 0");
     expect(run(dart + " damage-annotate --emi " + so + " -o " + dir + "/ram.tsv --em-use-damage-mapping" + common, dir + "/ram.log") == 0, "annotate (in-RAM) exits 0");
-    expect(slurp(dir + "/tape.log").find("reject null_p > 0.01 per submitted decoy") != std::string::npos, "Null model line names the rule");
+    expect(slurp(dir + "/tape.log").find("reject null_p > 0.05 per submitted decoy") != std::string::npos, "Null model line names the rule");
     expect(slurp(dir + "/tape.log").find("null reject: bin 10-12") != std::string::npos, "per-bin null reject lines");
     std::vector<std::string> ht, hr;
     const auto rt = read_table(dir + "/tape.tsv", ht), rr = read_table(dir + "/ram.tsv", hr);
