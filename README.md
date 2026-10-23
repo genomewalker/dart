@@ -221,6 +221,15 @@ parallel rapidgzip decoder is gone: fqdup dropped it after it silently truncated
 on network storage. A `.gz` that ends mid-stream is now an error. `dart profile` peak memory on
 a 2M-read library fell from 1.21 GB to 0.53 GB at `-t 32`.
 
+**EM-weighted abundance.** Protein and gene summaries credit each retained candidate to its
+own reference with that candidate's EM responsibility (`gamma`). Use `eff_reads` for abundance;
+`n_reads` counts candidate assignments and can sum to more than the input read count. Weights
+are not renormalized after candidate filtering, so discarded candidates lose their mass.
+This applies without `--emit-multimap`; that flag changes per-read output, not summary credit.
+Library-wide damage statistics still use one best-hit alignment per read. `--no-em` retains
+best-hit assignment. The integer authentication counts `auth_binom_k` and `auth_binom_n` are
+not abundance columns.
+
 **`.dcx` sort scratch.** `damage-annotate --dcx` sorts in memory up to 8 GiB and spills sorted
 runs past that to `--em-tape-dir` (or `DART_EM_TAPE_DIR`). That directory must be on node-local
 disk: NFS, tmpfs and `/tmp` are refused. The `dcx_streaming` test spills under `$TMPDIR`, so run

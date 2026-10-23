@@ -220,6 +220,221 @@ static bool test_em_target_gamma_consistency(const std::string& dart_bin, const 
 }
 
 
+static bool test_multimap_summary_invariance(const std::string& dart_bin, const std::string& tmpdir) {
+    std::cout << "Running multimap summary invariance regression...\n";
+    std::ostringstream hits;
+    hits << "shared_+_0\tprotA\t0.833\t9\t1\t0\t1\t6\t1\t6\t1e-20\t100\t6\t100\tWAAAAA\tRAAAAA\n";
+    hits << "shared_+_0\tprotB\t0.833\t9\t1\t0\t1\t6\t1\t6\t1e-20\t99\t6\t100\tWAAAAA\tRAAAAA\n";
+    for (int i = 0; i < 40; ++i)
+        hits << "anchor" << i << "_+_0\tprotB\t1\t6\t0\t0\t1\t6\t1\t6\t1e-20\t100\t6\t100\tRAAAAA\tRAAAAA\n";
+    for (int i = 0; i < 5; ++i)
+        hits << "anchorA" << i << "_+_0\tprotA\t1\t6\t0\t0\t1\t6\t1\t6\t1e-20\t100\t6\t100\tRAAAAA\tRAAAAA\n";
+    std::string err;
+    const std::string emi = tmpdir + "/multimap.emi";
+    if (!write_file(tmpdir + "/multimap.tsv", hits.str(), err) ||
+        !convert_hits_to_emi(dart_bin, tmpdir + "/multimap.tsv", emi, err)) {
+        std::cerr << err << "\n";
+        return false;
+    }
+    std::array<std::string, 2> expected;
+    for (int mode = 0; mode < 4; ++mode) {
+        const std::string prefix = tmpdir + "/multimap_" + std::to_string(mode);
+        std::string out;
+        const std::string cmd = shell_quote(dart_bin) + " damage-annotate --no-null -i " + shell_quote(emi) +
+            " --d-max 0.3 --min-reads 1 --min-breadth 0 --min-depth 0"
+            " --min-positional-score 0 --min-terminal-ratio 0 -t " + ((mode & 1) ? "4" : "1") +
+            ((mode & 2) ? " --emit-multimap --multimap-k 1" : "") +
+            " -o " + shell_quote(prefix + ".reads") +
+            " --protein-summary " + shell_quote(prefix + ".protein") +
+            " --gene-summary " + shell_quote(prefix + ".gene");
+        if (!run_command_capture(cmd, out, err)) {
+            std::cerr << err << "\n";
+            return false;
+        }
+        int table = 0;
+        for (const auto& suffix : {".protein", ".gene"}) {
+            std::string text;
+            if (!read_file(prefix + suffix, text, err)) return false;
+            if (mode == 0) expected[table] = text;
+            else if (!expect(text == expected[table],
+                             "multimap/thread mode " + std::to_string(mode) + suffix + " must match best-hit summary"))
+                return false;
+            ++table;
+        }
+    }
+    return true;
+}
+
+static bool test_soft_credit_mass(const std::string& dart_bin, const std::string& tmpdir) {
+    std::cout << "Running soft-credit mass regression...\n";
+    std::ostringstream hits;
+    for (const auto& target : {"protA", "protB"}) {
+        hits << "damaged_+_0\t" << target << "\t0.833\t6\t1\t0\t1\t6\t1\t6\t1e-20\t100\t6\t100\tWAAAAA\tRAAAAA\n";
+        hits << "clean_+_0\t" << target << "\t1\t6\t0\t0\t1\t6\t1\t6\t1e-20\t100\t6\t100\tRAAAAA\tRAAAAA\n";
+        hits << "unique_" << target << "_+_0\t" << target << "\t1\t6\t0\t0\t1\t6\t1\t6\t1e-20\t100\t6\t100\tRAAAAA\tRAAAAA\n";
+    }
+    std::string err;
+    const std::string emi = tmpdir + "/credit.emi";
+    if (!write_file(tmpdir + "/credit.tsv", hits.str(), err) ||
+        !convert_hits_to_emi(dart_bin, tmpdir + "/credit.tsv", emi, err)) {
+        std::cerr << err << "\n";
+        return false;
+    }
+    std::array<std::string, 2> expected;
+    for (int mode = 0; mode < 4; ++mode) {
+        const std::string prefix = tmpdir + "/credit_" + std::to_string(mode);
+        std::string out;
+        const std::string cmd = shell_quote(dart_bin) + " damage-annotate --no-null -i " + shell_quote(emi) +
+            " --d-max 0.3 --min-reads 1 --min-breadth 0 --min-depth 0"
+            " --min-positional-score 0 --min-terminal-ratio 0 -t " + ((mode & 1) ? "4" : "1") +
+            ((mode & 2) ? " --emit-multimap" : "") +
+            " -o " + shell_quote(prefix + ".reads") +
+            " --protein-summary " + shell_quote(prefix + ".protein") +
+            " --gene-summary " + shell_quote(prefix + ".gene");
+        if (!run_command_capture(cmd, out, err)) {
+            std::cerr << err << "\n";
+            return false;
+        }
+        int table = 0;
+        for (const auto& suffix : {".protein", ".gene"}) {
+            std::string text;
+            Table parsed;
+            if (!read_file(prefix + suffix, text, err) || !parse_table(text, parsed, err)) return false;
+            if (!expect(parsed.rows.size() == 2, "both candidate targets must receive credit")) return false;
+            for (const auto& row : parsed.rows) {
+                const auto fields = row_to_map(parsed, row);
+                if (!expect(std::stod(fields.at("n_reads")) == 3.0,
+                            "each target must count two shared assignments and one unique assignment")) return false;
+                if (!expect(std::stod(fields.at("eff_reads")) == 2.0,
+                            "each target must receive 0.5 + 0.5 + 1.0 credit; total mass must be four reads")) return false;
+                if (!expect(std::stod(fields.at(table == 0 ? "assign_eff_damage_reads" : "eff_damage_reads")) == 0.5,
+                            "the mismatched shared read must contribute its own gamma to damage mass")) return false;
+            }
+            if (mode == 0) expected[table] = text;
+            else if (!expect(text == expected[table], "soft credit must be independent of threads and multimap output"))
+                return false;
+            ++table;
+        }
+    }
+    return true;
+}
+
+static bool test_multimap_candidate_gamma(const std::string& dart_bin, const std::string& tmpdir) {
+    std::cout << "Running multimap candidate-gamma regression...\n";
+    std::ostringstream hits;
+    hits << "shared_+_0\tprotA\t0.833\t6\t1\t0\t1\t6\t1\t6\t1e-20\t100\t6\t100\tWAAAAA\tRAAAAA\n";
+    hits << "shared_+_0\tprotB\t0.833\t6\t1\t0\t1\t6\t1\t6\t1e-20\t99\t6\t100\tWAAAAA\tRAAAAA\n";
+    for (int i = 0; i < 45; ++i)
+        hits << "anchor" << i << "_+_0\t" << (i < 5 ? "protA" : "protB")
+             << "\t1\t6\t0\t0\t1\t6\t1\t6\t1e-20\t100\t6\t100\tRAAAAA\tRAAAAA\n";
+    std::string err;
+    const std::string emi = tmpdir + "/candidate_gamma.emi";
+    if (!write_file(tmpdir + "/candidate_gamma.tsv", hits.str(), err) ||
+        !convert_hits_to_emi(dart_bin, tmpdir + "/candidate_gamma.tsv", emi, err)) return false;
+
+    dart::AgdHeader header{};
+    header.magic = dart::AGD_MAGIC;
+    header.version = dart::AGD_VERSION;
+    header.num_records = header.num_buckets = 1;
+    header.d_max = header.d_max_5prime = header.d_max_3prime = 0.3f;
+    header.lambda = header.lambda_5prime = header.lambda_3prime = 0.3f;
+    header.pi_point = header.damage_prior_point = 0.5;
+    header.d_max_cooc_point = 0.3;
+    header.library_type = 2;
+    header.damage_validated = header.channel_b_valid = 1;
+    header.pi_state = header.damage_prior_state = 0;
+    dart::AgdRecord record{};
+    record.id_hash = dart::fnv1a_hash("shared");
+    record.seq_len = 18;
+    record.p_damaged_q = 204;
+    std::memset(record.codons_5prime, 255, sizeof(record.codons_5prime));
+    std::memset(record.codons_3prime, 255, sizeof(record.codons_3prime));
+    const uint32_t bucket = 0, end = UINT32_MAX;
+    const std::string agd = tmpdir + "/candidate_gamma.agd";
+    std::ofstream index(agd, std::ios::binary);
+    index.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    index.write(reinterpret_cast<const char*>(&bucket), sizeof(bucket));
+    index.write(reinterpret_cast<const char*>(&record), sizeof(record));
+    index.write(reinterpret_cast<const char*>(&end), sizeof(end));
+    index.close();
+    if (!expect(static_cast<bool>(index), "synthetic damage index must be written")) return false;
+
+    for (int threads : {1, 4}) {
+        std::string out;
+        const std::string cmd = shell_quote(dart_bin) + " damage-annotate --no-null -i " + shell_quote(emi) +
+            " --damage-index " + shell_quote(agd) + " --emit-multimap --multimap-floor 0 -t " +
+            std::to_string(threads);
+        if (!run_command_capture(cmd, out, err)) { std::cerr << err << "\n"; return false; }
+        Table table;
+        if (!parse_table(out, table, err)) return false;
+        std::unordered_map<std::string, double> gamma;
+        for (const auto& row : table.rows) {
+            const auto fields = row_to_map(table, row);
+            if (fields.at("query_id") != "shared_+_0") continue;
+            const double g = std::stod(fields.at("gamma"));
+            const double ga = std::stod(fields.at("gamma_ancient"));
+            gamma.emplace(fields.at("target_id"), g);
+            if (!expect(std::fabs(ga - 0.8 * g) < 1e-6,
+                        "candidate ancient gamma must equal its own gamma times the read posterior")) return false;
+        }
+        if (!expect(gamma.size() == 2, "both shared-read candidates must be emitted")) return false;
+        if (!expect(gamma.at("protB") > gamma.at("protA"), "EM-supported alternative must have its own larger gamma")) return false;
+        if (!expect(std::fabs(gamma.at("protA") + gamma.at("protB") - 1.0) < 1e-6,
+                    "multimap candidate gamma must sum to one across both targets")) return false;
+    }
+    return true;
+}
+
+static bool test_calibrated_credit_rejection(const std::string& dart_bin, const std::string& tmpdir) {
+    std::cout << "Running calibrated soft-credit rejection regression...\n";
+    std::ostringstream calibration;
+    calibration << "#dart-calib\tv1\tcensor=0\n";
+    for (int bin = 0; bin < 6; ++bin)
+        calibration << "null\t" << bin << "\t0\t1000\t50\t10\t100\n";
+    for (int bin = 0; bin < 6; ++bin)
+        calibration << "true\t" << bin << "\t1\t100\t10\t0\t100\t10\t100\n";
+    std::string err;
+    const std::string calib = tmpdir + "/credit.calib";
+    if (!write_file(calib, calibration.str(), err)) return false;
+    for (int best_bits : {55, 75}) {
+        const std::string prefix = tmpdir + "/calibrated_" + std::to_string(best_bits);
+        std::ostringstream hits;
+        for (int delta : {0, 1})
+            hits << "reassigned_+_0\t" << (delta == 0 ? "protA" : "protB")
+                 << "\t0.833\t6\t1\t0\t1\t6\t1\t6\t1e-20\t" << best_bits - delta
+                 << "\t6\t100\tWAAAAA\tRAAAAA\n";
+        // Clean anchors are calibrated KEEP; only their assignments may survive.
+        for (int i = 0; i < 40; ++i)
+            hits << "anchor" << i << "_+_0\tprotB\t1\t6\t0\t0\t1\t6\t1\t6\t1e-20\t100\t6\t100\tRAAAAA\tRAAAAA\n";
+        if (!write_file(prefix + ".tsv", hits.str(), err) ||
+            !convert_hits_to_emi(dart_bin, prefix + ".tsv", prefix + ".emi", err)) return false;
+        std::string out;
+        const std::string cmd = shell_quote(dart_bin) + " damage-annotate -i " + shell_quote(prefix + ".emi") +
+            " --em-calib-model " + shell_quote(calib) + " --em-min-prob 0.0001 --multimap-floor 0 --d-max 0.3 -t 1"
+            " --min-reads 1 --min-breadth 0 --min-depth 0 --min-positional-score 0 --min-terminal-ratio 0"
+            " --protein-summary " + shell_quote(prefix + ".protein");
+        if (!run_command_capture(cmd, out, err)) { std::cerr << err << "\n"; return false; }
+        Table table;
+        std::unordered_map<std::string, std::string> row;
+        if (!parse_table(out, table, err) || !get_row_for_query(table, "reassigned_+_0", row)) return false;
+        if (!expect(std::stod(row.at("gamma")) < std::stod(row.at("em_keep_threshold")),
+                    "calibrated fixture must put the bitscore-best target below the keep threshold")) return false;
+        const int reason = std::stoi(row.at("em_reject_reason"));
+        if (!expect((reason & (best_bits == 55 ? 1 : 8)) != 0 && row.at("em_keep") == "0",
+                    "calibrated fixture must exercise read-level reject and abstain")) return false;
+        std::string protein;
+        Table proteins;
+        if (!read_file(prefix + ".protein", protein, err) || !parse_table(protein, proteins, err)) return false;
+        if (!expect(proteins.rows.size() == 1, "calibrated fixture must retain only the clean anchor target")) return false;
+        const auto fields = row_to_map(proteins, proteins.rows.front());
+        if (!expect(fields.at("protein_id") == "protB" && std::stod(fields.at("n_reads")) == 40.0 &&
+                    std::stod(fields.at("assign_n_damage_reads")) == 0.0 &&
+                    std::stod(fields.at("assign_eff_damage_reads")) == 0.0,
+                    "calibrated reject or abstain must not leak candidate credit")) return false;
+    }
+    return true;
+}
+
 static bool test_protein_mapping_filters(const std::string& dart_bin, const std::string& tmpdir) {
     std::cout << "Running protein mapping filter regression...\n";
     const std::string hits_path = tmpdir + "/mapping_hits.tsv";
@@ -496,6 +711,18 @@ int main(int argc, char* argv[]) {
     setenv("DART_EM_TAPE_DIR", (tmpdir + "/emtape").c_str(), 0);
 
     bool ok = true;
+    if (argc == 3 && std::string(argv[2]) == "--multimap-only")
+        return test_multimap_summary_invariance(dart_bin, tmpdir) ? 0 : 1;
+    if (argc == 3 && std::string(argv[2]) == "--soft-credit-only")
+        return test_soft_credit_mass(dart_bin, tmpdir) ? 0 : 1;
+    if (argc == 3 && std::string(argv[2]) == "--multimap-gamma-only")
+        return test_multimap_candidate_gamma(dart_bin, tmpdir) ? 0 : 1;
+    if (argc == 3 && std::string(argv[2]) == "--calibrated-credit-only")
+        return test_calibrated_credit_rejection(dart_bin, tmpdir) ? 0 : 1;
+    ok = test_multimap_candidate_gamma(dart_bin, tmpdir) && ok;
+    ok = test_calibrated_credit_rejection(dart_bin, tmpdir) && ok;
+    ok = test_multimap_summary_invariance(dart_bin, tmpdir) && ok;
+    ok = test_soft_credit_mass(dart_bin, tmpdir) && ok;
     ok = test_em_target_gamma_consistency(dart_bin, tmpdir) && ok;
     ok = test_protein_mapping_filters(dart_bin, tmpdir) && ok;
     ok = test_refine_damage_zero_mismatch_denominator(dart_bin, tmpdir) && ok;
