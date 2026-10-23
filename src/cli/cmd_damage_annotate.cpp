@@ -1268,8 +1268,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // Null/noise component (spurious short-peptide rejection). Off by default.
     std::string em_null_model_file;  // .null sidecar (or deprecated TSV); default <emi>.null when present
     double em_null_tau = 0.5;        // calibrated path: reject read when gamma_null > tau
-    double null_p_max = 0.05;        // uncalibrated path: reject read when null_p > this
+    double null_p_max = 0.05;        // --null-p-max: reject read when null_p > this (opt-in)
     bool null_p_max_set = false;
+    double null_fdr = 0.05;          // default rule: reject read when its per-bin target-decoy q > this
+    bool null_fdr_set = false;
+    uint64_t null_queries = 0;       // queries searched (FDR scale); default: damage index records
 
     // Coherent-LR calibration (f_true + f_0). When loaded, the real EM component
     // becomes the normalized true-hit density log f_true(bit|Lbin) and the null
@@ -1368,6 +1371,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--null-p-max") == 0 && i + 1 < argc) {
             null_p_max = std::stod(argv[++i]);
             null_p_max_set = true;
+        } else if (strcmp(argv[i], "--null-fdr") == 0 && i + 1 < argc) {
+            null_fdr = std::stod(argv[++i]);
+            null_fdr_set = true;
+        } else if (strcmp(argv[i], "--null-queries") == 0 && i + 1 < argc) {
+            null_queries = std::stoull(argv[++i]);
         } else if (strcmp(argv[i], "--no-coverage-em") == 0) {
             // Kept for scripts: asks for the only behaviour there is.
         } else if (strcmp(argv[i], "--prior-ancient") == 0 && i + 1 < argc) {
@@ -1529,8 +1537,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 "Null model:\n"
                 "  --em-null-model FILE          .null sidecar from hits2emi --decoy-hits or dart null\n"
                 "                                (default: <emi>.null when it exists)\n"
-                "  --null-p-max P                Reject a read when the chance that a decoy scores as\n"
-                "                                high in its aligned-length bin exceeds P (default: 0.05)\n"
+                "  --null-fdr Q                  Reject a read as a chance hit when its per-bin target-decoy\n"
+                "                                q-value exceeds Q (default: 0.05; the default rule)\n"
+                "  --null-queries N              Queries searched, the FDR scale (default: damage index records)\n"
+                "  --null-p-max P                Instead of --null-fdr: reject a read when the chance that a\n"
+                "                                decoy scores as high in its aligned-length bin exceeds P\n"
                 "  --em-null-tau FLOAT           Null responsibility cutoff, calibrated null column only\n"
                 "                                (--em-calib-model; default: 0.5)\n"
                 "Resume:\n"
@@ -1583,6 +1594,14 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         std::cerr << "Error: --null-p-max must be in [0,1]\n";
         return 1;
     }
+    if (!(null_fdr >= 0.0 && null_fdr <= 1.0)) {
+        std::cerr << "Error: --null-fdr must be in [0,1]\n";
+        return 1;
+    }
+    if (null_fdr_set && null_p_max_set) {
+        std::cerr << "Error: --null-fdr and --null-p-max are two reject rules; give one\n";
+        return 1;
+    }
 
     // Load the empirical null model (Gumbel per length bin) if requested.
     // use_em_null gates the whole null path; disabled → zero behavior change.
@@ -1595,6 +1614,17 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
     // null_p (the per-read chance rule) reads the model on the scale it was loaded at:
     // em_null_model.mu = raw bits * null_p_scale. N is its decoy denominator.
+    // Reject rule for bit 0x1 on the uncalibrated path: the per-bin target-decoy FDR by default,
+    // which needs the number of queries searched (--null-queries, else the damage index record
+    // count: one record per predicted protein); --null-p-max, or no way to count queries, selects
+    // the fixed chance-probability rule.
+    const bool use_null_fdr = !null_p_max_set && (null_queries > 0 || !damage_index_file.empty());
+    auto null_rule_text = [&] {
+        std::ostringstream s;
+        if (use_null_fdr) s << "reject per-bin target-decoy q > " << null_fdr;
+        else s << "reject null_p > " << null_p_max;
+        return s.str();
+    };
     dart::NullProvenance em_null_prov;
     double null_p_scale = 1.0;
     uint64_t null_p_n = 0;
@@ -1616,8 +1646,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         use_em_null = em_null_model.valid();
         const int fitted = dart::fitted_bins(em_null_model);
         std::cerr << "Null model: " << em_null_model_file << " (" << em_null_source << ", "
-                  << dart::null_fit_summary(em_null_model) << "; reject null_p > " << null_p_max
+                  << dart::null_fit_summary(em_null_model) << "; " << null_rule_text()
                   << (null_p_per_submitted ? " per submitted decoy" : " per decoy with a hit") << ")\n";
+        if (!use_null_fdr && !null_p_max_set)
+            std::cerr << "Warning: no --damage-index or --null-queries, so the number of queries searched is\n"
+                         "  unknown and the per-bin FDR rule cannot run; rejecting by null_p > "
+                      << null_p_max << " instead.\n";
         if (fitted == 0)
             std::cerr << "Warning: no null bin is fitted (the decoy hits gave no finite Gumbel: fewer than two\n"
                          "  queries or zero variance): chance hits are too rare at this database size and search\n"
@@ -1649,8 +1683,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                       << em_calib_model.censor << ") from " << em_calib_model_file << "\n";
         }
     }
-    if (null_p_max_set && !use_em_null)
-        std::cerr << "Warning: --null-p-max has no effect without a null model (--em-null-model or <emi>.null)\n";
+    if ((null_p_max_set || null_fdr_set || null_queries) && !use_em_null)
+        std::cerr << "Warning: --null-fdr, --null-queries and --null-p-max have no effect without a null model "
+                     "(--em-null-model or <emi>.null)\n";
     if (w0 < 0.0f || w0 > 1.0f) {
         std::cerr << "Error: --w0 must be in [0, 1]\n";
         return 1;
@@ -2490,7 +2525,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     std::vector<EmReadResult> em_read_results(n_reads);
     // Null chance rule, per null bin: reads with a best hit and reads flagged by null_p.
     std::array<uint64_t, dart::kNumNullBins> null_bin_reads{}, null_bin_flagged{};
+    std::array<float, dart::kNumNullBins> null_bin_kept_min{};   // FDR rule: lowest kept best-hit bits
+    null_bin_kept_min.fill(std::numeric_limits<float>::infinity());
     bool null_p_ran = false;
+    bool null_fdr_ran = false;
     // True when damage-aware EM was active and gamma_ancient was actually populated.
     // Used by --refine-damage to avoid falling back to total gamma for modern reads.
     // Atomic because it may be set inside the parallel streaming_em_finalize callback.
@@ -3156,6 +3194,14 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         // tape and in-RAM paths. On the uncalibrated path it alone sets reject bit 0x1.
         if (use_em_null && null_p_n > 0) {
             null_p_ran = true;
+            if (use_null_fdr && null_queries == 0 && damage_index) null_queries = damage_index->record_count();
+            const bool fdr_rule = use_null_fdr && !use_em_calib && null_queries > 0;
+            if (use_null_fdr && !use_em_calib && null_queries == 0)
+                std::cerr << "Warning: the damage index did not load, so the number of queries searched is unknown;\n"
+                             "  rejecting by null_p > " << null_p_max << " instead of the per-bin FDR.\n";
+            null_fdr_ran = fdr_rule;
+            std::vector<float> fdr_bits; std::vector<uint16_t> fdr_len; std::vector<uint8_t> fdr_has;
+            if (fdr_rule) { fdr_bits.resize(n_reads); fdr_len.resize(n_reads); fdr_has.assign(n_reads, 0); }
             for (uint32_t r = 0; r < n_reads; ++r) {
                 const auto& bh = best_hits[r];
                 if (!bh.has) continue;
@@ -3164,9 +3210,24 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 er.null_p = static_cast<float>(p);
                 const int b = dart::null_length_bin(bh.aln_len);
                 ++null_bin_reads[b];
-                if (!use_em_calib && p > null_p_max) {
+                if (fdr_rule) { fdr_bits[r] = bh.bits; fdr_len[r] = bh.aln_len; fdr_has[r] = 1; }
+                else if (!use_em_calib && p > null_p_max) {
                     er.em_reject_reason |= 0x1;
                     ++null_bin_flagged[b];
+                }
+            }
+            if (fdr_rule) {
+                const std::vector<double> q = dart::null_fdr_q(em_null_model, null_p_scale, null_p_n, null_queries,
+                                                               fdr_bits, fdr_len, fdr_has);
+                for (uint32_t r = 0; r < n_reads; ++r) {
+                    if (!fdr_has[r]) continue;
+                    const int b = dart::null_length_bin(fdr_len[r]);
+                    if (q[r] > null_fdr) {
+                        em_read_results[r].em_reject_reason |= 0x1;
+                        ++null_bin_flagged[b];
+                    } else {
+                        null_bin_kept_min[b] = std::min(null_bin_kept_min[b], fdr_bits[r]);
+                    }
                 }
             }
         }
@@ -3729,21 +3790,33 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         // modern-baseline pool but leave the authentication evidence. Count them apart.
         uint64_t flagged = 0, flagged_no_row = 0, with_hit = 0;
         for (uint32_t r = 0; r < n_reads; ++r) {
-            if (!(em_read_results[r].null_p > null_p_max)) continue;
+            if (!(em_read_results[r].em_reject_reason & 0x1)) continue;
             ++flagged;
             if (summary_index_by_read[r] < 0) ++flagged_no_row;
         }
         for (int b = 0; b < dart::kNumNullBins; ++b) {
             with_hit += null_bin_reads[b];
-            const double s = dart::null_chance_bits_at(em_null_model, null_p_scale, null_p_n, b, null_p_max);
             std::ostringstream line;
             line << "null reject: bin " << dart::kNullBinEdges[b] << "-";
             if (b + 1 < dart::kNumNullBins) line << (dart::kNullBinEdges[b + 1] - 1); else line << "inf";
             line << " reads=" << null_bin_reads[b] << " flagged=" << null_bin_flagged[b] << " ("
                  << std::fixed << std::setprecision(2)
-                 << (null_bin_reads[b] ? 100.0 * null_bin_flagged[b] / null_bin_reads[b] : 0.0)
-                 << "%) bits at null_p=" << std::defaultfloat << null_p_max << ": ";
-            if (std::isfinite(s)) line << std::fixed << std::setprecision(1) << s; else line << "NA";
+                 << (null_bin_reads[b] ? 100.0 * null_bin_flagged[b] / null_bin_reads[b] : 0.0) << "%)";
+            if (null_fdr_ran) {
+                // chance = expected chance best hits among all queries searched: Q * w_b.
+                const bool fitted = em_null_model.beta[b] > 0.0f;
+                const double chance = static_cast<double>(null_queries) * em_null_model.n[b] / static_cast<double>(null_p_n);
+                line << " chance=";
+                if (fitted) line << std::setprecision(1) << chance; else line << "NA";
+                line << " bits at null_fdr=" << std::defaultfloat << null_fdr << ": ";
+                if (null_bin_flagged[b] == 0) line << "NA";
+                else if (std::isfinite(null_bin_kept_min[b])) line << std::fixed << std::setprecision(1) << null_bin_kept_min[b];
+                else line << "all";
+            } else {
+                const double s = dart::null_chance_bits_at(em_null_model, null_p_scale, null_p_n, b, null_p_max);
+                line << " bits at null_p=" << std::defaultfloat << null_p_max << ": ";
+                if (std::isfinite(s)) line << std::fixed << std::setprecision(1) << s; else line << "NA";
+            }
             std::cerr << line.str() << "\n";
         }
         std::ostringstream total;

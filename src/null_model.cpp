@@ -1,6 +1,7 @@
 #include "dart/null_model.hpp"
 #include "dart/fast_columnar_writer.hpp"   // ChunkedFileReader (plain or .gz, skips the header)
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <ctime>
@@ -339,6 +340,36 @@ double null_chance_bits_at(const NullModel& m, double scale, uint64_t n_decoys, 
     if (!chance_bin(m, n_decoys, b, w) || !(p < w) || !(p > 0.0)) return std::numeric_limits<double>::quiet_NaN();
     const double z = -std::log(-std::log1p(-p / w));
     return (m.mu[b] + m.beta[b] * z) / scale;
+}
+
+std::vector<double> null_fdr_q(const NullModel& m, double scale, uint64_t n_decoys, uint64_t n_queries,
+                               const std::vector<float>& bits, const std::vector<uint16_t>& aln_len,
+                               const std::vector<uint8_t>& has) {
+    std::vector<double> q(bits.size(), std::numeric_limits<double>::quiet_NaN());
+    if (n_queries == 0) return q;
+    std::vector<std::vector<size_t>> by_bin(kNumNullBins);
+    for (size_t i = 0; i < bits.size(); ++i) {
+        double w = 0.0;
+        const int b = null_length_bin(aln_len[i]);
+        if (has[i] && chance_bin(m, n_decoys, b, w)) by_bin[b].push_back(i);
+    }
+    std::vector<double> fdr;
+    for (auto& idx : by_bin) {
+        std::sort(idx.begin(), idx.end(), [&](size_t a, size_t c) { return bits[a] > bits[c]; });
+        fdr.assign(idx.size(), 0.0);
+        for (size_t k = 0; k < idx.size();) {
+            size_t e = k;
+            while (e + 1 < idx.size() && bits[idx[e + 1]] == bits[idx[k]]) ++e;
+            const double expected = static_cast<double>(n_queries) *
+                null_chance_p(m, scale, n_decoys, bits[idx[k]], aln_len[idx[k]]);
+            const double f = std::min(1.0, expected / static_cast<double>(e + 1));
+            for (size_t j = k; j <= e; ++j) fdr[j] = f;
+            k = e + 1;
+        }
+        double run = 1.0;
+        for (size_t k = idx.size(); k-- > 0;) { run = std::min(run, fdr[k]); q[idx[k]] = run; }
+    }
+    return q;
 }
 
 }  // namespace dart

@@ -364,8 +364,17 @@ void test_hits2emi_and_annotate(const std::string& dart, const std::string& tut,
     const std::string so = dir + "/so.emi";
     expect(run(dart + " damage-annotate --emi " + so + " -o " + dir + "/tape.tsv" + common, dir + "/tape.log") == 0, "annotate (tape) exits 0");
     expect(run(dart + " damage-annotate --emi " + so + " -o " + dir + "/ram.tsv --em-use-damage-mapping" + common, dir + "/ram.log") == 0, "annotate (in-RAM) exits 0");
-    expect(slurp(dir + "/tape.log").find("reject null_p > 0.05 per submitted decoy") != std::string::npos, "Null model line names the rule");
+    expect(slurp(dir + "/tape.log").find("reject per-bin target-decoy q > 0.05 per submitted decoy") != std::string::npos,
+           "Null model line names the default rule (per-bin FDR)");
     expect(slurp(dir + "/tape.log").find("null reject: bin 10-12") != std::string::npos, "per-bin null reject lines");
+    expect(slurp(dir + "/tape.log").find(" bits at null_fdr=0.05: ") != std::string::npos, "FDR lines name the q threshold");
+    expect(run(dart + " damage-annotate --emi " + so + " -o " + dir + "/pmax.tsv --null-p-max 0.05" + common, dir + "/pmax.log") == 0 &&
+           slurp(dir + "/pmax.log").find("reject null_p > 0.05 per submitted decoy") != std::string::npos &&
+           slurp(dir + "/pmax.log").find(" bits at null_p=0.05: ") != std::string::npos,
+           "--null-p-max selects the fixed chance rule");
+    expect(run(dart + " damage-annotate --emi " + so + " -o " + dir + "/both.tsv --null-p-max 0.05 --null-fdr 0.05" + common, dir + "/both.log") != 0 &&
+           slurp(dir + "/both.log").find("give one") != std::string::npos,
+           "--null-fdr with --null-p-max is refused");
     std::vector<std::string> ht, hr;
     const auto rt = read_table(dir + "/tape.tsv", ht), rr = read_table(dir + "/ram.tsv", hr);
     const int tq = col(ht, "query_id"), tp = col(ht, "null_p"), tb = col(ht, "em_reject_reason");
@@ -388,6 +397,52 @@ void test_hits2emi_and_annotate(const std::string& dart, const std::string& tut,
     std::cout << (failures ? "FAILED\n" : "ok\n");
 }
 
+// Per-bin target-decoy q-values. Bin 10-12 has its own fit (w = 1000/4000, mu 30, beta 2) and
+// Q = 200 queries; the expected values come from the closed form computed outside the helper:
+// fdr = min(1, Q * w * (1 - exp(-exp(-(bits - 30) / 2))) / rank), q = running min from below.
+void test_null_fdr() {
+    std::cout << "null_fdr_q... ";
+    dart::NullModel m;
+    m.mu = {20, 25, 30, 40, 40, 70}; m.beta = {1.5f, 1.8f, 2.0f, 0, 3, 4};
+    m.n = {100, 500, 1000, 50, 0, 20};
+    const uint64_t N = 4000, Q = 200;
+    const std::vector<float> bin2 = {39, 44, 30, 40, 43, 39, 36, 41, 39, 42, 34, 40, 38, 35, 37};
+    std::vector<float> bits(bin2);
+    std::vector<uint16_t> len(bin2.size(), 11);
+    std::vector<uint8_t> has(bin2.size(), 1);
+    bits.push_back(45.0f); len.push_back(20); has.push_back(1);   // bin 17-24: pooled fit, no own decoys
+    bits.push_back(45.0f); len.push_back(14); has.push_back(1);   // bin 13-16: unfit (beta 0)
+    bits.push_back(45.0f); len.push_back(11); has.push_back(0);   // no hit
+    const std::vector<double> q = dart::null_fdr_q(m, 1.0, N, Q, bits, len, has);
+    auto q_of = [&](float b) { for (size_t i = 0; i < bin2.size(); ++i) if (bin2[i] == b) return q[i]; return -1.0; };
+    auto near = [](double a, double b) { return std::fabs(a - b) <= 1e-8; };
+    expect(near(q_of(44), 0.0375577399), "top hit takes the smaller fdr below it (running min)");
+    expect(near(q_of(42), 0.0412613768), "rank 3 hand value");
+    expect(near(q_of(39), 0.0613751083), "tie group uses the rank of its last member (9, not 7)");
+    expect(near(q_of(34), 0.4520606482), "rank 14 hand value");
+    expect(q_of(30) == 1.0, "fdr is capped at 1");
+    bool shared = true;
+    for (size_t i = 0; i < bin2.size(); ++i) if (bin2[i] == 40) shared &= near(q[i], q_of(40));
+    expect(shared, "tied hits share one q");
+    bool mono = true;
+    for (size_t i = 0; i < bin2.size(); ++i) for (size_t j = 0; j < bin2.size(); ++j)
+        if (bin2[i] > bin2[j]) mono &= q[i] <= q[j];
+    expect(mono, "q is non-decreasing as the score falls");
+    size_t flagged = 0;
+    for (size_t i = 0; i < bin2.size(); ++i) flagged += q[i] > 0.05;
+    expect(flagged == 12, "12 of 15 bin 10-12 hits are chance at q 0.05");
+    expect(q[bin2.size()] == 0.0, "a bin without decoys has q 0");
+    expect(std::isnan(q[bin2.size() + 1]), "an unfit bin gives NaN");
+    expect(std::isnan(q[bin2.size() + 2]), "a read without a hit gives NaN");
+    const std::vector<double> q0 = dart::null_fdr_q(m, 1.0, N, 0, bits, len, has);
+    expect(std::isnan(q0[0]), "Q = 0 gives NaN");
+    // Scale invariance: the lambda-scaled model at its own scale gives the same q.
+    dart::NullModel s = m; s.scale(0.6931);
+    const std::vector<double> qs = dart::null_fdr_q(s, 0.6931, N, Q, bits, len, has);
+    expect(std::fabs(qs[1] - q[1]) <= 1e-5 * q[1], "scale-invariant");
+    std::cout << (failures ? "FAILED\n" : "ok\n");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -399,6 +454,7 @@ int main(int argc, char** argv) {
     test_roundtrip(dir);
     test_version2(tut, dir);
     test_chance_p(dir);
+    test_null_fdr();
     test_predict_decoys(dart, tut, dir);
     test_hits2emi_and_annotate(dart, tut, dir);
     if (failures) { std::cerr << failures << " failure(s); outputs kept in " << dir << "\n"; return 1; }

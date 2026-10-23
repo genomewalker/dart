@@ -101,4 +101,15 @@ double null_chance_p(const NullModel& m, double scale, uint64_t n_decoys, float 
 // Raw bit score at which null_chance_p in bin b falls to p; NaN when p >= w_b or the bin is unfit.
 double null_chance_bits_at(const NullModel& m, double scale, uint64_t n_decoys, int b, double p);
 
+// Per-bin target-decoy q-value of each read's best hit. Within an aligned-length bin, the hits
+// at or above a read's score number `rank` (ties count to the last tied member), the chance
+// hits expected among them are n_queries * null_chance_p(score), fdr = min(1, expected / rank),
+// and q is the smallest fdr at or below the read's score. A read is a chance hit at FDR q0 when
+// its q > q0. n_queries counts every query searched, including those with a true hit, which
+// overstates chance (the usual conservative choice). A pooled bin with no decoys of its own has
+// w_b = 0, so q = 0 there; an unfit bin, a read without a hit and n_queries = 0 give NaN.
+std::vector<double> null_fdr_q(const NullModel& m, double scale, uint64_t n_decoys, uint64_t n_queries,
+                               const std::vector<float>& bits, const std::vector<uint16_t>& aln_len,
+                               const std::vector<uint8_t>& has);
+
 }  // namespace dart
