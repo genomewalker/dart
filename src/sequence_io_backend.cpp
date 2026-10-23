@@ -1,33 +1,27 @@
 // sequence_io_backend.cpp
-// Implements make_gz_reader() — the only translation unit that includes
-// rapidgzip headers, isolating its ODR-visible symbols from all other TUs.
-
-#ifdef HAVE_RAPIDGZIP
-#include <rapidgzip/rapidgzip.hpp>
-#include <filereader/Standard.hpp>
-#endif
+// Implements make_gz_reader(): single-threaded ISA-L igzip.
+//
+// rapidgzip was removed 2026-10-21, as fqdup removed it on 2026-07-16: its parallel decode
+// raced on large gz over NFS and silently truncated a 30 GB fqdup input (115,146,482 reads
+// lost, no error), and its chunk cache added ~0.7 GB to dart profile on a 2M-read library.
 
 #include "dart/gz_reader_base.hpp"
+#include <isa-l/igzip_lib.h>
 #include <memory>
 #include <vector>
 #include <string>
 #include <cstdio>
 #include <cstring>
+#include <stdexcept>
 
 namespace {
 
-#ifdef HAVE_RAPIDGZIP
-class GzLineReaderRapidgzip : public dart::GzLineReader {
+// Line splitting over a decompressor; subclasses supply decompress().
+class BufferedGzLineReader : public dart::GzLineReader {
 public:
-    explicit GzLineReaderRapidgzip(const std::string& path)
-        : buf_pos_(0), buf_used_(0), eof_(false) {
+    BufferedGzLineReader() : buf_pos_(0), buf_used_(0), eof_(false) {
         buf_.resize(GZBUF_SIZE);
         overflow_.reserve(256);
-        reader_ = std::make_unique<rapidgzip::ParallelGzipReader<>>(
-            std::make_unique<rapidgzip::StandardFileReader>(path),
-            0,          // threads: 0 = auto-detect from hardware_concurrency
-            GZBUF_SIZE
-        );
     }
 
     bool readline(std::string& line) override {
@@ -61,7 +55,7 @@ public:
         }
         // Read directly from the decompressor for the remainder.
         if (!eof_) {
-            const size_t got = reader_->read(buf + written, n - written);
+            const size_t got = decompress(buf + written, n - written);
             if (got == 0) eof_ = true;
             written += got;
         }
@@ -100,23 +94,86 @@ public:
         return len > 0 ? overflow_.c_str() : nullptr;
     }
 
+protected:
+    // Fill up to n decompressed bytes; 0 means end of stream.
+    virtual size_t decompress(char* out, size_t n) = 0;
+
 private:
     bool refill() {
-        const size_t n = reader_->read(buf_.data(), buf_.size());
+        const size_t n = decompress(buf_.data(), buf_.size());
         if (n == 0) { eof_ = true; return false; }
         buf_used_ = n;
         buf_pos_  = 0;
         return true;
     }
 
-    std::unique_ptr<rapidgzip::ParallelGzipReader<>> reader_;
     std::vector<char> buf_;
     std::string       overflow_;
     size_t            buf_pos_;
     size_t            buf_used_;
     bool              eof_;
 };
-#endif  // HAVE_RAPIDGZIP
+
+// Single-threaded ISA-L inflate, as fqdup reads gz (fqdup src/fastq_io_backend.cpp). Two 4 MB
+// buffers; handles multi-member files and treats a stream that stops mid-member as an error,
+// not an EOF.
+class GzLineReaderIgzip : public BufferedGzLineReader {
+public:
+    explicit GzLineReaderIgzip(const std::string& path)
+        : path_(path), in_(GZBUF_SIZE) {
+        fp_ = std::fopen(path.c_str(), "rb");
+        if (!fp_) throw std::runtime_error("Cannot open: " + path);
+        isal_inflate_init(&state_);
+        state_.crc_flag = ISAL_GZIP;
+    }
+    ~GzLineReaderIgzip() override { std::fclose(fp_); }
+
+protected:
+    size_t decompress(char* out, size_t n) override {
+        while (true) {
+            if (state_.avail_in == 0 && !in_eof_) {
+                const size_t got = std::fread(in_.data(), 1, in_.size(), fp_);
+                if (got == 0) {
+                    if (std::ferror(fp_))
+                        throw std::runtime_error("Read error on '" + path_ + "'");
+                    in_eof_ = true;
+                } else {
+                    state_.next_in  = in_.data();
+                    state_.avail_in = static_cast<uint32_t>(got);
+                }
+            }
+            if (state_.avail_in == 0 && in_eof_) {
+                if (state_.block_state != ISAL_BLOCK_FINISH)
+                    throw std::runtime_error("Truncated gzip input '" + path_ +
+                                             "': stream ends mid-member");
+                return 0;
+            }
+            // Previous member ended and bytes remain: start the next one, keeping the cursor.
+            if (state_.block_state == ISAL_BLOCK_FINISH) {
+                uint8_t*       ni = state_.next_in;
+                const uint32_t ai = state_.avail_in;
+                isal_inflate_reset(&state_);
+                state_.crc_flag = ISAL_GZIP;
+                state_.next_in  = ni;
+                state_.avail_in = ai;
+            }
+            state_.next_out  = reinterpret_cast<uint8_t*>(out);
+            state_.avail_out = static_cast<uint32_t>(n);
+            if (isal_inflate(&state_) < 0)
+                throw std::runtime_error("ISA-L decompression error in '" + path_ + "'");
+            const size_t produced = n - state_.avail_out;
+            if (produced > 0) return produced;
+            // Zero bytes out at a member boundary or with input pending: keep going.
+        }
+    }
+
+private:
+    std::string          path_;
+    std::FILE*           fp_ = nullptr;
+    std::vector<uint8_t> in_;
+    inflate_state        state_{};
+    bool                 in_eof_ = false;
+};
 
 static bool is_gzip(const std::string& path) {
     FILE* f = fopen(path.c_str(), "rb");
@@ -133,12 +190,8 @@ static bool is_gzip(const std::string& path) {
 namespace dart {
 
 std::unique_ptr<GzLineReader> make_gz_reader(const std::string& path) {
-#ifdef HAVE_RAPIDGZIP
     if (is_gzip(path))
-        return std::make_unique<GzLineReaderRapidgzip>(path);
-#else
-    (void)path;
-#endif
+        return std::make_unique<GzLineReaderIgzip>(path);
     return nullptr;  // caller falls back to zlib
 }
 

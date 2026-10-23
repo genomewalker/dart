@@ -94,7 +94,7 @@ class SequenceReader::Impl {
 public:
     std::ifstream file_;
     gzFile gz_file_ = nullptr;
-    std::unique_ptr<GzLineReader> rg_reader_;  // rapidgzip (ISA-L) backend — preferred
+    std::unique_ptr<GzLineReader> rg_reader_;  // ISA-L igzip backend
     Format format_ = Format::UNKNOWN;
     bool is_gzipped_ = false;
     char buffer_[65536];  // Line buffer (separate from I/O buffer)
@@ -107,7 +107,6 @@ public:
             filename.substr(filename.size() - 3) == ".gz") {
             is_gzipped_ = true;
 
-            // Try rapidgzip first: in-process parallel decompression, no PATH dependency.
             rg_reader_ = make_gz_reader(filename);
             if (rg_reader_) {
                 // Detect format from first line, then reopen to reset to BOF.
@@ -119,7 +118,7 @@ public:
                 return bool(rg_reader_);
             }
 
-            // rapidgzip (ISA-L) is the decompression path. If it could not open the
+            // ISA-L is the decompression path. If it could not open the
             // stream, fall back to zlib -- never a subprocess.
             gz_file_ = gzopen(filename.c_str(), "rb");
             if (!gz_file_) return false;

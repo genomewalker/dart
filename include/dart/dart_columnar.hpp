@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <vector>
 #include <string>
+#include <memory>
 
 namespace dcx {
 
@@ -353,6 +354,37 @@ bool write_dcx(const char* path, const Batch& batch, const DcxWriteOptions& opt)
 // (n_records_b=0) with byte-identical grain-A scalar VALUES, read by the same reader.
 // Drops the grain-B position bulk so protein_auth reads a small fraction.
 bool write_dcx_auth(const char* path, const Batch& batch, const DcxWriteOptions& opt);
+
+// One alignment before dictionary ordinals are assigned. The source ordinal is
+// the final tie-break in the external sort; posterior may be patched at merge.
+struct Record {
+    uint32_t read_idx = 0, ref_idx = 0;
+    std::string query_id, target_id;
+    uint32_t tstart = 0, span = 0;
+    float gamma = 0, gamma_ancient = 0, em_margin = 0, em_ref_neff = 0;
+    float fident = 0, gamma_null = 0, p_read = 0, posterior = 0;
+    uint8_t strand = 0, em_keep = 0, candidate_rank = 0;
+    uint64_t src_idx = 0;
+    std::vector<uint8_t> presence, ref_aa, obs_aa, dcls, obs_codon, best_codon;
+    std::vector<float> p_damage, best_post;
+    std::vector<uint16_t> dist5, dist3;
+};
+
+// Input must be sorted by (target ordinal, tstart). Blocks are compressed in
+// parallel and flushed in order. Dictionaries are supplied once at close.
+class StreamWriter {
+public:
+    StreamWriter(const char* path, const DcxWriteOptions& opt, bool auth_only = false);
+    ~StreamWriter();
+    StreamWriter(const StreamWriter&) = delete;
+    StreamWriter& operator=(const StreamWriter&) = delete;
+    void append(const Record& rec, uint32_t target_ord, uint64_t query_ord, float posterior);
+    void close(const std::vector<std::string>& target_dict,
+               const std::vector<std::string>& query_dict);
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
 
 // Write-time auth reduce output (fusion dual-66c04a26): a tiny versioned zstd'd per-target
 // table {N, logLR, k@tau-grid} the annotate accumulates in its read-grouped pass. Convergence

@@ -399,15 +399,45 @@ inline double real_log_density(const EMParams& params, double bit,
     return params.lambda_b * bit * score_scale;
 }
 
+// Ancient/modern log scores of one alignment from its damage-free base bc. With
+// use_damage the damage terms enter the mapping: base_a = bc + log(pr) + ll_a,
+// base_m = bc + log(1-pr) + ll_m. Without it bc is split by p_anc = pr, so
+// e^base_a + e^base_m = e^bc (the mapping sees bc only) and base_a - base_m = logit(pr)
+// gives the post-hoc p_anc. ll_a/ll_m stay out of it: the AGD read posterior pr already
+// scores the terminal C->T sites the alignment likelihood would count again.
+inline void em_base_pair(const EMParams& params, double bc, double pr,
+                         double ll_a, double ll_m, double& base_a, double& base_m) {
+    if (params.use_damage) {
+        base_a = bc + std::log(pr) + ll_a;
+        base_m = bc + std::log(1.0 - pr) + ll_m;
+        return;
+    }
+    const double d = std::log(pr) - std::log1p(-pr);
+    const double sp = std::log1p(std::exp(-std::fabs(d)));
+    base_a = bc + std::min(d, 0.0) - sp;
+    base_m = bc + std::min(-d, 0.0) - sp;
+}
+
 // -------------------------------------------------------------------------
 // Empirical null model I/O (decoy Gumbel per aligned-length bin)
 // -------------------------------------------------------------------------
 struct NullModel {
-    std::vector<float> mu;    // per-bin location (on lambda_b*bit scale)
-    std::vector<float> beta;  // per-bin scale
-    std::vector<uint32_t> n;  // per-bin decoy query count used for the fit
+    std::vector<float> mu;      // per-bin location (raw bit scale in a .null sidecar; lambda scale once loaded)
+    std::vector<float> beta;    // per-bin scale
+    std::vector<uint32_t> n;    // per-bin decoy query count used for the fit
+    std::vector<double> sum;    // per-bin sum of the best decoy bit score (raw scale), for pooling
+    std::vector<double> sum_sq; // per-bin sum of squares
     bool valid() const { return !mu.empty() && mu.size() == beta.size(); }
+    void scale(double k) { for (auto& x : mu) x = static_cast<float>(x * k); for (auto& x : beta) x = static_cast<float>(x * k); }
 };
+
+// Fit from per-bin moments (n, sum, sum_sq) by method-of-moments Gumbel:
+//   beta = sqrt(6)*sd/pi,  mu = mean - 0.5772*beta,  sd from the n-1 sample variance.
+// Bins with n < min_n (or sd = 0) take the fit pooled over every bin.
+NullModel fit_null_model_moments(const std::vector<uint32_t>& n,
+                                 const std::vector<double>& sum,
+                                 const std::vector<double>& sum_sq,
+                                 uint32_t min_n = 200);
 
 // Fit the empirical null from per-query MAX (lambda_b * bit_score) values,
 // grouped by aligned-length bin, via method-of-moments Gumbel:
@@ -417,11 +447,7 @@ struct NullModel {
 NullModel fit_null_model(
     const std::vector<std::vector<double>>& per_bin_scores,
     uint32_t min_n = 200);
-
-// Write/read the sidecar TSV: header + one row per bin
-//   bin lo hi mu beta n
-bool write_null_model(const std::string& path, const NullModel& m);
-bool read_null_model(const std::string& path, NullModel& m);
+// Sidecar I/O lives in dart/null_model.hpp.
 
 // -------------------------------------------------------------------------
 // Coherent-LR calibration model I/O (f_true + f_0, frozen once, loaded by EM)
@@ -719,6 +745,23 @@ inline double em_objective_from_ll(
         prior_term += std::log(std::max(weights[i], params.min_weight));
     }
     return ll + coeff * prior_term;
+}
+
+// Dirichlet offset of the null coordinate in the M-step: alpha_null - 1 when the caller set an
+// informative alpha_null (> 0), otherwise the same offset as the real references.
+inline double em_null_offset(const EMParams& params) {
+    return (params.alpha_null > 0.0) ? params.alpha_null - 1.0 : params.alpha_prior - 1.0;
+}
+
+// The objective em_objective_from_ll plus the null coordinate's prior term, so the SQUAREM
+// safeguard and the stopping rule track the function the M-step maximises. weights[n] is the
+// null weight when null_on.
+inline double em_objective_with_null(const EMParams& params, const double* weights, size_t n,
+                                     bool null_on, double ll) {
+    double obj = em_objective_from_ll(params, weights, n, ll);
+    const double c = em_null_offset(params);
+    if (null_on && c != 0.0) obj += c * std::log(std::max(weights[n], params.min_weight));
+    return obj;
 }
 
 // SQUAREM helpers (Varadhan & Roland 2008)

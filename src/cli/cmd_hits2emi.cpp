@@ -4,6 +4,7 @@
 #include "dart/columnar_index.hpp"
 #include "dart/emi_v7_io.hpp"
 #include "dart/log_utils.hpp"
+#include "dart/null_model.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -182,10 +183,25 @@ int cmd_hits2emi(int argc, char* argv[]) {
     bool force_streaming = false;
     int threads = 0;  // 0 = use all available
     std::string damage_index_file;
+    std::string decoy_hits_file;
+    std::string null_out_file;
+    std::string db_label;
+    std::string decoy_fasta_file;
+    uint64_t decoys_submitted = 0;
 
     for (int i = 1; i < argc; ++i) {
         if ((strcmp(argv[i], "--tsv") == 0 || strcmp(argv[i], "-i") == 0) && i + 1 < argc) {
             tsv_file = argv[++i];
+        } else if (strcmp(argv[i], "--decoy-hits") == 0 && i + 1 < argc) {
+            decoy_hits_file = argv[++i];
+        } else if (strcmp(argv[i], "--decoy-fasta") == 0 && i + 1 < argc) {
+            decoy_fasta_file = argv[++i];
+        } else if (strcmp(argv[i], "--decoys-submitted") == 0 && i + 1 < argc) {
+            decoys_submitted = std::stoull(argv[++i]);
+        } else if (strcmp(argv[i], "--null-out") == 0 && i + 1 < argc) {
+            null_out_file = argv[++i];
+        } else if (strcmp(argv[i], "--db-label") == 0 && i + 1 < argc) {
+            db_label = argv[++i];
         } else if ((strcmp(argv[i], "--output") == 0 || strcmp(argv[i], "-o") == 0) && i + 1 < argc) {
             output_file = argv[++i];
         } else if (strcmp(argv[i], "--d-max") == 0 && i + 1 < argc) {
@@ -226,6 +242,14 @@ int cmd_hits2emi(int argc, char* argv[]) {
             std::cout << "  --lambda <float>       Damage decay parameter (default: 0.3)\n";
             std::cout << "  --damage-index <file>  .agd from predict; embeds per-read p_damaged\n";
             std::cout << "                         and alignment-level damage likelihood columns\n";
+            std::cout << "  --decoy-hits <file>    Hits of the decoy peptides predict wrote next to --fasta-aa,\n";
+            std::cout << "                         searched with the real search's parameters. Fits the null\n";
+            std::cout << "                         model and writes <output>.null; damage-annotate finds it\n";
+            std::cout << "  --decoy-fasta <file>   The decoy FASTA that was searched; its record count is stored\n";
+            std::cout << "                         as the decoys submitted (the null_p denominator)\n";
+            std::cout << "  --decoys-submitted <N> Decoys submitted to the search (wins over --decoy-fasta)\n";
+            std::cout << "  --null-out <file>      Where the null sidecar goes (default: <output>.null)\n";
+            std::cout << "  --db-label <str>       Database label recorded in the null sidecar\n";
             std::cout << "  -v, --verbose          Verbose output\n";
             std::cout << "  --help, -h             Show this help\n";
             return 0;
@@ -271,6 +295,40 @@ int cmd_hits2emi(int argc, char* argv[]) {
         uint64_t n_rows = FastColumnarWriter::convert(tsv_file, v6_path, config);
         write_v7_from_v6(v6_path, output_file);
         std::remove(v6_path.c_str());
+
+        if (!decoy_hits_file.empty()) {
+            dart::DecoyStats stats;
+            dart::NullProvenance prov;
+            prov.dart_version = DART_VERSION;
+            prov.db_label = db_label;
+            uint64_t skipped = 0;
+            bool by_prefix = false;
+            const uint64_t taken = dart::accumulate_decoy_hits(decoy_hits_file, stats, prov, &skipped, &by_prefix);
+            prov.n_decoy_submitted = decoys_submitted ? decoys_submitted
+                : (decoy_fasta_file.empty() ? 0 : dart::count_fasta_records(decoy_fasta_file));
+            const std::string null_path = null_out_file.empty() ? dart::null_sidecar_path(output_file) : null_out_file;
+            std::string err;
+            const dart::NullModel null_model = dart::fit_null_model(stats);
+            if (!dart::write_null_model(null_path, null_model, prov, &err))
+                throw std::runtime_error(err);
+            const int fitted = dart::fitted_bins(null_model);
+            std::cerr << "Null model: " << taken << " decoy queries (" << prov.n_decoy_hits << " hits"
+                      << (by_prefix ? "" : "; no DECOY_ prefix in the file, every query taken as a decoy")
+                      << (skipped ? "; " + std::to_string(skipped) + " queries without the DECOY_ prefix ignored" : "")
+                      << ") from " << decoy_hits_file << " -> " << null_path
+                      << " (" << dart::null_fit_summary(null_model) << "; decoys submitted: "
+                      << (prov.n_decoy_submitted ? std::to_string(prov.n_decoy_submitted) : "unknown") << ")\n";
+            for (int b = 0; b < dart::kNumNullBins; ++b)
+                if (stats.n[b] < 200)
+                    std::cerr << "  bin " << b << " [" << dart::kNullBinEdges[b] << "," << dart::kNullBinEdges[b + 1]
+                              << ") has " << stats.n[b] << " decoy queries (< 200): "
+                              << (null_model.beta[b] > 0.0f ? "pooled fit used" : "unfit") << "\n";
+            if (fitted == 0)
+                std::cerr << "Warning: no null bin fitted (the decoy hits give no finite Gumbel: fewer than two queries\n"
+                             "  or zero variance). Chance hits are too rare at this database size and search stringency\n"
+                             "  to model; damage-annotate will run EM with the null coordinate off, which gives the output\n"
+                             "  of --no-null.\n";
+        }
 
         auto t_end = std::chrono::steady_clock::now();
         auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();

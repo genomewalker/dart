@@ -8,6 +8,7 @@
 
 #include "subcommand.hpp"
 #include "dart/version.h"
+#include "dart/null_model.hpp"
 #include "dart/damage_subs.hpp"
 #include "dart/damage_stats.hpp"
 #include "dart/damage_index_reader.hpp"
@@ -21,6 +22,7 @@
 #include "dart/log_utils.hpp"
 #include "dart/mmap_array.hpp"
 #include "dart/damage_index.hpp"      // fnv1a_hash for the .dcx calib_contract_id
+#include "dart/dcx_external_sort.hpp"
 #include "dart/dart_columnar.hpp"     // .dcx interchange writer (--dcx)
 #include <iostream>
 #include <fstream>
@@ -29,6 +31,10 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <numeric>
+#ifdef _OPENMP
+#include <parallel/algorithm>
+#endif
 #include <iomanip>
 #include <unordered_set>
 #include <unordered_map>
@@ -129,35 +135,7 @@ struct DamageSite {
 // damage_class taken from the read's DamageSite at mismatch positions and left
 // at 0/None elsewhere — faithful to the format (bit k => covered) and lets
 // convergence compute depth while filtering mismatches itself (ref_aa<>obs_aa).
-struct DcxReadRec {
-    uint32_t read_idx = 0;               // for the posterior patch after scoring
-    std::string query_id, target_id;     // dict keys; strand derived from query_id
-    uint32_t tstart = 0, span = 0;       // 0-based target start; tend = tstart+span-1
-    float gamma = 0, gamma_ancient = 0, em_margin = 0, em_ref_neff = 0;
-    float fident = 0;                     // alignment identity [0,1] (COL_FIDENT); recruitment QC
-    float gamma_null = 0;                 // per-read null responsibility (spurious-hit mass)
-    float p_read = 0;                    // AGD reference-free per-read damage posterior (auth axis)
-    float posterior = 0;                 // filled post-scoring (identity-fused posterior; audit only)
-    uint8_t strand = 0;
-    uint8_t em_keep = 0;                  // real EM keep bit (SOFT weight, not a filter)
-    uint8_t candidate_rank = 0;           // DCX 2.2: EM candidate rank per read, 0=argmax (COL_CANDIDATE_RANK)
-    uint64_t src_idx = 0;                 // (rg_idx<<32)|row_in_group: globally-unique source ordinal.
-                                          // Sort tiebreak -> byte-deterministic dcx independent of the
-                                          // omp thread-completion order records are built in (two HSPs of
-                                          // one read to one target share (target_id,tstart,span,...) but
-                                          // never a source row, so this alone is a total order).
-    std::vector<uint8_t> presence;       // ceil(span/8), bit k => covered
-    std::vector<uint8_t> ref_aa, obs_aa, dcls;   // Grain B, covered positions
-    std::vector<float>   p_damage;
-    std::vector<uint16_t> dist5, dist3;
-    // RAW observed codon at the substitution -> the designed COL_OBS_CODON column
-    // (packed 0-63, A=0 C=1 G=2 T=3; 255 = not in the AGD terminal zone / unavailable).
-    // Lets convergence verify damage at the NUCLEOTIDE level (is the read codon a
-    // C->T/G->A deamination of a ref_aa-coding codon) vs only the AA-consistency in
-    // damage_class. Sourced from AgdRecord terminal codons indexed by dist5/dist3 (damage
-    // is terminal, so central positions carry no codon and don't need one).
-    std::vector<uint8_t> obs_codon;
-};
+using DcxReadRec = dcx::Record;
 
 struct ProteinDamageSummary {
     uint32_t read_idx = 0;
@@ -175,8 +153,6 @@ struct ProteinDamageSummary {
     float damage_fraction;
     float max_p_damage;         // Highest p_damage among terminal sites
     float p_damaged;            // Overall probability read is damaged
-    float prior_damaged = 0.5f; // Empirical prior P(read ancient) = EM pi; threaded so
-                                // recompute_summary_site_metrics reuses the same prior
     std::vector<DamageSite> sites;  // Cleared+shrunk in callback after aggregation
     // Channel D: Oxidative damage tracking (G→T at DNA level)
     // Gly→Cys (GGN→TGN) and Gly→Trp indicate G→T at codon position 1
@@ -205,9 +181,6 @@ struct ProteinDamageSummary {
     float aa_sum_qA = 0.0f;
     float aa_sum_log_qA_hits = 0.0f;
     float aa_sum_exp_decay = 0.0f;
-    // Stored for corrected protein output (empty unless --corrected-proteins requested)
-    std::string qaln;
-    std::string taln;
     size_t qstart_0;
     size_t qlen = 0;  // Total read length (for Bayesian scoring)
     size_t tstart_0 = 0;  // 0-based target start position
@@ -564,7 +537,6 @@ static ProteinDamageSummary annotate_alignment(
         : 0.0f;
     out.max_p_damage = max_p_damage;
     out.p_damaged = p_damaged;
-    out.prior_damaged = PRIOR_DAMAGED;
     out.sites = std::move(sites);
     out.aa_m_opportunities = aa_m_opportunities;
     out.aa_k_hits = aa_k_hits;
@@ -578,107 +550,6 @@ static ProteinDamageSummary annotate_alignment(
     out.trp_to_gly = trp_to_gly;
     out.gly_total = gly_total;
     return out;
-}
-
-static void recompute_summary_site_metrics(ProteinDamageSummary& summary) {
-    constexpr float Q_BASELINE = 0.005f;
-    // Bayesian LLR parameters (must match compute_damage_summary)
-    constexpr float SEQ_ERROR_RATE = 0.01f;
-    constexpr float MIN_DAMAGE_RATE = 0.01f;       // Interior sites: LLR=0 (no evidence)
-    const float PRIOR_DAMAGED = std::clamp(summary.prior_damaged, 0.02f, 0.98f);
-
-    float llr_sum = 0.0f;
-    summary.ct_sites = 0;
-    summary.ga_sites = 0;
-    summary.high_conf_sites = 0;
-    summary.max_p_damage = 0.0f;
-    summary.aa_k_hits = 0;
-    summary.aa_sum_log_qA_hits = 0.0f;
-
-    for (const auto& s : summary.sites) {
-        if (s.damage_class == 'C') summary.ct_sites++;
-        else summary.ga_sites++;
-        if (s.high_confidence) summary.high_conf_sites++;
-        summary.max_p_damage = std::max(summary.max_p_damage, s.p_damage);
-        summary.aa_k_hits++;
-        summary.aa_sum_log_qA_hits += std::log((s.p_damage + Q_BASELINE) / Q_BASELINE);
-
-        // Bayesian LLR for each site
-        float p_site_given_damaged = std::max(s.p_damage, MIN_DAMAGE_RATE);
-        float llr = std::log(p_site_given_damaged / SEQ_ERROR_RATE);
-        llr = std::clamp(llr, -3.0f, 5.0f);
-        llr_sum += llr;
-    }
-
-    if (!summary.sites.empty()) {
-        float logit_prior = std::log(PRIOR_DAMAGED / (1.0f - PRIOR_DAMAGED));
-        float logit_posterior = logit_prior + llr_sum;
-        logit_posterior = std::clamp(logit_posterior, -10.0f, 10.0f);
-        summary.p_damaged = 1.0f / (1.0f + std::exp(-logit_posterior));
-    } else {
-        summary.p_damaged = 0.0f;
-    }
-}
-
-// Filter sites by distance from relevant terminus
-static void filter_sites_by_distance(ProteinDamageSummary& summary, int max_dist) {
-    if (max_dist < 0) return;
-
-    std::vector<DamageSite> filtered;
-    for (auto& site : summary.sites) {
-        size_t dist = (site.damage_class == 'C') ? site.dist_5prime : site.dist_3prime;
-        if (dist <= static_cast<size_t>(max_dist)) {
-            filtered.push_back(std::move(site));
-        }
-    }
-
-    summary.sites = std::move(filtered);
-    summary.damage_consistent = summary.sites.size();
-    recompute_summary_site_metrics(summary);
-    summary.non_damage_mismatches = summary.total_mismatches - summary.damage_consistent;
-    summary.damage_fraction = summary.total_mismatches > 0
-        ? static_cast<float>(summary.damage_consistent) / static_cast<float>(summary.total_mismatches)
-        : 0.0f;
-}
-
-// Generate corrected protein by replacing damage sites with reference AAs
-// Uses sorted index walk instead of hash set (sites are ordered by query_pos)
-static std::string generate_corrected_protein(
-    const std::string& qaln, const std::string& taln,
-    const std::vector<DamageSite>& sites,
-    size_t qstart)
-{
-    size_t site_idx = 0;
-    std::string corrected;
-    corrected.reserve(qaln.size());
-    size_t q_pos = qstart;
-
-    for (size_t i = 0; i < qaln.size() && i < taln.size(); ++i) {
-        char q_aa = qaln[i];
-        char t_aa = taln[i];
-
-        if (q_aa == '-') continue;
-        if (t_aa == '-') {
-            corrected += q_aa;
-            q_pos++;
-            continue;
-        }
-
-        // Advance site_idx to match current position
-        while (site_idx < sites.size() && sites[site_idx].query_pos < q_pos) {
-            site_idx++;
-        }
-
-        if (site_idx < sites.size() && sites[site_idx].query_pos == q_pos) {
-            corrected += t_aa;  // Replace with reference AA
-            site_idx++;
-        } else {
-            corrected += q_aa;  // Keep observed
-        }
-        q_pos++;
-    }
-
-    return corrected;
 }
 
 // Expected terminal/middle coverage ratio for a uniformly-sampled gene.
@@ -1328,26 +1199,16 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     std::string emi_file;
     std::string output_file;
     std::string sites_file;
-    std::string corrected_file;
     std::string dcx_file;              // .dcx columnar interchange (grain A/B for convergence)
     std::string library_label;         // per-library id stamped into the .dcx calib section
     std::string protein_summary_file;  // Per-protein aggregation
-    std::string protein_filtered_file; // Per-protein filtered subset
-    std::string combined_output_file;  // Combined per-target protein+gene summary
-    std::string blast8_unique_file;    // BLAST8-like export with unique mappers only
-    std::string analysis_prefix;       // Output bundle prefix
-    std::string analysis_proteins_file;   // Explicit name for analysis proteins output
-    std::string analysis_blast8_file;     // Explicit name for analysis blast8 unique output
-    std::string analysis_categories_file; // Explicit name for analysis categories output
     std::string damage_index_file;     // Binary damage index from predict
     float d_max = -1.0f;  // -1 means "estimate from data"
     float lambda = 0.3f;
     bool lambda_set_by_user = false;
     bool refine_damage = false;
-    int max_dist = -1;
     std::string lib_type = "auto";    // ss, ds, or auto-detect
-    float threshold = 0.7f;           // Classification threshold for is_damaged
-    bool use_identity = true;         // Identity evidence enabled by default (+7.6% AUC)
+    const float threshold = 0.7f;           // Classification threshold for is_damaged
     bool verbose = false;
 
     // Gene summary options (work with or without --em)
@@ -1372,8 +1233,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
     // EM reassignment options (enabled by default for abundance estimation)
     bool use_em = true;
-    bool em_streaming = false;       // Use streaming EM (O(num_refs) memory instead of O(num_alns))
-    size_t em_max_memory_mb = 4096;  // Max memory for EM (MB), 0 = no limit, auto-switch to streaming if exceeded
     // Node-local scratch dir for the O_DIRECT EM tape (production streaming path).
     // Must be fast local NVMe supporting O_DIRECT (NOT /tmp, NOT NFS). Env fallback
     // DART_EM_TAPE_DIR; when unset the tape path errors and asks for it explicitly.
@@ -1381,22 +1240,23 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // EM fixed-point checkpoint (OPT-G). Iterations only; the final tape pass always re-runs.
     std::string em_checkpoint_path;  // --em-checkpoint; default <em_tape_dir>/dart_emtape_<pid>.ckpt
     bool em_resume = false;          // --resume: load the checkpoint when its fingerprint matches
-    uint32_t em_max_iters = 100;
+    const uint32_t em_max_iters = 100;
     // Raw-bit temperature for the legacy (non-calibrated) real component. mmseqs
     // bit scores are log2-odds; the principled bits→nats factor is ln2≈0.693.
     // The old 3.0 over-tempered ~4.3x and forced homolog near-ties to gamma≈1.
-    double em_lambda_b = M_LN2;
-    double em_tol = 1e-4;
+    const double em_lambda_b = M_LN2;
+    const double em_tol = 1e-4;
     double em_min_prob = 1e-6;       // absolute posterior threshold for keeping alignment
-    double em_min_margin = 0.5;      // auth evidence requires gamma_top1 - gamma_top2
-    double em_max_neff = 2.0;        // auth evidence requires exp(H(gamma)) <= cap
+    const double em_min_margin = 0.5;      // auth evidence requires gamma_top1 - gamma_top2
+    const double em_max_neff = 2.0;        // auth evidence requires exp(H(gamma)) <= cap
     // Fail-loud: a flat targeted DB can force-map absent-protein reads onto their
     // nearest wrong homolog. EM without a null model is refused unless the caller
     // opts in with --no-null (accept the risk explicitly).
     bool no_null = false;
     // Damage-free mapping (removes circularity: damage likelihoods must not both
     // pick the homolog and then be reused in gamma_ancient). OFF => mapping gamma
-    // is damage-free; gamma_ancient is still emitted post-hoc against frozen weights.
+    // is damage-free; gamma_ancient is emitted post-hoc against frozen weights when the
+    // damage index is pi DETECTED (see agd_read_prior).
     bool em_use_damage_mapping = false;
     // Soft multi-mapping emit (DCX 2.2): emit the top-K EM candidates per read (not just the
     // argmax) so downstream can distribute a read's SAAV evidence across homologs by gamma.
@@ -1406,21 +1266,19 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     double multimap_floor = 0.05;    // AND gamma > floor
 
     // Null/noise component (spurious short-peptide rejection). Off by default.
-    std::string em_null_model_file;  // load empirical decoy Gumbel (bin lo hi mu beta n)
-    double em_null_tau = 0.5;        // reject read when gamma_null > tau
-    double em_null_fdr = -1.0;       // target FDR knob (requires decoy pass; -1 = off)
-    std::string fit_null_from_file;  // decoy hits TSV to fit the null model from
-    std::string null_out_file;       // output sidecar for the fitted null model
+    std::string em_null_model_file;  // .null sidecar (or deprecated TSV); default <emi>.null when present
+    double em_null_tau = 0.5;        // calibrated path: reject read when gamma_null > tau
+    double null_p_max = 0.05;        // --null-p-max: reject read when null_p > this (opt-in)
+    bool null_p_max_set = false;
+    double null_fdr = 0.05;          // default rule: reject read when its per-bin target-decoy q > this
+    bool null_fdr_set = false;
+    uint64_t null_queries = 0;       // queries searched (FDR scale); default: damage index records
 
     // Coherent-LR calibration (f_true + f_0). When loaded, the real EM component
     // becomes the normalized true-hit density log f_true(bit|Lbin) and the null
     // f_0 lives on the raw-bit scale — a coherent likelihood ratio (lambda≡1).
     std::string em_calib_model_file;      // load a frozen calibration model
-    double em_calib_temperature = 1.0;    // frozen misspecification correction
-    // Full-population EM audit dump (sol verification requirement): every pre-em_keep
-    // hit-read with its densities/decision, truth-joinable. Independent of the em_keep-
-    // biased -o file.
-    std::string em_audit_file;
+    const double em_calib_temperature = 1.0;    // frozen misspecification correction
     // Posterior-identifiability abstention (sol): the 3-way call is on the per-read
     // density log-ratio LLR = log f_true - log f_0 of the best EM candidate, NOT on
     // gamma_null (which saturates to 1 via the EM w_null dynamics even for reads whose
@@ -1429,18 +1287,15 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     //   LLR >= keep_llr   → keep (assign);  LLR <= reject_llr → reject (spurious);
     //   between           → abstain (insufficient_information): excluded from
     //   assignment/auth but NOT counted as a contamination rejection.
-    double em_keep_llr = 0.5;      // f_true >= e^0.5 (~1.65x) as likely as f_0 → keep
-    double em_reject_llr = -5.0;   // f_0 >= e^5 (~150x) more likely than f_true → reject
+    const double em_keep_llr = 0.5;      // f_true >= e^0.5 (~1.65x) as likely as f_0 → keep
+    const double em_reject_llr = -5.0;   // f_0 >= e^5 (~150x) more likely than f_true → reject
 
     // Coverage-aware outer EM options
-    bool use_coverage_em = false;
-    uint32_t coverage_em_iters = 5;
-    float coverage_em_tau = 0.13f;
-    uint32_t coverage_em_bins = 6;
 
     // Bayesian scoring parameters
     float prior_ancient = 0.10f;     // Prior P(ancient) for Bayesian scorer
     bool  auto_prior_ancient = false; // Auto-calibrate prior from mean p_read distribution
+    bool  prior_ancient_set = false;  // --prior-ancient given explicitly
     int   min_damage_sites = -1;     // Min susceptible positions to trust site evidence (-1 = auto)
     float ancient_threshold  = 0.60f; // --ancient-threshold
     float modern_threshold   = 0.25f; // --modern-threshold
@@ -1448,14 +1303,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     float site_cap           = 3.0f;  // --site-cap
     float w0                 = 0.3f;  // --w0
     // Coverage EM tuning
-    float depth_gate_lo = 8.0f;       // --depth-gate-lo
-    float depth_gate_hi = 20.0f;      // --depth-gate-hi
-    float w_min         = 0.20f;      // --w-min
 
     // Alignment-level pre-filters (applied before any processing)
-    float aln_min_identity = 0.0f;   // 0 = no filter
-    float aln_min_bits = 0.0f;       // 0 = no filter
-    float aln_max_evalue = 1e10f;    // very large = no filter
+    const float aln_min_identity = 0.0f;   // 0 = no filter
+    const float aln_min_bits = 0.0f;       // 0 = no filter
+    const float aln_max_evalue = 1e10f;    // very large = no filter
     int threads = 0;                 // 0 = OpenMP runtime default
 
     // Functional profiling options
@@ -1472,14 +1324,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--lambda") == 0 && i + 1 < argc) {
             lambda = std::stof(argv[++i]);
             lambda_set_by_user = true;
-        } else if (strcmp(argv[i], "--max-dist") == 0 && i + 1 < argc) {
-            max_dist = std::stoi(argv[++i]);
         } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) {
             output_file = argv[++i];
         } else if (strcmp(argv[i], "--sites") == 0 && i + 1 < argc) {
             sites_file = argv[++i];
-        } else if (strcmp(argv[i], "--corrected") == 0 && i + 1 < argc) {
-            corrected_file = argv[++i];
         } else if (strcmp(argv[i], "--dcx") == 0 && i + 1 < argc) {
             dcx_file = argv[++i];
         } else if (strcmp(argv[i], "--emit-multimap") == 0) {
@@ -1492,50 +1340,24 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             library_label = argv[++i];
         } else if (strcmp(argv[i], "--protein-summary") == 0 && i + 1 < argc) {
             protein_summary_file = argv[++i];
-        } else if (strcmp(argv[i], "--protein-filtered") == 0 && i + 1 < argc) {
-            protein_filtered_file = argv[++i];
-        } else if (strcmp(argv[i], "--combined-output") == 0 && i + 1 < argc) {
-            combined_output_file = argv[++i];
-        } else if (strcmp(argv[i], "--blast8-unique") == 0 && i + 1 < argc) {
-            blast8_unique_file = argv[++i];
-        } else if (strcmp(argv[i], "--analysis-prefix") == 0 && i + 1 < argc) {
-            analysis_prefix = argv[++i];
-        } else if (strcmp(argv[i], "--analysis-proteins") == 0 && i + 1 < argc) {
-            analysis_proteins_file = argv[++i];
-        } else if (strcmp(argv[i], "--analysis-blast8") == 0 && i + 1 < argc) {
-            analysis_blast8_file = argv[++i];
-        } else if (strcmp(argv[i], "--analysis-categories") == 0 && i + 1 < argc) {
-            analysis_categories_file = argv[++i];
         } else if ((strcmp(argv[i], "--library-type") == 0 || strcmp(argv[i], "--lib-type") == 0) && i + 1 < argc) {
             lib_type = argv[++i];
+            if (lib_type != "ss" && lib_type != "ds" && lib_type != "auto") {
+                std::cerr << "Error: --library-type must be ss, ds or auto, got '" << lib_type << "'\n";
+                return 1;
+            }
         } else if (strcmp(argv[i], "--damage-index") == 0 && i + 1 < argc) {
             damage_index_file = argv[++i];
-        } else if (strcmp(argv[i], "--threshold") == 0 && i + 1 < argc) {
-            threshold = std::stof(argv[++i]);
         } else if (strcmp(argv[i], "-v") == 0 || strcmp(argv[i], "--verbose") == 0) {
             verbose = true;
-        } else if (strcmp(argv[i], "--use-identity") == 0) {
-            use_identity = true;
-        } else if (strcmp(argv[i], "--no-identity") == 0) {
-            use_identity = false;
         } else if (strcmp(argv[i], "--refine-damage") == 0) {
             refine_damage = true;
         } else if (strcmp(argv[i], "--em") == 0) {
             use_em = true;
         } else if (strcmp(argv[i], "--no-em") == 0) {
             use_em = false;
-        } else if (strcmp(argv[i], "--em-iters") == 0 && i + 1 < argc) {
-            em_max_iters = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (strcmp(argv[i], "--em-lambda") == 0 && i + 1 < argc) {
-            em_lambda_b = std::stod(argv[++i]);
-        } else if (strcmp(argv[i], "--em-tol") == 0 && i + 1 < argc) {
-            em_tol = std::stod(argv[++i]);
         } else if (strcmp(argv[i], "--em-min-prob") == 0 && i + 1 < argc) {
             em_min_prob = std::stod(argv[++i]);
-        } else if (strcmp(argv[i], "--em-min-margin") == 0 && i + 1 < argc) {
-            em_min_margin = std::stod(argv[++i]);
-        } else if (strcmp(argv[i], "--em-max-neff") == 0 && i + 1 < argc) {
-            em_max_neff = std::stod(argv[++i]);
         } else if (strcmp(argv[i], "--no-null") == 0) {
             no_null = true;
         } else if (strcmp(argv[i], "--em-use-damage-mapping") == 0) {
@@ -1544,41 +1366,21 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             em_null_model_file = argv[++i];
         } else if (strcmp(argv[i], "--em-calib-model") == 0 && i + 1 < argc) {
             em_calib_model_file = argv[++i];
-        } else if (strcmp(argv[i], "--em-calib-temperature") == 0 && i + 1 < argc) {
-            em_calib_temperature = std::stod(argv[++i]);
-        } else if (strcmp(argv[i], "--em-audit") == 0 && i + 1 < argc) {
-            em_audit_file = argv[++i];
-        } else if (strcmp(argv[i], "--em-keep-llr") == 0 && i + 1 < argc) {
-            em_keep_llr = std::stod(argv[++i]);
-        } else if (strcmp(argv[i], "--em-reject-llr") == 0 && i + 1 < argc) {
-            em_reject_llr = std::stod(argv[++i]);
         } else if (strcmp(argv[i], "--em-null-tau") == 0 && i + 1 < argc) {
             em_null_tau = std::stod(argv[++i]);
-        } else if (strcmp(argv[i], "--em-null-fdr") == 0 && i + 1 < argc) {
-            em_null_fdr = std::stod(argv[++i]);
-        } else if (strcmp(argv[i], "--fit-null-from") == 0 && i + 1 < argc) {
-            fit_null_from_file = argv[++i];
-        } else if (strcmp(argv[i], "--null-out") == 0 && i + 1 < argc) {
-            null_out_file = argv[++i];
-        } else if (strcmp(argv[i], "--coverage-em") == 0) {
-            use_coverage_em = true;
+        } else if (strcmp(argv[i], "--null-p-max") == 0 && i + 1 < argc) {
+            null_p_max = std::stod(argv[++i]);
+            null_p_max_set = true;
+        } else if (strcmp(argv[i], "--null-fdr") == 0 && i + 1 < argc) {
+            null_fdr = std::stod(argv[++i]);
+            null_fdr_set = true;
+        } else if (strcmp(argv[i], "--null-queries") == 0 && i + 1 < argc) {
+            null_queries = std::stoull(argv[++i]);
         } else if (strcmp(argv[i], "--no-coverage-em") == 0) {
-            // Backward-compatible alias; coverage EM is now opt-in.
-            use_coverage_em = false;
-        } else if (strcmp(argv[i], "--coverage-em-iters") == 0 && i + 1 < argc) {
-            coverage_em_iters = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (strcmp(argv[i], "--coverage-em-tau") == 0 && i + 1 < argc) {
-            coverage_em_tau = std::stof(argv[++i]);
-        } else if (strcmp(argv[i], "--coverage-em-bins") == 0 && i + 1 < argc) {
-            coverage_em_bins = static_cast<uint32_t>(std::stoul(argv[++i]));
-        } else if (strcmp(argv[i], "--depth-gate-lo") == 0 && i + 1 < argc) {
-            depth_gate_lo = std::stof(argv[++i]);
-        } else if (strcmp(argv[i], "--depth-gate-hi") == 0 && i + 1 < argc) {
-            depth_gate_hi = std::stof(argv[++i]);
-        } else if (strcmp(argv[i], "--w-min") == 0 && i + 1 < argc) {
-            w_min = std::stof(argv[++i]);
+            // Kept for scripts: asks for the only behaviour there is.
         } else if (strcmp(argv[i], "--prior-ancient") == 0 && i + 1 < argc) {
             prior_ancient = std::stof(argv[++i]);
+            prior_ancient_set = true;
         } else if (strcmp(argv[i], "--min-damage-sites") == 0 && i + 1 < argc) {
             min_damage_sites = std::stoi(argv[++i]);
         } else if (strcmp(argv[i], "--ancient-threshold") == 0 && i + 1 < argc) {
@@ -1591,32 +1393,52 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             site_cap = std::stof(argv[++i]);
         } else if (strcmp(argv[i], "--w0") == 0 && i + 1 < argc) {
             w0 = std::stof(argv[++i]);
-        } else if (strcmp(argv[i], "--preset") == 0 && i + 1 < argc) {
-            const char* preset = argv[++i];
-            if (strcmp(preset, "loose") == 0) {
-                min_reads = 1; min_breadth = 0.0f; min_depth = 0.0f;
-                min_distinct_starts = 0; min_damage_sites = 1;
-                // loose DISABLES the Q-CLUST single-molecule authentication gate (informative=1,
-                // frac=1.0) — it is an exploratory/recall preset, NOT an authentication preset.
-                // Passing under --preset loose does not mean a protein is authenticated as damaged.
-                min_informative_reads = 1; max_single_molecule_frac = 1.0f;
-                std::cerr << "  WARNING: --preset loose disables the Q-CLUST authentication gate; "
-                             "pass_mapping_filter=1 under loose is NOT an authentication verdict.\n";
-            } else if (strcmp(preset, "strict") == 0) {
-                min_reads = 5; min_breadth = 0.20f; min_depth = 1.0f;
-                auto_calibrate_spurious = true; min_damage_sites = 5;
-                min_informative_reads = 3; max_single_molecule_frac = 0.5f;
-            } else {
-                std::cerr << "Error: --preset must be 'loose' or 'strict'\n"; return 1;
-            }
         } else if (strcmp(argv[i], "--auto-prior-ancient") == 0) {
             auto_prior_ancient = true;
         } else if (strcmp(argv[i], "--em-streaming") == 0) {
             std::cerr << "Error: --em-streaming was removed; compact_em_map is the sole "
                          "EM solver (in-memory CSR). Drop --em-streaming.\n";
             return 1;
-        } else if ((strcmp(argv[i], "--em-max-memory") == 0 || strcmp(argv[i], "-m") == 0) && i + 1 < argc) {
-            em_max_memory_mb = static_cast<size_t>(std::stoul(argv[++i]));
+        } else if (strcmp(argv[i], "--em-max-memory") == 0 || strcmp(argv[i], "-m") == 0 ||
+                   strcmp(argv[i], "--em-null-fdr") == 0 ||
+                   strcmp(argv[i], "--coverage-em") == 0 ||
+                   strncmp(argv[i], "--coverage-em-", 14) == 0 ||
+                   strcmp(argv[i], "--depth-gate-lo") == 0 ||
+                   strcmp(argv[i], "--depth-gate-hi") == 0 ||
+                   strcmp(argv[i], "--w-min") == 0 ||
+                   strcmp(argv[i], "--aln-min-identity") == 0 ||
+                   strcmp(argv[i], "--aln-min-bits") == 0 ||
+                   strcmp(argv[i], "--aln-max-evalue") == 0 ||
+                   strcmp(argv[i], "--analysis-prefix") == 0 ||
+                   strcmp(argv[i], "--analysis-proteins") == 0 ||
+                   strcmp(argv[i], "--analysis-blast8") == 0 ||
+                   strcmp(argv[i], "--analysis-categories") == 0 ||
+                   strcmp(argv[i], "--blast8-unique") == 0 ||
+                   strcmp(argv[i], "--combined-output") == 0 ||
+                   strcmp(argv[i], "--corrected") == 0 ||
+                   strcmp(argv[i], "--protein-filtered") == 0 ||
+                   strcmp(argv[i], "--max-dist") == 0 ||
+                   strcmp(argv[i], "--threshold") == 0 ||
+                   strcmp(argv[i], "--use-identity") == 0 ||
+                   strcmp(argv[i], "--no-identity") == 0 ||
+                   strcmp(argv[i], "--em-iters") == 0 ||
+                   strcmp(argv[i], "--em-lambda") == 0 ||
+                   strcmp(argv[i], "--em-tol") == 0 ||
+                   strcmp(argv[i], "--em-min-margin") == 0 ||
+                   strcmp(argv[i], "--em-max-neff") == 0 ||
+                   strcmp(argv[i], "--em-audit") == 0 ||
+                   strcmp(argv[i], "--em-keep-llr") == 0 ||
+                   strcmp(argv[i], "--em-reject-llr") == 0 ||
+                   strcmp(argv[i], "--em-calib-temperature") == 0 ||
+                   strcmp(argv[i], "--preset") == 0) {
+            std::cerr << "Error: " << argv[i] << " was removed in DART 2.0. Drop it; runs without it "
+                         "behave as before (see 'Removed in 2.0' in the Command Reference).\n";
+            return 1;
+        } else if (strcmp(argv[i], "--fit-null-from") == 0 || strcmp(argv[i], "--null-out") == 0) {
+            std::cerr << "Error: " << argv[i] << " was removed in DART 2.0. Fit the null model with "
+                         "'dart hits2emi --decoy-hits decoy_hits.tsv' or 'dart null'; damage-annotate "
+                         "loads <emi>.null by itself.\n";
+            return 1;
         } else if (strcmp(argv[i], "--em-tape-dir") == 0 && i + 1 < argc) {
             em_tape_dir = argv[++i];
         } else if (strcmp(argv[i], "--em-checkpoint") == 0 && i + 1 < argc) {
@@ -1650,12 +1472,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             user_set_terminal_ratio = true;
         } else if (strcmp(argv[i], "--auto-calibrate-spurious") == 0) {
             auto_calibrate_spurious = true;
-        } else if (strcmp(argv[i], "--aln-min-identity") == 0 && i + 1 < argc) {
-            aln_min_identity = std::stof(argv[++i]);
-        } else if (strcmp(argv[i], "--aln-min-bits") == 0 && i + 1 < argc) {
-            aln_min_bits = std::stof(argv[++i]);
-        } else if (strcmp(argv[i], "--aln-max-evalue") == 0 && i + 1 < argc) {
-            aln_max_evalue = std::stof(argv[++i]);
         } else if ((strcmp(argv[i], "--threads") == 0 || strcmp(argv[i], "-t") == 0) && i + 1 < argc) {
             threads = std::stoi(argv[++i]);
             if (threads < 1) {
@@ -1670,187 +1486,95 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             anvio_ko_file = argv[++i];
         } else if (strcmp(argv[i], "--annotation-source") == 0 && i + 1 < argc) {
             annotation_source = argv[++i];
-        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
-            std::cout << "Usage: dart damage-annotate --emi <hits.emi> [options]\n\n";
-            std::cout << "Post-mapping damage annotation using EMI alignments.\n";
-            std::cout << "Compares observed proteins against reference proteins to identify\n";
-            std::cout << "damage-consistent amino acid substitutions with ~90% precision.\n\n";
-            std::cout << "Required:\n";
-            std::cout << "  --emi, -i FILE    EMI v7 index (dart hits2emi / hits2emi-stream)\n\n";
-            std::cout << "Options:\n";
-            std::cout << "  --d-max RATE      Override damage rate (default: estimated from data)\n";
-            std::cout << "  --lambda FLOAT    Decay constant (default: 0.3)\n";
-            std::cout << "  --max-dist INT    Positional filter: max nt from relevant terminus (-1=off)\n";
-            std::cout << "  -o FILE           Per-read damage summary TSV (default: stdout)\n";
-            std::cout << "  --protein-summary FILE  Per-protein aggregated damage TSV\n";
-            std::cout << "  --protein-filtered FILE Per-protein filtered subset TSV\n";
-            std::cout << "  --combined-output FILE  Per-target combined protein+gene summary TSV\n";
-            std::cout << "  --blast8-unique FILE  BLAST8-like hits for unique mappers only\n";
-            std::cout << "  --analysis-prefix STR  Output prefix: <STR>.reads.tsv, <STR>.protein.tsv,\n";
-            std::cout << "                         <STR>.blast8.unique.tsv, and <STR>.categories.tsv when --map is provided\n";
-            std::cout << "  --analysis-proteins FILE   Proteins output file\n";
-            std::cout << "  --analysis-blast8 FILE     Unique BLAST8 output file\n";
-            std::cout << "  --analysis-categories FILE Categories output file\n";
-            std::cout << "  --library-type TYPE     Library type: ss, ds, or auto (default: auto)\n";
-            std::cout << "  --sites FILE      Per-site damage calls TSV\n";
-            std::cout << "  --corrected FILE  Reference-guided corrected proteins FASTA\n";
-            std::cout << "  --dcx FILE        Single .dcx columnar interchange (grain A/B) for convergence-saav;\n";
-            std::cout << "                    replaces the --sites + -o + --protein-summary TSV triplet. Requires EM.\n";
-            std::cout << "  --library-label STR  Per-library id stamped into the .dcx calib section (default: --dcx basename)\n";
-            std::cout << "  --damage-index FILE  Binary damage index (.agd) from predict\n";
-            std::cout << "                       Enables synonymous damage detection\n";
-            std::cout << "  --threshold FLOAT Damage classification threshold (default: 0.7)\n";
-            std::cout << "                       Adds is_damaged column (1 if posterior >= threshold)\n";
-            std::cout << "  --no-identity     Disable identity evidence (enabled by default)\n";
-            std::cout << "  --refine-damage       Jointly update d_max from EM assignments (Phase 2)\n";
-            std::cout << "  -v                Verbose output\n\n";
-            std::cout << "Gene summary (per-gene aggregation, works with or without --em):\n";
-            std::cout << "  --gene-summary FILE  Per-gene statistics TSV\n";
-            std::cout << "  --min-breadth FLOAT  Minimum breadth filter (default: 0.1)\n";
-            std::cout << "  --min-depth FLOAT    Minimum depth filter (default: 0.5)\n";
-            std::cout << "  --min-reads INT      Minimum read count (default: 3)\n\n";
-            std::cout << "Functional profiling (requires --map):\n";
-            std::cout << "  --map FILE           Gene-to-group mapping TSV (gene_id<TAB>group)\n";
-            std::cout << "  --functional-summary FILE  Per-function stats TSV\n";
-            std::cout << "  --anvio-ko FILE      Gene-level group abundance for anvi-estimate-metabolism\n";
-            std::cout << "  --annotation-source STR  Source label for anvi output (default: DART)\n\n";
-            std::cout << "EM reassignment (multi-mapping resolution, enabled by default):\n";
-            std::cout << "  --no-em           Disable EM (use best-hit only)\n";
-            std::cout << "  --em-iters INT    Max EM iterations (default: 100)\n";
-            std::cout << "  --em-lambda FLOAT Bit-score temperature, bits to nats (default: ln 2 = 0.693)\n";
-            std::cout << "  --em-tol FLOAT    Convergence tolerance (default: 1e-4)\n";
-            std::cout << "  --em-min-prob FLOAT     Min EM posterior to keep (default: 1e-6)\n";
-            std::cout << "  --em-min-margin FLOAT   Min top1-top2 margin for damage/auth evidence (default: 0.5)\n";
-            std::cout << "  --em-max-neff FLOAT     Max effective refs/read for damage/auth evidence (default: 2.0)\n";
-            std::cout << "  --em-use-damage-mapping Let damage likelihoods influence the mapping (default: off;\n";
-            std::cout << "                          off => damage-free mapping, gamma_ancient still emitted post-hoc)\n";
-            std::cout << "  --no-null               Run EM without a null model, accepting that a flat targeted\n";
-            std::cout << "                          database can force-map absent-protein reads to false annotations\n";
-            std::cout << "  --em-tape-dir DIR       O_DIRECT EM tape dir (or DART_EM_TAPE_DIR); needed when EM runs\n";
-            std::cout << "                          without --em-null-model/--em-calib-model/--em-audit. Use\n";
-            std::cout << "                          node-local disk, not tmpfs\n";
-            std::cout << "  --em-checkpoint FILE    EM iteration checkpoint (default: <tape dir>/dart_emtape_<pid>.ckpt)\n";
-            std::cout << "  --resume                Resume EM from the checkpoint when its fingerprint matches\n";
-            std::cout << "\nNull/noise component (spurious short-peptide rejection, opt-in):\n";
-            std::cout << "  --em-null-model FILE    Load empirical decoy Gumbel sidecar (bin lo hi mu beta n)\n";
-            std::cout << "                          Enables the null column; reads dominated by it are rejected\n";
-            std::cout << "  --em-null-tau FLOAT     Reject read when gamma_null > tau (default: 0.5)\n";
-            std::cout << "  --em-audit FILE         Dump EVERY pre-em_keep hit-read (query,aln_len,bit,\n";
-            std::cout << "                          log_f_true,log_f_0,llr,gamma_null,decision,target) for gate audit\n";
-            std::cout << "  --em-keep-llr FLOAT     Keep (assign) when log f_true - log f_0 >= this (default: 0.5)\n";
-            std::cout << "  --em-reject-llr FLOAT   Reject (spurious) when llr <= this; between → abstain\n";
-            std::cout << "                          (insufficient_information; excluded from assignment, not a rejection) (default: -5.0)\n";
-            std::cout << "  --em-null-fdr FLOAT     Target FDR to solve tau (requires a decoy pass; default off)\n";
-            std::cout << "  --fit-null-from FILE    Fit the null from a 16-col decoy hits TSV, then exit\n";
-            std::cout << "  --null-out FILE         Output path for the fitted null sidecar (with --fit-null-from)\n";
-            std::cout << "\nCoverage-aware EM (outer loop, opt-in):\n";
-            std::cout << "  --coverage-em            Enable coverage-aware outer EM loop (default: off)\n";
-            std::cout << "  --no-coverage-em         Explicitly disable coverage-aware outer EM (kept for scripts)\n";
-            std::cout << "  --coverage-em-iters INT  Max outer EM iterations (default: 5)\n";
-            std::cout << "  --coverage-em-tau FLOAT  KL penalty temperature (default: 0.13)\n";
-            std::cout << "  --coverage-em-bins INT   Coverage bins per protein (default: 6)\n";
-            std::cout << "  --depth-gate-lo FLOAT    Coverage depth gate lower bound (default: 8.0)\n";
-            std::cout << "  --depth-gate-hi FLOAT    Coverage depth gate upper bound (default: 20.0)\n";
-            std::cout << "  --w-min FLOAT            Coverage weight floor (default: 0.20)\n";
-            std::cout << "\nBayesian scoring:\n";
-            std::cout << "  --prior-ancient FLOAT    Prior P(ancient) for Bayesian scorer (default: 0.10)\n";
-            std::cout << "  --auto-prior-ancient     Auto-calibrate prior from mean p_read distribution\n";
-            std::cout << "                           Requires AGD index (--damage-index). Uses E[p_read]\n";
-            std::cout << "                           as an empirical Bayes estimate of fraction ancient.\n";
-            std::cout << "  --min-damage-sites INT   Min susceptible AA positions to use site evidence\n";
-            std::cout << "                           (default: auto = max(1, median_qlen/10))\n";
-            std::cout << "  --ancient-threshold FLOAT  Ancient posterior cutoff (default: 0.60)\n";
-            std::cout << "  --modern-threshold FLOAT   Modern posterior cutoff (default: 0.25)\n";
-            std::cout << "  --terminal-threshold FLOAT Min p_read for terminal evidence (default: 0.50)\n";
-            std::cout << "  --site-cap FLOAT           Max |logBF| from AA site evidence (default: 3.0)\n";
-            std::cout << "  --w0 FLOAT                 Absence-evidence tempering weight 0-1 (default: 0.30)\n";
-            std::cout << "\nBinomial provenance-LR authentication (PRIMARY per-protein ancient call):\n";
-            std::cout << "  --modern-damage-rate FLOAT  Modern/background damaged-read rate eps0 (default: 0.02)\n";
-            std::cout << "  --eps0 FLOAT                 Alias for --modern-damage-rate\n";
-            std::cout << "  --auth-alpha FLOAT          Level for the LR power gate + ancient call (default: 0.05)\n";
-            std::cout << "  --per-read-damage-threshold FLOAT  p_read cutoff for the per-read damaged call k (default: 0.50)\n";
-            std::cout << "\nPresets (applied immediately; individual flags after --preset override):\n";
-            std::cout << "  --preset loose   Maximize recall: min-reads=1, breadth=0, depth=0, min-damage-sites=1\n";
-            std::cout << "  --preset strict  Maximize precision: min-reads=5, breadth=0.2, depth=1.0,\n";
-            std::cout << "                   auto-calibrate-spurious, min-damage-sites=5\n";
-            std::cout << "  --em-streaming    Use streaming EM (low memory, ~2.5x slower)\n";
-            std::cout << "  --em-max-memory, -m MB  Max EM memory in MB (default: 4096)\n";
-            std::cout << "                       Auto-switches to streaming if estimate exceeds limit\n";
-            std::cout << "  --min-positional-score FLOAT  Min read start diversity (default: 0)\n";
-            std::cout << "                       Filters spurious matches where all reads hit same position\n";
-            std::cout << "                       Score = sqrt(diversity * span), range 0-1\n";
-            std::cout << "  --min-distinct-starts INT  Min distinct query/target starts when n_reads>=3 (default: 2)\n";
-            std::cout << "  --min-terminal-ratio FLOAT  Min terminal/middle coverage ratio (default: 0)\n";
-            std::cout << "                       Filters matches with reads only in middle (spurious motif)\n";
-            std::cout << "  --auto-calibrate-spurious   Auto-derive thresholds from data\n";
-            std::cout << "                       Uses 5th percentile of well-supported proteins (n_reads>=10, n_unique_starts>=3)\n\n";
-            std::cout << "Alignment-level pre-filters (applied before any processing):\n";
-            std::cout << "  --aln-min-identity FLOAT  Min identity fraction (default: 0, no filter)\n";
-            std::cout << "  --aln-min-bits FLOAT      Min bit score (default: 0, no filter)\n";
-            std::cout << "  --aln-max-evalue FLOAT    Max e-value (default: 1e10, no filter)\n\n";
-            std::cout << "Parallelism:\n";
-            std::cout << "  --threads, -t INT    OpenMP threads for EMI scans (default: runtime default)\n\n";
-            std::cout << "Pipeline:\n";
-            std::cout << "  hits2emi -> damage-annotate\n";
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0 ||
+                   strcmp(argv[i], "--help-all") == 0) {
+            std::cout <<
+                "Usage: dart damage-annotate --emi <hits.emi> [options]\n"
+                "\n"
+                "Input:\n"
+                "  --emi, -i FILE          EMI v7 alignment index\n"
+                "  --damage-index FILE     AGD damage index from predict\n"
+                "  --library-type TYPE     ss, ds or auto (default: auto)\n"
+                "Null model (pick one):\n"
+                "  --no-null               Run without a null model\n"
+                "  --em-null-model FILE    Empirical decoy null model\n"
+                "  --em-calib-model FILE   Calibrated true-hit and null model\n"
+                "Output:\n"
+                "  -o FILE                 Per-read TSV (default: stdout)\n"
+                "  --protein-summary FILE  Per-protein damage TSV\n"
+                "  --gene-summary FILE     Per-gene statistics TSV\n"
+                "  --dcx FILE              Columnar alignment and site output (requires EM)\n"
+                "  --library-label STR     Library ID in DCX (default: DCX basename)\n"
+                "Running:\n"
+                "  --em-tape-dir DIR       Node-local disk for EM tape; or DART_EM_TAPE_DIR\n"
+                "  --threads, -t INT       OpenMP threads (default: runtime default)\n"
+                "  -v                      Verbose output\n";
+            if (strcmp(argv[i], "--help-all") == 0) {
+                std::cout <<
+                "\n"
+                "Damage:\n"
+                "  --sites FILE                  Per-site damage TSV\n"
+                "  --refine-damage               Update d_max from EM assignments\n"
+                "  --auto-prior-ancient          Estimate the ancient prior from AGD reads\n"
+                "  --prior-ancient FLOAT         Read prior for the posterior (default: the library's pi\n"
+                "                                when it is DETECTED, else 0.10)\n"
+                "  --d-max RATE                  Damage rate (default: estimated from data)\n"
+                "  --lambda FLOAT                Decay constant (default: 0.3)\n"
+                "Multimapping:\n"
+                "  --emit-multimap               Emit multiple EM candidates per read\n"
+                "  --multimap-k INT              Maximum candidates per read (default: 5)\n"
+                "  --multimap-floor FLOAT        Minimum candidate gamma (default: 0.05)\n"
+                "Protein filters:\n"
+                "  --auto-calibrate-spurious     Estimate mapping thresholds from supported proteins\n"
+                "  --min-breadth FLOAT           Minimum breadth (default: 0.10)\n"
+                "  --min-depth FLOAT             Minimum depth (default: 0.5)\n"
+                "  --min-reads INT               Minimum reads (default: 3)\n"
+                "Functional profiling:\n"
+                "  --map FILE                    Gene-to-group TSV\n"
+                "  --functional-summary FILE     Per-function TSV (requires --map)\n"
+                "  --anvio-ko FILE               Gene-level group abundance (requires --map)\n"
+                "  --annotation-source STR       Anvi'o source label (default: DART)\n"
+                "Null model:\n"
+                "  --em-null-model FILE          .null sidecar from hits2emi --decoy-hits or dart null\n"
+                "                                (default: <emi>.null when it exists)\n"
+                "  --null-fdr Q                  Reject a read as a chance hit when its per-bin target-decoy\n"
+                "                                q-value exceeds Q (default: 0.05; the default rule)\n"
+                "  --null-queries N              Queries searched, the FDR scale (default: damage index records)\n"
+                "  --null-p-max P                Instead of --null-fdr: reject a read when the chance that a\n"
+                "                                decoy scores as high in its aligned-length bin exceeds P\n"
+                "  --em-null-tau FLOAT           Null responsibility cutoff, calibrated null column only\n"
+                "                                (--em-calib-model; default: 0.5)\n"
+                "Resume:\n"
+                "  --em-checkpoint FILE          EM checkpoint (default: tape dir/dart_emtape_<pid>.ckpt)\n"
+                "  --resume                      Resume a matching EM checkpoint\n"
+                "Model parameters (change only with a reason):\n"
+                "  --ancient-threshold FLOAT     Ancient posterior cutoff (default: 0.60)\n"
+                "  --modern-threshold FLOAT      Modern posterior cutoff (default: 0.25)\n"
+                "  --terminal-threshold FLOAT    Terminal read posterior cutoff (default: 0.50)\n"
+                "  --auth-alpha FLOAT            Protein authentication level (default: 0.05)\n"
+                "  --modern-damage-rate, --eps0 FLOAT  Modern damaged-read rate (default: 0.02)\n"
+                "  --per-read-damage-threshold FLOAT   Damaged-read cutoff (default: 0.50)\n"
+                "  --min-damage-sites INT        Minimum susceptible sites (default: auto)\n"
+                "  --site-cap FLOAT              Site log-Bayes-factor cap (default: 3.0)\n"
+                "  --w0 FLOAT                    Absence-evidence weight (default: 0.3)\n"
+                "  --em-min-prob FLOAT           Minimum EM posterior to keep (default: 1e-6)\n"
+                "  --min-positional-score FLOAT  Minimum start diversity score (default: 0)\n"
+                "  --min-terminal-ratio FLOAT    Minimum terminal/middle coverage ratio (default: 0)\n"
+                "  --min-distinct-starts INT     Minimum distinct starts for 3+ reads (default: 2)\n"
+                "  --min-informative-reads INT   Minimum informative reads (default: 3)\n"
+                "  --max-single-molecule-frac FLOAT  Maximum single-molecule fraction (default: 0.5)\n"
+                "EM mode:\n"
+                "  --no-em                       Use best hits without EM\n"
+                "  --em-use-damage-mapping       Let damage evidence affect mapping (default: off)\n";
+            } else {
+                std::cout << "\nRun 'dart damage-annotate --help-all' for every option.\n";
+            }
             return 0;
         } else {
             std::cerr << "Unknown option: " << argv[i] << "\n";
             std::cerr << "Run 'dart damage-annotate --help' for usage.\n";
             return 1;
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // Fit-null mode: read a 16-col decoy hits TSV, fit the per-length-bin Gumbel
-    // to the per-query MAX (lambda_b * bit_score), write the sidecar, and exit.
-    // -----------------------------------------------------------------------
-    if (!fit_null_from_file.empty()) {
-        if (null_out_file.empty()) {
-            null_out_file = fit_null_from_file + ".null.tsv";
-        }
-        dart::MappedTSV tsv(fit_null_from_file.c_str());
-        if (!tsv.valid()) {
-            std::cerr << "Error: cannot open decoy hits TSV: " << fit_null_from_file << "\n";
-            return 1;
-        }
-        // Per query: track (max bit_score, aln_len at that max). Grouped by query id.
-        struct QMax { float bits; uint16_t aln_len; };
-        std::unordered_map<std::string, QMax> qmax;
-        std::mutex qmax_mutex;
-        dart::partitioned_parse_tsv(tsv, [&](const dart::TSVLine& line) {
-            if (line.n_fields < 12) return;
-            // Skip header rows (query...) defensively.
-            if (line.fields[0].size() >= 5 &&
-                std::strncmp(line.fields[0].data(), "query", 5) == 0) return;
-            const std::string q(line.fields[0]);
-            const uint32_t alnlen = dart::fast_stou(line.fields[3]);
-            const float bits = dart::fast_stof(line.fields[11]);
-            std::lock_guard<std::mutex> lk(qmax_mutex);
-            auto it = qmax.find(q);
-            if (it == qmax.end() || bits > it->second.bits) {
-                qmax[q] = {bits, static_cast<uint16_t>(std::min(alnlen, 65535u))};
-            }
-        }, /*skip_header=*/true, /*min_fields=*/12);
-
-        std::vector<std::vector<double>> per_bin(dart::kNumNullBins);
-        for (const auto& kv : qmax) {
-            const int b = dart::null_length_bin(kv.second.aln_len);
-            per_bin[b].push_back(static_cast<double>(em_lambda_b) *
-                                 static_cast<double>(kv.second.bits));
-        }
-        dart::NullModel model = dart::fit_null_model(per_bin, /*min_n=*/200);
-        if (!dart::write_null_model(null_out_file, model)) {
-            std::cerr << "Error: failed to write null model to " << null_out_file << "\n";
-            return 1;
-        }
-        std::cerr << "Fitted null model from " << qmax.size()
-                  << " decoy queries -> " << null_out_file << "\n";
-        for (int b = 0; b < dart::kNumNullBins; ++b) {
-            std::cerr << "  bin " << b << " [" << dart::kNullBinEdges[b] << ","
-                      << dart::kNullBinEdges[b + 1] << ") n=" << model.n[b]
-                      << " mu=" << model.mu[b] << " beta=" << model.beta[b] << "\n";
-        }
-        return 0;
     }
 
     if (emi_file.empty()) {
@@ -1862,16 +1586,20 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         std::cerr << "Error: --em-min-prob must be in [0,1]\n";
         return 1;
     }
-    if (em_min_margin < 0.0 || em_min_margin > 1.0) {
-        std::cerr << "Error: --em-min-margin must be in [0,1]\n";
-        return 1;
-    }
-    if (em_max_neff < 1.0) {
-        std::cerr << "Error: --em-max-neff must be >= 1\n";
-        return 1;
-    }
     if (em_null_tau < 0.0 || em_null_tau > 1.0) {
         std::cerr << "Error: --em-null-tau must be in [0,1]\n";
+        return 1;
+    }
+    if (!(null_p_max >= 0.0 && null_p_max <= 1.0)) {
+        std::cerr << "Error: --null-p-max must be in [0,1]\n";
+        return 1;
+    }
+    if (!(null_fdr >= 0.0 && null_fdr <= 1.0)) {
+        std::cerr << "Error: --null-fdr must be in [0,1]\n";
+        return 1;
+    }
+    if (null_fdr_set && null_p_max_set) {
+        std::cerr << "Error: --null-fdr and --null-p-max are two reject rules; give one\n";
         return 1;
     }
 
@@ -1879,21 +1607,55 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // use_em_null gates the whole null path; disabled → zero behavior change.
     dart::NullModel em_null_model;
     bool use_em_null = false;
+    std::string em_null_source = "--em-null-model";
+    if (em_null_model_file.empty() && !no_null && em_calib_model_file.empty()) {
+        const std::string sidecar = dart::null_sidecar_path(emi_file);
+        if (std::ifstream(sidecar).good()) { em_null_model_file = sidecar; em_null_source = "sidecar next to the EMI"; }
+    }
+    // null_p (the per-read chance rule) reads the model on the scale it was loaded at:
+    // em_null_model.mu = raw bits * null_p_scale. N is its decoy denominator.
+    // Reject rule for bit 0x1 on the uncalibrated path: the per-bin target-decoy FDR by default,
+    // which needs the number of queries searched (--null-queries, else the damage index record
+    // count: one record per predicted protein); --null-p-max, or no way to count queries, selects
+    // the fixed chance-probability rule.
+    const bool use_null_fdr = !null_p_max_set && (null_queries > 0 || !damage_index_file.empty());
+    auto null_rule_text = [&] {
+        std::ostringstream s;
+        if (use_null_fdr) s << "reject per-bin target-decoy q > " << null_fdr;
+        else s << "reject null_p > " << null_p_max;
+        return s.str();
+    };
+    dart::NullProvenance em_null_prov;
+    double null_p_scale = 1.0;
+    uint64_t null_p_n = 0;
+    bool null_p_per_submitted = false;
     if (!em_null_model_file.empty()) {
-        if (!dart::read_null_model(em_null_model_file, em_null_model)) {
-            std::cerr << "Error: cannot read --em-null-model " << em_null_model_file << "\n";
+        std::string null_err;
+        if (!dart::read_null_model(em_null_model_file, em_null_model, &em_null_prov, &null_err)) {
+            std::cerr << "Error: cannot read null model " << em_null_model_file << ": " << null_err << "\n";
             return 1;
         }
-        use_em_null = em_null_model.valid();
-        if (use_em_null && verbose) {
-            std::cerr << "Loaded null model (" << em_null_model.mu.size()
-                      << " bins) from " << em_null_model_file
-                      << "; reject tau=" << em_null_tau << "\n";
+        if (em_null_prov.legacy_tsv) {
+            std::cerr << "Warning: " << em_null_model_file << " is the deprecated TSV null sidecar; "
+                         "refit with dart null or hits2emi --decoy-hits to get the binary .null format.\n";
+        } else {
+            em_null_model.scale(em_lambda_b);   // sidecar is on the raw bit scale
         }
-    }
-    if (em_null_fdr >= 0.0 && !use_em_null) {
-        std::cerr << "Error: --em-null-fdr requires --em-null-model (and a decoy pass to solve tau).\n";
-        return 1;
+        null_p_scale = em_lambda_b;   // the legacy TSV is already on the lambda scale
+        null_p_n = dart::null_decoy_denominator(em_null_model, em_null_prov, &null_p_per_submitted);
+        use_em_null = em_null_model.valid();
+        const int fitted = dart::fitted_bins(em_null_model);
+        std::cerr << "Null model: " << em_null_model_file << " (" << em_null_source << ", "
+                  << dart::null_fit_summary(em_null_model) << "; " << null_rule_text()
+                  << (null_p_per_submitted ? " per submitted decoy" : " per decoy with a hit") << ")\n";
+        if (!use_null_fdr && !null_p_max_set)
+            std::cerr << "Warning: no --damage-index or --null-queries, so the number of queries searched is\n"
+                         "  unknown and the per-bin FDR rule cannot run; rejecting by null_p > "
+                      << null_p_max << " instead.\n";
+        if (fitted == 0)
+            std::cerr << "Warning: no null bin is fitted (the decoy hits gave no finite Gumbel: fewer than two\n"
+                         "  queries or zero variance): chance hits are too rare at this database size and search\n"
+                         "  stringency to model. The null coordinate stays off and the output equals --no-null.\n";
     }
 
     // Load the coherent-LR calibration model (f_true + f_0) if requested. This
@@ -1913,42 +1675,17 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         em_null_model.beta = em_calib_model.null.beta;
         em_null_model.n = em_calib_model.null.n;
         use_em_null = true;
+        null_p_scale = 1.0;   // the calibration f_0 is on the raw bit scale
+        null_p_n = dart::null_decoy_denominator(em_null_model, dart::NullProvenance{}, &null_p_per_submitted);
         if (verbose) {
             std::cerr << "Loaded calibration model (f_true " << em_calib_model.true_bins.size()
                       << " bins, f_0 " << em_calib_model.null.mu.size() << " bins, censor="
                       << em_calib_model.censor << ") from " << em_calib_model_file << "\n";
         }
     }
-    if (coverage_em_bins < 1) {
-        std::cerr << "Error: --coverage-em-bins must be >= 1\n";
-        return 1;
-    }
-    if (coverage_em_iters < 1) {
-        std::cerr << "Error: --coverage-em-iters must be >= 1\n";
-        return 1;
-    }
-    if (coverage_em_tau < 0.0f) {
-        std::cerr << "Error: --coverage-em-tau must be >= 0\n";
-        return 1;
-    }
-    // compact_em_map is the sole EM reassignment solver and ignores initial_weights /
-    // coverage reweighting; the coverage wrapper still calls squarem_em internally
-    // (coverage_em.cpp:712,800). Refuse rather than silently run a solver whose result
-    // does not reflect the requested coverage-aware objective.
-    if (use_coverage_em) {
-        std::cerr << "Error: --coverage-em is not supported: compact_em_map is the sole "
-                     "EM solver and does not honor coverage reweighting. Re-run without "
-                     "--coverage-em.\n";
-        return 1;
-    }
-    if (depth_gate_lo < 0.0f || depth_gate_hi <= depth_gate_lo) {
-        std::cerr << "Error: --depth-gate-lo must be >= 0 and < --depth-gate-hi\n";
-        return 1;
-    }
-    if (w_min < 0.0f || w_min > 1.0f) {
-        std::cerr << "Error: --w-min must be in [0, 1]\n";
-        return 1;
-    }
+    if ((null_p_max_set || null_fdr_set || null_queries) && !use_em_null)
+        std::cerr << "Warning: --null-fdr, --null-queries and --null-p-max have no effect without a null model "
+                     "(--em-null-model or <emi>.null)\n";
     if (w0 < 0.0f || w0 > 1.0f) {
         std::cerr << "Error: --w0 must be in [0, 1]\n";
         return 1;
@@ -1986,30 +1723,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         return 1;
     }
 
-    if (!analysis_proteins_file.empty()) {
-        protein_summary_file = analysis_proteins_file;
-    }
-    if (!analysis_blast8_file.empty()) {
-        blast8_unique_file = analysis_blast8_file;
-    }
-    if (!analysis_categories_file.empty()) {
-        functional_summary_file = analysis_categories_file;
-    }
-
-    if (!analysis_prefix.empty()) {
-        if (output_file.empty()) {
-            output_file = analysis_prefix + ".reads.tsv";
-        }
-        if (protein_summary_file.empty()) {
-            protein_summary_file = analysis_prefix + ".protein.tsv";
-        }
-        if (blast8_unique_file.empty()) {
-            blast8_unique_file = analysis_prefix + ".blast8.unique.tsv";
-        }
-        if (!map_file.empty() && functional_summary_file.empty()) {
-            functional_summary_file = analysis_prefix + ".categories.tsv";
-        }
-    }
 
     int runtime_threads = 1;
 #ifdef _OPENMP
@@ -2031,12 +1744,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cerr << "d_max: auto\n";
         }
         std::cerr << "lambda: " << lambda << "\n";
-        if (max_dist >= 0) {
-            std::cerr << "Positional filter: <=" << max_dist << " nt from terminus\n";
-        }
-        if (!analysis_prefix.empty()) {
-            std::cerr << "analysis-prefix: " << analysis_prefix << "\n";
-        }
         std::cerr << "threads: " << runtime_threads
 #ifdef _OPENMP
                   << "\n";
@@ -2101,6 +1808,34 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     const uint32_t n_reads = reader.num_reads();
     const uint32_t n_refs = reader.num_refs();
 
+    // Per-read ancient prior for post-hoc gamma_ancient: the AGD p_damaged, used only when the
+    // library is pi DETECTED, where libtaph wrote its prior-aware read posterior. Otherwise the
+    // AGD byte is sigmoid(prior-free LLR) under an implicit 0.5 prior, so gamma_ancient is left
+    // empty instead of being reported from it.
+    const bool agd_read_prior = damage_index && damage_index->pi_detected();
+    std::vector<uint8_t> agd_dmg_q;
+    if (agd_read_prior) {
+        agd_dmg_q.assign(n_reads, 0);
+        uint64_t agd_missing = 0;
+        #pragma omp parallel for schedule(static) reduction(+:agd_missing)
+        for (uint32_t r = 0; r < n_reads; ++r) {
+            if (const AgdRecord* rec = damage_index->find(reader.read_name(r))) agd_dmg_q[r] = rec->p_damaged_q;
+            else ++agd_missing;
+        }
+        if (agd_missing > 0)
+            std::cerr << "Warning: " << agd_missing << " of " << n_reads
+                      << " EMI reads are missing from the damage index; their p_damaged is 0\n";
+    }
+    if (verbose) {
+        std::cerr << "Per-read ancient prior: "
+                  << (agd_read_prior ? "AGD p_damaged (library pi DETECTED)"
+                                     : "none; gamma_ancient left empty (library not pi DETECTED)")
+                  << "\n";
+    }
+    auto read_dmg = [&](const float* col, size_t i, uint32_t ridx) {
+        return agd_read_prior ? agd_dmg_q[ridx] * (1.0f / 255.0f) : std::clamp(col[i], 0.0f, 1.0f);
+    };
+
     if (verbose) {
         std::cerr << "EMI metadata:\n";
         std::cerr << "  Version: " << reader.version() << "\n";
@@ -2109,9 +1844,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         std::cerr << "  References: " << n_refs << "\n";
         std::cerr << "  Sorted (read,score): "
                   << (reader.is_sorted_by_read_then_score() ? "yes" : "no") << "\n";
-        if (max_dist >= 0) {
-            std::cerr << "  Positional filter: <=" << max_dist << " nt from terminus\n";
-        }
         std::cerr << "\n";
     }
 
@@ -2131,6 +1863,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         uint32_t qlen = 0;
         uint32_t tlen = 0;
         uint32_t aln_len_on_target = 0;
+        uint16_t aln_len = 0;  // raw EMI ALN_LEN of the best hit: the null bin (the fit binned on it)
         uint32_t best_rg = UINT32_MAX;
         uint32_t best_row = UINT32_MAX;
         // Soft multi-mapping (--emit-multimap): the EM mapping responsibility for THIS
@@ -2157,20 +1890,16 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     };
     std::vector<std::vector<MmCand>> mm_pool;
     if (emit_multimap) mm_pool.assign(n_reads, {});
-    const bool need_unique_degree = !blast8_unique_file.empty();
-    std::vector<uint32_t> read_degree;
-    if (need_unique_degree) {
-        read_degree.assign(n_reads, 0);
-    }
     // Production streaming EM tape path (PI mandate 2026-07-23): when the config needs
-    // only ref/gamma/gamma_ancient per read (no --em-audit, no calib, no null column,
-    // damage-free mapping) the EM runs off an O_DIRECT tape on node-local scratch, feeding
-    // tape_em_core directly from streaming ingestion. Nothing O(alignments) is materialized
-    // in RAM (kills the ~288 GB in-RAM transient measured on LV626), giving aln-independent
-    // peak RSS for the 6-10B-aln production target. All predicates here are CLI-known, so the
-    // O(A) em_alignments buffers below are skipped entirely on this path.
-    const bool tape_path = use_em && em_audit_file.empty() && !use_em_calib &&
-                           !use_em_null && !em_use_damage_mapping;
+    // only ref/gamma/gamma_ancient per read (no calib, damage-free mapping) the EM runs
+    // off an O_DIRECT tape on node-local scratch, feeding tape_em_core directly from
+    // streaming ingestion. Nothing O(alignments) is materialized in RAM (kills the ~288 GB
+    // in-RAM transient measured on LV626), giving aln-independent peak RSS for the 6-10B-aln
+    // production target. The decoy null rides along as one double per read (the best null
+    // log-density over the read's alignments, computed while the tape is written), so a
+    // null model keeps the tape. All predicates here are CLI-known, so the O(A)
+    // em_alignments buffers below are skipped entirely on this path.
+    const bool tape_path = use_em && !use_em_calib && !em_use_damage_mapping;
     // read-major per-read degree (uint64 prefix: aln offsets exceed 2^32 at 6B+ alns) and
     // per-ref length (== build_alignment_data's ref_lengths). Tape path only.
     std::vector<uint64_t> em_read_deg;    // [n_reads+1], prefix-summed into read_offsets
@@ -2180,7 +1909,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         em_ref_lengths.assign(n_refs, 0);
     }
     std::vector<dart::CompactAlignment> em_alignments;
-    if (use_em && !em_streaming && !tape_path) {
+    if (use_em && !tape_path) {
         em_alignments.reserve(static_cast<size_t>(reader.num_alignments()));
     }
     std::mutex em_damage_stats_mutex;
@@ -2219,12 +1948,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
     size_t em_shard_count = 1;
 #ifdef _OPENMP
-    if (use_em && !em_streaming && !tape_path) {
+    if (use_em && !tape_path) {
         em_shard_count = static_cast<size_t>(std::max(1, omp_get_max_threads()));
     }
 #endif
     std::vector<std::vector<dart::CompactAlignment>> em_alignments_by_thread;
-    if (use_em && !em_streaming && !tape_path) {
+    if (use_em && !tape_path) {
         em_alignments_by_thread.resize(em_shard_count);
         const size_t reserve_per_shard =
             static_cast<size_t>(reader.num_alignments() / std::max<size_t>(1, em_shard_count) + 1);
@@ -2292,7 +2021,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         size_t local_filtered_evalue = 0;
 
         std::vector<dart::CompactAlignment> local_em;
-        if (use_em && !em_streaming && !tape_path) {
+        if (use_em && !tape_path) {
             local_em.reserve(num_rows);
         }
         uint64_t local_em_n = 0;
@@ -2336,10 +2065,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             local_best_unsorted.reserve(std::max<uint32_t>(1, num_rows / 4));
         }
 
-        std::unordered_map<uint32_t, uint32_t> local_degree_counts;
-        if (need_unique_degree) {
-            local_degree_counts.reserve(std::max<uint32_t>(1, num_rows / 8));
-        }
 
         auto update_candidate = [&](BestHitCandidate& cand,
                                     float bits,
@@ -2409,21 +2134,13 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 local_mm.emplace_back(ridx, d);
             }
 
-            if (need_unique_degree) {
-                auto it_deg = local_degree_counts.find(ridx);
-                if (it_deg == local_degree_counts.end()) {
-                    local_degree_counts.emplace(ridx, 1u);
-                } else {
-                    it_deg->second += 1u;
-                }
-            }
 
             if (use_em) {
                 dart::CompactAlignment ca{};
                 ca.read_idx = ridx;
                 ca.ref_idx = tidx;
                 ca.bit_score = bits;
-                const float ds = std::clamp(damage_score[i], 0.0f, 1.0f);
+                const float ds = read_dmg(damage_score, i, ridx);
                 ca.damage_score = ds;
                 const float ll_a = dmg_ll_a ? dmg_ll_a[i] : 0.0f;
                 const float ll_m = dmg_ll_m ? dmg_ll_m[i] : 0.0f;
@@ -2456,7 +2173,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     const uint32_t ref_len =
                         (tlen[i] > 0) ? static_cast<uint32_t>(tlen[i]) : static_cast<uint32_t>(ca.aln_end);
                     if (ref_len > em_ref_lengths[tidx]) em_ref_lengths[tidx] = ref_len;
-                } else if (!em_streaming) {
+                } else {
                     local_em.push_back(ca);
                 }
                 local_em_n++;
@@ -2478,7 +2195,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     BestHitCandidate cand;
                     cand.bits = bits;
                     cand.bits_second = 0.0f;
-                    cand.damage_score = std::clamp(damage_score[i], 0.0f, 1.0f);
+                    cand.damage_score = read_dmg(damage_score, i, ridx);
                     cand.ref_idx = tidx;
                     cand.fident = fident;
                     cand.evalue = evalue;
@@ -2492,7 +2209,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     local_best_sorted.emplace_back(ridx, cand);
                 } else {
                     update_candidate(local_best_sorted.back().second,
-                                     bits, std::clamp(damage_score[i], 0.0f, 1.0f),
+                                     bits, read_dmg(damage_score, i, ridx),
                                      tidx, fident, evalue,
                                      qstart_0, tstart_0, qlen_v, tlen_v,
                                      static_cast<uint32_t>(aln_len_v), i);
@@ -2503,7 +2220,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     BestHitCandidate cand;
                     cand.bits = bits;
                     cand.bits_second = 0.0f;
-                    cand.damage_score = std::clamp(damage_score[i], 0.0f, 1.0f);
+                    cand.damage_score = read_dmg(damage_score, i, ridx);
                     cand.ref_idx = tidx;
                     cand.fident = fident;
                     cand.evalue = evalue;
@@ -2517,7 +2234,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     it->second = cand;
                 } else {
                     update_candidate(it->second,
-                                     bits, std::clamp(damage_score[i], 0.0f, 1.0f),
+                                     bits, read_dmg(damage_score, i, ridx),
                                      tidx, fident, evalue,
                                      qstart_0, tstart_0, qlen_v, tlen_v,
                                      static_cast<uint32_t>(aln_len_v), i);
@@ -2549,6 +2266,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 hit.qlen = cand.qlen;
                 hit.tlen = cand.tlen;
                 hit.aln_len_on_target = cand.aln_len_on_target;
+                // aln_len_on_target is still the raw aln_len_v here (the annotation scan clips it later).
+                hit.aln_len = static_cast<uint16_t>(std::min(cand.aln_len_on_target, 65535u));
                 hit.best_rg = cand.best_rg;
                 hit.best_row = cand.best_row;
             } else {
@@ -2585,18 +2304,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             }
         }
 
-        if (need_unique_degree) {
-            for (const auto& kv : local_degree_counts) {
-                const uint32_t ridx = kv.first;
-                const uint32_t add = kv.second;
-                const size_t shard = static_cast<size_t>(ridx) & (kBestHitShards - 1);
-                std::lock_guard<std::mutex> lock(best_hit_mutexes[shard]);
-                read_degree[ridx] += add;
-            }
-        }
 
         if (use_em && local_em_has_rows) {
-            if (!em_streaming && !local_em.empty()) {
+            if (!local_em.empty()) {
                 size_t em_shard = 0;
 #ifdef _OPENMP
                 em_shard = static_cast<size_t>(omp_get_thread_num());
@@ -2650,7 +2360,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         }
     }
 
-    if (use_em && !em_streaming) {
+    if (use_em) {
         size_t em_total = 0;
         for (const auto& shard : em_alignments_by_thread) {
             em_total += shard.size();
@@ -2755,16 +2465,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         if (verbose) std::cerr << "\n";
     }
 
-    // Open BLAST8 output file if requested.
-    std::ofstream blast8_out;
-    size_t written_unique = 0;
-    if (!blast8_unique_file.empty()) {
-        blast8_out.open(blast8_unique_file);
-        if (!blast8_out.is_open()) {
-            std::cerr << "Error: Cannot open BLAST8 unique file: " << blast8_unique_file << "\n";
-            return 1;
-        }
-    }
 
     if (verbose) {
         size_t total = total_alignments.load(std::memory_order_relaxed);
@@ -2820,8 +2520,16 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         float em_ref_neff = 1.0f;       // Effective number of references: 1 / sum_j gamma_j^2
         float gamma_null = 0.0f;        // null-component responsibility (spurious-hit mass)
         uint8_t em_reject_reason = 0;   // 0=keep, bit0=null_dominated, bit1=low_margin, bit2=high_neff
+        float null_p = std::numeric_limits<float>::quiet_NaN();  // chance probability of the best hit
+        float null_q = std::numeric_limits<float>::quiet_NaN();  // per-bin target-decoy q (FDR rule only)
     };
     std::vector<EmReadResult> em_read_results(n_reads);
+    // Null chance rule, per null bin: reads with a best hit and reads flagged by null_p.
+    std::array<uint64_t, dart::kNumNullBins> null_bin_reads{}, null_bin_flagged{};
+    std::array<float, dart::kNumNullBins> null_bin_kept_min{};   // FDR rule: lowest kept best-hit bits
+    null_bin_kept_min.fill(std::numeric_limits<float>::infinity());
+    bool null_p_ran = false;
+    bool null_fdr_ran = false;
     // True when damage-aware EM was active and gamma_ancient was actually populated.
     // Used by --refine-damage to avoid falling back to total gamma for modern reads.
     // Atomic because it may be set inside the parallel streaming_em_finalize callback.
@@ -2838,10 +2546,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // wrong homolog and emitted as a false annotation. Refuse EM without a null
     // model unless the caller accepts the risk with --no-null.
     if (use_em && !use_em_null && !no_null) {
-        std::cerr << "Error: refusing EM annotation without --em-null-model FILE; "
+        std::cerr << "Error: refusing EM annotation without a null model; "
                      "a flat targeted database can force-map absent-protein reads to "
-                     "false annotations. Pass --em-null-model FILE, or --no-null to "
-                     "accept this explicitly.\n";
+                     "false annotations. Search the decoy peptides predict wrote next to "
+                     "--fasta-aa and pass them to hits2emi --decoy-hits (annotate then finds "
+                     "<emi>.null), pass --em-null-model FILE, or --no-null to accept this explicitly.\n";
         return 1;
     }
     if (use_em && em_aln_count > 0) {
@@ -2993,20 +2702,18 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
         // Post-hoc ancient responsibility is produced by the EM final pass itself when the
         // mapping is damage-free (gamma_ancient = gamma * P(ancient|aln) at frozen weights).
-        em_params.posthoc_gamma_ancient =
-            !em_use_damage_mapping &&
-            (emi_has_alignment_damage || (emi_has_damage_scores && em_damage_varies_within_read));
+        em_params.posthoc_gamma_ancient = !em_use_damage_mapping && agd_read_prior;
 
         // Streaming (transient-gamma) EM: iterations hold no O(alignments) gamma, the final
         // pass streams per-read gamma straight into the finalization below, and
         // compact_em_map releases aln_data.alignments after decode -> steady RSS ~20 B/aln
         // (vs 20+32). Gated to the production config where per-read finalization needs only
-        // ref/gamma/gamma_ancient: no --em-audit, no calib densities, no null column,
-        // damage-free mapping, and — when post-hoc ancient is active — alignment-level damage
-        // likelihoods so p_anc = sigmoid(base_a - base_m) is EXACT (matches the legacy loop).
+        // ref/gamma/gamma_ancient (+ the per-read null responsibility on the tape path): no
+        // calib densities, damage-free mapping. Post-hoc p_anc = sigmoid(base_a - base_m)
+        // matches the legacy loop with or without DMG_LL columns (without them it is the AGD
+        // read posterior itself).
         const bool can_stream =
-            em_audit_file.empty() && !use_em_calib && !use_em_null && !em_params.use_damage &&
-            (!em_params.posthoc_gamma_ancient || emi_has_alignment_damage);
+            !use_em_calib && !em_params.use_damage && (!use_em_null || tape_path);
         const float em_keep_thr = static_cast<float>(em_min_prob);
 
         // ---- Tape path: build the O_DIRECT hot tape by a streaming decode (scan-2) ----
@@ -3014,7 +2721,15 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         // needs only ref/gamma/gamma_ancient per read, and gamma_ancient is derived in-core
         // (posthoc: gamma*sigmoid(base_a-base_m)), so NO raw {bit,aln_len,ds} tape is needed —
         // only the 3 SoA hot streams tape_em_core consumes. Nothing O(alignments) in RAM.
+        // With a null model the tape writer also keeps, per read, the best null log-density
+        // over the read's kept alignments (what read_null_log_density returns on the in-RAM
+        // CSR); tape_em_core scores the null column from it and returns gamma_null per read.
         std::string tape_dir_path, p_tape_ref, p_tape_ba, p_tape_bm, em_input_fp;
+        std::vector<double> tape_null_lp, tape_gnull;
+        if (tape_path && use_em_null) {
+            tape_null_lp.assign(n_reads, -std::numeric_limits<double>::infinity());
+            tape_gnull.assign(n_reads, 0.0);
+        }
         struct TapeDirGuard {
             std::string dir, a, b, c;
             ~TapeDirGuard() {
@@ -3024,13 +2739,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             }
         } tape_guard;
         if (tape_path) {
-            if (!can_stream) {
-                std::cerr << "Error: EM tape path needs alignment-level damage likelihoods when "
-                             "post-hoc ancient responsibility is active (DAMAGE_SCORE varies within "
-                             "read but no DMG_LL columns). Re-run with an EMI carrying alignment "
-                             "damage likelihoods.\n";
-                return 1;
-            }
             if (em_tape_dir.empty()) { const char* e = std::getenv("DART_EM_TAPE_DIR"); if (e) em_tape_dir = e; }
             if (em_tape_dir.empty()) {
                 std::cerr << "Error: EM tape path needs a node-local scratch dir. Pass --em-tape-dir "
@@ -3149,19 +2857,33 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                     const uint32_t aln_end = std::min(tstart_0 + static_cast<uint32_t>(aln_len[i]), 65535u);
                     const uint16_t aln_len_em = (aln_end > aln_start)
                         ? static_cast<uint16_t>(std::min(aln_end - aln_start, 65535u)) : 0;
+                    if (!tape_null_lp.empty()) {
+                        // Same function as the in-RAM path, one alignment at a time; the
+                        // per-read max is order-exact, so scan order cannot change it.
+                        dart::Alignment na{};
+                        na.bit_score = bits;
+                        na.aln_len = aln_len_em;
+                        const double lp = dart::read_null_log_density(em_params, &na, 1);
+                        double& slot = tape_null_lp[ridx];   // read-major: this rg owns ridx
+                        if (lp > slot) slot = lp;
+                    }
                     const uint32_t ref = ref_idx[i];
                     // Decode == tape_decode_read with score_scale=1 (normalize_scores_per_query is
-                    // always false here): bc = length_log_penalty(shell) + coverage(0) + lambda_b*bit.
+                    // always false here): bc = length_log_penalty(shell) + coverage(0) + lambda_b*bit,
+                    // split by em_base_pair (damage-free here: the tape path excludes
+                    // --em-use-damage-mapping).
                     const double bc = dart::length_log_penalty(shell, em_params, ref)
                                     + dart::coverage_log_penalty(em_params, ref)
                                     + dart::real_log_density(em_params, static_cast<double>(bits), aln_len_em, 1.0);
                     const double pr = std::clamp(
-                        static_cast<double>(std::clamp(damage_score[i], 0.0f, 1.0f)), eps_dec, 1.0 - eps_dec);
+                        static_cast<double>(read_dmg(damage_score, i, ridx)), eps_dec, 1.0 - eps_dec);
                     const double la = dmg_ll_a ? static_cast<double>(dmg_ll_a[i]) : 0.0;
                     const double lm = dmg_ll_m ? static_cast<double>(dmg_ll_m[i]) : 0.0;
+                    double ba, bm;
+                    dart::em_base_pair(em_params, bc, pr, la, lm, ba, bm);
                     lref.push_back(ref);
-                    lba.push_back(bc + std::log(pr) + la);
-                    lbm.push_back(bc + std::log(1.0 - pr) + lm);
+                    lba.push_back(ba);
+                    lbm.push_back(bm);
                 }
                 if (lref.empty()) return;
                 const off_t o_ref = static_cast<off_t>(base) * static_cast<off_t>(sizeof(uint32_t));
@@ -3216,9 +2938,14 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 double best_g = -1.0;
                 float top1 = 0.0f, top2 = 0.0f;
                 double sum_sq = 0.0;
+                // Tape path with a null: tape_em_core stores gamma_null[r] before calling us.
+                // Margin/neff use the real responsibilities renormalized by 1/(1-gamma_null),
+                // exactly as the legacy loop below; best-hit gamma and the pool stay raw.
+                const double gnull = tape_gnull.empty() ? 0.0 : tape_gnull[r];
+                const double real_norm = (gnull < 1.0 - 1e-9) ? (1.0 / (1.0 - gnull)) : 0.0;
                 for (uint32_t j = 0; j < deg; ++j) {
-                    const double g = gamma[j];
-                    if (g > best_g) { best_g = g; em_best_ref = ref[j]; }
+                    const double g = gamma[j] * real_norm;
+                    if (gamma[j] > best_g) { best_g = gamma[j]; em_best_ref = ref[j]; }
                     sum_sq += g * g;
                     if (g > static_cast<double>(top1)) { top2 = top1; top1 = static_cast<float>(g); }
                     else if (g > static_cast<double>(top2)) { top2 = static_cast<float>(g); }
@@ -3258,25 +2985,30 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 uint8_t reason = 0;
                 if (em_margin < static_cast<float>(em_min_margin)) reason |= 0x2;
                 if (em_ref_neff > static_cast<float>(em_max_neff)) reason |= 0x4;
+                // Bit 0x1 on this (uncalibrated) path comes from null_p, set after the EM.
                 em_read_results[r] = {
                     best_hit_gamma, best_hit_gamma_ancient, bitscore_best_matches_em,
-                    em_keep, em_keep_thr, em_margin, em_ref_neff, 0.0f, reason
+                    em_keep, em_keep_thr, em_margin, em_ref_neff,
+                    static_cast<float>(gnull), reason
                 };
             };
             if (tape_path) {
                 // Stream-solve directly off the O_DIRECT hot tape: base_a/base_m live on
                 // scratch NVMe, not RAM, so peak RSS is O(num_refs) + fixed I/O buffers,
-                // INDEPENDENT of alignment count. null off => null_lp/gnull_out null.
+                // INDEPENDENT of alignment count. With a null model the per-read null
+                // log-density gathered by the tape writer feeds the null column.
                 dart::TapeEMResult res = dart::tape_em_core(
                     p_tape_ref, p_tape_ba, p_tape_bm, read_offsets.data(),
                     n_reads, n_refs, static_cast<uint64_t>(em_aln_count), em_params,
-                    nullptr, nullptr, finalize_cb,
-                    em_checkpoint_path, em_resume, em_input_fp);
+                    tape_null_lp.empty() ? nullptr : tape_null_lp.data(),
+                    tape_gnull.empty() ? nullptr : tape_gnull.data(),
+                    finalize_cb, em_checkpoint_path, em_resume, em_input_fp);
                 em_state.weights = std::move(res.weights);
                 em_state.pi = res.pi;
                 em_state.w_null = res.w_null;
                 em_state.log_likelihood = res.log_likelihood;
                 em_state.iterations = res.iterations;
+                if (!tape_gnull.empty()) em_state.gamma_null = std::move(tape_gnull);
             } else {
                 em_state = dart::compact_em_map(aln_data, em_params, finalize_cb);
             }
@@ -3298,9 +3030,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             }
             std::cerr << "  Runtime: "
                       << dart::log_utils::format_elapsed(em_start, em_end) << "\n";
-            if (use_coverage_em) {
-                std::cerr << "  Coverage stats: " << coverage_stats_map.size() << " proteins\n";
-            }
         }
 
         // The remaining per-read finalization runs only on the NON-streaming path. The
@@ -3316,28 +3045,15 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         // varies, which would re-couple mapping and damage in the ancient channel.
         // Damage never re-enters the mapping/M-step; pi stays at its 0.10 prior
         // because damage never drove the mapping loop.
-        if (!em_use_damage_mapping &&
-            (emi_has_alignment_damage ||
-             (emi_has_damage_scores && em_damage_varies_within_read))) {
+        if (em_params.posthoc_gamma_ancient) {
             const double eps = 1e-12;
-            const double pi_a = std::clamp(em_state.pi, eps, 1.0 - eps);
-            const bool use_aln_dmg = emi_has_alignment_damage;
+            // p_anc = the AGD read posterior; the alignment damage likelihoods would count
+            // its terminal C->T sites a second time (see em_base_pair).
             const size_t A = aln_data.alignments.size();
             em_state.gamma_ancient.assign(A, 0.0);
             for (size_t j = 0; j < A; ++j) {
                 const auto& aln = aln_data.alignments[j];
-                const double ds = std::clamp(static_cast<double>(aln.damage_score), eps, 1.0 - eps);
-                double p_anc;
-                if (use_aln_dmg) {
-                    const double la = std::log(ds) + static_cast<double>(aln.damage_ll_a);
-                    const double lm = std::log(1.0 - ds) + static_cast<double>(aln.damage_ll_m);
-                    const double mx = std::max(la, lm);
-                    const double ea = std::exp(la - mx), em = std::exp(lm - mx);
-                    p_anc = ea / (ea + em);
-                } else {
-                    const double num = pi_a * ds;
-                    p_anc = num / (num + (1.0 - pi_a) * (1.0 - ds));
-                }
+                const double p_anc = std::clamp(static_cast<double>(aln.damage_score), eps, 1.0 - eps);
                 em_state.gamma_ancient[j] = em_state.gamma[j] * p_anc;
             }
         }
@@ -3345,11 +3061,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         // Extract best assignments and build per-read lookup
         auto best = dart::reassign_reads(aln_data, em_state, 0.0);
 
-        // Full-population EM audit dump (sol verification requirement): one row per
-        // hit-read (deg>0), truth-joinable, carrying densities + the 3-way decision.
-        const bool do_audit = !em_audit_file.empty();
-        std::vector<std::string> audit_rows;
-        if (do_audit) audit_rows.reserve(n_reads);
 
         // Build per-read lookup: extract gamma for the best-hit target used in summaries,
         // while tracking whether EM would have reassigned this read elsewhere.
@@ -3453,31 +3164,17 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             // 3-way decision (sol). With calibrated densities the floor is on the LLR
             // (identifiability), which — unlike gamma_null — does not saturate to 1 via
             // the EM w_null dynamics, so information-poor reads ABSTAIN rather than being
-            // mislabeled contamination. Legacy/uncalibrated null keeps the original
-            // gamma_null > tau reject (no abstain band; preserves the regression baseline).
-            const char* decision = "kept";
-            if (em_params.use_null && end > start) {
+            // mislabeled contamination. Without an LLR the calibrated path keeps
+            // gamma_null > tau. The uncalibrated null gets bit 0x1 from null_p after the EM
+            // (gamma_null cannot reach tau there: the real term is unnormalised).
+            if (em_params.use_null && use_em_calib && end > start) {
                 if (have_llr) {
-                    // Calibrated path only: 3-way LLR call. Abstained/rejected reads
-                    // leave the assignment/auth pools (em_keep=false).
-                    if (llr <= em_reject_llr)     { decision = "reject";  reason |= 0x1; em_keep = false; }
-                    else if (llr < em_keep_llr)   { decision = "abstain"; reason |= 0x8; em_keep = false; }
-                } else if (gnull > em_null_tau)   { decision = "reject";  reason |= 0x1; }
-                // Legacy --em-null-model path preserves the original behavior exactly:
-                // reason 0x1 flags null-dominance downstream; em_keep is untouched here.
+                    // Abstained/rejected reads leave the assignment/auth pools (em_keep=false).
+                    if (llr <= em_reject_llr)     { reason |= 0x1; em_keep = false; }
+                    else if (llr < em_keep_llr)   { reason |= 0x8; em_keep = false; }
+                } else if (gnull > em_null_tau)   { reason |= 0x1; }
             }
 
-            if (do_audit && end > start) {
-                std::string qn(reader.read_name(r));
-                std::string tn = (em_best_ref < n_refs) ? std::string(reader.ref_name(em_best_ref)) : std::string("*");
-                char buf[512];
-                std::snprintf(buf, sizeof(buf),
-                    "%s\t%u\t%.1f\t%.4g\t%.4g\t%.4g\t%.6g\t%s\t%s\t%.4f\t%.4f",
-                    qn.c_str(), static_cast<unsigned>(em_best_aln), em_best_bit,
-                    log_ft, log_f0, llr, gnull, decision, tn.c_str(),
-                    best_hit_gamma, em_margin);
-                audit_rows.emplace_back(buf);
-            }
 
             em_read_results[r] = {
                 best_hit_gamma,
@@ -3492,25 +3189,50 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             };
         }
 
-        if (do_audit) {
-            std::ofstream af(em_audit_file);
-            if (!af) {
-                std::cerr << "Error: cannot open --em-audit " << em_audit_file << "\n";
-                return 1;
-            }
-            af << "query_id\taln_len\tbit\tlog_f_true\tlog_f_0\tllr\tgamma_null\t"
-                  "decision\tassigned_target\tbest_hit_gamma\tem_margin\n";
-            for (const auto& row : audit_rows) af << row << '\n';
-            size_t nk = 0, na = 0, nr = 0;
-            for (const auto& row : audit_rows) {
-                if (row.find("\tkept\t") != std::string::npos) ++nk;
-                else if (row.find("\tabstain\t") != std::string::npos) ++na;
-                else if (row.find("\treject\t") != std::string::npos) ++nr;
-            }
-            std::cerr << "  EM audit: " << audit_rows.size() << " hit-reads -> " << em_audit_file
-                      << " (kept=" << nk << " abstain=" << na << " reject=" << nr << ")\n";
-        }
         }  // end if(!can_stream) legacy per-read finalization
+
+        // Chance probability of each read's best hit under the decoy null, the same on the
+        // tape and in-RAM paths. On the uncalibrated path it alone sets reject bit 0x1.
+        if (use_em_null && null_p_n > 0) {
+            null_p_ran = true;
+            if (use_null_fdr && null_queries == 0 && damage_index) null_queries = damage_index->record_count();
+            const bool fdr_rule = use_null_fdr && !use_em_calib && null_queries > 0;
+            if (use_null_fdr && !use_em_calib && null_queries == 0)
+                std::cerr << "Warning: the damage index did not load, so the number of queries searched is unknown;\n"
+                             "  rejecting by null_p > " << null_p_max << " instead of the per-bin FDR.\n";
+            null_fdr_ran = fdr_rule;
+            std::vector<float> fdr_bits; std::vector<uint16_t> fdr_len; std::vector<uint8_t> fdr_has;
+            if (fdr_rule) { fdr_bits.resize(n_reads); fdr_len.resize(n_reads); fdr_has.assign(n_reads, 0); }
+            for (uint32_t r = 0; r < n_reads; ++r) {
+                const auto& bh = best_hits[r];
+                if (!bh.has) continue;
+                const double p = dart::null_chance_p(em_null_model, null_p_scale, null_p_n, bh.bits, bh.aln_len);
+                auto& er = em_read_results[r];
+                er.null_p = static_cast<float>(p);
+                const int b = dart::null_length_bin(bh.aln_len);
+                ++null_bin_reads[b];
+                if (fdr_rule) { fdr_bits[r] = bh.bits; fdr_len[r] = bh.aln_len; fdr_has[r] = 1; }
+                else if (!use_em_calib && p > null_p_max) {
+                    er.em_reject_reason |= 0x1;
+                    ++null_bin_flagged[b];
+                }
+            }
+            if (fdr_rule) {
+                const std::vector<double> q = dart::null_fdr_q(em_null_model, null_p_scale, null_p_n, null_queries,
+                                                               fdr_bits, fdr_len, fdr_has);
+                for (uint32_t r = 0; r < n_reads; ++r) {
+                    if (!fdr_has[r]) continue;
+                    const int b = dart::null_length_bin(fdr_len[r]);
+                    em_read_results[r].null_q = static_cast<float>(q[r]);
+                    if (q[r] > null_fdr) {
+                        em_read_results[r].em_reject_reason |= 0x1;
+                        ++null_bin_flagged[b];
+                    } else {
+                        null_bin_kept_min[b] = std::min(null_bin_kept_min[b], fdr_bits[r]);
+                    }
+                }
+            }
+        }
 
         if (verbose) {
             // Filtering stats
@@ -3560,18 +3282,99 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         }
     }
 
-    // .dcx interchange emit (--dcx): staged per accepted (em_keep=1) alignment
-    // during the annotate scan (qaln/taln only live there), then assembled into a
-    // Batch after the scoring loop patches in posteriors. Declared here so it
-    // outlives the annotate block. The grain-A EM columns are meaningless without
-    // EM, so require it.
+    // Stage covered alignments in bounded sort runs. Posteriors are filled after
+    // scoring, while auth picks are retained separately in read order.
     const bool emit_dcx = !dcx_file.empty();
     if (emit_dcx && !use_em) {
         std::cerr << "Error: --dcx requires EM (grain-A gamma/em_keep/posterior); "
                      "remove --no-em\n";
         return 1;
     }
-    std::vector<DcxReadRec> dcx_recs;
+    // .dcx records go to an external sort keyed by target rank (target name byte order),
+    // so the hot loop compares integers, never names. Each thread stages into its own sink.
+    // Auth picks (the em_keep record of each read) are collected per thread and reduced
+    // after the loop.
+    struct AuthPick { uint32_t read, rank, ref; uint16_t gamma, prior; };
+    std::vector<uint32_t> ref_rank;
+    std::unique_ptr<dcx::ExternalSort> dcx_sort;
+    std::mutex dcx_pick_mutex;
+    std::vector<std::vector<AuthPick>> dcx_pick_lists;
+    std::atomic<bool> dcx_stage_failed{false};
+    std::exception_ptr dcx_stage_error;
+    if (emit_dcx) {
+        // Decode the reference names in bulk, one arena per dictionary block, and rank them.
+        const auto& dict = reader.ref_dict();
+        const uint32_t bs = dict.dict_block_size();
+        const uint32_t nblk = n_refs ? (n_refs + bs - 1) / bs : 0;
+        std::vector<std::vector<char>> arena(nblk);
+        std::vector<std::vector<uint64_t>> ends(nblk);
+        #pragma omp parallel for schedule(dynamic, 16)
+        for (uint32_t blk = 0; blk < nblk; ++blk) dict.decode_block_bytes(blk, arena[blk], ends[blk]);
+        std::vector<std::string_view> names(n_refs);
+        for (uint32_t blk = 0; blk < nblk; ++blk)
+            for (size_t k = 0; k < ends[blk].size(); ++k) {
+                const uint64_t from = k ? ends[blk][k - 1] : 0;
+                names[size_t(blk) * bs + k] = std::string_view(arena[blk].data() + from, ends[blk][k] - from);
+            }
+        std::vector<uint32_t> order(n_refs);
+        std::iota(order.begin(), order.end(), 0u);
+        auto by_name = [&](uint32_t a, uint32_t b) { return names[a] < names[b]; };
+#ifdef _OPENMP
+        __gnu_parallel::sort(order.begin(), order.end(), by_name);
+#else
+        std::sort(order.begin(), order.end(), by_name);
+#endif
+        ref_rank.assign(n_refs, 0);
+        uint32_t rank = 0;
+        for (size_t k = 0; k < order.size(); ++k) {
+            if (k > 0 && names[order[k]] != names[order[k - 1]]) ++rank;
+            ref_rank[order[k]] = rank;
+        }
+        std::string run_dir = em_tape_dir;
+        if (run_dir.empty()) {
+            if (const char* dir = std::getenv("DART_EM_TAPE_DIR")) run_dir = dir;
+        }
+        size_t budget = size_t(8) << 30;
+        if (const char* value = std::getenv("DART_DCX_SORT_BYTES")) budget = std::stoull(value);
+        size_t fail_run = std::numeric_limits<size_t>::max();
+        if (const char* value = std::getenv("DART_DCX_TEST_FAIL_RUN")) fail_run = std::stoull(value);
+        dcx_sort = std::make_unique<dcx::ExternalSort>(run_dir, budget, runtime_threads, fail_run);
+    }
+    // Names for a list of reference indices, decoding each dictionary block once.
+    auto ref_names_of = [&](const std::vector<uint32_t>& refs) {
+        const auto& dict = reader.ref_dict();
+        const uint32_t bs = dict.dict_block_size();
+        std::vector<uint32_t> blocks;
+        for (uint32_t r : refs) blocks.push_back(r / bs);
+        std::sort(blocks.begin(), blocks.end());
+        blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
+        std::vector<std::vector<char>> arena(blocks.size());
+        std::vector<std::vector<uint64_t>> ends(blocks.size());
+        #pragma omp parallel for schedule(dynamic, 16)
+        for (size_t k = 0; k < blocks.size(); ++k) dict.decode_block_bytes(blocks[k], arena[k], ends[k]);
+        std::vector<std::string> out;
+        out.reserve(refs.size());
+        for (uint32_t r : refs) {
+            const size_t k = size_t(std::lower_bound(blocks.begin(), blocks.end(), r / bs) - blocks.begin());
+            const size_t i = r % bs;
+            const uint64_t from = i ? ends[k][i - 1] : 0;
+            out.emplace_back(arena[k].data() + from, ends[k][i] - from);
+        }
+        return out;
+    };
+    auto stage_dcx = [&](const DcxReadRec& rec, std::vector<AuthPick>& picks) {
+        if (dcx_stage_failed.load(std::memory_order_relaxed)) return;
+        try {
+            const uint32_t rank = ref_rank[rec.ref_idx];
+            if (rec.em_keep)
+                picks.push_back({rec.read_idx, rank, rec.ref_idx,
+                                 dcx::enc_unit(rec.gamma), dcx::enc_unit(rec.p_read)});
+            dcx_sort->local().append(rec, rank);
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(dcx_pick_mutex);
+            if (!dcx_stage_failed.exchange(true)) dcx_stage_error = std::current_exception();
+        }
+    };
 
     // ── Annotation pass (runs after EM) ──────────────────────────────────────
     // Running EM first means summaries (~8 GB compact) never coexist with EM
@@ -3581,8 +3384,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         std::vector<std::pair<uint32_t, ProteinDamageSummary>> all_results;
 
         // Open per-site and corrected-protein output files before the parallel scan.
-        std::ofstream sites_out_f, corrected_out_f;
-        size_t written_sites = 0, written_corrected = 0;
+        std::ofstream sites_out_f;
+        size_t written_sites = 0;
         if (!sites_file.empty()) {
             sites_out_f.open(sites_file);
             if (!sites_out_f.is_open()) {
@@ -3592,13 +3395,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             sites_out_f << "query_id\ttarget_id\tquery_pos\ttarget_pos\t"
                            "target_aa\tquery_aa\tdamage_class\tconfidence\t"
                            "dist_5prime\tdist_3prime\tp_damage\n";
-        }
-        if (!corrected_file.empty()) {
-            corrected_out_f.open(corrected_file);
-            if (!corrected_out_f.is_open()) {
-                std::cerr << "Error: Cannot open corrected file: " << corrected_file << "\n";
-                return 1;
-            }
         }
 
         // --emit-multimap: finalize the soft top-K pool by gamma and REBUILD best_rows_by_rg
@@ -3677,11 +3473,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 #pragma omp parallel
                 {
                     std::vector<std::pair<uint32_t, ProteinDamageSummary>> local_results;
-                    std::ostringstream local_blast8;
                     std::ostringstream local_sites;
-                    std::ostringstream local_corrected;
-                    std::vector<DcxReadRec> local_dcx;
-                    size_t local_corrected_count = 0;
+                    std::vector<AuthPick> local_picks;
 
                     #pragma omp for schedule(dynamic, 64) nowait
                     for (size_t i = 0; i < rows.size(); ++i) {
@@ -3705,7 +3498,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                             mm_cand.gamma = mc.gamma;
                             mm_cand.gamma_ancient = mc.gamma_ancient;
                             mm_cand.candidate_rank = mc.candidate_rank;
-                            mm_cand.damage_score = std::clamp(mm_damage_score[row_in_group], 0.0f, 1.0f);
+                            mm_cand.damage_score = read_dmg(mm_damage_score, row_in_group, ridx);
                             mm_cand.fident = static_cast<float>(mm_identity_q[row_in_group]) / 65535.0f;
                             mm_cand.evalue = std::pow(10.0f, mm_evalue_log10[row_in_group]);
                             mm_cand.qstart_0 = (mm_qstart[row_in_group] > 0)
@@ -3730,35 +3523,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                         std::string query_id(reader.read_name(ridx));
                         std::string target_id(reader.ref_name(hit.ref_idx));
 
-                        // BLAST8 unique-mapper output.
-                        if (!blast8_unique_file.empty() && need_unique_degree &&
-                            ridx < read_degree.size() && read_degree[ridx] == 1) {
-                            int aln_len = 0, mismatches = 0, gapopen = 0;
-                            int q_aln_non_gap = 0, t_aln_non_gap = 0;
-                            bool in_gap_q = false, in_gap_t = false;
-                            const size_t n = std::min(qaln_sv.size(), taln_sv.size());
-                            for (size_t j = 0; j < n; ++j) {
-                                const char q = qaln_sv[j];
-                                const char t = taln_sv[j];
-                                aln_len++;
-                                if (q == '-') { if (!in_gap_q) { gapopen++; in_gap_q = true; } }
-                                else { in_gap_q = false; q_aln_non_gap++; }
-                                if (t == '-') { if (!in_gap_t) { gapopen++; in_gap_t = true; } }
-                                else { in_gap_t = false; t_aln_non_gap++; }
-                                if (q != '-' && t != '-' && q != t) mismatches++;
-                            }
-                            const int qstart1 = static_cast<int>(hit.qstart_0 + 1);
-                            const int sstart1 = static_cast<int>(hit.tstart_0 + 1);
-                            const int qend1 = (q_aln_non_gap > 0) ? (qstart1 + q_aln_non_gap - 1) : qstart1;
-                            const int send1 = (t_aln_non_gap > 0) ? (sstart1 + t_aln_non_gap - 1) : sstart1;
-                            local_blast8 << query_id << '\t' << target_id << '\t'
-                                << std::fixed << std::setprecision(3) << (hit.fident * 100.0f) << '\t'
-                                << aln_len << '\t' << mismatches << '\t' << gapopen << '\t'
-                                << qstart1 << '\t' << qend1 << '\t'
-                                << sstart1 << '\t' << send1 << '\t'
-                                << std::scientific << std::setprecision(2) << hit.evalue << '\t'
-                                << std::fixed << std::setprecision(1) << hit.bits << '\n';
-                        }
 
                         // Annotate (target_id not passed — not stored in struct).
                         auto summary = annotate_alignment(
@@ -3774,11 +3538,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
                         if (summary.total_mismatches > 0) {
                             summary.read_idx = ridx;
-                            if (!corrected_file.empty()) {
-                                summary.qaln = std::string(qaln_sv);
-                                summary.taln = std::string(taln_sv);
-                            }
-                            filter_sites_by_distance(summary, max_dist);
                             summary.qlen = hit.qlen;
                             summary.qstart_0 = hit.qstart_0;
                             summary.tstart_0 = hit.tstart_0;
@@ -3802,19 +3561,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                                 }
                             }
 
-                            // Write corrected proteins inline (before clearing sites).
-                            if (!summary.sites.empty() && corrected_out_f.is_open() &&
-                                !summary.qaln.empty()) {
-                                std::string corrected = generate_corrected_protein(
-                                    summary.qaln, summary.taln, summary.sites, summary.qstart_0);
-                                local_corrected << ">" << query_id
-                                    << " corrected_sites=" << summary.sites.size()
-                                    << " damage_frac=" << std::fixed << std::setprecision(3)
-                                    << summary.damage_fraction << "\n";
-                                for (size_t j = 0; j < corrected.size(); j += 60)
-                                    local_corrected << corrected.substr(j, 60) << "\n";
-                                ++local_corrected_count;
-                            }
 
                             // Write per-site output inline (before clearing sites).
                             if (sites_out_f.is_open()) {
@@ -3864,9 +3610,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
                             DcxReadRec rec;
                             rec.read_idx = ridx;
+                            rec.ref_idx = hit.ref_idx;
                             rec.src_idx = (static_cast<uint64_t>(rg_idx) << 32) | uint64_t(row_in_group);
                             rec.query_id = query_id;
-                            rec.target_id = target_id;
                             rec.tstart = hit.tstart_0;
                             rec.strand = (query_id.find("_-_") != std::string::npos) ? 1 : 0;
                             const auto& em = em_read_results[ridx];
@@ -3935,7 +3681,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                                 for (uint32_t k = 0; k < rec.span; ++k)
                                     if (cover[k])
                                         rec.presence[k >> 3] |= uint8_t(1u << (k & 7));  // LSB-first
-                                local_dcx.push_back(std::move(rec));
+                                stage_dcx(rec, local_picks);
                             }
                         }
 
@@ -3944,8 +3690,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                             summary.sites.clear();
                             summary.sites.shrink_to_fit();
                             // Return corrected-output strings (already written above).
-                            std::string{}.swap(summary.qaln);
-                            std::string{}.swap(summary.taln);
 
                             local_results.emplace_back(ridx, std::move(summary));
                         }
@@ -3956,14 +3700,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                         all_results.insert(all_results.end(),
                             std::make_move_iterator(local_results.begin()),
                             std::make_move_iterator(local_results.end()));
-                        if (!blast8_unique_file.empty()) {
-                            std::string s = local_blast8.str();
-                            if (!s.empty()) {
-                                blast8_out << s;
-                                written_unique += static_cast<size_t>(
-                                    std::count(s.begin(), s.end(), '\n'));
-                            }
-                        }
                         if (sites_out_f.is_open()) {
                             std::string s = local_sites.str();
                             if (!s.empty()) {
@@ -3972,32 +3708,25 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                                     std::count(s.begin(), s.end(), '\n'));
                             }
                         }
-                        if (corrected_out_f.is_open() && local_corrected_count > 0) {
-                            corrected_out_f << local_corrected.str();
-                            written_corrected += local_corrected_count;
-                        }
-                        if (emit_dcx && !local_dcx.empty()) {
-                            dcx_recs.insert(dcx_recs.end(),
-                                std::make_move_iterator(local_dcx.begin()),
-                                std::make_move_iterator(local_dcx.end()));
-                            local_dcx.clear();
+                        if (emit_dcx && !local_picks.empty()) {
+                            dcx_pick_lists.push_back(std::move(local_picks));
                         }
                     }
                 }
             });
         }
 
-        if (!blast8_unique_file.empty() && verbose) {
-            std::cerr << "Unique-mapper BLAST8 written to: " << blast8_unique_file
-                      << " (" << written_unique << " rows)\n";
-        }
         if (verbose && sites_out_f.is_open()) {
             std::cerr << "Site calls written to: " << sites_file
                       << " (" << written_sites << " sites)\n";
         }
-        if (verbose && corrected_out_f.is_open()) {
-            std::cerr << "Corrected proteins written: " << written_corrected
-                      << " to " << corrected_file << "\n";
+
+        if (dcx_stage_error) {
+            try { std::rethrow_exception(dcx_stage_error); }
+            catch (const std::exception& e) {
+                std::cerr << "Error: --dcx run generation failed: " << e.what() << "\n";
+                return 1;
+            }
         }
 
         // Sort by read index for deterministic output order.
@@ -4056,6 +3785,47 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                                << " (median qlen=" << median_qlen << " aa)\n";
     } else if (min_damage_sites < 0) {
         min_damage_sites = 3;  // fallback if no summaries
+    }
+
+    if (null_p_ran && !use_em_calib) {
+        // Flagged reads whose best hit has no mismatch get no table row; they stay in the
+        // modern-baseline pool but leave the authentication evidence. Count them apart.
+        uint64_t flagged = 0, flagged_no_row = 0, with_hit = 0;
+        for (uint32_t r = 0; r < n_reads; ++r) {
+            if (!(em_read_results[r].em_reject_reason & 0x1)) continue;
+            ++flagged;
+            if (summary_index_by_read[r] < 0) ++flagged_no_row;
+        }
+        for (int b = 0; b < dart::kNumNullBins; ++b) {
+            with_hit += null_bin_reads[b];
+            std::ostringstream line;
+            line << "null reject: bin " << dart::kNullBinEdges[b] << "-";
+            if (b + 1 < dart::kNumNullBins) line << (dart::kNullBinEdges[b + 1] - 1); else line << "inf";
+            line << " reads=" << null_bin_reads[b] << " flagged=" << null_bin_flagged[b] << " ("
+                 << std::fixed << std::setprecision(2)
+                 << (null_bin_reads[b] ? 100.0 * null_bin_flagged[b] / null_bin_reads[b] : 0.0) << "%)";
+            if (null_fdr_ran) {
+                // chance = expected chance best hits among all queries searched: Q * w_b.
+                const bool fitted = em_null_model.beta[b] > 0.0f;
+                const double chance = static_cast<double>(null_queries) * em_null_model.n[b] / static_cast<double>(null_p_n);
+                line << " chance=";
+                if (fitted) line << std::setprecision(1) << chance; else line << "NA";
+                line << " bits at null_fdr=" << std::defaultfloat << null_fdr << ": ";
+                if (null_bin_flagged[b] == 0) line << "NA";
+                else if (std::isfinite(null_bin_kept_min[b])) line << std::fixed << std::setprecision(1) << null_bin_kept_min[b];
+                else line << "all";
+            } else {
+                const double s = dart::null_chance_bits_at(em_null_model, null_p_scale, null_p_n, b, null_p_max);
+                line << " bits at null_p=" << std::defaultfloat << null_p_max << ": ";
+                if (std::isfinite(s)) line << std::fixed << std::setprecision(1) << s; else line << "NA";
+            }
+            std::cerr << line.str() << "\n";
+        }
+        std::ostringstream total;
+        total << "null reject: " << flagged << " of " << with_hit << " reads with a best hit flagged ("
+              << std::fixed << std::setprecision(2) << (with_hit ? 100.0 * flagged / with_hit : 0.0)
+              << "%); " << flagged_no_row << " of them have no mismatch (no table row)";
+        std::cerr << total.str() << "\n";
     }
 
     if (verbose) {
@@ -4142,8 +3912,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // HIGH — the perfectly-matched reads (k=0, n>0), which are the cleanest technical
     // baseline, were absent. Pool every zero-mismatch best-hit read's opportunities as a
     // single (Σm_clean, 0) entry; estimate_modern_baseline sums (m,k), so aggregation is
-    // exact and O(1) in memory. em-ambiguous reads are excluded to match the fit.
+    // exact and O(1) in memory. em-ambiguous reads are excluded to match the fit, except
+    // for the uncalibrated null_p bit (0x1): a chance-level best hit says nothing about the
+    // technical substitution rate, and dropping those reads would move q_modern and so every
+    // other read's posterior.
     {
+        const uint8_t pool_reject_mask = use_em_calib ? uint8_t(0xFF) : uint8_t(~0x1u);
         uint64_t clean_m_sum = 0;
         for (uint32_t r = 0; r < n_reads; ++r) {
             if (!best_hits[r].has) continue;
@@ -4152,7 +3926,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             if (use_em) {
                 if (r >= em_read_results.size() || !em_read_results[r].em_keep) continue;
                 const auto& er = em_read_results[r];
-                const bool ambiguous = (er.em_reject_reason != 0) ||
+                const bool ambiguous = ((er.em_reject_reason & pool_reject_mask) != 0) ||
                                        (er.em_margin < static_cast<float>(em_min_margin)) ||
                                        (er.em_ref_neff > static_cast<float>(em_max_neff));
                 if (ambiguous) continue;
@@ -4170,11 +3944,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
 
     dart::ModernBaseline modern_est = dart::estimate_modern_baseline(modern_proxy);
-    // Use fixed pi0 = 0.10 as baseline for terminal evidence transform
-    // Empirical estimation fails for heavily damaged samples where all reads have high p_read
-    // (no low-tail to establish baseline), causing terminal evidence to collapse
-    constexpr float PI0_FIXED = 0.10f;
-    const float empirical_pi0 = PI0_FIXED;
+    // The terminal Bayes factor's pi0 is set below from the library state, once the damage
+    // index has been read: it must be the prior that p_read itself carries.
 
     // Self-calibrating protein-level NULL floor (π₀) for the Beta-Binomial damage
     // test (fit_protein_damage): the mean per-read p_damaged in the sample's LOW tail
@@ -4207,7 +3978,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // Set up scoring parameters with empirical Bayes approach
     dart::BayesianScoreParams score_params;
     score_params.pi = prior_ancient;
-    score_params.pi0 = empirical_pi0;    // Empirical baseline for terminal evidence transform
     score_params.q_modern = modern_est.q_modern;
     score_params.w0 = w0;
     score_params.terminal_threshold = terminal_threshold;
@@ -4216,7 +3986,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     score_params.channel_b_valid = (d_max > 0.0f);  // Trust site evidence if damage detected
     score_params.ancient_threshold = ancient_threshold;
     score_params.modern_threshold = modern_threshold;
-    score_params.use_identity = use_identity;
+    score_params.use_identity = true;
     score_params.k_identity = 20.0f;
     score_params.identity_baseline = 0.90f;
     score_params.d_max = d_max;  // For fixed-average site evidence formula
@@ -4244,7 +4014,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // EM pi. Captured before the index is released.
     double  library_damage_prior = -1.0;
     uint8_t library_damage_state = 255;
+    uint8_t agd_library_type = 0;  // 0=unknown, 1=ss, 2=ds
     if (damage_index) {
+        agd_library_type    = damage_index->library_type();
         library_v5          = damage_index->pi_state() != 255;
         library_pi_detected = damage_index->pi_detected();
         library_pi_usable   = damage_index->pi_usable();
@@ -4271,6 +4043,16 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         malloc_trim(0);  // Return freed AGD pages to OS immediately
 #endif
     }
+    // Terminal evidence is logit(p_read) - logit(pi0). p_read is libtaph's per-read posterior:
+    // sigmoid(llr + logit(pi.point)) for a DETECTED library, the prior-free sigmoid(llr) otherwise
+    // (the same rule the authentication LLR uses). Subtracting that exact prior leaves the read's
+    // own damage LLR, so the read prior pi enters the posterior once.
+    score_params.pi0 = (library_pi_detected && library_pi_point > 0.0)
+        ? static_cast<float>(library_pi_point) : 0.5f;
+    // Read prior: a DETECTED library's own pi.point (empirical Bayes), so the prior enters the
+    // posterior once and is the library's estimate; --prior-ancient and --auto-prior-ancient win.
+    if (library_pi_detected && library_pi_point > 0.0 && !prior_ancient_set && !auto_prior_ancient)
+        score_params.pi = static_cast<float>(library_pi_point);
     // State-aware gate. Only the abstain-equivalents with no usable pi point
     // (NOT_DETECTED/UNDETERMINED/BELOW_FLOOR, or a non-positive point) fail every
     // protein. The usable-advisory states (TRACE/ANCIENT_CPG/LOW_ABUNDANCE) carry a
@@ -4305,44 +4087,27 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         std::cerr << "  Damage informative: " << (score_params.damage_informative ? "yes" : "no") << "\n";
         std::cerr << "  Damage detectability: " << std::fixed << std::setprecision(3)
                   << damage_detectability << "\n";
-        std::cerr << "  Identity evidence: " << (use_identity ? "enabled (k=20, baseline=0.90)" : "disabled") << "\n";
+        std::cerr << "  Identity evidence: enabled (k=20, baseline=0.90)\n";
     }
 
     // Phase 2: gamma-weighted MLE update of d_max (--refine-damage)
     if (refine_damage && score_params.d_max > 0.0f && use_em) {
         dart::ThetaDSuffStats theta_ss;
-
-        // Numerator: weighted damage hits from reads that had any mismatches.
-        // When damage-aware EM was active, use gamma_ancient directly (even when 0 —
-        // that means a modern read and should not contribute to the ancient refit).
-        // When damage-aware EM was not active, fall back to total gamma.
-        for (const auto& s : summaries) {
-            if (!s.has_p_read || s.aa_m_opportunities == 0) continue;
-            const auto& er = em_read_results[s.read_idx];
-            const double g = damage_em_active
-                ? static_cast<double>(er.gamma_ancient)
-                : static_cast<double>(er.gamma);
-            if (g <= 0.0) continue;
-            theta_ss.sum_gamma_k += g * static_cast<double>(s.aa_k_hits);
-            ++theta_ss.n_reads;
-        }
-
-        // Denominator: weighted decay over ALL reads, including zero-mismatch
-        // reads that were excluded from summaries.  Skipping these would bias
-        // d_max_hat upward because their decay contributes to the expected
-        // denominator without any matching hits in the numerator.
+        // One pass over every read with susceptible opportunities: k from its mismatch summary
+        // (0 when the best hit has no mismatch), m and the decay sum from the annotation scan.
+        // gamma_ancient when the damage-aware EM produced it (0 = modern read), else total gamma.
         for (uint32_t r = 0; r < n_reads; ++r) {
-            if (per_read_aa_decay[r] <= 0.0f) continue;
             const auto& er = em_read_results[r];
             const double g = damage_em_active
                 ? static_cast<double>(er.gamma_ancient)
                 : static_cast<double>(er.gamma);
-            if (g <= 0.0) continue;
-            theta_ss.sum_gamma_decay += g * static_cast<double>(per_read_aa_decay[r]);
+            const int32_t si = summary_index_by_read[r];
+            const uint32_t k = (si >= 0) ? summaries[static_cast<size_t>(si)].aa_k_hits : 0u;
+            theta_ss.accumulate(g, k, per_read_m_opp[r], per_read_aa_decay[r]);
         }
 
         const float d_max_old = score_params.d_max;
-        const float d_max_new = theta_ss.refit(score_params.d_max);
+        const float d_max_new = theta_ss.refit(score_params.d_max, score_params.q_modern);
         score_params.d_max = d_max_new;
         if (verbose) {
             std::cerr << "  [refine-damage] d_max: " << d_max_old
@@ -4407,7 +4172,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             "damage_informative\t"
             "ox_hits\tox_total\tox_fraction";
     if (use_em) {
-        *out << "\tgamma\tgamma_ancient\tbest_hit\tem_keep\tem_keep_threshold\tem_margin\tem_ref_neff\tem_ambiguous\tgamma_null\tem_reject_reason";
+        *out << "\tgamma\tgamma_ancient\tbest_hit\tem_keep\tem_keep_threshold\tem_margin\tem_ref_neff\tem_ambiguous\tgamma_null\tnull_p\tnull_q\tem_reject_reason";
     }
     *out << "\n";
 
@@ -4493,9 +4258,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         if (use_em) {
             if (s.read_idx < em_read_results.size()) {
                 const auto& em = em_read_results[s.read_idx];
-                *out << "\t" << std::scientific << std::setprecision(6) << em.gamma
-                     << "\t" << std::scientific << std::setprecision(6) << em.gamma_ancient
-                     << "\t" << (em.best_hit ? 1 : 0)
+                *out << "\t" << std::scientific << std::setprecision(6) << em.gamma << "\t";
+                if (damage_em_active) *out << std::scientific << std::setprecision(6) << em.gamma_ancient;
+                *out << "\t" << (em.best_hit ? 1 : 0)
                      << "\t" << (em.em_keep ? 1 : 0)
                      << "\t" << std::fixed << std::setprecision(6) << em.em_threshold
                      << "\t" << std::fixed << std::setprecision(4) << em.em_margin
@@ -4503,162 +4268,76 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                      << "\t" << (((em.em_reject_reason != 0) ||
                                   (em.em_margin < static_cast<float>(em_min_margin)) ||
                                   (em.em_ref_neff > static_cast<float>(em_max_neff))) ? 1 : 0)
-                     << "\t" << std::scientific << std::setprecision(6) << em.gamma_null
+                     << "\t" << std::scientific << std::setprecision(6) << em.gamma_null;
+                char np[32] = "NA";
+                if (std::isfinite(em.null_p)) std::snprintf(np, sizeof np, "%.3g", em.null_p);
+                char nq[32] = "NA";
+                if (std::isfinite(em.null_q)) std::snprintf(nq, sizeof nq, "%.3g", em.null_q);
+                *out << "\t" << np << "\t" << nq
                      << "\t" << static_cast<int>(em.em_reject_reason);
             } else {
-                *out << "\t.\t.\t.\t.\t.\t.\t.\t.\t.\t.";
+                *out << "\t.\t.\t.\t.\t.\t.\t.\t.\t.\t.\t.\t.";
             }
         }
         *out << "\n";
     }
 
     // ── .dcx interchange emit (--dcx) ────────────────────────────────────────
-    // Assemble the staged grain-A/B records into a dcx::Batch and write one file.
-    // Records were staged during the annotate scan (all covered positions, EM
-    // stats) with posterior left blank; patch it in from the now-scored summaries,
-    // then sort by (target_id, tstart) so target_ord is dense/monotonic as the
-    // writer requires. Convergence reads grain-A (gamma/posterior/em_keep/tstart/
-    // tend) and grain-B (ref_aa/obs_aa/p_damage), filtering mismatches itself.
+    // Merge target-sorted runs and patch the scored per-read posterior. Full and
+    // grain-A-only writers cut their blocks independently, as before.
     if (emit_dcx) {
-        std::unordered_map<uint32_t, float> post_by_read;
-        post_by_read.reserve(summaries.size() * 2);
+        std::vector<float> post_by_read(n_reads, 0.0f);
         // Deterministic per-read collapse. A multimapping read has one summary per candidate,
         // each with its own posterior; plain emplace() kept whichever appeared first in the
         // parallel-built summaries vector -> the kept value flipped between runs. Take the max
         // (order-independent) so the audit posterior is reproducible. posterior is audit-only
         // (convergence detect reads gamma/em_keep/p_damage, never posterior).
-        for (const auto& s : summaries) {
-            auto [it, ins] = post_by_read.try_emplace(s.read_idx, s.posterior);
-            if (!ins && s.posterior > it->second) it->second = s.posterior;
-        }
-        for (auto& rec : dcx_recs) {
-            auto it = post_by_read.find(rec.read_idx);
-            rec.posterior = (it != post_by_read.end()) ? it->second : 0.0f;
-        }
-
-        // ── WRITE-TIME AUTH REDUCE (fusion dual-66c04a26 #1) ─────────────────
-        // Runs HERE, while dcx_recs is still READ-GROUPED — before the (target,tstart)
-        // sort below scatters each read's alignments by target (which is exactly why a
-        // reduce over the written target-sorted .dcx over-counts multi-mapped reads).
-        // Per read: EM-pick = max quantized gamma among em_keep, tie-break target_id ASC
-        // then ordinal (== struct_auth rn=1). Per target accumulate {N, logLR=Σ
-        // gamma*ln(clamp(p_read,eps,1-eps)/(1-clamp)), k@τ-grid}. Values are the writer's
-        // quantized dec_unit(enc_unit(.)) so the stats == any grain_a re-derive; logLR
-        // summed in canonical read_idx order. Written to <dcx>.authstats after the label
-        // is resolved (below). p_read is always present here (COL_P_READ is set).
+        for (const auto& s : summaries)
+            post_by_read[s.read_idx] = std::max(post_by_read[s.read_idx], s.posterior);
         std::vector<std::string> a_targets;
-        std::vector<uint64_t> a_N, a_k;          // a_k row-major: [target*5 + j]
+        std::vector<uint32_t> a_target_refs;
+        std::vector<uint64_t> a_N, a_k;
         std::vector<double> a_logLR;
         static const double AUTH_TAU[5] = {0.3, 0.4, 0.5, 0.6, 0.7};
-        {
-            const double AEPS = 1e-6;
-            struct Best { double g, pr; const std::string* tgt; uint64_t ord; };
-            std::unordered_map<uint32_t, Best> best;
-            best.reserve(dcx_recs.size());
-            for (uint64_t i = 0; i < dcx_recs.size(); ++i) {
-                const DcxReadRec& r = dcx_recs[i];
-                if (!r.em_keep) continue;
-                double g = dcx::dec_unit(dcx::enc_unit(r.gamma));
-                double pr = dcx::dec_unit(dcx::enc_unit(r.p_read));
-                auto it = best.find(r.read_idx);
-                if (it == best.end()) { best.emplace(r.read_idx, Best{g, pr, &r.target_id, i}); continue; }
-                Best& b = it->second;
-                bool better = g > b.g
-                           || (g == b.g && r.target_id < *b.tgt)
-                           || (g == b.g && r.target_id == *b.tgt && i < b.ord);
-                if (better) { b = Best{g, pr, &r.target_id, i}; }
+        // Per read keep the em_keep record with the highest quantized gamma, ties to the
+        // lower target rank; reduce in canonical read order so the floating-point sums
+        // match the old in-memory reduction.
+        std::vector<AuthPick> auth_picks;
+        for (auto& list : dcx_pick_lists) auth_picks.insert(auth_picks.end(), list.begin(), list.end());
+        std::vector<std::vector<AuthPick>>().swap(dcx_pick_lists);
+        std::sort(auth_picks.begin(), auth_picks.end(), [](const AuthPick& a, const AuthPick& b) {
+            if (a.read != b.read) return a.read < b.read;
+            if (a.gamma != b.gamma) return a.gamma > b.gamma;
+            return a.rank < b.rank;
+        });
+        std::unordered_map<uint32_t, uint32_t> auth_target_ord;
+        for (size_t k = 0; k < auth_picks.size(); ++k) {
+            const AuthPick& pick = auth_picks[k];
+            if (k > 0 && auth_picks[k - 1].read == pick.read) continue;
+            auto [it, inserted] = auth_target_ord.try_emplace(pick.ref, static_cast<uint32_t>(a_target_refs.size()));
+            const uint32_t ix = it->second;
+            if (inserted) {
+                a_target_refs.push_back(pick.ref);
+                a_N.push_back(0); a_logLR.push_back(0.0); a_k.insert(a_k.end(), 5, 0);
             }
-            std::vector<uint32_t> rids; rids.reserve(best.size());
-            for (auto& kv : best) rids.push_back(kv.first);
-            std::sort(rids.begin(), rids.end());          // canonical read_idx order
-            std::unordered_map<std::string, uint32_t> tix;
-            for (uint32_t rid : rids) {
-                const Best& b = best[rid];
-                auto ti = tix.find(*b.tgt);
-                uint32_t ix;
-                if (ti == tix.end()) {
-                    ix = uint32_t(a_targets.size()); tix.emplace(*b.tgt, ix);
-                    a_targets.push_back(*b.tgt); a_N.push_back(0); a_logLR.push_back(0.0);
-                    a_k.insert(a_k.end(), 5, 0);
-                } else ix = ti->second;
-                a_N[ix] += 1;
-                double pc = std::min(std::max(b.pr, AEPS), 1.0 - AEPS);
-                a_logLR[ix] += b.g * std::log(pc / (1.0 - pc));
-                for (int j = 0; j < 5; ++j) if (b.pr > AUTH_TAU[j]) a_k[ix * 5 + j] += 1;
-            }
+            const double g = dcx::dec_unit(pick.gamma), pr = dcx::dec_unit(pick.prior);
+            ++a_N[ix];
+            const double pc = std::min(std::max(pr, 1e-6), 1.0 - 1e-6);
+            a_logLR[ix] += g * std::log(pc / (1.0 - pc));
+            for (int j = 0; j < 5; ++j) if (pr > AUTH_TAU[j]) ++a_k[ix * 5 + j];
         }
-
-        // Total order -> byte-deterministic dcx. (target_id,tstart) alone leaves ties that
-        // std::sort (unstable) resolved by omp thread-completion order (records are merged
-        // per-thread under an omp critical at the parallel record-build), so reruns diverged:
-        // two HSPs of one read to one target share (target_id,tstart,span,strand,read_idx,
-        // candidate_rank) yet carry different scores, and swapped between runs. src_idx
-        // (source row ordinal) is globally unique -> a genuine total order. (target_id,tstart)
-        // stays primary to keep each target's records contiguous (dcx blocks split on target).
-        // Detection is order-independent, so this changes bytes only, never results.
-        std::sort(dcx_recs.begin(), dcx_recs.end(),
-            [](const DcxReadRec& a, const DcxReadRec& b) {
-                if (a.target_id != b.target_id) return a.target_id < b.target_id;
-                if (a.tstart != b.tstart)       return a.tstart < b.tstart;
-                return a.src_idx < b.src_idx;
-            });
-
-        dcx::Batch B;
-        B.col_flags = dcx::COL_GAMMA_ANCIENT | dcx::COL_EM_MARGIN |
+        std::vector<AuthPick>().swap(auth_picks);
+        a_targets = ref_names_of(a_target_refs);
+        uint32_t dcx_flags;
+        dcx_flags = dcx::COL_EM_MARGIN |
                       dcx::COL_EM_REF_NEFF | dcx::COL_GAMMA_NULL |
                       dcx::COL_P_READ | dcx::COL_OBS_CODON |
                       dcx::COL_STRAND | dcx::COL_QID_DICT | dcx::COL_FIDENT;
+        if (damage_em_active) dcx_flags |= dcx::COL_GAMMA_ANCIENT;
         if (emit_multimap)
-            B.col_flags |= dcx::COL_SOFT_MULTIMAP | dcx::COL_CANDIDATE_RANK;
-        std::unordered_map<std::string, uint32_t> tord_map;
-        std::unordered_map<std::string, uint64_t> qord_map;
-        for (auto& rec : dcx_recs) {
-            uint32_t tord;
-            auto ti = tord_map.find(rec.target_id);
-            if (ti != tord_map.end()) tord = ti->second;
-            else { tord = uint32_t(B.target_dict.size());
-                   tord_map.emplace(rec.target_id, tord);
-                   B.target_dict.push_back(rec.target_id); }
-            uint64_t qord;
-            auto qi = qord_map.find(rec.query_id);
-            if (qi != qord_map.end()) qord = qi->second;
-            else { qord = uint64_t(B.query_dict.size());
-                   qord_map.emplace(rec.query_id, qord);
-                   B.query_dict.push_back(rec.query_id); }
-
-            B.query_ord.push_back(qord);
-            B.target_ord.push_back(tord);
-            B.tstart.push_back(rec.tstart);
-            B.span.push_back(rec.span);
-            B.gamma.push_back(rec.gamma);
-            B.posterior.push_back(rec.posterior);
-            B.em_keep.push_back(rec.em_keep);       // real EM keep bit (soft weight)
-            B.strand.push_back(rec.strand);
-            B.gamma_ancient.push_back(rec.gamma_ancient);
-            B.em_margin.push_back(rec.em_margin);
-            B.em_ref_neff.push_back(rec.em_ref_neff);
-            B.gamma_null.push_back(rec.gamma_null);
-            B.p_read.push_back(rec.p_read);
-            B.fident.push_back(rec.fident);
-            if (emit_multimap) B.candidate_rank.push_back(rec.candidate_rank);
-            B.presence.insert(B.presence.end(), rec.presence.begin(), rec.presence.end());
-            B.ref_aa.insert(B.ref_aa.end(), rec.ref_aa.begin(), rec.ref_aa.end());
-            B.obs_aa.insert(B.obs_aa.end(), rec.obs_aa.begin(), rec.obs_aa.end());
-            B.obs_codon.insert(B.obs_codon.end(), rec.obs_codon.begin(), rec.obs_codon.end());
-            B.p_damage.insert(B.p_damage.end(), rec.p_damage.begin(), rec.p_damage.end());
-            B.dist5.insert(B.dist5.end(), rec.dist5.begin(), rec.dist5.end());
-            B.dist3.insert(B.dist3.end(), rec.dist3.begin(), rec.dist3.end());
-            B.damage_class.insert(B.damage_class.end(), rec.dcls.begin(), rec.dcls.end());
-            // OPT-H2: this record's grain-B payload is now fully copied into B; free it so
-            // peak stays at ~one Batch (B) instead of dcx_recs + B simultaneously. Byte
-            // output is unchanged — B already holds the data. dcx_recs is unused hereafter.
-            rec.presence = {}; rec.ref_aa = {}; rec.obs_aa = {}; rec.obs_codon = {};
-            rec.p_damage = {}; rec.dist5 = {}; rec.dist3 = {}; rec.dcls = {};
-            rec.query_id = {}; rec.target_id = {};
-        }
-
+            dcx_flags |= dcx::COL_SOFT_MULTIMAP | dcx::COL_CANDIDATE_RANK;
         dcx::DcxWriteOptions opt;
-        opt.col_flags = B.col_flags;
+        opt.col_flags = dcx_flags;
         opt.sample_flags = 0;   // grain-B target_pos is 0-based (DART convention)
         // Test-only: force a small block cap so a modest input spans >1 .dcx block,
         // exercising the writer's block loop and the reader's cross-block walk.
@@ -4702,27 +4381,32 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         std::memcpy(opt.calib_contract_id, &h0, 8);
         std::memcpy(opt.calib_contract_id + 8, &h1, 8);
 
-        bool dcx_ok = false;
+        const std::string auth_file = dcx_file + ".auth";
+        std::vector<std::string> target_dict, query_dict;
+        std::vector<uint32_t> target_refs;
+        std::vector<uint64_t> query_ord(n_reads, UINT64_MAX);
+        uint64_t dcx_records = 0, dcx_observations = 0;
         try {
-            dcx_ok = dcx::write_dcx(dcx_file.c_str(), B, opt);
+            dcx::StreamWriter full(dcx_file.c_str(), opt);
+            dcx::StreamWriter auth(auth_file.c_str(), opt, true);
+            uint32_t last_rank = UINT32_MAX;
+            dcx_sort->finish([&](const DcxReadRec& rec, uint32_t rank) {
+                if (rank != last_rank) { target_refs.push_back(rec.ref_idx); last_rank = rank; }
+                uint64_t& qord = query_ord[rec.read_idx];
+                if (qord == UINT64_MAX) { qord = query_dict.size(); query_dict.push_back(rec.query_id); }
+                const uint32_t tord = static_cast<uint32_t>(target_refs.size() - 1);
+                const float posterior = post_by_read[rec.read_idx];
+                full.append(rec, tord, qord, posterior);
+                auth.append(rec, tord, qord, posterior);
+                ++dcx_records; dcx_observations += rec.ref_aa.size();
+            });
+            target_dict = ref_names_of(target_refs);
+            std::vector<uint32_t>().swap(target_refs);
+            full.close(target_dict, query_dict);
+            auth.close(target_dict, query_dict);
+            dcx_sort.reset();
         } catch (const std::exception& e) {
             std::cerr << "Error: --dcx write failed: " << e.what() << "\n";
-            return 1;
-        }
-        if (!dcx_ok) {
-            std::cerr << "Error: --dcx write_dcx returned false for " << dcx_file << "\n";
-            return 1;
-        }
-        // DUAL-EMIT the grain-A auth sidecar (<dcx>.auth) so convergence protein_auth
-        // (fold-gap) reads a small grain-A-only file instead of inflating the full .dcx.
-        const std::string auth_file = dcx_file + ".auth";
-        try {
-            if (!dcx::write_dcx_auth(auth_file.c_str(), B, opt)) {
-                std::cerr << "Error: --dcx auth sidecar write returned false for " << auth_file << "\n";
-                return 1;
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "Error: --dcx auth sidecar write failed: " << e.what() << "\n";
             return 1;
         }
         // EMIT the write-time auth-stats table (<dcx>.authstats) computed above.
@@ -4738,11 +4422,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             return 1;
         }
         if (verbose) {
-            std::cerr << ".dcx written to: " << dcx_file << " (" << B.target_ord.size()
-                      << " alignments, " << B.ref_aa.size() << " covered positions, "
-                      << B.target_dict.size() << " targets)\n";
+            std::cerr << ".dcx written to: " << dcx_file << " (" << dcx_records
+                      << " alignments, " << dcx_observations << " covered positions, "
+                      << target_dict.size() << " targets)\n";
             std::cerr << ".dcx auth sidecar: " << auth_file << " (grain-A only, "
-                      << B.target_ord.size() << " alignments)\n";
+                      << dcx_records << " alignments)\n";
             std::cerr << ".dcx authstats: " << authstats_file << " (write-time reduce, "
                       << a_targets.size() << " targets)\n";
         }
@@ -4752,7 +4436,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // vector before building gene_agg. Uses pre-aggregated site scalars (info_sum,
     // terminal_5, terminal_3) populated during annotation — no per-read sites heap.
     const bool need_protein_agg =
-        !protein_summary_file.empty() || !protein_filtered_file.empty() || !combined_output_file.empty();
+        !protein_summary_file.empty();
     std::vector<ProteinAggInput> protein_agg_inputs;
     if (need_protein_agg) {
         protein_agg_inputs.reserve(summaries.size());
@@ -4798,8 +4482,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
     const bool need_any_aggregation =
         !gene_summary_file.empty() || !functional_summary_file.empty() ||
-        !anvio_ko_file.empty() || !combined_output_file.empty() ||
-        !protein_summary_file.empty() || !protein_filtered_file.empty();
+        !anvio_ko_file.empty() || !protein_summary_file.empty();
 
     // 1. Build ReadRefEntry list (only em_keep reads), sort by ref_idx.
     // summaries must remain alive here: e.posterior/e.classification are read from
@@ -4956,6 +4639,11 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         use_both_ends = false;
     } else if (lib_type == "ds") {
         use_both_ends = true;
+    } else if (agd_library_type == 1 || agd_library_type == 2) {
+        use_both_ends = (agd_library_type == 2);
+        if (verbose) {
+            std::cerr << "Library type from damage index: " << (use_both_ends ? "dsDNA" : "ssDNA") << "\n";
+        }
     } else {
         size_t total_5 = 0, total_3 = 0;
         for (const auto& c : protein_agg_inputs) {
@@ -4983,7 +4671,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
 
     // 7. Open output files.
-    std::ofstream gf, pf_os, pff_os, cof_os, af_f;
+    std::ofstream gf, pf_os, af_f;
     if (!gene_summary_file.empty()) {
         gf.open(gene_summary_file);
         if (!gf.is_open()) {
@@ -5039,32 +4727,13 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         }
         pf_os << protein_header;
     }
-    if (!protein_filtered_file.empty()) {
-        pff_os.open(protein_filtered_file);
-        if (!pff_os.is_open()) {
-            std::cerr << "Error: Cannot open protein filtered file: " << protein_filtered_file << "\n";
-            return 1;
-        }
-        pff_os << protein_header;
-    }
-    if (!combined_output_file.empty()) {
-        cof_os.open(combined_output_file);
-        if (!cof_os.is_open()) {
-            std::cerr << "Error: Cannot open combined output file: " << combined_output_file << "\n";
-            return 1;
-        }
-        cof_os << "target_id\tgroup_id\tannotation_source\tgene_present\tprotein_present\t"
-                  "n_reads\teff_reads\tabundance\tbreadth\tmean_identity\tmean_posterior\t"
-                  "protein_n_damage_reads\tprotein_mean_p_damaged\tprotein_damage_confidence\tprotein_d_aa\t"
-                  "positional_score\tterminal_middle_ratio\tpass_mapping_filter\tfilter_fail\n";
-    }
 
     // 8. Functional accumulator (written after streaming pass).
     std::unordered_map<std::string, FunctionalAccumulator> func_acc;
 
     // 9. Main streaming pass: one ref at a time.
     constexpr size_t TERMINAL_CODONS_S = 3;
-    size_t gene_written = 0, protein_written = 0, filtered_written = 0, combined_written = 0;
+    size_t gene_written = 0, protein_written = 0;
 
     auto ri_cur = read_ref_entries.cbegin();
     // Binomial provenance-LR library constants (uniform across the library → computed once).
@@ -5360,8 +5029,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         const float abundance_adj    = assign_eff_reads * cov_weight;
         bool protein_passes = false;
         std::string filter_fail_p;
-
-        if ((pf_os.is_open() || pff_os.is_open() || cof_os.is_open()) && have_protein) {
+        if (pf_os.is_open() && have_protein) {
             const float mean_p  = pa.n_auth_reads > 0
                 ? (pa.sum_p_damaged / static_cast<float>(pa.n_auth_reads)) : 0.0f;
             const float frac    = pa.n_auth_reads > 0
@@ -5430,7 +5098,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             // Q-CLUST ship-gate: fail proteins whose per-opportunity binomial rests on too few
             // informative reads or is dominated by a single molecule (pooled-tail
             // anti-conservative regime). Override via --min-informative-reads /
-            // --max-single-molecule-frac; --preset loose disables it.
+            // --max-single-molecule-frac.
             if (result.n_informative_reads < min_informative_reads) add_fp("min_informative_reads");
             if (result.max_ni_frac > max_single_molecule_frac)      add_fp("single_molecule_dominated");
             protein_passes = filter_fail_p.empty();
@@ -5593,90 +5261,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 << '\t' << prov_call
                 << '\n';
             if (pf_os.is_open()) { pf_os << row.str(); ++protein_written; }
-            if (pff_os.is_open() && protein_passes) { pff_os << row.str(); ++filtered_written; }
         }
-
-        // --- Combined output ---
-        if (cof_os.is_open()) {
-            const bool gene_present    = (gene_acc.n_reads > 0);
-            const bool protein_present = have_protein;
-
-            std::string gene_fail_str;
-            if (gene_present && !gene_passes) {
-                auto add_gf = [&gene_fail_str](const char* t) {
-                    if (!gene_fail_str.empty()) gene_fail_str.push_back(',');
-                    gene_fail_str += t;
-                };
-                if (gene_acc.n_reads < min_reads)          add_gf("min_reads");
-                if (gene_breadth < min_breadth)            add_gf("min_breadth");
-                if (gene_abundance < min_depth)            add_gf("min_depth");
-                if (gene_pos_score < min_positional_score) add_gf("min_positional_score");
-                if (gene_term_ratio < min_terminal_ratio)  add_gf("min_terminal_ratio");
-            }
-            const std::string gene_filter_fail = gene_present
-                ? (gene_passes ? "." : gene_fail_str)
-                : "missing";
-            const std::string prot_filter_fail = protein_present
-                ? (filter_fail_p.empty() ? "." : filter_fail_p)
-                : "missing";
-
-            std::string comb_fail;
-            auto append_cf = [&comb_fail](const std::string& t) {
-                if (t.empty() || t == ".") return;
-                if (!comb_fail.empty()) comb_fail.push_back(',');
-                comb_fail += t;
-            };
-            if (!gene_present)    append_cf("no_gene");
-            if (!protein_present) append_cf("no_protein");
-            if (gene_filter_fail != "." && gene_filter_fail != "missing") append_cf(gene_filter_fail);
-            if (prot_filter_fail != "." && prot_filter_fail != "missing") append_cf(prot_filter_fail);
-            if (comb_fail.empty()) comb_fail = ".";
-
-            const bool pass_final = gene_present && protein_present && gene_passes && protein_passes;
-            const uint32_t comb_n_reads = protein_present ? static_cast<uint32_t>(pa.n_reads) : gene_acc.n_reads;
-            const float comb_pos_score  = protein_present ? pa.positional_score() : gene_pos_score;
-            const float comb_term_ratio = protein_present ? pa.terminal_middle_ratio() : gene_term_ratio;
-            const float protein_mean_p  = pa.n_auth_reads > 0
-                ? (pa.sum_p_damaged / static_cast<float>(pa.n_auth_reads)) : 0.0f;
-            ProteinDamageResult comb_result = protein_present
-                ? fit_protein_damage_binomial(pa.read_obs, modern_est.q_modern, 0.5, 2.0)
-                : ProteinDamageResult{};
-            const float protein_d_aa_c = protein_present ? [&]() {
-                const float obs = use_both_ends
-                    ? static_cast<float>(pa.terminal_5 + pa.terminal_3)
-                    : static_cast<float>(pa.terminal_5);
-                const float exp_val = static_cast<float>(pa.n_reads_eff) * n_ends_lib *
-                    3.0f * 0.25f * 0.70f;
-                return (exp_val > 0.0f) ? std::min(1.0f, obs / exp_val) : 0.0f;
-            }() : 0.0f;
-
-            std::string grp_id = ".";
-            auto gm_it = group_map.find(target_name);
-            if (gm_it != group_map.end()) grp_id = gm_it->second;
-
-            cof_os << target_name << '\t' << grp_id << '\t' << annotation_source
-                   << '\t' << (gene_present ? 1 : 0)
-                   << '\t' << (protein_present ? 1 : 0)
-                   << '\t' << comb_n_reads
-                   << '\t' << std::fixed << std::setprecision(2) << static_cast<float>(gene_acc.eff_reads())
-                   << '\t' << std::setprecision(4) << gene_abundance
-                   << '\t' << std::setprecision(4) << gene_breadth
-                   << '\t' << std::setprecision(4) << gene_acc.avg_fident()
-                   << '\t' << std::setprecision(4) << gene_acc.avg_posterior()
-                   << '\t' << static_cast<uint32_t>(pa.n_damage_reads)
-                   << '\t' << std::setprecision(4) << protein_mean_p
-                   // GATED to pass_final: the combined damage confidence is suppressed to 0 unless the
-                   // protein passes authentication, so the combined score cannot resurrect a failure.
-                   << '\t' << std::setprecision(4) << (pass_final ? static_cast<float>(comb_result.p_damaged) : 0.0f)
-                   << '\t' << std::setprecision(4) << protein_d_aa_c
-                   << '\t' << std::setprecision(4) << comb_pos_score
-                   << '\t' << std::setprecision(4) << comb_term_ratio
-                   << '\t' << (pass_final ? 1 : 0)
-                   << '\t' << comb_fail
-                   << '\n';
-            ++combined_written;
-        }
-
         ri_cur = ri_end;
         pi_cur = pi_end;
     }
@@ -5730,10 +5315,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cerr << "Gene summary written to: " << gene_summary_file << " (" << gene_written << " genes)\n";
         if (pf_os.is_open())
             std::cerr << "Protein summary written to: " << protein_summary_file << " (" << protein_written << " proteins)\n";
-        if (pff_os.is_open())
-            std::cerr << "Filtered proteins written to: " << protein_filtered_file << " (" << filtered_written << " proteins passed mapping filters)\n";
-        if (cof_os.is_open())
-            std::cerr << "Combined output written to: " << combined_output_file << " (" << combined_written << " targets)\n";
         if (af_f.is_open())
             std::cerr << "Anvi'o gene abundance written to: " << anvio_ko_file << "\n";
         std::cerr << "\nSummary: assigned_reads=" << assigned_kept_reads

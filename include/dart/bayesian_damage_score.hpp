@@ -78,7 +78,7 @@ struct StratifiedBaseline {
 // Scoring parameters with tempering and gating
 struct BayesianScoreParams {
     float pi = 0.10f;              // prior P(ancient)
-    float pi0 = 0.10f;             // prior used when computing p_read
+    float pi0 = 0.5f;              // prior baked into p_read (library pi.point if DETECTED, else 0.5)
     float q_modern = 0.005f;       // baseline substitution rate (or use stratified)
     float w0 = 0.3f;               // tempering: weight for absence evidence [0,1]
                                    // w0=0 -> one-sided (only hits count)

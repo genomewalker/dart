@@ -96,6 +96,7 @@ struct ThreadOutputBuffer {
     std::ostringstream fasta_aa;
     std::ostringstream fasta_aa_corrected;
     std::ostringstream fasta_aa_masked;
+    std::ostringstream fasta_aa_decoy;
     std::vector<std::tuple<std::string, Gene, std::string>> damage_records;
     size_t gene_count = 0;
 
@@ -110,6 +111,8 @@ struct ThreadOutputBuffer {
         fasta_aa_corrected.clear();
         fasta_aa_masked.str("");
         fasta_aa_masked.clear();
+        fasta_aa_decoy.str("");
+        fasta_aa_decoy.clear();
         damage_records.clear();
         gene_count = 0;
     }
@@ -161,6 +164,14 @@ struct ThreadOutputBuffer {
                  << " stop_fix=" << gene.stop_restorations
                  << " corr_score=" << gene.orf_rank
                  << "\n" << gene.protein << "\n";
+    }
+
+    // Decoy peptide for the null model: the same protein reversed, id prefixed DECOY_.
+    // Reversal keeps length and composition; the chance-score distribution depends on both.
+    void write_fasta_aa_decoy(const std::string& seq_id, const Gene& gene, int gene_num) {
+        fasta_aa_decoy << ">DECOY_" << seq_id << "_" << (gene.is_forward ? "+" : "-") << "_" << gene.frame
+                       << "_" << gene_num << "\n"
+                       << std::string(gene.protein.rbegin(), gene.protein.rend()) << "\n";
     }
 
     // Format FASTA entry for Bayesian-corrected protein (ancestor AAs at damage stops)
@@ -269,10 +280,13 @@ int cmd_predict(int argc, char* argv[]) {
         OutputFile fasta_aa_file;
         OutputFile fasta_aa_corrected_file;
         OutputFile fasta_aa_masked_file;
+        OutputFile fasta_aa_decoy_file;
 
         // Flags to check if outputs are enabled
         bool write_fasta_nt = !opts.fasta_nt.empty();
         bool write_fasta_aa = !opts.fasta_aa.empty();
+        const bool write_fasta_aa_decoy = write_fasta_aa && opts.decoy_every > 0;
+        const std::string fasta_aa_decoy_path = dart::cli::decoy_fasta_path(opts.fasta_aa);
         bool write_fasta_aa_corrected = !opts.fasta_aa_corrected.empty();
         bool write_fasta_aa_masked = !opts.fasta_aa_masked.empty();
 
@@ -292,6 +306,12 @@ int cmd_predict(int argc, char* argv[]) {
             fasta_aa_file.open(opts.fasta_aa);
             if (!fasta_aa_file) {
                 throw std::runtime_error("Cannot open FASTA AA file: " + opts.fasta_aa);
+            }
+        }
+        if (write_fasta_aa_decoy) {
+            fasta_aa_decoy_file.open(fasta_aa_decoy_path);
+            if (!fasta_aa_decoy_file) {
+                throw std::runtime_error("Cannot open decoy FASTA AA file: " + fasta_aa_decoy_path);
             }
         }
         if (write_fasta_aa_corrected) {
@@ -403,19 +423,13 @@ int cmd_predict(int argc, char* argv[]) {
                 };
             };
 
-            // Side channel: capture 60..200 bp clipped reads for the periodic-codon EM
-            // model (feeds Pass-2 gene prediction, NOT the damage gate). Per-thread
-            // buffers, flattened in tid order after the pass — no locks.
-            const size_t EM_MAX_SEQS = 50000;
-            std::vector<std::vector<std::string>> em_by_thread(std::max(1, num_threads));
-            taph::PerReadHook em_hook =
-                [&](int tid, const std::string& seq, int /*L*/) {
-                    if (seq.size() >= 60 && seq.size() <= 200 &&
-                        em_by_thread[tid].size() < EM_MAX_SEQS)
-                        em_by_thread[tid].push_back(seq);
-                };
-
-            taph::ProfileResult pres = taph::profile_reads(make_reader, cfg, em_hook);
+            // Count the EM-eligible reads (60..200 bp after the profile gate) during the
+            // profile pass; per-thread counters summed afterwards, so the total is exact at any -t.
+            std::vector<size_t> em_eligible_by_thread(std::max(1, num_threads), 0);
+            taph::PerReadHook em_count = [&](int tid, const std::string&, int L) {
+                if (L >= 60 && L <= 200) ++em_eligible_by_thread[tid];
+            };
+            taph::ProfileResult pres = taph::profile_reads(make_reader, cfg, em_count);
             sample_profile = std::move(pres.profile);
 
             // Single-engine override: the fqdup-fit sidecar is authoritative for the damage
@@ -432,16 +446,38 @@ int cmd_predict(int argc, char* argv[]) {
             // gate when a sidecar was present (the production path). The single-engine
             // sidecar override above is authoritative.
 
-            // Train periodic model from the hook-captured EM sequences (flattened in
-            // tid order, capped at EM_MAX_SEQS). Feeds Pass-2 gene prediction.
+            // Periodic-codon EM training set (feeds Pass-2 gene prediction, NOT the damage
+            // gate): every k-th read of prof_in that is 60..200 bp after the same clean +
+            // clip + length gate profile_reads applies, k = eligible count / EM_MAX_SEQS so
+            // the sample spans the whole file (a head sample is one genome in a simulated or
+            // concatenated input). One ordered single-threaded decode of prof_in, so the
+            // set, and with it every Pass-2 score, is the same at any -t.
+            const size_t EM_MAX_SEQS = 50000;
+            size_t em_eligible_total = 0;
+            for (size_t n : em_eligible_by_thread) em_eligible_total += n;
+            const size_t em_stride = std::max<size_t>(1, em_eligible_total / EM_MAX_SEQS);
             std::vector<std::string> em_training_seqs;
             em_training_seqs.reserve(EM_MAX_SEQS);
-            for (auto& v : em_by_thread) {
-                for (auto& s : v) {
-                    if (em_training_seqs.size() >= EM_MAX_SEQS) break;
-                    em_training_seqs.push_back(std::move(s));
+            {
+                auto em_start = std::chrono::steady_clock::now();
+                const bool em_clip  = pres.stubs.adapter_clipped || pres.stubs.adapter3_clipped;
+                const auto em_stub5 = taph::encode_stub_codes(pres.stubs.stubs5);
+                const auto em_stub3 = taph::encode_stub_codes(pres.stubs.stubs3);
+                dart::SequenceReader em_reader(prof_in);
+                dart::SequenceRecord rec;
+                size_t eligible = 0;
+                while (em_training_seqs.size() < EM_MAX_SEQS && em_reader.read_next(rec)) {
+                    std::string seq = dart::SequenceUtils::clean(rec.sequence);
+                    if (em_clip) seq = taph::clip_adapters(seq, em_stub5, em_stub3, 0);
+                    if (seq.size() < static_cast<size_t>(cfg.min_read_len)) continue;
+                    if (seq.size() < 60 || seq.size() > 200) continue;
+                    if (eligible++ % em_stride == 0) em_training_seqs.push_back(std::move(seq));
                 }
-                if (em_training_seqs.size() >= EM_MAX_SEQS) break;
+                std::cerr << "  EM training set: " << em_training_seqs.size() << " reads, every "
+                          << em_stride << "th of " << eligible << " eligible, "
+                          << std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - em_start).count() / 1000.0
+                          << " s\n";
             }
             if (!em_training_seqs.empty()) {
                 dart::codon::DamageParams em_dmg;
@@ -528,8 +564,11 @@ int cmd_predict(int argc, char* argv[]) {
                 buf.clear();
             }
 
-            // Process batch in parallel - format output to thread-local buffers
-            #pragma omp parallel for schedule(dynamic, 100)
+            // Process batch in parallel - format output to thread-local buffers.
+            // schedule(static) with no chunk size: each thread gets one contiguous block,
+            // in tid order, so the tid-order flush below writes reads in input order.
+            const size_t batch_base = total_seqs.load();   // input ordinal of batch[0]
+            #pragma omp parallel for schedule(static)
             for (size_t i = 0; i < batch.size(); ++i) {
                 std::string seq = dart::SequenceUtils::clean(batch[i].sequence);
                 // Clip adapter stubs before ORF enumeration AND per-read authentication, on
@@ -647,6 +686,8 @@ int cmd_predict(int argc, char* argv[]) {
                     buf.write_gff(id, gene, gene_num);
                     if (write_fasta_nt) buf.write_fasta_nt(id, gene, gene_num);
                     if (write_fasta_aa) buf.write_fasta_aa(id, gene, gene_num);
+                    if (write_fasta_aa_decoy && (batch_base + i) % static_cast<size_t>(opts.decoy_every) == 0)
+                        buf.write_fasta_aa_decoy(id, gene, gene_num);
                     if (write_fasta_aa_corrected) buf.write_fasta_aa_corrected(id, gene, gene_num);
                     if (write_fasta_aa_masked) buf.write_fasta_aa_masked(id, gene, gene_num);
                     if (damage_index_writer) {
@@ -668,6 +709,9 @@ int cmd_predict(int argc, char* argv[]) {
                 }
                 if (write_fasta_aa) {
                     fasta_aa_file << buf.fasta_aa.str();
+                }
+                if (write_fasta_aa_decoy) {
+                    fasta_aa_decoy_file << buf.fasta_aa_decoy.str();
                 }
                 if (write_fasta_aa_corrected) {
                     fasta_aa_corrected_file << buf.fasta_aa_corrected.str();

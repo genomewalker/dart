@@ -1,9 +1,6 @@
 #pragma once
-// Abstract gzip line reader — virtual dispatch firewall for rapidgzip.
-//
-// GzLineReaderRapidgzip is defined in src/sequence_io_backend.cpp, which is
-// the only TU that includes rapidgzip headers (ODR firewall, same pattern as
-// fqdup's fastq_io_backend.cpp).  All other TUs see only this interface.
+// Abstract gzip line reader. The ISA-L implementation lives in
+// src/sequence_io_backend.cpp; all other TUs see only this interface.
 
 #include <memory>
 #include <string>
@@ -33,7 +30,9 @@ public:
 };
 
 // Factory — implemented in src/sequence_io_backend.cpp.
-// Returns nullptr when HAVE_RAPIDGZIP is not defined; caller falls back to zlib.
+// Single-threaded ISA-L igzip, the decoder fqdup uses: two 4 MB buffers, multi-member
+// aware, and a stream that ends mid-member is an error. Returns nullptr for a non-gzip
+// file; caller falls back to zlib.
 std::unique_ptr<GzLineReader> make_gz_reader(const std::string& path);
 
 }  // namespace dart

@@ -122,7 +122,42 @@ int main() {
     printf("    TAPE vs compact (bit-for-bit): max|dgamma|=%.3e max|dgamma_anc|=%.3e -> %s\n",
            tvc_g, tvc_ga, tape_eq ? "IDENTICAL" : "DIVERGENT");
 
-    bool pass = det_bit && (dg < 1e-9) && (win_flip == 0) && tape_det && tape_eq;
+    // (d) DAMAGE-FREE MAPPING: one read, two refs with equal bits and lengths but
+    // damage_ll_m differing by 3. use_damage off -> gamma 0.5/0.5 on both solvers and
+    // gamma_ancient = gamma * pr (the alignment damage likelihoods do not enter it).
+    AlignmentData d1;
+    d1.num_reads = 1; d1.num_refs = 2;
+    d1.read_offsets = {0, 2};
+    d1.ref_lengths = {300, 300};
+    d1.ref_log_len_half.assign(2, 0.5f * std::log(300.0f));
+    for (uint32_t t = 0; t < 2; ++t) {
+        Alignment a{};
+        a.read_idx = 0; a.ref_idx = t; a.bit_score = 80.f; a.aln_len = 40;
+        a.damage_score = 0.3f; a.damage_ll_a = -1.0f; a.damage_ll_m = (t == 0) ? -0.5f : -3.5f;
+        a.fident = 0.9f;
+        d1.alignments.push_back(a);
+    }
+    EMParams pf;
+    pf.use_damage = false; pf.posthoc_gamma_ancient = true; pf.use_squarem = true;
+    set_threads(1);
+    EMState f_c = compact_em_map(d1, pf);
+    EMState f_t = compact_em_map_tape(d1, pf, tdir);
+    double free_err = (f_c.gamma.size() == 2 && f_t.gamma.size() == 2 &&
+                       f_c.gamma_ancient.size() == 2 && f_t.gamma_ancient.size() == 2) ? 0.0 : 1.0;
+    for (uint32_t j = 0; free_err == 0.0 && j < 2; ++j) {
+        const auto& a = d1.alignments[j];
+        const double pr = a.damage_score;
+        const double want_ga = 0.5 * pr;
+        for (const EMState* st : {&f_c, &f_t}) {
+            free_err = std::max(free_err, std::fabs(st->gamma[j] - 0.5));
+            free_err = std::max(free_err, std::fabs(st->gamma_ancient[j] - want_ga));
+            free_err = std::max(free_err, std::fabs(st->weights[j] - 0.5));
+        }
+    }
+    const bool free_ok = free_err < 1e-9;
+    printf("(d) DAMAGE-FREE MAPPING: max err=%.3e -> %s\n", free_err, free_ok ? "OK" : "TILTED");
+
+    bool pass = det_bit && (dg < 1e-9) && (win_flip == 0) && tape_det && tape_eq && free_ok;
     printf("GATE: %s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }
