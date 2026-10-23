@@ -1268,7 +1268,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // Null/noise component (spurious short-peptide rejection). Off by default.
     std::string em_null_model_file;  // .null sidecar (or deprecated TSV); default <emi>.null when present
     double em_null_tau = 0.5;        // calibrated path: reject read when gamma_null > tau
-    double null_p_max = 0.01;        // uncalibrated path: reject read when null_p > this
+    double null_p_max = 0.05;        // uncalibrated path: reject read when null_p > this
     bool null_p_max_set = false;
 
     // Coherent-LR calibration (f_true + f_0). When loaded, the real EM component
@@ -1527,7 +1527,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 "  --em-null-model FILE          .null sidecar from hits2emi --decoy-hits or dart null\n"
                 "                                (default: <emi>.null when it exists)\n"
                 "  --null-p-max P                Reject a read when the chance that a decoy scores as\n"
-                "                                high in its aligned-length bin exceeds P (default: 0.01)\n"
+                "                                high in its aligned-length bin exceeds P (default: 0.05)\n"
                 "  --em-null-tau FLOAT           Null responsibility cutoff, calibrated null column only\n"
                 "                                (--em-calib-model; default: 0.5)\n"
                 "Resume:\n"
