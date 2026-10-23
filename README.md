@@ -7,7 +7,7 @@
 
 DART predicts protein-coding ORFs from ancient DNA reads, writes a damage index, and annotates protein-search alignments. Gene prediction, reference assignment and protein authentication are separate steps.
 
-> Status as of 2026-10-23: checked against the v2.0.0 release branch (libtaph `c3b3a5d`); a null model now runs the EM on the tape path. The decoy null rejects reads by a per-bin target-decoy FDR (`--null-fdr`, default 0.05), which replaces the fixed `--null-p-max` default; `--null-p-max` remains as an explicit alternative.
+> Status as of 2026-10-23: checked against the v2.0.0 release branch (libtaph `c3b3a5d`); a null model now runs the EM on the tape path. The decoy null rejects reads by a per-bin target-decoy FDR (`--null-fdr`, default 0.05), which replaces the fixed `--null-p-max` default; `--null-p-max` remains as an explicit alternative. The per-read table writes each read's q as `null_q` after `null_p`.
 
 This release uses EMI v7. Damage-aware prediction requires an fqdup library damage summary or explicit self-profiling. `--em-use-damage-mapping` controls the joint damage E-step; protein authentication uses library-level damage information and assigned read evidence.
 
@@ -113,7 +113,8 @@ decoys whose best hit landed in bin `b`. With `Q` queries searched, `Q · null_p
 chance best hits expected at or above that score in the bin. Within each bin damage-annotate ranks
 the reads by bit score, divides the expected chance hits at each score by the reads at or above it,
 and takes the running minimum from below: that is the read's q-value, the false discovery rate of
-keeping it and every read above it. A read with q above `--null-fdr` (default 0.05) gets reject bit
+keeping it and every read above it, written per read as `null_q` (`NA` without a hit, in an unfit
+bin, or under `--null-p-max`), so a stricter cutoff is a filter on one run's table. A read with q above `--null-fdr` (default 0.05) gets reject bit
 `1` and is ambiguous: it leaves the authentication evidence but stays in the modern-baseline pool,
 so `q_modern` and the other reads' posteriors do not move. `Q` is the record count of
 `--damage-index` (one record per predicted protein, the proteins searched); pass
@@ -178,7 +179,7 @@ decoy file and the new one does not.
 Reject bit `1` on the uncalibrated path now comes from the decoy null (`--null-fdr`, or `null_p > --null-p-max`); the old
 `gamma_null > --em-null-tau` test could not fire there (the unnormalised real term outscores the
 Gumbel density by about 29 nats) and stays only for `--em-calib-model`. The per-read table gains
-`null_p` after `gamma_null`. Sidecars are written as version 2, which adds the decoys submitted;
+`null_p` and `null_q` after `gamma_null`. Sidecars are written as version 2, which adds the decoys submitted;
 version 1 still loads, with the count unknown.
 
 **Per-bin damaged fraction.** A length bin's `pi_damaged`, `pi_lo` and `pi_hi` used to need
