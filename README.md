@@ -9,7 +9,7 @@ DART predicts protein-coding ORFs from ancient DNA reads, writes a damage index,
 
 > Status as of 2026-10-23: checked against the v2.0.0 release branch (libtaph `c3b3a5d`); a null model now runs the EM on the tape path. The decoy null now rejects reads by their chance probability (`null_p`, `--null-p-max`, sidecar version 2); the default `--null-p-max` is 0.05.
 
-The current main branch uses EMI v7. Damage-aware prediction requires an fqdup library damage summary or explicit self-profiling. `--em-use-damage-mapping` controls the joint damage E-step; protein authentication uses library-level damage information and assigned read evidence.
+This release uses EMI v7. Damage-aware prediction requires an fqdup library damage summary or explicit self-profiling. `--em-use-damage-mapping` controls the joint damage E-step; protein authentication uses library-level damage information and assigned read evidence.
 
 ## Workflow
 

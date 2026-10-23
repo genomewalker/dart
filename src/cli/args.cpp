@@ -23,8 +23,7 @@ void print_usage(const char* program_name) {
     std::cout << "  --fasta-aa <file>        Output amino acid FASTA (observed, stops as *)\n";
     std::cout << "  --decoy-every <N>        With --fasta-aa, also write the reversed proteins of every N-th\n";
     std::cout << "                           read to <aa>.decoy.<ext> as DECOY_ queries for the null model\n";
-    std::cout << "                           (hits2emi --decoy-hits); off by default, 10 is a good value\n";
-    std::cout << "                           (default: 10; 0 = off)\n";
+    std::cout << "                           (hits2emi --decoy-hits). Default 0 (off); 10 is a good value\n";
     std::cout << "  --fasta-aa-masked <file> Search-optimized: terminal damage stops as X\n";
     std::cout << "  --summary <file>         Output sample statistics (JSON format)\n";
     std::cout << "  --damage-index <file>    Output binary damage index (.agd) for damage-annotate\n";

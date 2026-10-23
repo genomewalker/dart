@@ -326,8 +326,8 @@ int cmd_hits2emi(int argc, char* argv[]) {
             if (fitted == 0)
                 std::cerr << "Warning: no null bin fitted (the decoy hits give no finite Gumbel: fewer than two queries\n"
                              "  or zero variance). Chance hits are too rare at this database size and search stringency\n"
-                             "  to model; damage-annotate will run EM in memory with the null coordinate off, which gives\n"
-                             "  the output of --no-null.\n";
+                             "  to model; damage-annotate will run EM with the null coordinate off, which gives the output\n"
+                             "  of --no-null.\n";
         }
 
         auto t_end = std::chrono::steady_clock::now();

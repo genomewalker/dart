@@ -2,17 +2,17 @@
 # DART Tutorial: Ancient Gene Prediction + Damage Annotation
 #
 # Dataset: 50,000 synthetic ancient DNA reads from the KapK sediment benchmark
-# (sample KapK-12-1-37, AT-rich community, ~25% 5' C→T damage, ~25% 3' G→A).
+# (sample KapK-12-1-37, AT-rich community). predict prints the measured 5' C→T and 3' G→A rates.
 #
 # The included ref_proteins.faa.gz is the subset of reference proteins
 # (13,681 of 149,276) that are actually matched by these reads.
 #
 # Prerequisites:
-#   - dart built: cmake --build build -j8 && cp build/dart /usr/local/bin/
+#   - dart built (cmake --build build -j8); pass its path as DART=, e.g. DART=../../build/dart
 #   - mmseqs2 installed: conda install -c bioconda mmseqs2
 #     (VTML20.out substitution matrix is bundled in examples/tutorial/data/)
 #
-# Runtime: ~5 s (predict) + ~10 s (MMseqs2 against tutorial DB, real + decoy queries) + <1 s (annotate)
+# Runtime: about a minute with 8 threads, most of it in the two MMseqs2 searches
 #
 # Usage:
 #   cd examples/tutorial
@@ -127,6 +127,7 @@ echo "Step 5/5: Damage annotation..."
     --damage-index "$OUT_DIR/predictions.agd" \
     -o "$OUT_DIR/annotated.tsv" \
     --gene-summary "$OUT_DIR/gene_summary.tsv" \
+    --protein-summary "$OUT_DIR/protein_summary.tsv" \
     --auto-calibrate-spurious \
     --em-tape-dir "$EM_TAPE_DIR" \
     -t "$THREADS" \
@@ -142,11 +143,11 @@ HITS=$(wc -l < "$OUT_DIR/hits.tsv")
 DECOYS=$(grep -c "^>" "$OUT_DIR/proteins.decoy.faa")
 DECOY_HITS=$(wc -l < "$OUT_DIR/decoy_hits.tsv")
 ANN=$(awk 'NR>1' "$OUT_DIR/annotated.tsv" | wc -l)
-POSTERIOR_COL=$(
+DAMAGED_COL=$(
     awk -F'\t' '
         NR==1 {
             for (i=1; i<=NF; ++i) {
-                if ($i == "posterior") {
+                if ($i == "is_damaged") {
                     print i;
                     exit;
                 }
@@ -155,10 +156,10 @@ POSTERIOR_COL=$(
     ' "$OUT_DIR/annotated.tsv"
 )
 ANCIENT="n/a"
-if [[ -n "${POSTERIOR_COL}" ]]; then
+if [[ -n "${DAMAGED_COL}" ]]; then
     ANCIENT=$(
-        awk -F'\t' -v c="$POSTERIOR_COL" '
-            NR>1 && $c != "NA" && $c+0 >= 0.5 { n++ }
+        awk -F'\t' -v c="$DAMAGED_COL" '
+            NR>1 && $c == 1 { n++ }
             END { print n+0 }
         ' "$OUT_DIR/annotated.tsv"
     )
@@ -168,7 +169,7 @@ echo "  Predicted genes:          $GENES"
 echo "  MMseqs2 hits:             $HITS"
 echo "  Decoy peptides / hits:    $DECOYS / $DECOY_HITS"
 echo "  Damage-annotated reads:   $ANN"
-echo "  Ancient (posterior≥0.5):  $ANCIENT"
+echo "  Reads called damaged:     $ANCIENT (is_damaged = 1, posterior >= 0.7)"
 echo ""
 echo "Key output files:"
 echo "  $OUT_DIR/predictions.gff     — gene predictions (GFF3)"
@@ -177,6 +178,6 @@ echo "  $OUT_DIR/proteins.decoy.faa  — reversed decoy peptides (every 10th rea
 echo "  $OUT_DIR/hits.emi.null       — decoy null model (inspect with: dart damage-info hits.emi.null)"
 echo "  $OUT_DIR/annotated.tsv       — per-read damage posteriors"
 echo "  $OUT_DIR/gene_summary.tsv    — per-gene damage statistics"
-echo "  $TUTORIAL_DIR/data/benchmark_summary.tsv  — benchmark summary fixture for docs/tests"
+echo "  $OUT_DIR/protein_summary.tsv — per-protein authentication (protein_auth_tier, auth_binom_call)"
 echo ""
 echo "Compare against expected outputs in: $TUTORIAL_DIR/expected/"
