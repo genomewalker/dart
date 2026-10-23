@@ -319,8 +319,10 @@ static bool test_soft_credit_mass(const std::string& dart_bin, const std::string
     return true;
 }
 
-static bool test_multimap_candidate_gamma(const std::string& dart_bin, const std::string& tmpdir) {
-    std::cout << "Running multimap candidate-gamma regression...\n";
+// One damaged read (AGD p_read 0.8) aligned to protA (best hit, bits 100) and protB (bits 99);
+// 40 clean anchors on protB pull the read's EM mass towards protB.
+static bool write_shared_read_fixture(const std::string& dart_bin, const std::string& tmpdir,
+                                      std::string& emi, std::string& agd) {
     std::ostringstream hits;
     hits << "shared_+_0\tprotA\t0.833\t6\t1\t0\t1\t6\t1\t6\t1e-20\t100\t6\t100\tWAAAAA\tRAAAAA\n";
     hits << "shared_+_0\tprotB\t0.833\t6\t1\t0\t1\t6\t1\t6\t1e-20\t99\t6\t100\tWAAAAA\tRAAAAA\n";
@@ -328,9 +330,9 @@ static bool test_multimap_candidate_gamma(const std::string& dart_bin, const std
         hits << "anchor" << i << "_+_0\t" << (i < 5 ? "protA" : "protB")
              << "\t1\t6\t0\t0\t1\t6\t1\t6\t1e-20\t100\t6\t100\tRAAAAA\tRAAAAA\n";
     std::string err;
-    const std::string emi = tmpdir + "/candidate_gamma.emi";
-    if (!write_file(tmpdir + "/candidate_gamma.tsv", hits.str(), err) ||
-        !convert_hits_to_emi(dart_bin, tmpdir + "/candidate_gamma.tsv", emi, err)) return false;
+    emi = tmpdir + "/shared_read.emi";
+    if (!write_file(tmpdir + "/shared_read.tsv", hits.str(), err) ||
+        !convert_hits_to_emi(dart_bin, tmpdir + "/shared_read.tsv", emi, err)) return false;
 
     dart::AgdHeader header{};
     header.magic = dart::AGD_MAGIC;
@@ -350,15 +352,20 @@ static bool test_multimap_candidate_gamma(const std::string& dart_bin, const std
     std::memset(record.codons_5prime, 255, sizeof(record.codons_5prime));
     std::memset(record.codons_3prime, 255, sizeof(record.codons_3prime));
     const uint32_t bucket = 0, end = UINT32_MAX;
-    const std::string agd = tmpdir + "/candidate_gamma.agd";
+    agd = tmpdir + "/shared_read.agd";
     std::ofstream index(agd, std::ios::binary);
     index.write(reinterpret_cast<const char*>(&header), sizeof(header));
     index.write(reinterpret_cast<const char*>(&bucket), sizeof(bucket));
     index.write(reinterpret_cast<const char*>(&record), sizeof(record));
     index.write(reinterpret_cast<const char*>(&end), sizeof(end));
     index.close();
-    if (!expect(static_cast<bool>(index), "synthetic damage index must be written")) return false;
+    return expect(static_cast<bool>(index), "synthetic damage index must be written");
+}
 
+static bool test_multimap_candidate_gamma(const std::string& dart_bin, const std::string& tmpdir) {
+    std::cout << "Running multimap candidate-gamma regression...\n";
+    std::string emi, agd, err;
+    if (!write_shared_read_fixture(dart_bin, tmpdir, emi, agd)) return false;
     for (int threads : {1, 4}) {
         std::string out;
         const std::string cmd = shell_quote(dart_bin) + " damage-annotate --no-null -i " + shell_quote(emi) +
@@ -381,6 +388,46 @@ static bool test_multimap_candidate_gamma(const std::string& dart_bin, const std
         if (!expect(gamma.at("protB") > gamma.at("protA"), "EM-supported alternative must have its own larger gamma")) return false;
         if (!expect(std::fabs(gamma.at("protA") + gamma.at("protB") - 1.0) < 1e-6,
                     "multimap candidate gamma must sum to one across both targets")) return false;
+    }
+    return true;
+}
+
+static bool test_damaged_counts_best_hit_only(const std::string& dart_bin, const std::string& tmpdir) {
+    std::cout << "Running best-hit damaged-read count regression...\n";
+    std::string emi, agd, err;
+    if (!write_shared_read_fixture(dart_bin, tmpdir, emi, agd)) return false;
+    for (int threads : {1, 4}) {
+        const std::string prefix = tmpdir + "/best_counts_t" + std::to_string(threads);
+        std::string out, text;
+        const std::string cmd = shell_quote(dart_bin) + " damage-annotate --no-null -i " + shell_quote(emi) +
+            " --damage-index " + shell_quote(agd) + " --min-reads 1 --min-breadth 0 --min-depth 0"
+            " --min-positional-score 0 --min-terminal-ratio 0 -t " + std::to_string(threads) +
+            " -o " + shell_quote(prefix + ".reads") + " --protein-summary " + shell_quote(prefix + ".protein");
+        Table table;
+        if (!run_command_capture(cmd, out, err) || !read_file(prefix + ".protein", text, err) ||
+            !parse_table(text, table, err)) {
+            std::cerr << err << "\n";
+            return false;
+        }
+        std::unordered_map<std::string, std::unordered_map<std::string, std::string>> rows;
+        for (const auto& row : table.rows) {
+            auto fields = row_to_map(table, row);
+            rows.emplace(fields.at("protein_id"), std::move(fields));
+        }
+        if (!expect(rows.count("protA") && rows.count("protB"), "both candidates must have a protein row")) return false;
+        const auto& a = rows.at("protA");
+        const auto& b = rows.at("protB");
+        if (!expect(std::stod(b.at("eff_reads")) > 40.5, "the shared read must also credit protB")) return false;
+        if (!expect(a.at("n_damaged") == "1" && a.at("auth_binom_k") == "1" && a.at("auth_binom_n") == "1",
+                    "the damaged read must count once on its best hit")) return false;
+        if (!expect(std::fabs(std::stod(a.at("mean_p_damaged")) - 0.8) < 1e-3 &&
+                    std::stod(a.at("frac_damaged")) == 1.0 &&
+                    std::fabs(std::stod(a.at("frac_damaged_all")) - 1.0 / 6.0) < 1e-3,
+                    "best-hit damaged fractions must count the read once over six best-hit reads")) return false;
+        if (!expect(b.at("n_damaged") == "0" && b.at("auth_binom_k") == "0" && b.at("auth_binom_n") == "0" &&
+                    std::stod(b.at("mean_p_damaged")) == 0.0 && std::stod(b.at("frac_damaged")) == 0.0 &&
+                    std::stod(b.at("frac_damaged_all")) == 0.0,
+                    "a credited non-best candidate must not count the read as damaged")) return false;
     }
     return true;
 }
@@ -717,9 +764,12 @@ int main(int argc, char* argv[]) {
         return test_soft_credit_mass(dart_bin, tmpdir) ? 0 : 1;
     if (argc == 3 && std::string(argv[2]) == "--multimap-gamma-only")
         return test_multimap_candidate_gamma(dart_bin, tmpdir) ? 0 : 1;
+    if (argc == 3 && std::string(argv[2]) == "--best-counts-only")
+        return test_damaged_counts_best_hit_only(dart_bin, tmpdir) ? 0 : 1;
     if (argc == 3 && std::string(argv[2]) == "--calibrated-credit-only")
         return test_calibrated_credit_rejection(dart_bin, tmpdir) ? 0 : 1;
     ok = test_multimap_candidate_gamma(dart_bin, tmpdir) && ok;
+    ok = test_damaged_counts_best_hit_only(dart_bin, tmpdir) && ok;
     ok = test_calibrated_credit_rejection(dart_bin, tmpdir) && ok;
     ok = test_multimap_summary_invariance(dart_bin, tmpdir) && ok;
     ok = test_soft_credit_mass(dart_bin, tmpdir) && ok;
