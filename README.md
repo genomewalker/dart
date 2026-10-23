@@ -110,7 +110,8 @@ The null rejects reads by chance probability. For each read's best hit, `null_p`
 probability that a decoy query gets its best hit in the same aligned-length bin with at least
 that bit score: `w_b · (1 − exp(−exp(−(bits − mu_b)/beta_b)))`, where `w_b` is the share of submitted
 decoys whose best hit landed in bin `b`. A read with `null_p > --null-p-max` (default 0.01) gets
-reject bit `1`, is ambiguous, and leaves the authentication and modern-baseline pools. Give the
+reject bit `1` and is ambiguous: it leaves the authentication evidence but stays in the
+modern-baseline pool, so `q_modern` and the other reads' posteriors do not move. Give the
 decoy count with `--decoy-fasta` (or `--decoys-submitted N`; `dart null` takes the latter); without
 it `w_b` is per decoy with a hit, which overstates chance. At the end damage-annotate prints one
 `null reject:` line per bin with the reads, the share flagged and `S*`, the bit score below which
