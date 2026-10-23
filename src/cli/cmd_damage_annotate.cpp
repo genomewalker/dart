@@ -1292,6 +1292,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // Bayesian scoring parameters
     float prior_ancient = 0.10f;     // Prior P(ancient) for Bayesian scorer
     bool  auto_prior_ancient = false; // Auto-calibrate prior from mean p_read distribution
+    bool  prior_ancient_set = false;  // --prior-ancient given explicitly
     int   min_damage_sites = -1;     // Min susceptible positions to trust site evidence (-1 = auto)
     float ancient_threshold  = 0.60f; // --ancient-threshold
     float modern_threshold   = 0.25f; // --modern-threshold
@@ -1371,6 +1372,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             // Kept for scripts: asks for the only behaviour there is.
         } else if (strcmp(argv[i], "--prior-ancient") == 0 && i + 1 < argc) {
             prior_ancient = std::stof(argv[++i]);
+            prior_ancient_set = true;
         } else if (strcmp(argv[i], "--min-damage-sites") == 0 && i + 1 < argc) {
             min_damage_sites = std::stoi(argv[++i]);
         } else if (strcmp(argv[i], "--ancient-threshold") == 0 && i + 1 < argc) {
@@ -1506,7 +1508,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 "  --sites FILE                  Per-site damage TSV\n"
                 "  --refine-damage               Update d_max from EM assignments\n"
                 "  --auto-prior-ancient          Estimate the ancient prior from AGD reads\n"
-                "  --prior-ancient FLOAT         Ancient prior (default: 0.10)\n"
+                "  --prior-ancient FLOAT         Read prior for the posterior (default: the library's pi\n"
+                "                                when it is DETECTED, else 0.10)\n"
                 "  --d-max RATE                  Damage rate (default: estimated from data)\n"
                 "  --lambda FLOAT                Decay constant (default: 0.3)\n"
                 "Multimapping:\n"
@@ -3866,11 +3869,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
 
     dart::ModernBaseline modern_est = dart::estimate_modern_baseline(modern_proxy);
-    // Use fixed pi0 = 0.10 as baseline for terminal evidence transform
-    // Empirical estimation fails for heavily damaged samples where all reads have high p_read
-    // (no low-tail to establish baseline), causing terminal evidence to collapse
-    constexpr float PI0_FIXED = 0.10f;
-    const float empirical_pi0 = PI0_FIXED;
+    // The terminal Bayes factor's pi0 is set below from the library state, once the damage
+    // index has been read: it must be the prior that p_read itself carries.
 
     // Self-calibrating protein-level NULL floor (π₀) for the Beta-Binomial damage
     // test (fit_protein_damage): the mean per-read p_damaged in the sample's LOW tail
@@ -3903,7 +3903,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // Set up scoring parameters with empirical Bayes approach
     dart::BayesianScoreParams score_params;
     score_params.pi = prior_ancient;
-    score_params.pi0 = empirical_pi0;    // Empirical baseline for terminal evidence transform
     score_params.q_modern = modern_est.q_modern;
     score_params.w0 = w0;
     score_params.terminal_threshold = terminal_threshold;
@@ -3969,6 +3968,16 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         malloc_trim(0);  // Return freed AGD pages to OS immediately
 #endif
     }
+    // Terminal evidence is logit(p_read) - logit(pi0). p_read is libtaph's per-read posterior:
+    // sigmoid(llr + logit(pi.point)) for a DETECTED library, the prior-free sigmoid(llr) otherwise
+    // (the same rule the authentication LLR uses). Subtracting that exact prior leaves the read's
+    // own damage LLR, so the read prior pi enters the posterior once.
+    score_params.pi0 = (library_pi_detected && library_pi_point > 0.0)
+        ? static_cast<float>(library_pi_point) : 0.5f;
+    // Read prior: a DETECTED library's own pi.point (empirical Bayes), so the prior enters the
+    // posterior once and is the library's estimate; --prior-ancient and --auto-prior-ancient win.
+    if (library_pi_detected && library_pi_point > 0.0 && !prior_ancient_set && !auto_prior_ancient)
+        score_params.pi = static_cast<float>(library_pi_point);
     // State-aware gate. Only the abstain-equivalents with no usable pi point
     // (NOT_DETECTED/UNDETERMINED/BELOW_FLOOR, or a non-positive point) fail every
     // protein. The usable-advisory states (TRACE/ANCIENT_CPG/LOW_ABUNDANCE) carry a
@@ -4009,38 +4018,21 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // Phase 2: gamma-weighted MLE update of d_max (--refine-damage)
     if (refine_damage && score_params.d_max > 0.0f && use_em) {
         dart::ThetaDSuffStats theta_ss;
-
-        // Numerator: weighted damage hits from reads that had any mismatches.
-        // When damage-aware EM was active, use gamma_ancient directly (even when 0 —
-        // that means a modern read and should not contribute to the ancient refit).
-        // When damage-aware EM was not active, fall back to total gamma.
-        for (const auto& s : summaries) {
-            if (!s.has_p_read || s.aa_m_opportunities == 0) continue;
-            const auto& er = em_read_results[s.read_idx];
-            const double g = damage_em_active
-                ? static_cast<double>(er.gamma_ancient)
-                : static_cast<double>(er.gamma);
-            if (g <= 0.0) continue;
-            theta_ss.sum_gamma_k += g * static_cast<double>(s.aa_k_hits);
-            ++theta_ss.n_reads;
-        }
-
-        // Denominator: weighted decay over ALL reads, including zero-mismatch
-        // reads that were excluded from summaries.  Skipping these would bias
-        // d_max_hat upward because their decay contributes to the expected
-        // denominator without any matching hits in the numerator.
+        // One pass over every read with susceptible opportunities: k from its mismatch summary
+        // (0 when the best hit has no mismatch), m and the decay sum from the annotation scan.
+        // gamma_ancient when the damage-aware EM produced it (0 = modern read), else total gamma.
         for (uint32_t r = 0; r < n_reads; ++r) {
-            if (per_read_aa_decay[r] <= 0.0f) continue;
             const auto& er = em_read_results[r];
             const double g = damage_em_active
                 ? static_cast<double>(er.gamma_ancient)
                 : static_cast<double>(er.gamma);
-            if (g <= 0.0) continue;
-            theta_ss.sum_gamma_decay += g * static_cast<double>(per_read_aa_decay[r]);
+            const int32_t si = summary_index_by_read[r];
+            const uint32_t k = (si >= 0) ? summaries[static_cast<size_t>(si)].aa_k_hits : 0u;
+            theta_ss.accumulate(g, k, per_read_m_opp[r], per_read_aa_decay[r]);
         }
 
         const float d_max_old = score_params.d_max;
-        const float d_max_new = theta_ss.refit(score_params.d_max);
+        const float d_max_new = theta_ss.refit(score_params.d_max, score_params.q_modern);
         score_params.d_max = d_max_new;
         if (verbose) {
             std::cerr << "  [refine-damage] d_max: " << d_max_old
