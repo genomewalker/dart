@@ -33,7 +33,7 @@ int failures = 0;
 
 std::string make_tmpdir() {
     const char* base = std::getenv("TMPDIR");
-    std::string tmpl = std::string(base && *base ? base : "/scratch/tmp") + "/dart_emi_merge_XXXXXX";
+    std::string tmpl = std::string(base && *base ? base : "/tmp") + "/dart_emi_merge_XXXXXX";
     std::vector<char> buf(tmpl.begin(), tmpl.end());
     buf.push_back('\0');
     if (!mkdtemp(buf.data())) { printf("mkdtemp failed\n"); std::exit(2); }
