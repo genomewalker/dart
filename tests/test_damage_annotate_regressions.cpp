@@ -220,6 +220,51 @@ static bool test_em_target_gamma_consistency(const std::string& dart_bin, const 
 }
 
 
+static bool test_multimap_summary_invariance(const std::string& dart_bin, const std::string& tmpdir) {
+    std::cout << "Running multimap summary invariance regression...\n";
+    std::ostringstream hits;
+    hits << "shared_+_0\tprotA\t0.833\t9\t1\t0\t1\t6\t1\t6\t1e-20\t100\t6\t100\tWAAAAA\tRAAAAA\n";
+    hits << "shared_+_0\tprotB\t0.833\t9\t1\t0\t1\t6\t1\t6\t1e-20\t99\t6\t100\tWAAAAA\tRAAAAA\n";
+    for (int i = 0; i < 40; ++i)
+        hits << "anchor" << i << "_+_0\tprotB\t1\t6\t0\t0\t1\t6\t1\t6\t1e-20\t100\t6\t100\tRAAAAA\tRAAAAA\n";
+    for (int i = 0; i < 5; ++i)
+        hits << "anchorA" << i << "_+_0\tprotA\t1\t6\t0\t0\t1\t6\t1\t6\t1e-20\t100\t6\t100\tRAAAAA\tRAAAAA\n";
+    std::string err;
+    const std::string emi = tmpdir + "/multimap.emi";
+    if (!write_file(tmpdir + "/multimap.tsv", hits.str(), err) ||
+        !convert_hits_to_emi(dart_bin, tmpdir + "/multimap.tsv", emi, err)) {
+        std::cerr << err << "\n";
+        return false;
+    }
+    std::array<std::string, 2> expected;
+    for (int mode = 0; mode < 4; ++mode) {
+        const std::string prefix = tmpdir + "/multimap_" + std::to_string(mode);
+        std::string out;
+        const std::string cmd = shell_quote(dart_bin) + " damage-annotate --no-null -i " + shell_quote(emi) +
+            " --d-max 0.3 --min-reads 1 --min-breadth 0 --min-depth 0"
+            " --min-positional-score 0 --min-terminal-ratio 0 -t " + ((mode & 1) ? "4" : "1") +
+            ((mode & 2) ? " --emit-multimap --multimap-k 1" : "") +
+            " -o " + shell_quote(prefix + ".reads") +
+            " --protein-summary " + shell_quote(prefix + ".protein") +
+            " --gene-summary " + shell_quote(prefix + ".gene");
+        if (!run_command_capture(cmd, out, err)) {
+            std::cerr << err << "\n";
+            return false;
+        }
+        int table = 0;
+        for (const auto& suffix : {".protein", ".gene"}) {
+            std::string text;
+            if (!read_file(prefix + suffix, text, err)) return false;
+            if (mode == 0) expected[table] = text;
+            else if (!expect(text == expected[table],
+                             "multimap/thread mode " + std::to_string(mode) + suffix + " must match best-hit summary"))
+                return false;
+            ++table;
+        }
+    }
+    return true;
+}
+
 static bool test_protein_mapping_filters(const std::string& dart_bin, const std::string& tmpdir) {
     std::cout << "Running protein mapping filter regression...\n";
     const std::string hits_path = tmpdir + "/mapping_hits.tsv";
@@ -496,6 +541,9 @@ int main(int argc, char* argv[]) {
     setenv("DART_EM_TAPE_DIR", (tmpdir + "/emtape").c_str(), 0);
 
     bool ok = true;
+    if (argc == 3 && std::string(argv[2]) == "--multimap-only")
+        return test_multimap_summary_invariance(dart_bin, tmpdir) ? 0 : 1;
+    ok = test_multimap_summary_invariance(dart_bin, tmpdir) && ok;
     ok = test_em_target_gamma_consistency(dart_bin, tmpdir) && ok;
     ok = test_protein_mapping_filters(dart_bin, tmpdir) && ok;
     ok = test_refine_damage_zero_mismatch_denominator(dart_bin, tmpdir) && ok;
