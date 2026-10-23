@@ -420,6 +420,32 @@ if(BUILD_TESTING)
         COMMAND dart-null-model-tests $<TARGET_FILE:dart>
                 ${CMAKE_CURRENT_SOURCE_DIR}/examples/tutorial
     )
+
+    # emi-merge end to end: two v7 inputs over overlapping reads and targets, merged by
+    # `dart emi-merge`, gated by `dart emi-verify`, compared against a hand-built expected union
+    # (best bit wins, ties keep input 0, first-owner annot, payload pass-through).
+    add_executable(
+        dart-emi-merge-golden
+        tests/test_emi_merge_golden.cpp
+    )
+    target_link_libraries(dart-emi-merge-golden PkgConfig::ZSTD)
+    add_test(
+        NAME emi_merge_golden
+        COMMAND dart-emi-merge-golden $<TARGET_FILE:dart>
+    )
+
+    # emi-merge memory gate: peak RSS (VmHWM / ru_maxrss) of a ~4M-row two-input merge at a
+    # pinned thread count stays under a fixed bound; the multi-block output passes emi-verify.
+    add_executable(
+        dart-emi-merge-memory-gate
+        tests/gate_emi_merge_memory.cpp
+    )
+    target_link_libraries(dart-emi-merge-memory-gate PkgConfig::ZSTD)
+    add_test(
+        NAME emi_merge_memory_gate
+        COMMAND dart-emi-merge-memory-gate $<TARGET_FILE:dart>
+    )
+    set_tests_properties(emi_merge_memory_gate PROPERTIES TIMEOUT 600)
 endif()
 
 # Install
