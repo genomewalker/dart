@@ -219,6 +219,7 @@ struct ProteinAggInput {
     uint32_t aa_k_hits;           // #2: damage-consistent mismatches → ProteinReadObs.k_damaged
     float gamma = 1.0f;         // real EM mapping responsibility (weights per-read auth evidence)
     bool em_ambiguous = false;  // EM confidence gate: exclude from damage/auth evidence
+    bool best = true;           // the read's best-hit alignment: the only input counted in the damaged-read columns
 };
 
 // Compact per-read assignment data sorted by ref_idx for streaming gene/protein output.
@@ -240,6 +241,7 @@ struct ReadRefEntry {
     uint32_t aa_m_opportunities;  // BUG1: C→T/G→A opportunity count (carried for clean reads too); uint32 avoids truncation
     uint8_t classification;  // dart::AncientClassification cast to uint8_t
     uint8_t em_ambiguous;    // BUG1: EM-ambiguous → exclude clean read from per-opportunity evidence
+    bool best = true;        // the read's best-hit alignment
 };  // packed per-read annotation row
 
 // Soft credit: one credited (read, ref) candidate and the alignment metadata ReadRefEntry needs,
@@ -254,6 +256,7 @@ struct CandMeta {
     uint32_t aln_len_on_target;
     uint32_t tlen, qlen;
     uint32_t aa_m_opportunities;
+    bool best;
 };
 
 // --- Binomial provenance-LR helpers (per-protein ancient authentication) ---
@@ -614,13 +617,14 @@ struct ProteinAggregate {
     size_t n_reads = 0;           // Total assigned reads mapping to this protein
     double n_reads_eff = 0.0;     // EM-effective assigned reads (sum gamma)
     size_t n_damage_reads = 0;    // Assigned reads with mismatch evidence (abundance/coverage base)
-    size_t n_auth_reads = 0;      // Reads with an AGD p_read (denominator for the columns below)
-    size_t n_damaged = 0;         // AGD reads with p_read > 0.5
+    size_t n_best_reads = 0;      // n_reads counted on the read's best hit only
+    size_t n_auth_reads = 0;      // Best-hit reads with an AGD p_read (denominator for the columns below)
+    size_t n_damaged = 0;         // Best-hit AGD reads with p_read > 0.5
     size_t total_damage_sites = 0; // Sum of damage_consistent across reads
     size_t terminal_5 = 0;        // C→T sites at 5' end (first 3 codons)
     size_t terminal_3 = 0;        // G→A sites at 3' end (first 3 codons)
     float max_p_damaged = 0.0f;   // Maximum AGD p_read across reads
-    float sum_p_damaged = 0.0f;   // Sum of AGD p_read (for averaging over n_auth_reads)
+    float sum_p_damaged = 0.0f;   // Sum of best-hit AGD p_read (for averaging over n_auth_reads)
 
     // Per-protein authentication accumulators (Stage 2b). p_protein_damaged =
     // sigmoid(logit(prior) + Σ gamma_i·llr_i), llr_i = the PRIOR-FREE per-read damage LLR.
@@ -3631,6 +3635,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                                 cm.candidate_rank = hit.candidate_rank;
                                 cm.gamma = hit.gamma;
                                 cm.aa_m_opportunities = summary.aa_m_opportunities;
+                                cm.best = is_best_hit;
                                 if (is_best_hit) {
                                     cm.qstart_0 = bh.qstart_0; cm.tstart_0 = bh.tstart_0;
                                     cm.fident = bh.fident; cm.bits = bh.bits; cm.bits_second = bh.bits_second;
@@ -4585,6 +4590,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             c.p_damaged = s.p_damaged;
             c.p_read = s.p_read;
             c.has_p_read = s.has_p_read;
+            c.best = s.best;
             c.damage_consistent = static_cast<uint32_t>(s.damage_consistent);
             c.info_sum = s.info_sum;
             c.terminal_5 = s.terminal_5;
@@ -4658,6 +4664,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             e.posterior            = has_summary ? summaries[si].posterior : 0.0f;
             e.classification       = has_summary ? summaries[si].classification : 0;
             e.aa_m_opportunities   = cm.aa_m_opportunities;
+            e.best                 = cm.best;
             const auto& er = em_read_results[cm.read_idx];
             e.em_ambiguous = ((er.em_reject_reason != 0) ||
                               (er.em_margin < static_cast<float>(em_min_margin)) ||
@@ -4970,6 +4977,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         for (auto it = ri_cur; it != ri_end; ++it) {
             if (pa.tlen == 0 && it->tlen > 0) pa.tlen = it->tlen;
             pa.n_reads++;
+            if (it->best) pa.n_best_reads++;
             pa.n_reads_eff += it->gamma;
             pa.sum_delta_bits += it->gamma * (it->bits - it->bits_second);
             const float bpa_v = (it->aln_len_on_target > 0)
@@ -5032,14 +5040,19 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             pa.total_damage_sites += it->damage_consistent;
             const float p_eff = it->p_read;
             if (it->has_p_read) {
-                pa.n_auth_reads++;
                 // Per-read "damaged" call for the binomial-LR k: the reference-FREE MAP call on
                 // p_read (identity EXCLUDED). For a DETECTED library p_read=sigmoid(llr+logit(pi)),
                 // so p_read>0.5 <=> llr>-logit(pi): the threshold adapts to the library prior, which
                 // is what keeps library-wide k/N tied to pi (per-read-damage-threshold default 0.5).
-                if (p_eff > per_read_damage_threshold) pa.n_damaged++;
+                // p_read is a property of the read, so under soft credit every credited candidate
+                // would carry the same call; the counts (and the binomial test, which needs
+                // independent molecules) take each read only on its best hit.
+                if (it->best) {
+                    pa.n_auth_reads++;
+                    if (p_eff > per_read_damage_threshold) pa.n_damaged++;
+                    pa.sum_p_damaged += p_eff;
+                }
                 if (p_eff > pa.max_p_damaged) pa.max_p_damaged = p_eff;
-                pa.sum_p_damaged += p_eff;
                 // Stage 2b: bank the per-read PRIOR-FREE damage LLR weighted by the REAL EM
                 // responsibility. p_read is the .agd reference-free terminal-site posterior:
                 //   read_ancient_posterior fires IFF pi.state==DETECTED, storing
@@ -5210,8 +5223,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 ? (pa.sum_p_damaged / static_cast<float>(pa.n_auth_reads)) : 0.0f;
             const float frac    = pa.n_auth_reads > 0
                 ? static_cast<float>(pa.n_damaged) / static_cast<float>(pa.n_auth_reads) : 0.0f;
-            const float frac_all= pa.n_reads > 0
-                ? static_cast<float>(pa.n_damaged) / static_cast<float>(pa.n_reads) : 0.0f;
+            const float frac_all= pa.n_best_reads > 0
+                ? static_cast<float>(pa.n_damaged) / static_cast<float>(pa.n_best_reads) : 0.0f;
 
             // #2: per-opportunity Beta-Binomial (k damaged / n eligible); null = per-opportunity
             // technical floor q_modern (baseline substitution rate at eligible sites).
@@ -5314,7 +5327,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
 
             // --- Binomial provenance LR: PRIMARY per-protein ancient authentication ---
             // logLR = k*log(pi/eps0) + (N-k)*log((1-pi)/(1-eps0)); H1:rate=pi vs H0:rate=eps0.
-            // N = independent (em_keep, non-ambiguous) reads carrying reference-free evidence
+            // N = independent (em_keep, non-ambiguous) reads carrying reference-free evidence, each
+            // counted on its best hit only (soft credit adds candidates that share the read's call)
             // (pa.n_auth_reads); k = those the reference-free MAP call flags damaged (pa.n_damaged).
             // gamma weights only the SECONDARY p_protein_damaged above; the LR uses INTEGER
             // molecule counts (em_keep independence), never gamma. p_ancient is the LR posterior

@@ -7,7 +7,7 @@
 
 DART predicts protein-coding ORFs from ancient DNA reads, writes a damage index, and annotates protein-search alignments. Gene prediction, reference assignment and protein authentication are separate steps.
 
-> Status as of 2026-10-23: checked against the v2.0.0 release branch (libtaph `c3b3a5d`); a null model now runs the EM on the tape path. The decoy null rejects reads by a per-bin target-decoy FDR (`--null-fdr`, default 0.05), which replaces the fixed `--null-p-max` default; `--null-p-max` remains as an explicit alternative. The per-read table writes each read's q as `null_q` after `null_p`.
+> Status as of 2026-10-23: checked against the v2.0.0 release branch (libtaph `c3b3a5d`); a null model now runs the EM on the tape path. The decoy null rejects reads by a per-bin target-decoy FDR (`--null-fdr`, default 0.05), which replaces the fixed `--null-p-max` default; `--null-p-max` remains as an explicit alternative. The per-read table writes each read's q as `null_q` after `null_p`. With the EM on, every kept candidate is credited to its own protein with its own `gamma` (use `eff_reads` for abundance); the damaged-read counts and the protein authentication test count each read once, on its best hit.
 
 This release uses EMI v7. Damage-aware prediction requires an fqdup library damage summary or explicit self-profiling. `--em-use-damage-mapping` controls the joint damage E-step; protein authentication uses library-level damage information and assigned read evidence.
 
@@ -227,8 +227,10 @@ own reference with that candidate's EM responsibility (`gamma`). Use `eff_reads`
 are not renormalized after candidate filtering, so discarded candidates lose their mass.
 This applies without `--emit-multimap`; that flag changes per-read output, not summary credit.
 Library-wide damage statistics still use one best-hit alignment per read. `--no-em` retains
-best-hit assignment. The integer authentication counts `auth_binom_k` and `auth_binom_n` are
-not abundance columns.
+best-hit assignment. The damaged-read columns (`n_damaged`, `mean_p_damaged`, `frac_damaged`,
+`frac_damaged_all`) and the integer authentication counts `auth_binom_k` and `auth_binom_n` are
+not abundance columns: each read is counted once, on its best hit, so one damaged read cannot
+authenticate several candidate proteins. `max_p_damaged` is taken over every credited read.
 
 **`.dcx` sort scratch.** `damage-annotate --dcx` sorts in memory up to 8 GiB and spills sorted
 runs past that to `--em-tape-dir` (or `DART_EM_TAPE_DIR`). That directory must be on node-local
