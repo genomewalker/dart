@@ -313,6 +313,15 @@ if(BUILD_TESTING)
         COMMAND bash ${CMAKE_SOURCE_DIR}/tests/cli_errors.sh $<TARGET_FILE:dart>
     )
 
+    # damage-annotate --dcx: a forced spill of the external sort equals the in-memory sort.
+    # Needs TMPDIR on node-local disk; skipped (77) otherwise.
+    add_test(
+        NAME dcx_spill
+        COMMAND bash ${CMAKE_SOURCE_DIR}/tests/dcx_spill.sh $<TARGET_FILE:dart>
+                ${CMAKE_SOURCE_DIR}/examples/tutorial
+    )
+    set_tests_properties(dcx_spill PROPERTIES SKIP_RETURN_CODE 77)
+
     add_test(NAME gate_compact_em COMMAND gate-compact-em)
     set_tests_properties(gate_compact_em PROPERTIES
         ENVIRONMENT "GATE_TAPE_DIR=${CMAKE_BINARY_DIR}/gate_tape")
