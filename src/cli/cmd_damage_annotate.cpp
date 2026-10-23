@@ -3722,8 +3722,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     }
 
     if (null_p_ran && !use_em_calib) {
-        // Flagged reads whose best hit has no mismatch get no table row but still leave the
-        // modern-baseline pool through em_reject_reason; count them apart.
+        // Flagged reads whose best hit has no mismatch get no table row; they stay in the
+        // modern-baseline pool but leave the authentication evidence. Count them apart.
         uint64_t flagged = 0, flagged_no_row = 0, with_hit = 0;
         for (uint32_t r = 0; r < n_reads; ++r) {
             if (!(em_read_results[r].null_p > null_p_max)) continue;
@@ -3746,8 +3746,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         std::ostringstream total;
         total << "null reject: " << flagged << " of " << with_hit << " reads with a best hit flagged ("
               << std::fixed << std::setprecision(2) << (with_hit ? 100.0 * flagged / with_hit : 0.0)
-              << "%); " << flagged_no_row << " of them have no mismatch (no table row) and leave the"
-              << " modern-baseline pool";
+              << "%); " << flagged_no_row << " of them have no mismatch (no table row)";
         std::cerr << total.str() << "\n";
     }
 
@@ -3835,8 +3834,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // HIGH — the perfectly-matched reads (k=0, n>0), which are the cleanest technical
     // baseline, were absent. Pool every zero-mismatch best-hit read's opportunities as a
     // single (Σm_clean, 0) entry; estimate_modern_baseline sums (m,k), so aggregation is
-    // exact and O(1) in memory. em-ambiguous reads are excluded to match the fit.
+    // exact and O(1) in memory. em-ambiguous reads are excluded to match the fit, except
+    // for the uncalibrated null_p bit (0x1): a chance-level best hit says nothing about the
+    // technical substitution rate, and dropping those reads would move q_modern and so every
+    // other read's posterior.
     {
+        const uint8_t pool_reject_mask = use_em_calib ? uint8_t(0xFF) : uint8_t(~0x1u);
         uint64_t clean_m_sum = 0;
         for (uint32_t r = 0; r < n_reads; ++r) {
             if (!best_hits[r].has) continue;
@@ -3845,7 +3848,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             if (use_em) {
                 if (r >= em_read_results.size() || !em_read_results[r].em_keep) continue;
                 const auto& er = em_read_results[r];
-                const bool ambiguous = (er.em_reject_reason != 0) ||
+                const bool ambiguous = ((er.em_reject_reason & pool_reject_mask) != 0) ||
                                        (er.em_margin < static_cast<float>(em_min_margin)) ||
                                        (er.em_ref_neff > static_cast<float>(em_max_neff));
                 if (ambiguous) continue;
