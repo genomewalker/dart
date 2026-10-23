@@ -23,12 +23,10 @@ requirements:
     - zlib
     - zstd
     - libgomp        # [linux]
-    - llvm-openmp    # [osx]
   run:
     - zlib
     - zstd
     - libgomp        # [linux]
-    - llvm-openmp    # [osx]
 
 test:
   commands:
