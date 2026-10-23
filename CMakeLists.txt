@@ -350,6 +350,13 @@ if(BUILD_TESTING)
         COMMAND dart-formal-model-tests
     )
 
+    add_executable(dart-tape-long-read tests/test_tape_long_read.cpp ${DART_CORE_SOURCES})
+    target_link_libraries(dart-tape-long-read ${ZLIB_LIBRARIES} ${ISAL_LIB} PkgConfig::ZSTD taph)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(dart-tape-long-read OpenMP::OpenMP_CXX)
+    endif()
+    add_test(NAME tape_long_read COMMAND dart-tape-long-read)
+
     # .dcx writer round-trip (offset math, footer adler32, calib section, obs grain)
     add_executable(
         dart-dcx-roundtrip
