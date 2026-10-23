@@ -23,6 +23,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <tuple>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -377,23 +378,37 @@ void test_hits2emi_and_annotate(const std::string& dart, const std::string& tut,
            "--null-fdr with --null-p-max is refused");
     std::vector<std::string> ht, hr;
     const auto rt = read_table(dir + "/tape.tsv", ht), rr = read_table(dir + "/ram.tsv", hr);
-    const int tq = col(ht, "query_id"), tp = col(ht, "null_p"), tb = col(ht, "em_reject_reason");
-    const int rq = col(hr, "query_id"), rp2 = col(hr, "null_p"), rb = col(hr, "em_reject_reason");
-    expect(tp >= 0 && tb == tp + 1 && col(ht, "gamma_null") == tp - 1, "null_p sits between gamma_null and em_reject_reason");
-    std::unordered_map<std::string, std::pair<std::string, int>> ram;
-    for (const auto& f : rr) if (rq >= 0 && rb >= 0 && static_cast<int>(f.size()) > rb) ram[f[rq]] = {f[rp2], std::atoi(f[rb].c_str()) & 1};
-    size_t compared = 0, differ = 0, finite = 0;
+    const int tq = col(ht, "query_id"), tp = col(ht, "null_p"), tn = col(ht, "null_q"), tb = col(ht, "em_reject_reason");
+    const int rq = col(hr, "query_id"), rp2 = col(hr, "null_p"), rn = col(hr, "null_q"), rb = col(hr, "em_reject_reason");
+    expect(tp >= 0 && tn == tp + 1 && tb == tn + 1 && col(ht, "gamma_null") == tp - 1,
+           "null_p, null_q sit between gamma_null and em_reject_reason");
+    std::unordered_map<std::string, std::tuple<std::string, std::string, int>> ram;
+    for (const auto& f : rr) if (rq >= 0 && rb >= 0 && rn >= 0 && static_cast<int>(f.size()) > rb)
+        ram[f[rq]] = {f[rp2], f[rn], std::atoi(f[rb].c_str()) & 1};
+    size_t compared = 0, differ = 0, finite = 0, finite_q = 0, q_flagged = 0, q_mismatch = 0;
     for (const auto& f : rt) {
-        if (tq < 0 || tb < 0 || static_cast<int>(f.size()) <= tb) continue;
+        if (tq < 0 || tb < 0 || tn < 0 || static_cast<int>(f.size()) <= tb) continue;
         auto it = ram.find(f[tq]);
         if (it == ram.end()) continue;
         ++compared;
+        const int bit = std::atoi(f[tb].c_str()) & 1;
         if (f[tp] != "NA") ++finite;
-        if (it->second.first != f[tp] || it->second.second != (std::atoi(f[tb].c_str()) & 1)) ++differ;
+        // Under the FDR rule bit 0x1 is exactly q > 0.05; a read without a q is never flagged.
+        if (f[tn] != "NA") { ++finite_q; const bool fl = std::atof(f[tn].c_str()) > 0.05; q_flagged += fl; q_mismatch += fl != (bit == 1); }
+        else q_mismatch += bit;
+        if (std::get<0>(it->second) != f[tp] || std::get<1>(it->second) != f[tn] || std::get<2>(it->second) != bit) ++differ;
     }
     expect(compared > 0 && compared == rt.size() && rt.size() == rr.size(), "tape and in-RAM tables have the same reads");
-    expect(differ == 0, "null_p and bit 0x1 agree between tape and in-RAM (" + std::to_string(differ) + " of " + std::to_string(compared) + " differ)");
-    std::cout << "(" << finite << " finite null_p) ";
+    expect(differ == 0, "null_p, null_q and bit 0x1 agree between tape and in-RAM (" + std::to_string(differ) + " of " + std::to_string(compared) + " differ)");
+    expect(finite_q > 0 && q_flagged > 0 && q_flagged < finite_q, "null_q is written and splits flagged from kept reads");
+    expect(q_mismatch == 0, "bit 0x1 is null_q > 0.05 (" + std::to_string(q_mismatch) + " reads disagree)");
+    std::vector<std::string> hp;
+    const auto rp = read_table(dir + "/pmax.tsv", hp);
+    const int pq = col(hp, "null_q");
+    size_t pmax_q = 0;
+    for (const auto& f : rp) pmax_q += pq < 0 || static_cast<int>(f.size()) <= pq || f[pq] != "NA";
+    expect(pq >= 0 && !rp.empty() && pmax_q == 0, "--null-p-max writes null_q as NA");
+    std::cout << "(" << finite << " finite null_p, " << finite_q << " finite null_q, " << q_flagged << " q-flagged) ";
     std::cout << (failures ? "FAILED\n" : "ok\n");
 }
 

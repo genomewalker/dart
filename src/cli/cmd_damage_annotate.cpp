@@ -2521,6 +2521,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         float gamma_null = 0.0f;        // null-component responsibility (spurious-hit mass)
         uint8_t em_reject_reason = 0;   // 0=keep, bit0=null_dominated, bit1=low_margin, bit2=high_neff
         float null_p = std::numeric_limits<float>::quiet_NaN();  // chance probability of the best hit
+        float null_q = std::numeric_limits<float>::quiet_NaN();  // per-bin target-decoy q (FDR rule only)
     };
     std::vector<EmReadResult> em_read_results(n_reads);
     // Null chance rule, per null bin: reads with a best hit and reads flagged by null_p.
@@ -3222,6 +3223,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 for (uint32_t r = 0; r < n_reads; ++r) {
                     if (!fdr_has[r]) continue;
                     const int b = dart::null_length_bin(fdr_len[r]);
+                    em_read_results[r].null_q = static_cast<float>(q[r]);
                     if (q[r] > null_fdr) {
                         em_read_results[r].em_reject_reason |= 0x1;
                         ++null_bin_flagged[b];
@@ -4170,7 +4172,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             "damage_informative\t"
             "ox_hits\tox_total\tox_fraction";
     if (use_em) {
-        *out << "\tgamma\tgamma_ancient\tbest_hit\tem_keep\tem_keep_threshold\tem_margin\tem_ref_neff\tem_ambiguous\tgamma_null\tnull_p\tem_reject_reason";
+        *out << "\tgamma\tgamma_ancient\tbest_hit\tem_keep\tem_keep_threshold\tem_margin\tem_ref_neff\tem_ambiguous\tgamma_null\tnull_p\tnull_q\tem_reject_reason";
     }
     *out << "\n";
 
@@ -4269,10 +4271,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                      << "\t" << std::scientific << std::setprecision(6) << em.gamma_null;
                 char np[32] = "NA";
                 if (std::isfinite(em.null_p)) std::snprintf(np, sizeof np, "%.3g", em.null_p);
-                *out << "\t" << np
+                char nq[32] = "NA";
+                if (std::isfinite(em.null_q)) std::snprintf(nq, sizeof nq, "%.3g", em.null_q);
+                *out << "\t" << np << "\t" << nq
                      << "\t" << static_cast<int>(em.em_reject_reason);
             } else {
-                *out << "\t.\t.\t.\t.\t.\t.\t.\t.\t.\t.\t.";
+                *out << "\t.\t.\t.\t.\t.\t.\t.\t.\t.\t.\t.\t.";
             }
         }
         *out << "\n";
