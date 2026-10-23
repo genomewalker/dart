@@ -139,6 +139,8 @@ using DcxReadRec = dcx::Record;
 
 struct ProteinDamageSummary {
     uint32_t read_idx = 0;
+    uint32_t ref_idx = 0;         // target of THIS alignment (differs per --emit-multimap candidate)
+    uint8_t candidate_rank = 0;   // --emit-multimap rank by gamma, 0 = EM argmax; 0 otherwise
     // query_id and target_id omitted — reconstructed at output time via reader.read_name/ref_name
     float evalue;
     float bits;
@@ -2294,8 +2296,13 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 auto& pool = mm_pool[ridx];
                 pool.push_back(kv.second);
                 if (pool.size() > soft_cap) {  // keep memory bounded; final top-K taken post-EM
+                    // Total order: pool order follows thread timing, so ties need a key.
                     std::sort(pool.begin(), pool.end(),
-                              [](const MmCand& a, const MmCand& b) { return a.bits > b.bits; });
+                              [](const MmCand& a, const MmCand& b) {
+                                  if (a.bits != b.bits) return a.bits > b.bits;
+                                  if (a.best_rg != b.best_rg) return a.best_rg < b.best_rg;
+                                  return a.best_row < b.best_row;
+                              });
                     // Preserve the intended 8*K pre-EM candidate reservoir. Shrinking to K
                     // here discards candidates before gamma exists and makes the later
                     // gamma-ranked top-K depend on row-group ingestion order.
@@ -3412,8 +3419,15 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             for (uint32_t r = 0; r < n_reads; ++r) {
                 auto& pool = mm_pool[r];
                 if (pool.empty()) continue;
+                // Every HSP of one ref shares its gamma, so seen_ref keeps the first HSP per ref:
+                // break ties by bits then position so that choice does not follow thread timing.
                 std::sort(pool.begin(), pool.end(),
-                          [](const MmCand& a, const MmCand& b) { return a.gamma > b.gamma; });
+                          [](const MmCand& a, const MmCand& b) {
+                              if (a.gamma != b.gamma) return a.gamma > b.gamma;
+                              if (a.bits != b.bits) return a.bits > b.bits;
+                              if (a.best_rg != b.best_rg) return a.best_rg < b.best_rg;
+                              return a.best_row < b.best_row;
+                          });
                 std::vector<MmCand> kept;
                 std::unordered_set<uint32_t> seen_ref;
                 for (auto& c : pool) {
@@ -3531,13 +3545,20 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                             hit.evalue, hit.bits, hit.fident, d_max, lambda,
                             em_state.pi);
 
-                        per_read_aa_decay[ridx] = summary.aa_sum_exp_decay;
-                        // Capture opportunity count for ALL reads (clean incl.) before the
-                        // total_mismatches>0 gate discards clean-read summaries below.
-                        per_read_m_opp[ridx] = summary.aa_m_opportunities;
+                        // Per-read arrays describe the best-hit alignment. Under --emit-multimap
+                        // every candidate of a read passes here, possibly on different threads.
+                        const bool is_best_hit = (hit.ref_idx == best_hits[ridx].ref_idx);
+                        if (is_best_hit) {
+                            per_read_aa_decay[ridx] = summary.aa_sum_exp_decay;
+                            // Capture opportunity count for ALL reads (clean incl.) before the
+                            // total_mismatches>0 gate discards clean-read summaries below.
+                            per_read_m_opp[ridx] = summary.aa_m_opportunities;
+                        }
 
                         if (summary.total_mismatches > 0) {
                             summary.read_idx = ridx;
+                            summary.ref_idx = hit.ref_idx;
+                            summary.candidate_rank = hit.candidate_rank;
                             summary.qlen = hit.qlen;
                             summary.qstart_0 = hit.qstart_0;
                             summary.tstart_0 = hit.tstart_0;
@@ -3729,12 +3750,19 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             }
         }
 
-        // Sort by read index for deterministic output order.
+        // Sort by (read, candidate rank) for deterministic output order: --emit-multimap
+        // gives a read one summary per candidate, appended in thread order.
         std::sort(all_results.begin(), all_results.end(),
-            [](const auto& a, const auto& b) { return a.first < b.first; });
+            [](const auto& a, const auto& b) {
+                return a.first != b.first ? a.first < b.first
+                                          : a.second.candidate_rank < b.second.candidate_rank;
+            });
         summaries.reserve(all_results.size());
         for (auto& [ridx, summary] : all_results) {
-            summary_index_by_read[ridx] = static_cast<int32_t>(summaries.size());
+            // The read-level consumers (ReadRefEntry, protein aggregation) credit the best hit's
+            // ref, so index the summary of that alignment; the EM argmax may be another ref.
+            if (summary.ref_idx == best_hits[ridx].ref_idx)
+                summary_index_by_read[ridx] = static_cast<int32_t>(summaries.size());
             summaries.push_back(std::move(summary));
         }
         all_results.clear();
@@ -4203,8 +4231,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         // Reconstruct names at output time. Query name via mmap (safe for read names).
         // Ref name from cached vector (NFS-safe pread).
         const std::string qname = reader.read_name(s.read_idx);
-        const uint32_t ref_idx = best_hits[s.read_idx].ref_idx;
-        const std::string& tname = cached_ref_names[ref_idx];
+        const std::string& tname = cached_ref_names[s.ref_idx];
 
         *out << qname << "\t" << tname << "\t"
              << std::scientific << std::setprecision(2) << s.evalue << "\t"
@@ -4441,9 +4468,12 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     if (need_protein_agg) {
         protein_agg_inputs.reserve(summaries.size());
         for (const auto& s : summaries) {
+            // One input per read, from its best-hit alignment: other --emit-multimap
+            // candidates align to other refs and would be credited k times to this one.
+            if (s.ref_idx != best_hits[s.read_idx].ref_idx) continue;
             ProteinAggInput c;
             c.read_idx = s.read_idx;
-            c.ref_idx = best_hits[s.read_idx].ref_idx;
+            c.ref_idx = s.ref_idx;
             c.tlen = static_cast<uint16_t>(std::min<size_t>(s.tlen, UINT16_MAX));
             c.p_damaged = s.p_damaged;
             c.p_read = s.p_read;
