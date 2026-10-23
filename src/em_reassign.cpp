@@ -1116,6 +1116,7 @@ EMState compact_em_map(AlignmentData& data, const EMParams& params,
     // M-step: weights[t] = (prior + Σ_lane s_lane[l][t]) ascending-lane, then normalize.
     auto m_step_fused = [&](double* out_w) {
         const double prior_offset = params.alpha_prior - 1.0;
+        const double null_offset = em_null_offset(params);
         double tot = 0.0;
         for (uint32_t t = 0; t < T; ++t) {
             double w = prior_offset;
@@ -1125,7 +1126,7 @@ EMState compact_em_map(AlignmentData& data, const EMParams& params,
         }
         double wn = 0.0;
         if (null_on) {
-            wn = prior_offset;
+            wn = null_offset;
             for (uint32_t r = 0; r < R; ++r) wn += gn_s[r];
             wn = std::max(wn, params.min_weight); tot += wn;
         }
@@ -1156,13 +1157,13 @@ EMState compact_em_map(AlignmentData& data, const EMParams& params,
             squarem_extrapolate(w0.data(), r_buf.data(), v_buf.data(), Tn, alpha, params.min_weight);
             do_e(w0.data()); do_m(w1.data()); std::copy(w1.begin(), w1.end(), w0.begin());
             ll = do_e(w0.data());
-            objective = em_objective_from_ll(params, w0.data(), T, ll);
+            objective = em_objective_with_null(params, w0.data(), T, null_on, ll);
             const bool nonmono = (iter > 0) && std::isfinite(params.squarem_objfn_inc)
                                  && (objective < (prev_obj - params.squarem_objfn_inc));
             if (nonmono) {
                 std::copy(w2.begin(), w2.end(), state.weights.begin());
                 ll = do_e(state.weights.data());
-                objective = em_objective_from_ll(params, state.weights.data(), T, ll);
+                objective = em_objective_with_null(params, state.weights.data(), T, null_on, ll);
                 if (std::abs(alpha - step_max) <= (1e-12 * (1.0 + std::abs(step_max)))) step_max = std::max(step_max0, step_max / mstep);
             } else {
                 std::copy(w0.begin(), w0.end(), state.weights.begin());
@@ -1171,7 +1172,7 @@ EMState compact_em_map(AlignmentData& data, const EMParams& params,
             if (step_min < 0.0 && std::abs(alpha - step_min) <= (1e-12 * (1.0 + std::abs(step_min)))) step_min = mstep * step_min;
         } else {
             ll = do_e(state.weights.data());
-            objective = em_objective_from_ll(params, state.weights.data(), T, ll);
+            objective = em_objective_with_null(params, state.weights.data(), T, null_on, ll);
             do_m(state.weights.data());
         }
         state.log_likelihood = ll; state.iterations = iter + 1;
@@ -1548,6 +1549,7 @@ TapeEMResult tape_em_core(
     // sum it was when fused into the t loop. The null reduction stays serial ascending r.
     auto m_step = [&](double* out_w) {
         const double prior_offset = params.alpha_prior - 1.0;
+        const double null_offset = em_null_offset(params);
         #pragma omp parallel for schedule(static)
         for (int64_t t = 0; t < static_cast<int64_t>(T); ++t) {
             double w = prior_offset;
@@ -1558,7 +1560,7 @@ TapeEMResult tape_em_core(
         for (uint32_t t = 0; t < T; ++t) tot += out_w[t];        // ascending t, SERIAL
         double wn = 0.0;
         if (null_on) {
-            wn = prior_offset;
+            wn = null_offset;
             for (uint32_t r = 0; r < R; ++r) wn += gn_s[r];      // ascending r, SERIAL
             wn = std::max(wn, params.min_weight); tot += wn;
         }
@@ -1636,13 +1638,13 @@ TapeEMResult tape_em_core(
             squarem_extrapolate(w0.data(), r_buf.data(), v_buf.data(), Tn, alpha, params.min_weight);
             do_e(w0.data()); do_m(w1.data()); std::copy(w1.begin(), w1.end(), w0.begin());
             ll = do_e(w0.data());
-            objective = em_objective_from_ll(params, w0.data(), T, ll);
+            objective = em_objective_with_null(params, w0.data(), T, null_on, ll);
             const bool nonmono = (iter > 0) && std::isfinite(params.squarem_objfn_inc)
                                  && (objective < (prev_obj - params.squarem_objfn_inc));
             if (nonmono) {
                 std::copy(w2.begin(), w2.end(), weights.begin());
                 ll = do_e(weights.data());
-                objective = em_objective_from_ll(params, weights.data(), T, ll);
+                objective = em_objective_with_null(params, weights.data(), T, null_on, ll);
                 if (std::abs(alpha - step_max) <= (1e-12 * (1.0 + std::abs(step_max)))) step_max = std::max(step_max0, step_max / mstep);
             } else {
                 std::copy(w0.begin(), w0.end(), weights.begin());
@@ -1654,7 +1656,7 @@ TapeEMResult tape_em_core(
             if (step_min < 0.0 && std::abs(alpha - step_min) <= (1e-12 * (1.0 + std::abs(step_min)))) step_min = mstep * step_min;
         } else {
             ll = do_e(weights.data());
-            objective = em_objective_from_ll(params, weights.data(), T, ll);
+            objective = em_objective_with_null(params, weights.data(), T, null_on, ll);
             do_m(weights.data());
         }
         res.log_likelihood = ll; res.iterations = iter + 1;

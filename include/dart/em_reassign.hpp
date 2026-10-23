@@ -747,6 +747,23 @@ inline double em_objective_from_ll(
     return ll + coeff * prior_term;
 }
 
+// Dirichlet offset of the null coordinate in the M-step: alpha_null - 1 when the caller set an
+// informative alpha_null (> 0), otherwise the same offset as the real references.
+inline double em_null_offset(const EMParams& params) {
+    return (params.alpha_null > 0.0) ? params.alpha_null - 1.0 : params.alpha_prior - 1.0;
+}
+
+// The objective em_objective_from_ll plus the null coordinate's prior term, so the SQUAREM
+// safeguard and the stopping rule track the function the M-step maximises. weights[n] is the
+// null weight when null_on.
+inline double em_objective_with_null(const EMParams& params, const double* weights, size_t n,
+                                     bool null_on, double ll) {
+    double obj = em_objective_from_ll(params, weights, n, ll);
+    const double c = em_null_offset(params);
+    if (null_on && c != 0.0) obj += c * std::log(std::max(weights[n], params.min_weight));
+    return obj;
+}
+
 // SQUAREM helpers (Varadhan & Roland 2008)
 // q1 = x1 - x, q2 = x2 - x1, v = q2 - q1.
 inline void squarem_build_directions(
