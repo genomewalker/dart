@@ -32,8 +32,8 @@ conda env create -f environment.yml
 conda activate dart
 ```
 
-Or with system packages: `apt install zlib1g-dev libzstd-dev libisal-dev nasm pkg-config`
-(macOS: `brew install zstd isa-l nasm pkg-config`). Then:
+Or with system packages: `apt install zlib1g-dev libzstd-dev libisal-dev nasm pkg-config`.
+Then:
 
 ```bash
 git clone https://github.com/genomewalker/dart.git
