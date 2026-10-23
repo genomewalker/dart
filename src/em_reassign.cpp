@@ -1312,15 +1312,16 @@ struct TapeStream {
     uint64_t win_lo = 0;       // first record currently buffered
     uint64_t win_n = 0;        // records currently buffered
     uint64_t file_recs = 0;    // total valid records in the file
+    uint64_t cap = 0;          // records the buffer holds; grows for reads longer than kTapeChunkRecs
 
     bool open(const std::string& path, uint64_t total_recs) {
         file_recs = total_recs;
         fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
         if (fd < 0) { std::perror(("tape_read open " + path).c_str()); return false; }
-        size_t bytes = size_t(kTapeChunkRecs) * sizeof(T);
         void* p = nullptr;
-        if (posix_memalign(&p, kODAlign, bytes) != 0) { ::close(fd); fd = -1; return false; }
+        if (posix_memalign(&p, kODAlign, size_t(kTapeChunkRecs) * sizeof(T)) != 0) { ::close(fd); fd = -1; return false; }
         buf = static_cast<T*>(p);
+        cap = kTapeChunkRecs;
         win_lo = 0; win_n = 0;
         return true;
     }
@@ -1330,7 +1331,16 @@ struct TapeStream {
     void ensure(uint64_t s, uint64_t e) {
         if (s >= win_lo && e <= win_lo + win_n) return;
         uint64_t start = s & ~uint64_t(1023);
-        uint64_t want = std::min<uint64_t>(kTapeChunkRecs, file_recs - start);
+        // A read with more alignments than the window (GPU short-query reads reach 371k) must fit whole.
+        const uint64_t need = (e - start + 1023) & ~uint64_t(1023);
+        if (need > cap) {
+            void* p = nullptr;
+            if (posix_memalign(&p, kODAlign, size_t(need) * sizeof(T)) != 0) { std::perror("tape_read grow"); std::abort(); }
+            free(buf);
+            buf = static_cast<T*>(p);
+            cap = need;
+        }
+        uint64_t want = std::min<uint64_t>(cap, file_recs - start);
         // Round read length up to kODAlign; safe because the file tail is padded.
         size_t nbytes = size_t(want) * sizeof(T);
         size_t rlen = (nbytes + kODAlign - 1) & ~(kODAlign - 1);
@@ -1339,6 +1349,7 @@ struct TapeStream {
         if (got < 0) { std::perror("tape_read pread"); std::abort(); }
         win_lo = start;
         win_n = std::min<uint64_t>(want, static_cast<uint64_t>(got) / sizeof(T));
+        if (e > win_lo + win_n) { std::fprintf(stderr, "tape_read: short read for records [%llu, %llu)\n", (unsigned long long)s, (unsigned long long)e); std::abort(); }
     }
     inline const T& at(uint64_t j) const { return buf[j - win_lo]; }
 };
