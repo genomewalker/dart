@@ -25,6 +25,7 @@ struct Options {
     std::string fasta_aa;            // Protein output (observed, stops as *)
     std::string fasta_aa_corrected;  // Protein output (Bayesian-corrected ancestor AAs at damage stops)
     std::string fasta_aa_masked;     // Search-optimized: terminal damage stops masked as X
+    int decoy_every = 0;             // --decoy-every N with --fasta-aa: reversed proteins of every N-th read -> <aa>.decoy.<ext>; 0 (default) = off
     std::string summary_file;        // Summary statistics output file (JSON format)
     std::string damage_index;        // Binary damage index (.agd) for post-mapping annotation
 
@@ -87,6 +88,10 @@ void print_usage(const char* program_name);
 
 // Parse command-line arguments into Options struct
 Options parse_args(int argc, char* argv[]);
+
+// Decoy peptide file next to --fasta-aa: ".decoy" inserted before the extension so
+// compression detection still works (proteins.faa.gz -> proteins.decoy.faa.gz).
+std::string decoy_fasta_path(const std::string& fasta_aa);
 
 }  // namespace cli
 }  // namespace dart

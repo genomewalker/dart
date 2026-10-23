@@ -147,60 +147,6 @@ static bool read_file(const std::string& path, std::string& content, std::string
     return true;
 }
 
-static bool write_single_record_agd(
-    const std::string& path,
-    const std::string& read_id_with_suffix,
-    float p_read,
-    std::string& err) {
-    dart::AgdHeader header{};
-    header.magic = dart::AGD_MAGIC;
-    header.version = dart::AGD_VERSION;
-    header.num_records = 1;
-    header.num_buckets = 8;
-    header.d_max = 0.30f;
-    header.lambda = 0.30f;
-    header.library_type = 2;
-    header.damage_validated = 1;
-    header.damage_artifact = 0;
-    header.channel_b_valid = 1;
-    header.stop_decay_llr = 1000.0f;
-    header.terminal_shift = 0.05f;
-
-    std::vector<dart::AgdBucket> buckets(header.num_buckets);
-    for (auto& b : buckets) b.record_offset = 0xFFFFFFFFu;
-
-    dart::AgdRecord rec{};
-    rec.id_hash = dart::fnv1a_hash(dart::strip_dart_suffix(read_id_with_suffix));
-    rec.seq_len = 120;
-    rec.frame_strand = dart::encode_frame_strand(0, false);
-    rec.damage_pct_q = dart::quantize_damage_pct(10.0f);
-    rec.p_damaged_q = dart::quantize_probability(p_read);
-    rec.n_5prime = 0;
-    rec.n_3prime = 0;
-    std::memset(rec.codons_5prime, 255, sizeof(rec.codons_5prime));
-    std::memset(rec.codons_3prime, 255, sizeof(rec.codons_3prime));
-
-    const uint64_t bucket_idx = rec.id_hash % header.num_buckets;
-    buckets[bucket_idx].record_offset = 0;
-
-    const uint32_t chain = 0xFFFFFFFFu;
-
-    std::ofstream out(path, std::ios::binary);
-    if (!out.is_open()) {
-        err = "cannot open " + path;
-        return false;
-    }
-    out.write(reinterpret_cast<const char*>(&header), sizeof(header));
-    out.write(reinterpret_cast<const char*>(buckets.data()),
-              static_cast<std::streamsize>(buckets.size() * sizeof(dart::AgdBucket)));
-    out.write(reinterpret_cast<const char*>(&rec), sizeof(rec));
-    out.write(reinterpret_cast<const char*>(&chain), sizeof(chain));
-    if (!out) {
-        err = "failed writing AGD file";
-        return false;
-    }
-    return true;
-}
 
 static bool get_row_for_query(
     const Table& t,
@@ -215,10 +161,6 @@ static bool get_row_for_query(
         }
     }
     return false;
-}
-
-static bool approx_zero(double x, double eps = 1e-6) {
-    return std::fabs(x) <= eps;
 }
 
 static bool expect(bool cond, const std::string& msg) {
@@ -277,122 +219,6 @@ static bool test_em_target_gamma_consistency(const std::string& dart_bin, const 
     return true;
 }
 
-static bool test_max_dist_recomputes_metrics(const std::string& dart_bin, const std::string& tmpdir) {
-    std::cout << "Running --max-dist metric recompute regression...\n";
-    const std::string hits_path = tmpdir + "/maxdist_hits.tsv";
-    const std::string taln = "AAAAAAAAAARAAAAAAAAA";
-    const std::string qaln = "AAAAAAAAAAWAAAAAAAAA";
-    std::ostringstream hits;
-    hits << "readM_+_0\ttargetM\t0.90\t20\t1\t0\t1\t20\t1\t20\t1e-30\t120\t20\t100\t"
-         << qaln << "\t" << taln << "\n";
-    std::string err;
-    if (!write_file(hits_path, hits.str(), err)) {
-        std::cerr << err << "\n";
-        return false;
-    }
-    const std::string emi_path = tmpdir + "/maxdist_hits.emi2";
-    if (!convert_hits_to_emi(dart_bin, hits_path, emi_path, err)) {
-        std::cerr << err << "\n";
-        return false;
-    }
-
-    std::string out1, out2;
-    std::string cmd1 = shell_quote(dart_bin) + " damage-annotate --no-null --emi " + shell_quote(emi_path) +
-                       " --d-max 0.3 --lambda 0.3";
-    if (!run_command_capture(cmd1, out1, err)) {
-        std::cerr << err << "\n";
-        return false;
-    }
-    std::string cmd2 = shell_quote(dart_bin) + " damage-annotate --no-null --emi " + shell_quote(emi_path) +
-                       " --d-max 0.3 --lambda 0.3 --max-dist 0";
-    if (!run_command_capture(cmd2, out2, err)) {
-        std::cerr << err << "\n";
-        return false;
-    }
-
-    Table t1, t2;
-    if (!parse_table(out1, t1, err) || !parse_table(out2, t2, err)) {
-        std::cerr << err << "\n";
-        return false;
-    }
-    std::unordered_map<std::string, std::string> r1, r2;
-    if (!get_row_for_query(t1, "readM_+_0", r1) || !get_row_for_query(t2, "readM_+_0", r2)) {
-        std::cerr << "readM_+_0 missing in output\n";
-        return false;
-    }
-
-    if (!expect(r1["damage_consistent"] == "1", "unfiltered run should retain one damage site")) return false;
-    if (!expect(r2["damage_consistent"] == "0", "max-dist run should remove distant site")) return false;
-
-    double p1 = std::stod(r1["p_damaged"]);
-    double p2 = std::stod(r2["p_damaged"]);
-    double maxp2 = std::stod(r2["max_p_damage"]);
-    if (!expect(p1 > 0.0, "unfiltered p_damaged should be > 0")) return false;
-    if (!expect(approx_zero(p2), "filtered p_damaged should be recomputed to 0")) return false;
-    if (!expect(approx_zero(maxp2), "filtered max_p_damage should be recomputed to 0")) return false;
-    return true;
-}
-
-static bool test_threshold_is_damaged(const std::string& dart_bin, const std::string& tmpdir) {
-    std::cout << "Running threshold/is_damaged regression...\n";
-    const std::string hits_path = tmpdir + "/threshold_hits.tsv";
-    std::ostringstream hits;
-    // Use a damage-consistent substitution so posterior falls in a threshold-sensitive range.
-    hits << "readT_+_0\ttargetT\t0.90\t4\t1\t0\t1\t4\t1\t4\t1e-10\t40\t4\t100\tWCDE\tRCDE\n";
-    std::string err;
-    if (!write_file(hits_path, hits.str(), err)) {
-        std::cerr << err << "\n";
-        return false;
-    }
-    const std::string emi_path = tmpdir + "/threshold_hits.emi2";
-    if (!convert_hits_to_emi(dart_bin, hits_path, emi_path, err)) {
-        std::cerr << err << "\n";
-        return false;
-    }
-
-    const std::string agd_path = tmpdir + "/threshold.agd";
-    if (!write_single_record_agd(agd_path, "readT_+_0", 0.6f, err)) {
-        std::cerr << err << "\n";
-        return false;
-    }
-
-    std::string out_lo, out_hi;
-    std::string cmd_hi = shell_quote(dart_bin) + " damage-annotate --no-null --emi " + shell_quote(emi_path) +
-                         " --damage-index " + shell_quote(agd_path) +
-                         " --d-max 0.3 --no-identity --threshold 1.0";
-    if (!run_command_capture(cmd_hi, out_hi, err)) {
-        std::cerr << err << "\n";
-        return false;
-    }
-    std::string cmd_lo = shell_quote(dart_bin) + " damage-annotate --no-null --emi " + shell_quote(emi_path) +
-                         " --damage-index " + shell_quote(agd_path) +
-                         " --d-max 0.3 --no-identity --threshold 0.0";
-    if (!run_command_capture(cmd_lo, out_lo, err)) {
-        std::cerr << err << "\n";
-        return false;
-    }
-
-    Table thi, tlo;
-    if (!parse_table(out_hi, thi, err) || !parse_table(out_lo, tlo, err)) {
-        std::cerr << err << "\n";
-        return false;
-    }
-    std::unordered_map<std::string, std::string> rhi, rlo;
-    if (!get_row_for_query(thi, "readT_+_0", rhi) || !get_row_for_query(tlo, "readT_+_0", rlo)) {
-        std::cerr << "readT_+_0 missing in output\n";
-        return false;
-    }
-
-    if (!expect(rhi["posterior"] != "NA", "posterior should be informative with AGD p_read")) return false;
-    if (!expect(rhi["damage_informative"] == "1", "damage_informative should be 1 with AGD evidence")) return false;
-
-    const double posterior = std::stod(rhi["posterior"]);
-    if (!expect(posterior > 0.0 && posterior < 1.0, "posterior should be strictly between 0 and 1")) return false;
-
-    if (!expect(rhi["is_damaged"] == "0", "threshold 1.0 should mark read as not damaged")) return false;
-    if (!expect(rlo["is_damaged"] == "1", "threshold 0.0 should mark read as damaged")) return false;
-    return true;
-}
 
 static bool test_protein_mapping_filters(const std::string& dart_bin, const std::string& tmpdir) {
     std::cout << "Running protein mapping filter regression...\n";
@@ -423,14 +249,10 @@ static bool test_protein_mapping_filters(const std::string& dart_bin, const std:
 
     const std::string gene_summary = tmpdir + "/gene_summary.tsv";
     const std::string protein_summary = tmpdir + "/protein_summary.tsv";
-    const std::string protein_filtered = tmpdir + "/protein_filtered.tsv";
-    const std::string combined_output = tmpdir + "/combined_output.tsv";
     std::string out;
     std::string cmd = shell_quote(dart_bin) + " damage-annotate --no-null --emi " + shell_quote(emi_path) +
                       " --gene-summary " + shell_quote(gene_summary) +
                       " --protein-summary " + shell_quote(protein_summary) +
-                      " --protein-filtered " + shell_quote(protein_filtered) +
-                      " --combined-output " + shell_quote(combined_output) +
                       " --min-reads 1 --min-breadth 0 --min-depth 0 " +
                       " --min-positional-score 0.4 --min-terminal-ratio 0.5";
     if (!run_command_capture(cmd, out, err)) {
@@ -438,18 +260,15 @@ static bool test_protein_mapping_filters(const std::string& dart_bin, const std:
         return false;
     }
 
-    std::string gene_txt, protein_txt, protein_filt_txt, combined_txt;
+    std::string gene_txt, protein_txt;
     if (!read_file(gene_summary, gene_txt, err) ||
-        !read_file(protein_summary, protein_txt, err) ||
-        !read_file(protein_filtered, protein_filt_txt, err) ||
-        !read_file(combined_output, combined_txt, err)) {
+        !read_file(protein_summary, protein_txt, err)) {
         std::cerr << err << "\n";
         return false;
     }
 
-    Table tg, tp, tpf, tc;
-    if (!parse_table(gene_txt, tg, err) || !parse_table(protein_txt, tp, err) ||
-        !parse_table(protein_filt_txt, tpf, err) || !parse_table(combined_txt, tc, err)) {
+    Table tg, tp;
+    if (!parse_table(gene_txt, tg, err) || !parse_table(protein_txt, tp, err)) {
         std::cerr << err << "\n";
         return false;
     }
@@ -472,169 +291,9 @@ static bool test_protein_mapping_filters(const std::string& dart_bin, const std:
     if (!expect(good_pass, "protein summary should mark prot_good as pass_mapping_filter=1")) return false;
     if (!expect(bad_fail, "protein summary should mark prot_bad as pass_mapping_filter=0")) return false;
 
-    if (!expect(tpf.rows.size() == 1, "protein-filtered should contain exactly one passing protein")) return false;
-    auto only = row_to_map(tpf, tpf.rows.front());
-    if (!expect(only["protein_id"] == "prot_good", "protein-filtered should contain prot_good")) return false;
-
-    bool combined_good_pass = false, combined_bad_fail = false;
-    for (const auto& row : tc.rows) {
-        auto m = row_to_map(tc, row);
-        if (m["target_id"] == "prot_good" && m["pass_mapping_filter"] == "1") combined_good_pass = true;
-        if (m["target_id"] == "prot_bad" && m["pass_mapping_filter"] == "0") combined_bad_fail = true;
-    }
-    if (!expect(combined_good_pass, "combined output should mark prot_good as pass_mapping_filter=1")) return false;
-    if (!expect(combined_bad_fail, "combined output should mark prot_bad as pass_mapping_filter=0")) return false;
     return true;
 }
 
-static bool test_blast8_unique_export(const std::string& dart_bin, const std::string& tmpdir) {
-    std::cout << "Running BLAST8 unique export regression...\n";
-    const std::string hits_path = tmpdir + "/blast8_unique_hits.tsv";
-    std::ostringstream hits;
-    hits << "readU_+_0\ttargetU\t0.95\t6\t0\t0\t1\t6\t1\t6\t1e-20\t80\t6\t120\tACDEFG\tACDEFG\n";
-    hits << "readM_+_0\ttargetA\t0.95\t6\t0\t0\t1\t6\t1\t6\t1e-20\t80\t6\t120\tACDEFG\tACDEFG\n";
-    hits << "readM_+_0\ttargetB\t0.90\t6\t1\t0\t1\t6\t1\t6\t1e-10\t60\t6\t120\tACDEFG\tACDEFA\n";
-
-    std::string err;
-    if (!write_file(hits_path, hits.str(), err)) {
-        std::cerr << err << "\n";
-        return false;
-    }
-    const std::string emi_path = tmpdir + "/blast8_unique_hits.emi2";
-    if (!convert_hits_to_emi(dart_bin, hits_path, emi_path, err)) {
-        std::cerr << err << "\n";
-        return false;
-    }
-
-    const std::string blast8_unique = tmpdir + "/blast8_unique.tsv";
-    std::string out;
-    std::string cmd = shell_quote(dart_bin) + " damage-annotate --no-null --emi " + shell_quote(emi_path) +
-                      " --blast8-unique " + shell_quote(blast8_unique);
-    if (!run_command_capture(cmd, out, err)) {
-        std::cerr << err << "\n";
-        return false;
-    }
-
-    std::string blast_txt;
-    if (!read_file(blast8_unique, blast_txt, err)) {
-        std::cerr << err << "\n";
-        return false;
-    }
-
-    std::istringstream iss(blast_txt);
-    std::string line;
-    std::vector<std::string> lines;
-    while (std::getline(iss, line)) {
-        if (!line.empty()) lines.push_back(line);
-    }
-
-    if (!expect(lines.size() == 1, "blast8-unique should contain only one uniquely-mapped read")) return false;
-    if (!expect(lines[0].find("readU_+_0\ttargetU\t") == 0, "blast8-unique should retain readU->targetU")) return false;
-    if (!expect(lines[0].find("readM_+_0") == std::string::npos, "blast8-unique should exclude multi-mapped readM")) return false;
-    return true;
-}
-
-static bool test_analysis_prefix_bundle(const std::string& dart_bin, const std::string& tmpdir) {
-    std::cout << "Running analysis-prefix bundle regression...\n";
-    const std::string hits_path = tmpdir + "/bundle_hits.tsv";
-    std::ostringstream hits;
-    hits << "r1_+_0\tprotA\t0.95\t6\t0\t0\t1\t6\t1\t6\t1e-20\t80\t6\t120\tACDEFG\tACDEFG\n";
-    hits << "r2_+_0\tprotA\t0.95\t6\t1\t0\t1\t6\t10\t15\t1e-10\t70\t6\t120\tACDEFA\tACDEFG\n";
-    std::string err;
-    if (!write_file(hits_path, hits.str(), err)) {
-        std::cerr << err << "\n";
-        return false;
-    }
-    const std::string emi_path = tmpdir + "/bundle_hits.emi2";
-    if (!convert_hits_to_emi(dart_bin, hits_path, emi_path, err)) {
-        std::cerr << err << "\n";
-        return false;
-    }
-
-    const std::string map_path = tmpdir + "/bundle_map.tsv";
-    if (!write_file(map_path, "protA\tK00001\n", err)) {
-        std::cerr << err << "\n";
-        return false;
-    }
-
-    const std::string prefix = tmpdir + "/bundle";
-    std::string out;
-    std::string cmd = shell_quote(dart_bin) + " damage-annotate --no-null --emi " + shell_quote(emi_path) +
-                      " --map " + shell_quote(map_path) +
-                      " --analysis-prefix " + shell_quote(prefix) +
-                      " --min-reads 1 --min-breadth 0 --min-depth 0";
-    if (!run_command_capture(cmd, out, err)) {
-        std::cerr << err << "\n";
-        return false;
-    }
-
-    std::string reads_txt, proteins_txt, blast8_txt, categories_txt;
-    if (!read_file(prefix + ".reads.tsv", reads_txt, err) ||
-        !read_file(prefix + ".protein.tsv", proteins_txt, err) ||
-        !read_file(prefix + ".blast8.unique.tsv", blast8_txt, err) ||
-        !read_file(prefix + ".categories.tsv", categories_txt, err)) {
-        std::cerr << err << "\n";
-        return false;
-    }
-
-    if (!expect(!reads_txt.empty(), "bundle reads output should not be empty")) return false;
-    if (!expect(proteins_txt.find("pass_mapping_filter\tfilter_fail") != std::string::npos,
-                "bundle proteins output should include pass_mapping_filter and filter_fail")) return false;
-    if (!expect(categories_txt.find("n_damaged_genes\tdamaged_gene_frac\tdamage_enrichment") != std::string::npos,
-                "bundle categories output should include damage enrichment columns")) return false;
-    if (!expect(!blast8_txt.empty(), "bundle blast8 unique output should not be empty")) return false;
-    return true;
-}
-
-static bool test_analysis_explicit_named_outputs(const std::string& dart_bin, const std::string& tmpdir) {
-    std::cout << "Running explicit named analysis outputs regression...\n";
-    const std::string hits_path = tmpdir + "/named_hits.tsv";
-    std::ostringstream hits;
-    hits << "n1_+_0\tprotN\t0.95\t6\t0\t0\t1\t6\t1\t6\t1e-20\t80\t6\t120\tACDEFG\tACDEFG\n";
-    std::string err;
-    if (!write_file(hits_path, hits.str(), err)) {
-        std::cerr << err << "\n";
-        return false;
-    }
-    const std::string emi_path = tmpdir + "/named_hits.emi2";
-    if (!convert_hits_to_emi(dart_bin, hits_path, emi_path, err)) {
-        std::cerr << err << "\n";
-        return false;
-    }
-
-    const std::string map_path = tmpdir + "/named_map.tsv";
-    if (!write_file(map_path, "protN\tK99999\n", err)) {
-        std::cerr << err << "\n";
-        return false;
-    }
-
-    const std::string proteins_out = tmpdir + "/my.proteins.custom.tsv";
-    const std::string blast8_out = tmpdir + "/my.unique.custom.blast8";
-    const std::string categories_out = tmpdir + "/my.categories.custom.tsv";
-    std::string out;
-    std::string cmd = shell_quote(dart_bin) + " damage-annotate --no-null --emi " + shell_quote(emi_path) +
-                      " --map " + shell_quote(map_path) +
-                      " --analysis-proteins " + shell_quote(proteins_out) +
-                      " --analysis-blast8 " + shell_quote(blast8_out) +
-                      " --analysis-categories " + shell_quote(categories_out) +
-                      " --min-reads 1 --min-breadth 0 --min-depth 0";
-    if (!run_command_capture(cmd, out, err)) {
-        std::cerr << err << "\n";
-        return false;
-    }
-
-    std::string ptxt, btxt, ctxt;
-    if (!read_file(proteins_out, ptxt, err) ||
-        !read_file(blast8_out, btxt, err) ||
-        !read_file(categories_out, ctxt, err)) {
-        std::cerr << err << "\n";
-        return false;
-    }
-    if (!expect(!ptxt.empty(), "explicit proteins output should exist and be non-empty")) return false;
-    if (!expect(!btxt.empty(), "explicit blast8 output should exist and be non-empty")) return false;
-    if (!expect(!ctxt.empty(), "explicit categories output should exist and be non-empty")) return false;
-    return true;
-}
 
 static bool test_refine_damage_zero_mismatch_denominator(const std::string& dart_bin, const std::string& tmpdir) {
     std::cout << "Running --refine-damage zero-mismatch denominator regression...\n";
@@ -731,7 +390,7 @@ static bool test_ancient_threshold_cli_flag(const std::string& dart_bin, const s
     // Default threshold (0.60): site-only posterior ~0.38 -> Undetermined -> is_damaged=0
     std::string out_default, out_low;
     std::string cmd_default = shell_quote(dart_bin) + " damage-annotate --no-null --emi " + shell_quote(emi_path) +
-                              " --d-max 0.3 --no-identity";
+                              " --d-max 0.3";
     if (!run_command_capture(cmd_default, out_default, err)) {
         std::cerr << err << "\n";
         return false;
@@ -740,7 +399,7 @@ static bool test_ancient_threshold_cli_flag(const std::string& dart_bin, const s
     // Lower ancient-threshold to 0.20 (and modern-threshold to 0.10 to satisfy ordering constraint):
     // same posterior should become damage_class="ancient"
     std::string cmd_low = shell_quote(dart_bin) + " damage-annotate --no-null --emi " + shell_quote(emi_path) +
-                          " --d-max 0.3 --no-identity --ancient-threshold 0.20 --modern-threshold 0.10";
+                          " --d-max 0.3 --ancient-threshold 0.20 --modern-threshold 0.10";
     if (!run_command_capture(cmd_low, out_low, err)) {
         std::cerr << err << "\n";
         return false;
@@ -823,8 +482,11 @@ int main(int argc, char* argv[]) {
     }
     const std::string dart_bin = argv[1];
 
-    char tmp_template[] = "/tmp/dart_regress_XXXXXX";
-    char* tmp = mkdtemp(tmp_template);
+    const char* base = std::getenv("TMPDIR");
+    std::string pattern = std::string(base && *base ? base : ".") + "/dart_regress_XXXXXX";
+    std::vector<char> tmp_template(pattern.begin(), pattern.end());
+    tmp_template.push_back('\0');
+    char* tmp = mkdtemp(tmp_template.data());
     if (!tmp) {
         std::cerr << "Failed to create temp dir\n";
         return 2;
@@ -835,12 +497,7 @@ int main(int argc, char* argv[]) {
 
     bool ok = true;
     ok = test_em_target_gamma_consistency(dart_bin, tmpdir) && ok;
-    ok = test_max_dist_recomputes_metrics(dart_bin, tmpdir) && ok;
-    ok = test_threshold_is_damaged(dart_bin, tmpdir) && ok;
     ok = test_protein_mapping_filters(dart_bin, tmpdir) && ok;
-    ok = test_blast8_unique_export(dart_bin, tmpdir) && ok;
-    ok = test_analysis_prefix_bundle(dart_bin, tmpdir) && ok;
-    ok = test_analysis_explicit_named_outputs(dart_bin, tmpdir) && ok;
     ok = test_refine_damage_zero_mismatch_denominator(dart_bin, tmpdir) && ok;
     ok = test_ancient_threshold_cli_flag(dart_bin, tmpdir) && ok;
     ok = test_fdr_scan_non_monotone() && ok;

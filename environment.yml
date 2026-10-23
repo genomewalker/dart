@@ -16,7 +16,6 @@ dependencies:
   - libgomp  # OpenMP runtime
   - zstd     # Columnar compression (required)
   - isa-l    # gzip codec for reading and writing (required)
-  - nasm     # Assembler for the bundled ISA-L build in rapidgzip (required)
   - pkg-config
 
   # Recommended workflow tools

@@ -109,44 +109,40 @@ AlignmentData build_alignment_data(
 // Empirical null model: fit / write / read
 // ---------------------------------------------------------------------------
 
-// Method-of-moments Gumbel from a set of scores (needs n>=2 with sd>0).
-static bool fit_gumbel_mom(const std::vector<double>& xs, float& mu, float& beta) {
-    const size_t n = xs.size();
+// Method-of-moments Gumbel from (n, sum, sum_sq); n-1 sample variance.
+static bool fit_gumbel_mom(uint32_t n, double sum, double sum_sq, float& mu, float& beta) {
     if (n < 2) return false;
-    double mean = 0.0;
-    for (double x : xs) mean += x;
-    mean /= static_cast<double>(n);
-    double var = 0.0;
-    for (double x : xs) { const double d = x - mean; var += d * d; }
-    var /= static_cast<double>(n - 1);  // sample variance
-    const double sd = std::sqrt(var);
-    if (!(sd > 0.0)) return false;
-    const double b = std::sqrt(6.0) * sd / M_PI;
+    const double mean = sum / n;
+    const double var = (sum_sq - n * mean * mean) / (n - 1.0);
+    if (!(var > 0.0)) return false;
+    const double b = std::sqrt(6.0) * std::sqrt(var) / M_PI;
     beta = static_cast<float>(b);
     mu = static_cast<float>(mean - 0.5772156649015329 * b);
     return true;
 }
 
-NullModel fit_null_model(
-    const std::vector<std::vector<double>>& per_bin_scores,
-    uint32_t min_n)
+NullModel fit_null_model_moments(const std::vector<uint32_t>& n,
+                                 const std::vector<double>& sum,
+                                 const std::vector<double>& sum_sq,
+                                 uint32_t min_n)
 {
     NullModel m;
-    const int nbins = static_cast<int>(per_bin_scores.size());
+    const int nbins = static_cast<int>(n.size());
     m.mu.assign(nbins, 0.0f);
     m.beta.assign(nbins, 0.0f);
-    m.n.assign(nbins, 0u);
+    m.n = n;
+    m.sum = sum;
+    m.sum_sq = sum_sq;
 
     // Pooled fallback fit across every bin (used for sparse bins).
-    std::vector<double> pooled;
-    for (const auto& v : per_bin_scores) pooled.insert(pooled.end(), v.begin(), v.end());
+    uint32_t pn = 0; double ps = 0.0, pss = 0.0;
+    for (int b = 0; b < nbins; ++b) { pn += n[b]; ps += sum[b]; pss += sum_sq[b]; }
     float pooled_mu = 0.0f, pooled_beta = 0.0f;
-    const bool pooled_ok = fit_gumbel_mom(pooled, pooled_mu, pooled_beta);
+    const bool pooled_ok = fit_gumbel_mom(pn, ps, pss, pooled_mu, pooled_beta);
 
     for (int b = 0; b < nbins; ++b) {
-        m.n[b] = static_cast<uint32_t>(per_bin_scores[b].size());
         float bmu = 0.0f, bbeta = 0.0f;
-        if (per_bin_scores[b].size() >= min_n && fit_gumbel_mom(per_bin_scores[b], bmu, bbeta)) {
+        if (n[b] >= min_n && fit_gumbel_mom(n[b], sum[b], sum_sq[b], bmu, bbeta)) {
             m.mu[b] = bmu;
             m.beta[b] = bbeta;
         } else if (pooled_ok) {
@@ -157,39 +153,18 @@ NullModel fit_null_model(
     return m;
 }
 
-bool write_null_model(const std::string& path, const NullModel& m) {
-    std::ofstream out(path);
-    if (!out) return false;
-    out << "bin\tlo\thi\tmu\tbeta\tn\n";
-    const int nbins = static_cast<int>(m.mu.size());
-    for (int b = 0; b < nbins && b < kNumNullBins; ++b) {
-        const uint16_t lo = kNullBinEdges[b];
-        const uint16_t hi = kNullBinEdges[b + 1];
-        out << b << '\t' << lo << '\t' << hi << '\t'
-            << m.mu[b] << '\t' << m.beta[b] << '\t'
-            << (b < static_cast<int>(m.n.size()) ? m.n[b] : 0u) << '\n';
+NullModel fit_null_model(
+    const std::vector<std::vector<double>>& per_bin_scores,
+    uint32_t min_n)
+{
+    const size_t nbins = per_bin_scores.size();
+    std::vector<uint32_t> n(nbins, 0u);
+    std::vector<double> sum(nbins, 0.0), sum_sq(nbins, 0.0);
+    for (size_t b = 0; b < nbins; ++b) {
+        n[b] = static_cast<uint32_t>(per_bin_scores[b].size());
+        for (double x : per_bin_scores[b]) { sum[b] += x; sum_sq[b] += x * x; }
     }
-    return static_cast<bool>(out);
-}
-
-bool read_null_model(const std::string& path, NullModel& m) {
-    std::ifstream in(path);
-    if (!in) return false;
-    m.mu.clear(); m.beta.clear(); m.n.clear();
-    std::string line;
-    bool first = true;
-    while (std::getline(in, line)) {
-        if (line.empty()) continue;
-        if (first) { first = false; if (line.rfind("bin", 0) == 0) continue; }
-        std::istringstream ss(line);
-        int bin; double lo, hi, mu, beta; long n = 0;
-        if (!(ss >> bin >> lo >> hi >> mu >> beta)) continue;
-        ss >> n;
-        m.mu.push_back(static_cast<float>(mu));
-        m.beta.push_back(static_cast<float>(beta));
-        m.n.push_back(static_cast<uint32_t>(std::max(0L, n)));
-    }
-    return m.valid();
+    return fit_null_model_moments(n, sum, sum_sq, min_n);
 }
 
 // ---------------------------------------------------------------------------
@@ -1016,8 +991,8 @@ EMState squarem_em(
 // ---------------------------------------------------------------------------
 // compact_em_map (fusion dual-b8247d43): the SINGLE EM solver. Decode-once CSR
 // {ref_idx, base_a, base_m} where base = length_log_penalty + coverage_log_penalty +
-// real_log_density (+ frozen damage log(p_read)+ll_a / log(1-p_read)+ll_m), all
-// iteration-independent. Per-iter E-step adds only log(weights[ref]); fused per-ref
+// real_log_density, split into ancient/modern by em_base_pair (damage enters the
+// mapping only with use_damage), all iteration-independent. Per-iter E-step adds only log(weights[ref]); fused per-ref
 // s_t = Σγ; full SQUAREM; DETERMINISTIC-LANE M-step (fixed lanes, read-order per lane,
 // ascending-lane reduce) -> bitwise-identical across thread counts. Frozen-damage branch
 // (use_alignment_damage_likelihood): pi is post-hoc, only w_null rides the SQUAREM state.
@@ -1069,8 +1044,7 @@ EMState compact_em_map(AlignmentData& data, const EMParams& params,
                       + coverage_log_penalty(params, aln.ref_idx)
                       + real_log_density(params, static_cast<double>(aln.bit_score), aln.aln_len, score_scale);
             const double pr = std::clamp(static_cast<double>(aln.damage_score), eps, 1.0 - eps);
-            base_a[j] = bc + std::log(pr) + aln.damage_ll_a;
-            base_m[j] = bc + std::log(1.0 - pr) + aln.damage_ll_m;
+            em_base_pair(params, bc, pr, aln.damage_ll_a, aln.damage_ll_m, base_a[j], base_m[j]);
         }
     }
 
@@ -1142,6 +1116,7 @@ EMState compact_em_map(AlignmentData& data, const EMParams& params,
     // M-step: weights[t] = (prior + Σ_lane s_lane[l][t]) ascending-lane, then normalize.
     auto m_step_fused = [&](double* out_w) {
         const double prior_offset = params.alpha_prior - 1.0;
+        const double null_offset = em_null_offset(params);
         double tot = 0.0;
         for (uint32_t t = 0; t < T; ++t) {
             double w = prior_offset;
@@ -1151,7 +1126,7 @@ EMState compact_em_map(AlignmentData& data, const EMParams& params,
         }
         double wn = 0.0;
         if (null_on) {
-            wn = prior_offset;
+            wn = null_offset;
             for (uint32_t r = 0; r < R; ++r) wn += gn_s[r];
             wn = std::max(wn, params.min_weight); tot += wn;
         }
@@ -1182,13 +1157,13 @@ EMState compact_em_map(AlignmentData& data, const EMParams& params,
             squarem_extrapolate(w0.data(), r_buf.data(), v_buf.data(), Tn, alpha, params.min_weight);
             do_e(w0.data()); do_m(w1.data()); std::copy(w1.begin(), w1.end(), w0.begin());
             ll = do_e(w0.data());
-            objective = em_objective_from_ll(params, w0.data(), T, ll);
+            objective = em_objective_with_null(params, w0.data(), T, null_on, ll);
             const bool nonmono = (iter > 0) && std::isfinite(params.squarem_objfn_inc)
                                  && (objective < (prev_obj - params.squarem_objfn_inc));
             if (nonmono) {
                 std::copy(w2.begin(), w2.end(), state.weights.begin());
                 ll = do_e(state.weights.data());
-                objective = em_objective_from_ll(params, state.weights.data(), T, ll);
+                objective = em_objective_with_null(params, state.weights.data(), T, null_on, ll);
                 if (std::abs(alpha - step_max) <= (1e-12 * (1.0 + std::abs(step_max)))) step_max = std::max(step_max0, step_max / mstep);
             } else {
                 std::copy(w0.begin(), w0.end(), state.weights.begin());
@@ -1197,7 +1172,7 @@ EMState compact_em_map(AlignmentData& data, const EMParams& params,
             if (step_min < 0.0 && std::abs(alpha - step_min) <= (1e-12 * (1.0 + std::abs(step_min)))) step_min = mstep * step_min;
         } else {
             ll = do_e(state.weights.data());
-            objective = em_objective_from_ll(params, state.weights.data(), T, ll);
+            objective = em_objective_with_null(params, state.weights.data(), T, null_on, ll);
             do_m(state.weights.data());
         }
         state.log_likelihood = ll; state.iterations = iter + 1;
@@ -1214,7 +1189,8 @@ EMState compact_em_map(AlignmentData& data, const EMParams& params,
     // gamma is likewise at state.weights). When streaming, hand each read to finalize_cb
     // and hold no O(A) gamma; else fill state.gamma / state.gamma_ancient as before.
     // gamma_ancient: use_damage -> ga (joint); posthoc_gamma_ancient -> gamma * p_anc with
-    // p_anc = sigmoid(base_a - base_m) (bc cancels; == the CLI's post-hoc formula). ----
+    // p_anc = sigmoid(base_a - base_m) (bc cancels; == the CLI's post-hoc formula; the
+    // damage-free split in em_base_pair keeps this difference). ----
     {
         const double log_w_null_dyn = null_on ? std::log(std::max(state.weights[T], params.min_weight)) : 0.0;
         std::vector<double> ls, gbuf, gabuf;
@@ -1391,8 +1367,7 @@ static inline void tape_decode_read(
                   + coverage_log_penalty(params, aln.ref_idx)
                   + real_log_density(params, static_cast<double>(aln.bit_score), aln.aln_len, score_scale);
         const double pr = std::clamp(static_cast<double>(aln.damage_score), eps, 1.0 - eps);
-        basea_out[j] = bc + std::log(pr) + aln.damage_ll_a;
-        basem_out[j] = bc + std::log(1.0 - pr) + aln.damage_ll_m;
+        em_base_pair(params, bc, pr, aln.damage_ll_a, aln.damage_ll_m, basea_out[j], basem_out[j]);
     }
 }
 
@@ -1401,7 +1376,7 @@ static inline void tape_decode_read(
 // it re-reads the whole tape and drives finalize_cb, so it always re-runs, and a
 // resumed run is therefore bit-identical (final pass is a pure function of weights).
 static constexpr uint64_t TAPE_CKPT_MAGIC   = 0x5441504543484B31ULL;  // "TAPECHK1"
-static constexpr uint32_t TAPE_CKPT_VERSION = 1;
+static constexpr uint32_t TAPE_CKPT_VERSION = 2;  // 2: damage-free mapping base (em_base_pair)
 
 struct TapeCkptHeader {
     uint64_t magic;
@@ -1448,6 +1423,11 @@ static uint64_t tape_ckpt_fingerprint(const std::string& input_fingerprint,
     h = tape_ckpt_fnv1a(&nl, 1, h);
     h = tape_ckpt_fnv1a(&params.lambda_null, sizeof(double), h);
     h = tape_ckpt_fnv1a(&params.log_w_null, sizeof(double), h);
+    if (null_on) {   // the null column's Gumbel table changes the converged weights
+        h = tape_ckpt_fnv1a(&params.alpha_null, sizeof(double), h);
+        for (float v : params.null_mu) h = tape_ckpt_fnv1a(&v, sizeof(float), h);
+        for (float v : params.null_beta) h = tape_ckpt_fnv1a(&v, sizeof(float), h);
+    }
     return h;
 }
 
@@ -1487,7 +1467,8 @@ TapeEMResult tape_em_core(
     double* const lane_s = lane_s_buf.get();
     // gn_s: written by lane l over r in [lane_lo[l], lane_lo[l+1]) and read ascending in
     // m_step, so first-touch on the same partition. Zeroed ONCE: deg==0 reads never assign
-    // gn_s[r] and must stay 0.0 across all E-steps. null is OFF on the production CLI path.
+    // gn_s[r] and must stay 0.0 across all E-steps. The CLI passes null_lp whenever a null
+    // model is loaded (one double per read gathered while the tape is written).
     std::unique_ptr<double[]> gn_s_buf(null_on ? new double[R] : nullptr);
     double* const gn_s = gn_s_buf.get();
     if (null_on) {
@@ -1568,6 +1549,7 @@ TapeEMResult tape_em_core(
     // sum it was when fused into the t loop. The null reduction stays serial ascending r.
     auto m_step = [&](double* out_w) {
         const double prior_offset = params.alpha_prior - 1.0;
+        const double null_offset = em_null_offset(params);
         #pragma omp parallel for schedule(static)
         for (int64_t t = 0; t < static_cast<int64_t>(T); ++t) {
             double w = prior_offset;
@@ -1578,7 +1560,7 @@ TapeEMResult tape_em_core(
         for (uint32_t t = 0; t < T; ++t) tot += out_w[t];        // ascending t, SERIAL
         double wn = 0.0;
         if (null_on) {
-            wn = prior_offset;
+            wn = null_offset;
             for (uint32_t r = 0; r < R; ++r) wn += gn_s[r];      // ascending r, SERIAL
             wn = std::max(wn, params.min_weight); tot += wn;
         }
@@ -1656,13 +1638,13 @@ TapeEMResult tape_em_core(
             squarem_extrapolate(w0.data(), r_buf.data(), v_buf.data(), Tn, alpha, params.min_weight);
             do_e(w0.data()); do_m(w1.data()); std::copy(w1.begin(), w1.end(), w0.begin());
             ll = do_e(w0.data());
-            objective = em_objective_from_ll(params, w0.data(), T, ll);
+            objective = em_objective_with_null(params, w0.data(), T, null_on, ll);
             const bool nonmono = (iter > 0) && std::isfinite(params.squarem_objfn_inc)
                                  && (objective < (prev_obj - params.squarem_objfn_inc));
             if (nonmono) {
                 std::copy(w2.begin(), w2.end(), weights.begin());
                 ll = do_e(weights.data());
-                objective = em_objective_from_ll(params, weights.data(), T, ll);
+                objective = em_objective_with_null(params, weights.data(), T, null_on, ll);
                 if (std::abs(alpha - step_max) <= (1e-12 * (1.0 + std::abs(step_max)))) step_max = std::max(step_max0, step_max / mstep);
             } else {
                 std::copy(w0.begin(), w0.end(), weights.begin());
@@ -1674,7 +1656,7 @@ TapeEMResult tape_em_core(
             if (step_min < 0.0 && std::abs(alpha - step_min) <= (1e-12 * (1.0 + std::abs(step_min)))) step_min = mstep * step_min;
         } else {
             ll = do_e(weights.data());
-            objective = em_objective_from_ll(params, weights.data(), T, ll);
+            objective = em_objective_with_null(params, weights.data(), T, null_on, ll);
             do_m(weights.data());
         }
         res.log_likelihood = ll; res.iterations = iter + 1;

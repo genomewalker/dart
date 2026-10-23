@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(AncientGenePredictor VERSION 1.0.0 LANGUAGES CXX)
+project(AncientGenePredictor VERSION 2.0.0 LANGUAGES CXX)
 include(CTest)
 include(FetchContent)
 
@@ -105,23 +105,6 @@ if(USE_OPENMP)
     endif()
 endif()
 
-# rapidgzip (via indexed_bzip2) — in-process parallel gzip decompression.
-# Replaces the pigz subprocess; no PATH dependency, true multi-threaded inflate.
-# WITH_ISAL ON: rapidgzip inflates via ISA-L igzip (hardware-accelerated), matching
-# fqdup's decompression backend. pigz is no longer used at all (removed from
-# sequence_io.cpp); the reader path is rapidgzip(ISA-L) -> zlib.
-set(LIBRAPIDARCHIVE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(LIBRAPIDARCHIVE_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
-set(LIBRAPIDARCHIVE_WITH_ISAL   ON  CACHE BOOL "" FORCE)
-FetchContent_Declare(
-    librapidarchive
-    GIT_REPOSITORY https://github.com/mxmlnkn/indexed_bzip2.git
-    GIT_TAG        master
-    GIT_SHALLOW    TRUE
-    UPDATE_DISCONNECTED TRUE
-)
-FetchContent_MakeAvailable(librapidarchive)
-
 # libtaph: reference-free ancient DNA damage estimation and library-type classification
 set(TAPH_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 # The damage estimates in every DART artifact come from libtaph, so the libtaph revision IS a build
@@ -177,7 +160,7 @@ endif()
 # Find zlib for compressed file support
 find_package(ZLIB REQUIRED)
 
-# ISA-L: igzip is DART's gzip codec for BOTH read (via rapidgzip) and write. No pigz
+# ISA-L: igzip is DART's gzip codec for BOTH read and write. No pigz
 # subprocess anywhere -- SequenceWriter/GeneWriter/FastaWriter compress with isal_deflate
 # in-process, matching fqdup's backend. Required: a mislabeled or missing isa-l is a
 # silent regression to no compression, so fail loud.
@@ -234,6 +217,7 @@ set(DART_CORE_SOURCES
     src/damage_index_reader.cpp
     src/reference_stats.cpp
     src/em_reassign.cpp
+    src/null_model.cpp
     src/em_index.cpp
     src/columnar_index.cpp
     src/coverage_em.cpp
@@ -258,12 +242,12 @@ set(DART_SUBCOMMAND_SOURCES
     src/cli/cmd_simulate.cpp          # simulate (synthetic damage reads)
     src/cli/cmd_eval.cpp              # eval (benchmark accuracy vs truth TSV)
     src/cli/cmd_fit_calib.cpp         # fit-calib (f_true + f_0 coherent-LR model)
+    src/cli/cmd_null.cpp              # null (fit / pool the decoy null sidecar)
 )
 
 # Main executable with subcommands
 add_executable(dart ${DART_CORE_SOURCES} ${DART_SUBCOMMAND_SOURCES})
-target_link_libraries(dart ${ZLIB_LIBRARIES} ${ISAL_LIB} PkgConfig::ZSTD rapidgzip::rapidgzip taph)
-target_compile_definitions(dart PRIVATE HAVE_RAPIDGZIP)
+target_link_libraries(dart ${ZLIB_LIBRARIES} ${ISAL_LIB} PkgConfig::ZSTD taph)
 if(OpenMP_CXX_FOUND)
     target_link_libraries(dart OpenMP::OpenMP_CXX)
 endif()
@@ -324,6 +308,24 @@ if(BUILD_TESTING)
         COMMAND dart-damage-annotate-regressions $<TARGET_FILE:dart>
     )
 
+    add_test(
+        NAME cli_errors
+        COMMAND bash ${CMAKE_SOURCE_DIR}/tests/cli_errors.sh $<TARGET_FILE:dart>
+    )
+
+    # damage-annotate --dcx: a forced spill of the external sort equals the in-memory sort.
+    # Needs TMPDIR on node-local disk; skipped (77) otherwise.
+    add_test(
+        NAME dcx_spill
+        COMMAND bash ${CMAKE_SOURCE_DIR}/tests/dcx_spill.sh $<TARGET_FILE:dart>
+                ${CMAKE_SOURCE_DIR}/examples/tutorial
+    )
+    set_tests_properties(dcx_spill PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_test(NAME gate_compact_em COMMAND gate-compact-em)
+    set_tests_properties(gate_compact_em PROPERTIES
+        ENVIRONMENT "GATE_TAPE_DIR=${CMAKE_BINARY_DIR}/gate_tape")
+
     add_executable(
         dart-profile-regressions
         tests/test_profile_regressions.cpp
@@ -362,6 +364,13 @@ if(BUILD_TESTING)
         NAME dcx_roundtrip
         COMMAND dart-dcx-roundtrip
     )
+
+    add_executable(dart-dcx-streaming tests/test_dcx_streaming.cpp src/dart_columnar.cpp)
+    target_link_libraries(dart-dcx-streaming PkgConfig::ZSTD)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(dart-dcx-streaming OpenMP::OpenMP_CXX)
+    endif()
+    add_test(NAME dcx_streaming COMMAND dart-dcx-streaming)
 
     # ORF id uniqueness: the id grammar (legacy 3-field and current 4-field,
     # incl. a two-digit ordinal) plus an end-to-end check that `dart predict`
@@ -403,6 +412,49 @@ if(BUILD_TESTING)
         NAME emi_v7_roundtrip
         COMMAND dart-emi-v7-roundtrip
     )
+
+    # Decoy null model: .null sidecar round trip and corruption, predict decoy file,
+    # hits2emi --decoy-hits / dart null, damage-annotate auto-discovery and refusal.
+    add_executable(
+        dart-null-model-tests
+        tests/test_null_model.cpp
+        ${DART_CORE_SOURCES}
+    )
+    target_link_libraries(dart-null-model-tests ${ZLIB_LIBRARIES} ${ISAL_LIB} PkgConfig::ZSTD taph)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(dart-null-model-tests OpenMP::OpenMP_CXX)
+    endif()
+    add_test(
+        NAME null_model
+        COMMAND dart-null-model-tests $<TARGET_FILE:dart>
+                ${CMAKE_CURRENT_SOURCE_DIR}/examples/tutorial
+    )
+
+    # emi-merge end to end: two v7 inputs over overlapping reads and targets, merged by
+    # `dart emi-merge`, gated by `dart emi-verify`, compared against a hand-built expected union
+    # (best bit wins, ties keep input 0, first-owner annot, payload pass-through).
+    add_executable(
+        dart-emi-merge-golden
+        tests/test_emi_merge_golden.cpp
+    )
+    target_link_libraries(dart-emi-merge-golden PkgConfig::ZSTD)
+    add_test(
+        NAME emi_merge_golden
+        COMMAND dart-emi-merge-golden $<TARGET_FILE:dart>
+    )
+
+    # emi-merge memory gate: peak RSS (VmHWM / ru_maxrss) of a ~4M-row two-input merge at a
+    # pinned thread count stays under a fixed bound; the multi-block output passes emi-verify.
+    add_executable(
+        dart-emi-merge-memory-gate
+        tests/gate_emi_merge_memory.cpp
+    )
+    target_link_libraries(dart-emi-merge-memory-gate PkgConfig::ZSTD)
+    add_test(
+        NAME emi_merge_memory_gate
+        COMMAND dart-emi-merge-memory-gate $<TARGET_FILE:dart>
+    )
+    set_tests_properties(emi_merge_memory_gate PROPERTIES TIMEOUT 600)
 endif()
 
 # Install
