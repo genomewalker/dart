@@ -25,7 +25,7 @@ struct Options {
     std::string fasta_aa;            // Protein output (observed, stops as *)
     std::string fasta_aa_corrected;  // Protein output (Bayesian-corrected ancestor AAs at damage stops)
     std::string fasta_aa_masked;     // Search-optimized: terminal damage stops masked as X
-    int decoy_every = 0;             // --decoy-every N with --fasta-aa: reversed proteins of every N-th read -> <aa>.decoy.<ext>; 0 (default) = off
+    int decoy_every = 0;             // --decoy-every N with --fasta-aa: reversed proteins of every N-th read -> <aa>.decoy.<ext>; 0 = off; parse_args defaults to 10 with --fasta-aa
     std::string summary_file;        // Summary statistics output file (JSON format)
     std::string damage_index;        // Binary damage index (.agd) for post-mapping annotation
 

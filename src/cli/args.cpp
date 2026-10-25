@@ -23,7 +23,7 @@ void print_usage(const char* program_name) {
     std::cout << "  --fasta-aa <file>        Output amino acid FASTA (observed, stops as *)\n";
     std::cout << "  --decoy-every <N>        With --fasta-aa, also write the reversed proteins of every N-th\n";
     std::cout << "                           read to <aa>.decoy.<ext> as DECOY_ queries for the null model\n";
-    std::cout << "                           (hits2emi --decoy-hits). Default 0 (off); 10 is a good value\n";
+    std::cout << "                           (hits2emi --decoy-hits). Default 10 with --fasta-aa; 0 turns decoys off\n";
     std::cout << "  --fasta-aa-masked <file> Search-optimized: terminal damage stops as X\n";
     std::cout << "  --summary <file>         Output sample statistics (JSON format)\n";
     std::cout << "  --damage-index <file>    Output binary damage index (.agd) for damage-annotate\n";
@@ -60,6 +60,7 @@ void print_usage(const char* program_name) {
 
 Options parse_args(int argc, char* argv[]) {
     Options opts;
+    bool decoy_every_set = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -121,6 +122,7 @@ Options parse_args(int argc, char* argv[]) {
             opts.fasta_aa = require_value(arg);
         } else if (arg == "--decoy-every") {
             opts.decoy_every = parse_int(arg, require_value(arg));
+            decoy_every_set = true;
             if (opts.decoy_every < 0) throw ParseArgsExit(1, "Error: --decoy-every must be >= 0");
         } else if (arg == "--fasta-aa-masked") {
             opts.fasta_aa_masked = require_value(arg);
@@ -183,6 +185,7 @@ Options parse_args(int argc, char* argv[]) {
         throw ParseArgsExit(1, "Error: No input file specified");
     }
 
+    if (!opts.fasta_aa.empty() && !decoy_every_set) opts.decoy_every = 10;
     return opts;
 }
 

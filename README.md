@@ -7,14 +7,14 @@
 
 DART predicts protein-coding ORFs from ancient DNA reads, writes a damage index, and annotates protein-search alignments. Gene prediction, reference assignment and protein authentication are separate steps.
 
-> Status as of 2026-10-25: checked against release/v2.0.0 at merge `d1837bf` (null-flagged abundance filtering, libtaph `c3b3a5d`). The default excludes null-flagged reads from EM-weighted abundance; `--keep-null-flagged` restores their credit. Damaged-read and authentication counts remain once per retained read on its best hit.
+> Status as of 2026-10-25: checked against DART v2.0.0 (release/v2.0.0 merge `b01731e`, libtaph `c3b3a5d`). The default excludes null-flagged reads from EM-weighted abundance; `--keep-null-flagged` restores their credit. Damaged-read and authentication counts remain once per retained read on its best hit.
 
 This release uses EMI v7. Damage-aware prediction requires an fqdup library damage summary or explicit self-profiling. `--em-use-damage-mapping` controls the joint damage E-step; protein authentication uses library-level damage information and assigned read evidence.
 
 ## Workflow
 
 1. Run `predict` to write GFF3, protein FASTA and an AGD damage index, plus reversed decoy
-   peptides with `--decoy-every 10`.
+   peptides by default with `--fasta-aa` (`--decoy-every 10`; `0` opts out).
 2. Search the proteins and the decoys with MMseqs2; `hits2emi` converts the hits to EMI v7 and
    fits the null model from the decoy hits into `<emi>.null`.
 3. Run `damage-annotate` for read assignments, damage scores and protein summaries.
@@ -61,8 +61,8 @@ DART=../../build/dart DB=./ref_proteins.faa.gz bash run_tutorial.sh
 For your own inputs you need one thing the tutorial skips: a damage profile measured with
 [fqdup](https://github.com/genomewalker/fqdup) on the reads before deduplication. The null model
 that keeps reads from proteins missing from your database off the nearest homolog is built into
-the pipeline: `predict --decoy-every 10` writes reversed decoy peptides next to `--fasta-aa`, you
-search them with the same MMseqs2 options, `hits2emi --decoy-hits` fits the null into
+the pipeline: `predict --fasta-aa FILE` writes reversed decoy peptides by default (every 10th
+input read). Search them with the same MMseqs2 options, `hits2emi --decoy-hits` fits the null into
 `hits.emi.null`, and `damage-annotate` finds that file by itself.
 
 ```bash
@@ -70,10 +70,10 @@ mkdir -p out
 # 0) Damage profile from the merged reads, before deduplication
 fqdup profile -i merged.fq.gz --damage-summary out/library.tdmg
 
-# 1) Predict genes + damage index. --decoy-every 10 also writes out/proteins.decoy.faa:
+# 1) Predict genes + damage index. Also writes out/proteins.decoy.faa by default:
 #    the reversed proteins of every 10th read, ids prefixed DECOY_
 dart predict -i reads.fq.gz -o out/predictions.gff --fasta-aa out/proteins.faa \
-  --damage-index out/predictions.agd --library-profile out/library.tdmg --decoy-every 10 -t 16
+  --damage-index out/predictions.agd --library-profile out/library.tdmg -t 16
 
 # 2) Search against reference proteins. VTML20 suits short aDNA peptides; the matrix
 #    ships in examples/tutorial/data/ of the DART source tree
@@ -100,8 +100,8 @@ dart damage-annotate --emi out/hits.emi --damage-index out/predictions.agd \
 One null per database and search configuration is enough for a study: run `--decoy-every 10`
 and the decoy search on a few representative samples, pool them with
 `dart null -o study.null --db-label mydb sampleA/decoy_hits.tsv sampleB/decoy_hits.tsv ...`,
-and pass `--em-null-model study.null` to every `damage-annotate`; the other samples need no
-decoys.
+and pass `--em-null-model study.null` to every `damage-annotate`; the other samples can opt out
+with `predict --decoy-every 0`.
 `dart damage-info hits.emi.null` prints the fitted bins and the provenance (dart version, inputs,
 decoy counts). Refit when the database, the search options, the library type or the read length
 range changes.
@@ -120,8 +120,10 @@ so `q_modern` and the other reads' posteriors do not move. `Q` is the record cou
 `--damage-index` (one record per predicted protein, the proteins searched); pass
 `--null-queries N` when the searched set differs. Every query counts, including those with a true
 hit, so the rule is conservative. Give the decoy count with `--decoy-fasta` (or
-`--decoys-submitted N`; `dart null` takes the latter); without it `w_b` is per decoy with a hit,
-which overstates chance. At the end damage-annotate prints one `null reject:` line per bin with
+`--decoys-submitted N`; `dart null` takes the latter). `hits2emi --decoy-hits` requires one
+of these options; omitting both is an error. Older sidecars with an unknown count still use
+decoys with a hit as the denominator, which overstates chance. At the end damage-annotate prints
+one `null reject:` line per bin with
 the reads, the share flagged, `chance` (the chance best hits expected in the bin, `Q · w_b`) and the
 lowest kept bit score (`NA` when nothing in the bin is flagged). A bin with no decoy hits of its own
 never flags. `--null-p-max P` instead rejects a read when `null_p > P`, a fixed per-query chance;
@@ -139,6 +141,7 @@ MMseqs2 can align across them.
 | Command | You must pass | Why |
 |---------|---------------|-----|
 | `predict` | `--library-profile FILE` (binary TDM1 sidecar) or `--allow-self-profile` when damage detection is on | Self-profiling is unreliable on deduplicated libraries |
+| `hits2emi --decoy-hits FILE` | `--decoy-fasta FILE` or `--decoys-submitted N` (> 0) | The null denominator counts all decoys searched, including those without hits |
 | `damage-annotate` | a null model when EM is on: `<emi>.null` next to the EMI (written by `hits2emi --decoy-hits`), `--em-null-model FILE`, `--em-calib-model FILE`, or `--no-null` | Without a null model, reads from proteins absent from the database are force-mapped to the nearest homolog |
 | `damage-annotate` (EM on) | `--em-tape-dir DIR` or `DART_EM_TAPE_DIR` | Without `--em-calib-model` and `--em-use-damage-mapping`, EM input uses an `O_DIRECT` tape, with or without a null model (the null adds one double per read); supply node-local disk supporting it. Only the calibrated and damage-in-mapping configurations run EM in memory. |
 
@@ -147,6 +150,10 @@ proteins the reads come from, too few for chance hits: the decoy search yields a
 no null bin reaches two decoy queries, and `hits2emi` and `damage-annotate` both say so and run EM
 with the null coordinate off. A real database fills the bins. `predict --no-damage` does not require
 a profile; `damage-annotate --no-em` bypasses the EM null-model choice.
+
+`damage-annotate --lambda F` sets the decay constant explicitly. By default it comes from
+the damage index (or the EMI header when no damage index is supplied); `0.3` is the fallback
+when absent.
 
 ### Damage profile only
 
@@ -161,8 +168,11 @@ reads.
 ### Changes in v2.0.0
 
 **Decoy null model.** `predict --fasta-aa X --decoy-every N` also writes `X` with `.decoy`
-before the extension: the reversed proteins of every N-th read, ids prefixed `DECOY_` (off by
-default, since not every predict run feeds a search; 10 is a good value). Search that file with the real search's options and pass the hits to
+before the extension: the reversed proteins of every N-th input read, ids prefixed `DECOY_`.
+With `--fasta-aa`, N defaults to 10; `--decoy-every 0` disables decoys and an explicit N wins.
+`--fasta-aa-masked` alone does not enable decoys. The interval selects input reads, so the
+decoy record count includes every ORF of each selected read. Search that file with the real
+search's options and pass the hits to
 `hits2emi --decoy-hits`, which fits the Gumbel-per-length-bin null and writes it as the binary
 sidecar `<emi>.null` with its provenance (dart version, inputs with size and mtime, decoy counts,
 `--db-label`). `damage-annotate` loads `<emi>.null` when it exists, after `--em-null-model` and
