@@ -7,7 +7,7 @@
 
 DART predicts protein-coding ORFs from ancient DNA reads, writes a damage index, and annotates protein-search alignments. Gene prediction, reference assignment and protein authentication are separate steps.
 
-> Status as of 2026-10-25: checked against DART v2.0.0 (release/v2.0.0 merge `c60a96f`, libtaph `c3b3a5d`). The default excludes null-flagged reads from EM-weighted abundance; `--keep-null-flagged` restores their credit. Damaged-read and authentication counts remain once per retained read on its best hit.
+> Status as of 2026-10-25: checked against DART v2.0.1 (release/v2.0.0; v2.0.1 only re-pins libtaph `c3b3a5d` -> `933877c`, identical source). The default excludes null-flagged reads from EM-weighted abundance; `--keep-null-flagged` restores their credit. Damaged-read and authentication counts remain once per retained read on its best hit.
 
 This release uses EMI v7. Damage-aware prediction requires an fqdup library damage summary or explicit self-profiling. `--em-use-damage-mapping` controls the joint damage E-step; protein authentication uses library-level damage information and assigned read evidence.
 
@@ -164,6 +164,11 @@ dart profile -i merged.fq.gz -o profile.json --damage-summary library.tdmg -t 16
 `dart profile` and `fqdup profile` run the same profiler in libtaph and write byte-identical
 JSON and `.tdmg` for the same reads and options. The `.tdmg` is what `predict --library-profile`
 reads.
+
+### Changes in v2.0.1
+
+Re-pins libtaph from `c3b3a5d` to `933877c`. libtaph's history was rewritten and `c3b3a5d` can no
+longer be fetched from GitHub; `933877c` has the identical source tree, so results match v2.0.0.
 
 ### Changes in v2.0.0
 
