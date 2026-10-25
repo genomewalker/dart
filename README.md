@@ -7,7 +7,7 @@
 
 DART predicts protein-coding ORFs from ancient DNA reads, writes a damage index, and annotates protein-search alignments. Gene prediction, reference assignment and protein authentication are separate steps.
 
-> Status as of 2026-10-23: checked against the v2.0.0 release branch (libtaph `c3b3a5d`); a null model now runs the EM on the tape path. The decoy null rejects reads by a per-bin target-decoy FDR (`--null-fdr`, default 0.05), which replaces the fixed `--null-p-max` default; `--null-p-max` remains as an explicit alternative. The per-read table writes each read's q as `null_q` after `null_p`. With the EM on, every kept candidate is credited to its own protein with its own `gamma` (use `eff_reads` for abundance); the damaged-read counts and the protein authentication test count each read once, on its best hit.
+> Status as of 2026-10-25: checked against feature branch `null-drop-abundance` at `6fa0e9e` (base release/v2.0.0 `122bbc3`, libtaph `c3b3a5d`). The opt-in `--drop-null-flagged` change is awaiting review; it is not merged into the release branch. The default remains EM-weighted abundance, with damaged-read and authentication counts taken once per read on its best hit.
 
 This release uses EMI v7. Damage-aware prediction requires an fqdup library damage summary or explicit self-profiling. `--em-use-damage-mapping` controls the joint damage E-step; protein authentication uses library-level damage information and assigned read evidence.
 
@@ -231,6 +231,15 @@ best-hit assignment. The damaged-read columns (`n_damaged`, `mean_p_damaged`, `f
 `frac_damaged_all`) and the integer authentication counts `auth_binom_k` and `auth_binom_n` are
 not abundance columns: each read is counted once, on its best hit, so one damaged read cannot
 authenticate several candidate proteins. `max_p_damaged` is taken over every credited read.
+
+**Dropping null-flagged abundance.** Add `--drop-null-flagged` with an explicit
+`--em-null-model FILE` to remove reads carrying null-reject bit `0x1` from protein and
+gene abundance, coverage, assignment counts and summary rows. Without the flag these
+reads still contribute abundance, as before. Reads carrying only margin, effective-reference
+or calibrated-abstain bits keep their existing treatment. The per-read TSV, `.dcx`,
+modern-baseline pool, library-wide damage statistics and `null reject:` lines do not change.
+The `null drop:` stderr line reports the reads and effective mass actually removed from
+abundance. Omitting the explicit null-model argument is an error.
 
 **`.dcx` sort scratch.** `damage-annotate --dcx` sorts in memory up to 8 GiB and spills sorted
 runs past that to `--em-tape-dir` (or `DART_EM_TAPE_DIR`). That directory must be on node-local
