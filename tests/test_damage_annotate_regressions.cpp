@@ -1,4 +1,5 @@
 #include "dart/damage_index.hpp"
+#include "dart/abundance_filter.hpp"
 #include "dart/fdr_estimator.hpp"
 
 #include <algorithm>
@@ -10,6 +11,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <random>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -362,6 +364,181 @@ static bool write_shared_read_fixture(const std::string& dart_bin, const std::st
     index.write(reinterpret_cast<const char*>(&end), sizeof(end));
     index.close();
     return expect(static_cast<bool>(index), "synthetic damage index must be written");
+}
+
+static bool test_drop_null_policy() {
+    struct Hit { bool has = true; };
+    struct Decision { bool em_keep = true; uint8_t em_reject_reason = 0; };
+    const std::vector<Hit> hits(1);
+    size_t states = 0;
+    for (bool enabled : {false, true}) for (bool use_em : {false, true})
+    for (bool keep : {false, true}) for (unsigned reason = 0; reason < 16; ++reason) {
+        const std::vector<Decision> decisions{{keep, static_cast<uint8_t>(reason)}};
+        size_t visited = 0, dropped = 0;
+        dart::visit_best_abundance_reads(hits, decisions, use_em, enabled,
+            [&](uint32_t) { ++visited; }, [&](uint32_t) { ++dropped; });
+        const bool eligible = !use_em || keep;
+        const bool rejected = enabled && (reason & 1u);
+        if (!expect(visited == static_cast<size_t>(eligible && !rejected) &&
+                    dropped == static_cast<size_t>(eligible && rejected),
+                    "best-hit/fallback policy must drop only null bit 0x1")) return false;
+        ++states;
+    }
+    std::cout << "Null-drop best-hit/fallback policy: " << states << " decision states checked\n";
+    return true;
+}
+
+static bool test_drop_null_flagged(const std::string& dart_bin, const std::string& tmpdir) {
+    std::cout << "Running null-flagged abundance regression...\n";
+    if (!test_drop_null_policy()) return false;
+    const std::string extras =
+        "kept_+_0\tprotA\t0.833\t6\t1\t0\t1\t6\t1\t6\t1e-20\t200\t6\t100\tWAAAAA\tRAAAAA\n"
+        "margin_+_0\tmarginA\t0.833\t6\t1\t0\t1\t6\t1\t6\t1e-20\t200\t6\t100\tWAAAAA\tRAAAAA\n"
+        "margin_+_0\tmarginB\t0.833\t6\t1\t0\t1\t6\t1\t6\t1e-20\t200\t6\t100\tWAAAAA\tRAAAAA\n"
+        "anchorMA_+_0\tmarginA\t1\t6\t0\t0\t1\t6\t1\t6\t1e-20\t200\t6\t100\tRAAAAA\tRAAAAA\n"
+        "anchorMB_+_0\tmarginB\t1\t6\t0\t0\t1\t6\t1\t6\t1e-20\t200\t6\t100\tRAAAAA\tRAAAAA\n";
+    std::string emi, agd, err;
+    if (!write_shared_read_fixture(dart_bin, tmpdir, "null_drop", extras, emi, agd)) return false;
+    std::ostringstream decoys;
+    for (int i = 0; i < 256; ++i)
+        decoys << "DECOY_" << i << "\tprotA\t1\t6\t0\t0\t1\t6\t1\t6\t1e-20\t" << 90 + i % 21
+               << "\t6\t100\tRAAAAA\tRAAAAA\n";
+    const std::string model = emi + ".null";
+    std::string out;
+    if (!write_file(tmpdir + "/null_decoys.tsv", decoys.str(), err) ||
+        !run_command_capture(shell_quote(dart_bin) + " null " + shell_quote(tmpdir + "/null_decoys.tsv") +
+                             " -o " + shell_quote(model) + " --decoys-submitted 256", out, err)) {
+        std::cerr << err << "\n";
+        return false;
+    }
+    using Row = std::unordered_map<std::string, std::string>;
+    using Rows = std::unordered_map<std::string, Row>;
+    std::array<Rows, 3> proteins, genes;
+    std::array<std::string, 3> reads, dcx, logs;
+    const auto load_rows = [&](const std::string& path, const std::string& key, Rows& rows) {
+        std::string text;
+        Table table;
+        if (!read_file(path, text, err) || !parse_table(text, table, err)) return false;
+        for (const auto& row : table.rows) {
+            auto fields = row_to_map(table, row);
+            rows.emplace(fields.at(key), std::move(fields));
+        }
+        return true;
+    };
+    for (int mode = 0; mode < 3; ++mode) {
+        const std::string prefix = tmpdir + "/null_drop_" + std::to_string(mode);
+        const std::string cmd = shell_quote(dart_bin) + " damage-annotate -i " + shell_quote(emi) +
+            " --damage-index " + shell_quote(agd) +
+            (mode == 2 ? "" : " --em-null-model " + shell_quote(model)) +
+            " --null-p-max 0.05 --emit-multimap --multimap-floor 0 -t 2 -v"
+            " --min-reads 1 --min-breadth 0 --min-depth 0 --min-distinct-starts 1"
+            " --min-positional-score 0 --min-terminal-ratio 0" +
+            (mode ? "" : " --keep-null-flagged") + " -o " + shell_quote(prefix + ".reads") +
+            " --dcx " + shell_quote(prefix + ".dcx") + " --library-label null-drop-test" +
+            " --protein-summary " + shell_quote(prefix + ".protein") +
+            " --gene-summary " + shell_quote(prefix + ".gene");
+        if (!run_command_capture(cmd, logs[mode], err) ||
+            !load_rows(prefix + ".protein", "protein_id", proteins[mode]) ||
+            !load_rows(prefix + ".gene", "target_id", genes[mode]) ||
+            !read_file(prefix + ".reads", reads[mode], err) || !read_file(prefix + ".dcx", dcx[mode], err)) {
+            std::cerr << err << "\n";
+            return false;
+        }
+    }
+    if (!expect(reads[0] == reads[1] && dcx[0] == dcx[1], "null drop must not change per-read TSV or DCX bytes")) return false;
+    if (!expect(proteins[1] == proteins[2] && genes[1] == genes[2] &&
+                reads[1] == reads[2] && dcx[1] == dcx[2],
+                "auto-discovered null must drop exactly the same support as an explicit model")) return false;
+    const auto null_reject_lines = [](const std::string& log) {
+        std::istringstream input(log);
+        std::string line, selected;
+        while (std::getline(input, line))
+            if (line.find("null reject:") == 0) selected += line + '\n';
+        return selected;
+    };
+    if (!expect(!null_reject_lines(logs[0]).empty() &&
+                null_reject_lines(logs[0]) == null_reject_lines(logs[1]) &&
+                null_reject_lines(logs[1]) == null_reject_lines(logs[2]),
+                "default dropping and opt-out must preserve null rejection diagnostics")) return false;
+    Table perread;
+    if (!parse_table(reads[0], perread, err)) return false;
+    double shared_credit = -1;
+    for (const auto& row : perread.rows) {
+        const auto fields = row_to_map(perread, row);
+        if (fields.at("query_id") == "shared_+_0" && fields.at("target_id") == "protA") {
+            if (!expect((std::stoi(fields.at("em_reject_reason")) & 1) != 0,
+                        "shared read must be null-flagged")) return false;
+            shared_credit = std::stod(fields.at("gamma"));
+        }
+        if (fields.at("query_id") == "margin_+_0")
+            if (!expect(std::stoi(fields.at("em_reject_reason")) == 2,
+                        "margin fixture must carry only bit 0x2")) return false;
+        if (fields.at("query_id") == "kept_+_0")
+            if (!expect((std::stoi(fields.at("em_reject_reason")) & 1) == 0,
+                        "strong kept read must not be null-flagged")) return false;
+    }
+    if (!expect(shared_credit > 0, "shared candidate credit must be observed")) return false;
+    for (const auto* tables : {&proteins, &genes}) {
+        if (!expect((*tables)[0].count("protA") && (*tables)[1].count("protA"),
+                    "flagged and kept reads must share a surviving target")) return false;
+        const auto& before = (*tables)[0].at("protA");
+        const auto& after = (*tables)[1].at("protA");
+        if (!expect(std::stod(before.at("n_reads")) == 7 && std::stod(after.at("n_reads")) == 1,
+                    "null-drop target must lose exactly six flagged assignments and retain its kept read")) return false;
+        // Each printed eff_reads is rounded to two decimal places: their difference has <=0.01 error.
+        if (!expect(std::fabs(std::stod(before.at("eff_reads")) - std::stod(after.at("eff_reads")) -
+                             (5.0 + shared_credit)) <= 0.010001,
+                    "effective mass must fall by exactly the flagged candidate credit, within TSV rounding")) return false;
+        for (const auto& target : {"marginA", "marginB"})
+            if (!expect((*tables)[0].count(target) && (*tables)[1].count(target) &&
+                        std::stod((*tables)[1].at(target).at("n_reads")) == 2.0 &&
+                        std::stod((*tables)[1].at(target).at("eff_reads")) == 1.5 &&
+                        (*tables)[0].at(target) == (*tables)[1].at(target),
+                        "margin-only support must remain unchanged")) return false;
+    }
+    if (!expect(logs[0].find("null drop: off (--keep-null-flagged)") != std::string::npos &&
+                logs[1].find("null drop: 46 reads, 46.000000 eff_reads removed from abundance") != std::string::npos,
+                "null-drop log must count unique removed reads and their full candidate mass")) return false;
+    out.clear();
+    std::string no_null_default, no_null_keep;
+    if (!expect(run_command_capture(shell_quote(dart_bin) + " damage-annotate -i " + shell_quote(emi) +
+                                    " --no-null -o " + shell_quote(tmpdir + "/no_null_default.tsv"), out, err) &&
+                out.find("null drop:") == std::string::npos &&
+                read_file(tmpdir + "/no_null_default.tsv", no_null_default, err) &&
+                run_command_capture(shell_quote(dart_bin) + " damage-annotate -i " + shell_quote(emi) +
+                                    " --no-null --keep-null-flagged -o " + shell_quote(tmpdir + "/no_null_keep.tsv"), out, err) &&
+                read_file(tmpdir + "/no_null_keep.tsv", no_null_keep, err) &&
+                no_null_default == no_null_keep,
+                "keep-null-flagged with no null must succeed and leave per-read output unchanged")) return false;
+    return true;
+}
+
+static bool test_null_drop_cli_fuzz(const std::string& dart_bin, const std::string& tmpdir) {
+    std::mt19937 rng(0x4e554c4c);
+    const std::string forbidden = tmpdir + "/fuzz_must_not_write.tsv";
+    for (int seed = 0; seed < 32; ++seed) {
+        std::string cmd = shell_quote(dart_bin) + " damage-annotate --keep-null-flagged --no-null -i " +
+            shell_quote(tmpdir + "/missing.emi") + " -o " + shell_quote(forbidden);
+        if (seed % 4 == 0) cmd += " --keep-null-flagged";
+        else if (seed % 4 == 1) cmd += " --threads " + std::to_string(1 + rng() % 4);
+        else if (seed % 4 == 2) cmd += " --em-null-model";
+        else {
+            std::string malformed = "--";
+            for (unsigned i = 0, n = 1 + rng() % 32; i < n; ++i) malformed += static_cast<char>('a' + rng() % 26);
+            cmd += " " + shell_quote(malformed);
+        }
+        std::string out, err;
+        if (!expect(!run_command_capture(cmd, out, err) && out.size() < 4096 &&
+                    out.find(seed % 4 < 2 ? "cannot open" : "Unknown option:") != std::string::npos &&
+                    !std::ifstream(forbidden).good(),
+                    "bounded CLI fuzz must reject missing input or malformed options without creating output")) return false;
+    }
+    std::string out, err;
+    if (!expect(!run_command_capture(shell_quote(dart_bin) + " damage-annotate --drop-null-flagged", out, err) &&
+                out.find("Unknown option: --drop-null-flagged") != std::string::npos,
+                "removed opt-in spelling must not be accepted")) return false;
+    std::cout << "Null-drop CLI fuzz: 32 seeds, malformed flag length <=34, rejection/no-write properties PASS\n";
+    return true;
 }
 
 static bool test_multimap_candidate_gamma(const std::string& dart_bin, const std::string& tmpdir) {
@@ -766,6 +943,11 @@ int main(int argc, char* argv[]) {
     setenv("DART_EM_TAPE_DIR", (tmpdir + "/emtape").c_str(), 0);
 
     bool ok = true;
+    if (argc == 3 && std::string(argv[2]) == "--drop-null-only")
+        return test_drop_null_flagged(dart_bin, tmpdir) ? 0 : 1;
+    if (argc == 3 && std::string(argv[2]) == "--drop-null-cli-fuzz-only")
+        return test_null_drop_cli_fuzz(dart_bin, tmpdir) ? 0 : 1;
+    ok = test_drop_null_flagged(dart_bin, tmpdir) && ok;
     if (argc == 3 && std::string(argv[2]) == "--multimap-only")
         return test_multimap_summary_invariance(dart_bin, tmpdir) ? 0 : 1;
     if (argc == 3 && std::string(argv[2]) == "--soft-credit-only")
