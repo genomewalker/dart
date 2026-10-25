@@ -13,6 +13,7 @@
 #include "dart/damage_stats.hpp"
 #include "dart/damage_index_reader.hpp"
 #include "dart/bayesian_damage_score.hpp"
+#include "dart/abundance_filter.hpp"
 #include "dart/em_reassign.hpp"
 #include "dart/fast_tsv.hpp"
 #include "dart/theta_d_coordinator.hpp"
@@ -1278,6 +1279,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // nearest wrong homolog. EM without a null model is refused unless the caller
     // opts in with --no-null (accept the risk explicitly).
     bool no_null = false;
+    bool drop_null_flagged = false;
     // Damage-free mapping (removes circularity: damage likelihoods must not both
     // pick the homolog and then be reused in gamma_ancient). OFF => mapping gamma
     // is damage-free; gamma_ancient is emitted post-hoc against frozen weights when the
@@ -1399,6 +1401,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--null-fdr") == 0 && i + 1 < argc) {
             null_fdr = std::stod(argv[++i]);
             null_fdr_set = true;
+        } else if (strcmp(argv[i], "--drop-null-flagged") == 0) {
+            drop_null_flagged = true;
         } else if (strcmp(argv[i], "--null-queries") == 0 && i + 1 < argc) {
             null_queries = std::stoull(argv[++i]);
         } else if (strcmp(argv[i], "--no-coverage-em") == 0) {
@@ -1523,6 +1527,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 "Null model (pick one):\n"
                 "  --no-null               Run without a null model\n"
                 "  --em-null-model FILE    Empirical decoy null model\n"
+                "  --null-fdr Q            Per-bin target-decoy FDR (default: 0.05)\n"
+                "  --drop-null-flagged     Drop bit-0x1 reads from abundance; requires --em-null-model\n"
                 "  --em-calib-model FILE   Calibrated true-hit and null model\n"
                 "Output:\n"
                 "  -o FILE                 Per-read TSV (default: stdout)\n"
@@ -1564,6 +1570,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 "                                (default: <emi>.null when it exists)\n"
                 "  --null-fdr Q                  Reject a read as a chance hit when its per-bin target-decoy\n"
                 "                                q-value exceeds Q (default: 0.05; the default rule)\n"
+                "  --drop-null-flagged           Drop null-reject bit-0x1 reads from protein/gene abundance\n"
+                "                                (requires explicit --em-null-model; per-read output unchanged)\n"
                 "  --null-queries N              Queries searched, the FDR scale (default: damage index records)\n"
                 "  --null-p-max P                Instead of --null-fdr: reject a read when the chance that a\n"
                 "                                decoy scores as high in its aligned-length bin exceeds P\n"
@@ -1602,6 +1610,10 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         }
     }
 
+    if (drop_null_flagged && em_null_model_file.empty()) {
+        std::cerr << "Error: --drop-null-flagged requires --em-null-model FILE\n";
+        return 1;
+    }
     if (emi_file.empty()) {
         std::cerr << "Error: No EMI index specified (--emi).\n";
         std::cerr << "Run 'dart damage-annotate --help' for usage.\n";
@@ -4576,6 +4588,33 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // terminal_5, terminal_3) populated during annotation — no per-read sites heap.
     const bool need_protein_agg =
         !protein_summary_file.empty();
+    const auto drop_abundance_read = [&](uint32_t r) {
+        return r < em_read_results.size() &&
+               dart::null_abundance_rejected(drop_null_flagged, em_read_results[r].em_reject_reason);
+    };
+    if (drop_null_flagged) {
+        uint64_t removed_reads = 0;
+        double removed_eff = 0.0;
+        if (soft_credit) {
+            uint32_t last_read = UINT32_MAX;
+            for (const auto& cm : all_cands) {
+                if (!drop_abundance_read(cm.read_idx)) continue;
+                if (cm.read_idx != last_read) { ++removed_reads; last_read = cm.read_idx; }
+                removed_eff += cm.gamma;
+            }
+        } else {
+            dart::visit_best_abundance_reads(best_hits, em_read_results, use_em, true,
+                [](uint32_t) {}, [&](uint32_t r) {
+                    ++removed_reads;
+                    removed_eff += use_em ? em_read_results[r].gamma : 1.0;
+                });
+        }
+        std::ostringstream line;
+        line << "null drop: " << removed_reads << " reads, " << std::fixed << std::setprecision(6)
+             << removed_eff << " eff_reads removed from abundance\n";
+        std::cerr << line.str();
+    }
+    uint64_t library_terminal_5 = 0, library_terminal_3 = 0;
     std::vector<ProteinAggInput> protein_agg_inputs;
     if (need_protein_agg) {
         protein_agg_inputs.reserve(summaries.size());
@@ -4583,6 +4622,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             // Soft credit: every credited candidate, to its own ref. Otherwise one input per
             // read, from its best-hit alignment.
             if (soft_credit ? !s.credited : s.ref_idx != best_hits[s.read_idx].ref_idx) continue;
+            library_terminal_5 += s.terminal_5;
+            library_terminal_3 += s.terminal_3;
+            if (drop_abundance_read(s.read_idx)) continue;
             ProteinAggInput c;
             c.read_idx = s.read_idx;
             c.ref_idx = s.ref_idx;
@@ -4642,6 +4684,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         size_t si = 0;
         uint32_t last_read = UINT32_MAX;
         for (const auto& cm : all_cands) {
+            if (drop_abundance_read(cm.read_idx)) continue;
             while (si < summaries.size() &&
                    (summaries[si].read_idx < cm.read_idx ||
                     (summaries[si].read_idx == cm.read_idx && summaries[si].candidate_rank < cm.candidate_rank)))
@@ -4677,11 +4720,9 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             [](const ReadRefEntry& a, const ReadRefEntry& b) { return a.ref_idx < b.ref_idx; });
     } else if (need_any_aggregation) {
         read_ref_entries.reserve(std::min<size_t>(n_reads, size_t{1} << 26));
-        for (uint32_t ridx = 0; ridx < n_reads; ++ridx) {
+        dart::visit_best_abundance_reads(best_hits, em_read_results, use_em, drop_null_flagged,
+          [&](uint32_t ridx) {
             const auto& hit = best_hits[ridx];
-            if (!hit.has) continue;
-            if (use_em && (ridx >= em_read_results.size() || !em_read_results[ridx].em_keep))
-                continue;
             ReadRefEntry e;
             e.ref_idx              = hit.ref_idx;
             e.qstart_0             = static_cast<uint32_t>(hit.qstart_0);
@@ -4715,16 +4756,13 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                                              (er.em_ref_neff > static_cast<float>(em_max_neff)))) ? 1 : 0;
             }
             read_ref_entries.push_back(e);
-        }
+          }, [](uint32_t) {});
         std::sort(read_ref_entries.begin(), read_ref_entries.end(),
             [](const ReadRefEntry& a, const ReadRefEntry& b) { return a.ref_idx < b.ref_idx; });
         assigned_kept_reads = read_ref_entries.size();
     } else {
-        for (uint32_t ridx = 0; ridx < n_reads; ++ridx) {
-            if (!best_hits[ridx].has) continue;
-            if (use_em && (ridx >= em_read_results.size() || !em_read_results[ridx].em_keep)) continue;
-            ++assigned_kept_reads;
-        }
+        dart::visit_best_abundance_reads(best_hits, em_read_results, use_em, drop_null_flagged,
+            [&](uint32_t) { ++assigned_kept_reads; }, [](uint32_t) {});
     }
 
     // Free summaries now that read_ref_entries has extracted posterior/classification.
@@ -4828,11 +4866,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
             std::cerr << "Library type from damage index: " << (use_both_ends ? "dsDNA" : "ssDNA") << "\n";
         }
     } else {
-        size_t total_5 = 0, total_3 = 0;
-        for (const auto& c : protein_agg_inputs) {
-            total_5 += c.terminal_5;
-            total_3 += c.terminal_3;
-        }
+        const uint64_t total_5 = library_terminal_5, total_3 = library_terminal_3;
         float ratio = (total_5 > 0) ? static_cast<float>(total_3) / static_cast<float>(total_5) : 0.0f;
         use_both_ends = (ratio > 0.3f);
         if (verbose) {

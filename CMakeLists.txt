@@ -307,6 +307,10 @@ if(BUILD_TESTING)
         NAME damage_annotate_regressions
         COMMAND dart-damage-annotate-regressions $<TARGET_FILE:dart>
     )
+    add_test(
+        NAME null_drop_cli_fuzz
+        COMMAND dart-damage-annotate-regressions $<TARGET_FILE:dart> --drop-null-cli-fuzz-only
+    )
 
     add_test(
         NAME cli_errors
