@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(AncientGenePredictor VERSION 2.0.0 LANGUAGES CXX)
+project(AncientGenePredictor VERSION 2.0.1 LANGUAGES CXX)
 include(CTest)
 include(FetchContent)
 
@@ -118,6 +118,10 @@ set(TAPH_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 # 2026-10-16: re-pinned be1f750 -> 7540cc8. libtaph main was force-pushed and be1f750 is no longer
 # reachable from any GitHub ref; 7540cc8 is its rewritten counterpart with the byte-identical source
 # tree (fb1d5e3c), so the built code and damage numbers are unchanged.
+#
+# 2026-10-25: re-pinned c3b3a5d -> 933877c (v2.0.1). libtaph main was rewritten and
+# c3b3a5d is no longer reachable from any GitHub ref; 933877c has the
+# identical source tree, so the built code and damage numbers are unchanged.
 #
 # A local checkout (LIBTAPH_LOCAL_PATH) wins when present; otherwise FetchContent fetches exactly the
 # pinned commit from GitHub (CI, release, fresh clones). Never fall back to a tag or branch: building
