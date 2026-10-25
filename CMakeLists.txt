@@ -285,6 +285,13 @@ if(BUILD_TESTING)
         tests/test_cli_args.cpp
         src/cli/args.cpp
     )
+    add_executable(dart-predict-defaults-fuzz
+        tests/test_predict_defaults_fuzz.cpp src/cli/args.cpp)
+    target_compile_options(dart-predict-defaults-fuzz PRIVATE -UNDEBUG)
+    add_test(
+        NAME predict_defaults_cli_fuzz
+        COMMAND dart-predict-defaults-fuzz
+    )
     add_test(
         NAME cli_args
         COMMAND dart-cli-args-tests

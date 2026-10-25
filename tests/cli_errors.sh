@@ -49,6 +49,9 @@ expect 0 "Usage"                  damage-annotate --help-all
 
 "$dart" damage-annotate --help >help.txt
 "$dart" damage-annotate --help-all >help-all.txt
+if ! grep -Fq "Decay constant (default: from the damage index; 0.3 if absent)" help-all.txt; then
+    echo "FAIL: lambda help does not describe its source"; fail=1
+fi
 advanced=(
     --sites --refine-damage --auto-prior-ancient --prior-ancient --d-max --lambda
     --emit-multimap --multimap-k --multimap-floor
