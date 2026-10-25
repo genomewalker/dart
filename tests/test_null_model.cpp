@@ -3,8 +3,8 @@
 //   1. .null sidecar round trip: write -> read preserves every field, rewrite is byte-identical,
 //      a bad magic, a truncated file and an unknown version are refused with a message;
 //   2. `dart predict --fasta-aa X --decoy-every 10` writes the reversed proteins of every 10th
-//      input read to the decoy file with the DECOY_ prefix, and nothing else; without the flag
-//      no decoy file is written;
+//      input read to the decoy file with the DECOY_ prefix, and nothing else; this is the default
+//      with --fasta-aa, and --decoy-every 0 opts out;
 //   3. `dart hits2emi` with and without --decoy-hits writes byte-identical EMIs, the sidecar
 //      exists only with the flag, and `dart null` on the same decoy hits fits the same bins;
 //   4. `dart damage-annotate` finds <emi>.null by itself and gives the same output as
@@ -16,6 +16,7 @@
 
 #include <zlib.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -277,12 +278,47 @@ void test_predict_decoys(const std::string& dart, const std::string& tut, const 
     expect(bad_ordinal == 0, "every decoy comes from a read with ordinal % 10 == 0 (" + std::to_string(bad_ordinal) + " do not)");
     expect(missing == 0, "every protein of an ordinal % 10 == 0 read has a decoy (" + std::to_string(missing) + " missing)");
     expect(dec.size() == decoy_ids.size(), "decoy ids are unique");
-    // Default (no --decoy-every): no decoy file.
+    // Default matches explicit 10, including all ORFs of each selected input read.
     const std::string faa0 = dir + "/p0.faa";
     expect(run(dart + " predict -i " + tut + "/reads.fq.gz -o " + dir + "/p0.gff --fasta-aa " + faa0 + " --allow-self-profile -t 4", dir + "/predict0.log") == 0, "predict without --decoy-every exits 0");
-    expect(!exists(dir + "/p0.decoy.faa"), "no decoy file without --decoy-every");
+    expect(exists(dir + "/p0.decoy.faa") && slurp(dir + "/p0.decoy.faa") == slurp(decoy),
+           "default decoys equal explicit --decoy-every 10");
+    for (int n : {0, 3}) {
+        const std::string prefix = dir + "/p" + std::to_string(n + 1);
+        expect(run(dart + " predict -i " + tut + "/reads.fq.gz -o " + prefix + ".gff --fasta-aa " + prefix + ".faa --allow-self-profile --decoy-every " + std::to_string(n) + " -t 4", prefix + ".log") == 0, "explicit decoy interval exits 0");
+        expect(slurp(prefix + ".faa") == slurp(faa), "explicit interval preserves proteins");
+        if (n == 0) { expect(!exists(prefix + ".decoy.faa"), "explicit 0 writes no decoys"); continue; }
+        std::vector<std::pair<std::string, std::string>> expected;
+        for (const auto& kv : real) if (ordinal.at(read_of(kv.first)) % n == 0)
+            expected.emplace_back("DECOY_" + kv.first, std::string(kv.second.rbegin(), kv.second.rend()));
+        expect(read_fasta(prefix + ".decoy.faa") == expected, "explicit 3 writes exactly the selected reads ORFs");
+    }
     expect(slurp(faa0) == slurp(faa), "--decoy-every leaves the protein file unchanged");
     std::cout << (failures ? "FAILED\n" : "ok\n");
+}
+
+// Tiny CLI fixture also serves the deliberate missing-count mutant runs.
+void test_decoy_count_requirement(const std::string& dart, const std::string& dir) {
+    const std::string row = "q_+_0_0\tref\t100\t12\t0\t0\t1\t12\t1\t12\t1e-5\t40\t12\t12\tACDEFGHIKLMN\tACDEFGHIKLMN\n";
+    { std::ofstream f(dir + "/tiny-real.tsv"); f << row; }
+    { std::ofstream f(dir + "/tiny-decoy.tsv"); f << "DECOY_" << row; }
+    { std::ofstream f(dir + "/tiny-decoy.faa");
+      f << ">DECOY_q_+_0_0\nACDEFGHIKLMN\n>unmatched1\nACDEFGHIKLMN\n>unmatched2\nACDEFGHIKLMN\n"; }
+    const std::string cmd = dart + " hits2emi -i " + dir + "/tiny-real.tsv --decoy-hits " + dir + "/tiny-decoy.tsv -t 1";
+    const std::string output = dir + "/tiny.emi";
+    expect(run(cmd + " -o " + output, dir + "/tiny-refusal.log") != 0, "tiny missing-count run is refused");
+    const std::string msg = slurp(dir + "/tiny-refusal.log");
+    expect(msg.find("--decoy-fasta") != std::string::npos && std::count(msg.begin(), msg.end(), '\n') == 1,
+           "tiny refusal is one line naming --decoy-fasta");
+    expect(!exists(output), "tiny refusal writes no EMI");
+    expect(run(cmd + " -o " + output + " --decoy-fasta " + dir + "/tiny-decoy.faa", dir + "/tiny-fasta.log") == 0,
+           "tiny run with decoy FASTA succeeds");
+    dart::NullModel model; dart::NullProvenance prov; std::string error;
+    expect(dart::read_null_model(output + ".null", model, &prov, &error) && prov.n_decoy_submitted == 3,
+           "submitted count includes both decoys without hits");
+    expect(run(cmd + " -o " + dir + "/tiny-n.emi --decoys-submitted 7", dir + "/tiny-n.log") == 0 &&
+           dart::read_null_model(dir + "/tiny-n.emi.null", model, &prov, &error) && prov.n_decoy_submitted == 7,
+           "explicit submitted count without FASTA succeeds");
 }
 
 void test_hits2emi_and_annotate(const std::string& dart, const std::string& tut, const std::string& dir) {
@@ -313,7 +349,7 @@ void test_hits2emi_and_annotate(const std::string& dart, const std::string& tut,
     const std::string agd = tut + "/expected/predictions.agd";
     const std::string a = dir + "/a.emi", b = dir + "/b.emi";
     expect(run(dart + " hits2emi -i " + dir + "/real.tsv -o " + a + " --damage-index " + agd + " -t 4", dir + "/h2e_a.log") == 0, "hits2emi without decoys exits 0");
-    expect(run(dart + " hits2emi -i " + dir + "/real.tsv -o " + b + " --damage-index " + agd + " --decoy-hits " + dir + "/decoy.tsv --db-label tutorial -t 4", dir + "/h2e_b.log") == 0, "hits2emi --decoy-hits exits 0");
+    expect(run(dart + " hits2emi -i " + dir + "/real.tsv -o " + b + " --damage-index " + agd + " --decoy-hits " + dir + "/decoy.tsv --decoy-fasta " + tut + "/expected/proteins.decoy.faa.gz --db-label tutorial -t 4", dir + "/h2e_b.log") == 0, "hits2emi --decoy-hits exits 0");
     expect(slurp(a) == slurp(b), "EMI is byte-identical with and without --decoy-hits");
     expect(!exists(a + ".null"), "no sidecar without --decoy-hits");
     expect(exists(b + ".null"), "sidecar b.emi.null written");
@@ -351,10 +387,16 @@ void test_hits2emi_and_annotate(const std::string& dart, const std::string& tut,
     expect(submitted_of(" --decoy-fasta " + dir + "/decoy.faa", "sf") == n_dfa, "--decoy-fasta (plain) recorded");
     expect(submitted_of(" --decoy-fasta " + dfa_gz, "sg") == n_dfa, "--decoy-fasta (.gz) recorded");
     expect(submitted_of(" --decoy-fasta " + dfa_gz + " --decoys-submitted 777", "so") == 777, "--decoys-submitted overrides --decoy-fasta");
-    expect(submitted_of("", "su") == 0, "without either the count is unknown");
+    const std::string missing = dart + " hits2emi -i " + dir + "/real.tsv -o " + dir + "/su.emi --damage-index " + agd + " --decoy-hits " + dir + "/decoy.tsv -t 4";
+    expect(run(missing, dir + "/su.log") != 0, "missing decoy count is refused");
+    const std::string refusal = slurp(dir + "/su.log");
+    expect(refusal.find("--decoy-fasta") != std::string::npos &&
+           std::count(refusal.begin(), refusal.end(), '\n') == 1, "one-line refusal names --decoy-fasta");
+    expect(!exists(dir + "/su.emi"), "missing count is rejected before writing EMI");
+    expect(submitted_of(" --decoys-submitted 777", "sn") == 777, "explicit submitted count without FASTA recorded");
     // dart null: pooling a known and an unknown sidecar gives unknown; --decoys-submitted sets it.
     dart::NullModel x; dart::NullProvenance px;
-    expect(run(dart + " null -o " + dir + "/p1.null " + dir + "/sf.emi.null " + dir + "/su.emi.null", dir + "/p1.log") == 0 &&
+    expect(run(dart + " null -o " + dir + "/p1.null " + dir + "/sf.emi.null " + dir + "/n.null", dir + "/p1.log") == 0 &&
            dart::read_null_model(dir + "/p1.null", x, &px, &err) && px.n_decoy_submitted == 0, "pooling known + unknown gives unknown");
     expect(run(dart + " null -o " + dir + "/p2.null " + dir + "/sf.emi.null " + dir + "/sg.emi.null", dir + "/p2.log") == 0 &&
            dart::read_null_model(dir + "/p2.null", x, &px, &err) && px.n_decoy_submitted == 2 * n_dfa, "pooling two known sums them");
@@ -466,6 +508,13 @@ int main(int argc, char** argv) {
     const std::string dir = make_tmpdir();
     // damage-annotate with a null runs on the EM tape; keep a caller's DART_EM_TAPE_DIR.
     setenv("DART_EM_TAPE_DIR", (dir + "/emtape").c_str(), 0);
+    if (argc == 4 && std::string(argv[3]) == "--decoy-count-only") {
+        test_decoy_count_requirement(dart, dir);
+        if (failures) return 1;
+        std::system(("rm -rf " + dir).c_str());
+        return 0;
+    }
+    test_decoy_count_requirement(dart, dir);
     test_roundtrip(dir);
     test_version2(tut, dir);
     test_chance_p(dir);

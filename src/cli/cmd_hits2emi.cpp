@@ -245,6 +245,7 @@ int cmd_hits2emi(int argc, char* argv[]) {
             std::cout << "  --decoy-hits <file>    Hits of the decoy peptides predict wrote next to --fasta-aa,\n";
             std::cout << "                         searched with the real search's parameters. Fits the null\n";
             std::cout << "                         model and writes <output>.null; damage-annotate finds it\n";
+            std::cout << "                         Requires --decoy-fasta or --decoys-submitted (> 0)\n";
             std::cout << "  --decoy-fasta <file>   The decoy FASTA that was searched; its record count is stored\n";
             std::cout << "                         as the decoys submitted (the null_p denominator)\n";
             std::cout << "  --decoys-submitted <N> Decoys submitted to the search (wins over --decoy-fasta)\n";
@@ -267,6 +268,11 @@ int cmd_hits2emi(int argc, char* argv[]) {
     if (tsv_file.empty() || output_file.empty()) {
         std::cerr << "Error: --tsv and --output are required\n";
         std::cerr << "Run 'dart hits2emi --help' for usage.\n";
+        return 1;
+    }
+
+    if (!decoy_hits_file.empty() && decoy_fasta_file.empty() && decoys_submitted == 0) {
+        std::cerr << "Error: --decoy-hits requires --decoy-fasta FILE or --decoys-submitted N (> 0)\n";
         return 1;
     }
 

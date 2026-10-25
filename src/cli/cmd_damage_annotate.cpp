@@ -1548,7 +1548,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 "  --prior-ancient FLOAT         Read prior for the posterior (default: the library's pi\n"
                 "                                when it is DETECTED, else 0.10)\n"
                 "  --d-max RATE                  Damage rate (default: estimated from data)\n"
-                "  --lambda FLOAT                Decay constant (default: 0.3)\n"
+                "  --lambda FLOAT                Decay constant (default: from the damage index; 0.3 if absent)\n"
                 "Multimapping:\n"
                 "  --emit-multimap               Emit multiple EM candidates per read\n"
                 "  --multimap-k INT              Maximum candidates per read (default: 5)\n"
