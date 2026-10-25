@@ -1527,8 +1527,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 "Null model (pick one):\n"
                 "  --no-null               Run without a null model\n"
                 "  --em-null-model FILE    Empirical decoy null model\n"
-                "  --null-fdr Q            Per-bin target-decoy FDR (default: 0.05)\n"
-                "  --drop-null-flagged     Drop bit-0x1 reads from abundance; requires --em-null-model\n"
                 "  --em-calib-model FILE   Calibrated true-hit and null model\n"
                 "Output:\n"
                 "  -o FILE                 Per-read TSV (default: stdout)\n"
@@ -1600,7 +1598,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 "  --no-em                       Use best hits without EM\n"
                 "  --em-use-damage-mapping       Let damage evidence affect mapping (default: off)\n";
             } else {
-                std::cout << "\nRun 'dart damage-annotate --help-all' for every option.\n";
+                std::cout << "\nRun 'dart damage-annotate --help-all' for every option.\n"
+                             "Null abundance filtering (--null-fdr, --drop-null-flagged) is described there.\n";
             }
             return 0;
         } else {
