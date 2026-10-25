@@ -1279,7 +1279,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // nearest wrong homolog. EM without a null model is refused unless the caller
     // opts in with --no-null (accept the risk explicitly).
     bool no_null = false;
-    bool drop_null_flagged = false;
+    bool keep_null_flagged = false;
     // Damage-free mapping (removes circularity: damage likelihoods must not both
     // pick the homolog and then be reused in gamma_ancient). OFF => mapping gamma
     // is damage-free; gamma_ancient is emitted post-hoc against frozen weights when the
@@ -1401,8 +1401,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         } else if (strcmp(argv[i], "--null-fdr") == 0 && i + 1 < argc) {
             null_fdr = std::stod(argv[++i]);
             null_fdr_set = true;
-        } else if (strcmp(argv[i], "--drop-null-flagged") == 0) {
-            drop_null_flagged = true;
+        } else if (strcmp(argv[i], "--keep-null-flagged") == 0) {
+            keep_null_flagged = true;
         } else if (strcmp(argv[i], "--null-queries") == 0 && i + 1 < argc) {
             null_queries = std::stoull(argv[++i]);
         } else if (strcmp(argv[i], "--no-coverage-em") == 0) {
@@ -1568,8 +1568,8 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 "                                (default: <emi>.null when it exists)\n"
                 "  --null-fdr Q                  Reject a read as a chance hit when its per-bin target-decoy\n"
                 "                                q-value exceeds Q (default: 0.05; the default rule)\n"
-                "  --drop-null-flagged           Drop null-reject bit-0x1 reads from protein/gene abundance\n"
-                "                                (requires explicit --em-null-model; per-read output unchanged)\n"
+                "  --keep-null-flagged           Keep null-reject bit-0x1 reads in protein/gene abundance\n"
+                "                                (default: drop when a null rule ran; per-read output unchanged)\n"
                 "  --null-queries N              Queries searched, the FDR scale (default: damage index records)\n"
                 "  --null-p-max P                Instead of --null-fdr: reject a read when the chance that a\n"
                 "                                decoy scores as high in its aligned-length bin exceeds P\n"
@@ -1599,7 +1599,7 @@ int cmd_damage_annotate(int argc, char* argv[]) {
                 "  --em-use-damage-mapping       Let damage evidence affect mapping (default: off)\n";
             } else {
                 std::cout << "\nRun 'dart damage-annotate --help-all' for every option.\n"
-                             "Null abundance filtering (--null-fdr, --drop-null-flagged) is described there.\n";
+                             "Null abundance filtering (--null-fdr, --keep-null-flagged) is described there.\n";
             }
             return 0;
         } else {
@@ -1609,10 +1609,6 @@ int cmd_damage_annotate(int argc, char* argv[]) {
         }
     }
 
-    if (drop_null_flagged && em_null_model_file.empty()) {
-        std::cerr << "Error: --drop-null-flagged requires --em-null-model FILE\n";
-        return 1;
-    }
     if (emi_file.empty()) {
         std::cerr << "Error: No EMI index specified (--emi).\n";
         std::cerr << "Run 'dart damage-annotate --help' for usage.\n";
@@ -4587,11 +4583,15 @@ int cmd_damage_annotate(int argc, char* argv[]) {
     // terminal_5, terminal_3) populated during annotation — no per-read sites heap.
     const bool need_protein_agg =
         !protein_summary_file.empty();
+    const bool drop_null_flagged = !keep_null_flagged &&
+                                  (null_p_ran || (use_em && use_em_calib));
     const auto drop_abundance_read = [&](uint32_t r) {
         return r < em_read_results.size() &&
                dart::null_abundance_rejected(drop_null_flagged, em_read_results[r].em_reject_reason);
     };
-    if (drop_null_flagged) {
+    if (keep_null_flagged) {
+        std::cerr << "null drop: off (--keep-null-flagged)\n";
+    } else if (drop_null_flagged) {
         uint64_t removed_reads = 0;
         double removed_eff = 0.0;
         if (soft_credit) {

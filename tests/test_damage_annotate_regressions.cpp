@@ -403,7 +403,7 @@ static bool test_drop_null_flagged(const std::string& dart_bin, const std::strin
     for (int i = 0; i < 256; ++i)
         decoys << "DECOY_" << i << "\tprotA\t1\t6\t0\t0\t1\t6\t1\t6\t1e-20\t" << 90 + i % 21
                << "\t6\t100\tRAAAAA\tRAAAAA\n";
-    const std::string model = tmpdir + "/null_drop.null";
+    const std::string model = emi + ".null";
     std::string out;
     if (!write_file(tmpdir + "/null_decoys.tsv", decoys.str(), err) ||
         !run_command_capture(shell_quote(dart_bin) + " null " + shell_quote(tmpdir + "/null_decoys.tsv") +
@@ -413,8 +413,8 @@ static bool test_drop_null_flagged(const std::string& dart_bin, const std::strin
     }
     using Row = std::unordered_map<std::string, std::string>;
     using Rows = std::unordered_map<std::string, Row>;
-    std::array<Rows, 2> proteins, genes;
-    std::array<std::string, 2> reads, dcx, logs;
+    std::array<Rows, 3> proteins, genes;
+    std::array<std::string, 3> reads, dcx, logs;
     const auto load_rows = [&](const std::string& path, const std::string& key, Rows& rows) {
         std::string text;
         Table table;
@@ -425,14 +425,15 @@ static bool test_drop_null_flagged(const std::string& dart_bin, const std::strin
         }
         return true;
     };
-    for (int mode = 0; mode < 2; ++mode) {
+    for (int mode = 0; mode < 3; ++mode) {
         const std::string prefix = tmpdir + "/null_drop_" + std::to_string(mode);
         const std::string cmd = shell_quote(dart_bin) + " damage-annotate -i " + shell_quote(emi) +
-            " --damage-index " + shell_quote(agd) + " --em-null-model " + shell_quote(model) +
+            " --damage-index " + shell_quote(agd) +
+            (mode == 2 ? "" : " --em-null-model " + shell_quote(model)) +
             " --null-p-max 0.05 --emit-multimap --multimap-floor 0 -t 2 -v"
             " --min-reads 1 --min-breadth 0 --min-depth 0 --min-distinct-starts 1"
             " --min-positional-score 0 --min-terminal-ratio 0" +
-            (mode ? " --drop-null-flagged" : "") + " -o " + shell_quote(prefix + ".reads") +
+            (mode ? "" : " --keep-null-flagged") + " -o " + shell_quote(prefix + ".reads") +
             " --dcx " + shell_quote(prefix + ".dcx") + " --library-label null-drop-test" +
             " --protein-summary " + shell_quote(prefix + ".protein") +
             " --gene-summary " + shell_quote(prefix + ".gene");
@@ -445,6 +446,20 @@ static bool test_drop_null_flagged(const std::string& dart_bin, const std::strin
         }
     }
     if (!expect(reads[0] == reads[1] && dcx[0] == dcx[1], "null drop must not change per-read TSV or DCX bytes")) return false;
+    if (!expect(proteins[1] == proteins[2] && genes[1] == genes[2] &&
+                reads[1] == reads[2] && dcx[1] == dcx[2],
+                "auto-discovered null must drop exactly the same support as an explicit model")) return false;
+    const auto null_reject_lines = [](const std::string& log) {
+        std::istringstream input(log);
+        std::string line, selected;
+        while (std::getline(input, line))
+            if (line.find("null reject:") == 0) selected += line + '\n';
+        return selected;
+    };
+    if (!expect(!null_reject_lines(logs[0]).empty() &&
+                null_reject_lines(logs[0]) == null_reject_lines(logs[1]) &&
+                null_reject_lines(logs[1]) == null_reject_lines(logs[2]),
+                "default dropping and opt-out must preserve null rejection diagnostics")) return false;
     Table perread;
     if (!parse_table(reads[0], perread, err)) return false;
     double shared_credit = -1;
@@ -481,14 +496,20 @@ static bool test_drop_null_flagged(const std::string& dart_bin, const std::strin
                         (*tables)[0].at(target) == (*tables)[1].at(target),
                         "margin-only support must remain unchanged")) return false;
     }
-    if (!expect(logs[0].find("null drop:") == std::string::npos &&
+    if (!expect(logs[0].find("null drop: off (--keep-null-flagged)") != std::string::npos &&
                 logs[1].find("null drop: 46 reads, 46.000000 eff_reads removed from abundance") != std::string::npos,
                 "null-drop log must count unique removed reads and their full candidate mass")) return false;
     out.clear();
-    if (!expect(!run_command_capture(shell_quote(dart_bin) + " damage-annotate -i " + shell_quote(emi) +
-                                    " --no-null --drop-null-flagged", out, err) &&
-                out == "Error: --drop-null-flagged requires --em-null-model FILE\n",
-                "null drop without an explicit null model must fail with one line")) return false;
+    std::string no_null_default, no_null_keep;
+    if (!expect(run_command_capture(shell_quote(dart_bin) + " damage-annotate -i " + shell_quote(emi) +
+                                    " --no-null -o " + shell_quote(tmpdir + "/no_null_default.tsv"), out, err) &&
+                out.find("null drop:") == std::string::npos &&
+                read_file(tmpdir + "/no_null_default.tsv", no_null_default, err) &&
+                run_command_capture(shell_quote(dart_bin) + " damage-annotate -i " + shell_quote(emi) +
+                                    " --no-null --keep-null-flagged -o " + shell_quote(tmpdir + "/no_null_keep.tsv"), out, err) &&
+                read_file(tmpdir + "/no_null_keep.tsv", no_null_keep, err) &&
+                no_null_default == no_null_keep,
+                "keep-null-flagged with no null must succeed and leave per-read output unchanged")) return false;
     return true;
 }
 
@@ -496,9 +517,9 @@ static bool test_null_drop_cli_fuzz(const std::string& dart_bin, const std::stri
     std::mt19937 rng(0x4e554c4c);
     const std::string forbidden = tmpdir + "/fuzz_must_not_write.tsv";
     for (int seed = 0; seed < 32; ++seed) {
-        std::string cmd = shell_quote(dart_bin) + " damage-annotate --drop-null-flagged --no-null -i " +
+        std::string cmd = shell_quote(dart_bin) + " damage-annotate --keep-null-flagged --no-null -i " +
             shell_quote(tmpdir + "/missing.emi") + " -o " + shell_quote(forbidden);
-        if (seed % 4 == 0) cmd += " --drop-null-flagged";
+        if (seed % 4 == 0) cmd += " --keep-null-flagged";
         else if (seed % 4 == 1) cmd += " --threads " + std::to_string(1 + rng() % 4);
         else if (seed % 4 == 2) cmd += " --em-null-model";
         else {
@@ -508,10 +529,14 @@ static bool test_null_drop_cli_fuzz(const std::string& dart_bin, const std::stri
         }
         std::string out, err;
         if (!expect(!run_command_capture(cmd, out, err) && out.size() < 4096 &&
-                    (out.find("Error: --drop-null-flagged requires") != std::string::npos ||
-                     out.find("Unknown option:") != std::string::npos) && !std::ifstream(forbidden).good(),
-                    "bounded CLI fuzz must reject missing/truncated models without creating output")) return false;
+                    out.find(seed % 4 < 2 ? "cannot open" : "Unknown option:") != std::string::npos &&
+                    !std::ifstream(forbidden).good(),
+                    "bounded CLI fuzz must reject missing input or malformed options without creating output")) return false;
     }
+    std::string out, err;
+    if (!expect(!run_command_capture(shell_quote(dart_bin) + " damage-annotate --drop-null-flagged", out, err) &&
+                out.find("Unknown option: --drop-null-flagged") != std::string::npos,
+                "removed opt-in spelling must not be accepted")) return false;
     std::cout << "Null-drop CLI fuzz: 32 seeds, malformed flag length <=34, rejection/no-write properties PASS\n";
     return true;
 }
