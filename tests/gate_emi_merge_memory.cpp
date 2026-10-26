@@ -40,7 +40,7 @@ namespace {
 constexpr uint32_t NA = 500000, NB = 500000, OVERLAP = 250000, DEG = 4, NREF = 100000;
 constexpr uint32_t ESCAPE_DEG = 70000;      // one A read with >= EMI_V7_DEGREE_ESCAPE targets
 constexpr int THREADS = 4;
-// Measured on a compute node 2026-10-23 (Release, THREADS=4): peak_rss_kb=240704 (235 MB), the
+// Measured in a Release build with THREADS=4: peak_rss_kb=240704 (235 MB), the
 // same from the /proc VmHWM samples and from ru_maxrss. Bound = 1.5x that, rounded to 360 MB.
 constexpr long BOUND_KB = 360L * 1024L;
 

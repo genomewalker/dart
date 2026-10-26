@@ -425,7 +425,7 @@ def main():
         "--min-coverage", type=float, default=0.5, help="Min coverage for correct label"
     )
     parser.add_argument(
-        "--tmp-dir", default="/tmp/calibration", help="Temp directory"
+        "--tmp-dir", default="calibration_tmp", help="Temp directory"
     )
 
     args = parser.parse_args()

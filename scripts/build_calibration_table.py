@@ -7,7 +7,7 @@ computes FDR using target-decoy, and generates calibration header.
 
 Usage:
     python build_calibration_table.py \
-        --results-dir /projects/caeg/scratch/user/agp/calibration \
+        --results-dir calibration_runs \
         --output-header include/dart/score_calibration_protein.hpp
 """
 
