@@ -1,7 +1,7 @@
 # DART Benchmark
 
 Plotting scripts and pre-computed data for reproducing the benchmark figures in
-the [DART wiki](../wiki/Benchmarks.md) and the associated paper (Fernandez-Guerra
+the [DART wiki](https://github.com/genomewalker/dart/wiki/Benchmarks) and the associated paper (Fernandez-Guerra
 et al. 2025).
 
 ## Directory Structure
@@ -16,12 +16,12 @@ benchmark/
 │   ├── roc_benchmark/
 │   │   ├── protein_damage_evaluation.tsv
 │   │   ├── sample_damage_comparison.tsv
-│   │   └── synthetic/            # NOT included — see Download below
+│   │   └── synthetic/            # not included
 │   ├── gene_prediction/
 │   │   ├── method_comparison.tsv # Pre-computed metrics from all 18.3M reads
-│   │   └── *_hits.tsv            # NOT included — see Download below
+│   │   └── *_hits.tsv            # not included
 │   └── damage_comparison/
-│       ├── comparison_table.tsv  # Pre-computed (10-sample subset; full 31-sample on a remote server)
+│       ├── comparison_table.tsv  # Pre-computed (10 of the 31 samples)
 │       └── *.json                # DART JSON output per sample (10-sample subset)
 └── figures/                      # Pre-generated PDF and PNG output
 ```
@@ -47,9 +47,8 @@ Rscript scripts/plot_damage_comparison.R
 # Output: figures/damage_validation_scatter.pdf
 ```
 
-Note: The included `data/damage_comparison/` contains 10 of 31 samples (local subset).
-Full 31-sample data is on a remote server at `/path/to/paper_figures/damage_comparison/`.
-The pre-generated figure in `figures/` uses all 31 samples (r = 0.81).
+`data/damage_comparison/` holds 10 of the 31 samples, so the plot you get differs from the
+figure in `figures/`, which uses all 31.
 
 ### Gene prediction comparison (pre-computed, seconds)
 
@@ -59,12 +58,9 @@ python scripts/plot_gene_prediction.py
 # Uses pre-computed data/gene_prediction/method_comparison.tsv
 ```
 
-To recompute from raw hits files (~500 MB each, not distributed):
-```bash
-# Download from zenodo: [TODO: add DOI]
-# Place as data/gene_prediction/agp_hits.tsv, blastx_hits.tsv, fgs_hits.tsv
-python scripts/plot_gene_prediction.py
-```
+Recomputing the metrics needs the raw hits files (about 500 MB each), which are not
+distributed yet. Place them as `data/gene_prediction/agp_hits.tsv`, `blastx_hits.tsv` and
+`fgs_hits.tsv` and rerun the script.
 
 ### ROC curves — read-level and protein-level (requires raw data)
 
@@ -73,21 +69,17 @@ python scripts/plot_roc.py
 # Output: figures/read_benchmark.pdf, figures/protein_benchmark.pdf
 ```
 
-Requires per-sample annotated.tsv and read_gt.tsv (~360 MB total):
-```bash
-# Download from zenodo: [TODO: add DOI]
-# Place as data/roc_benchmark/synthetic/<sample>/annotated.tsv
-#                                                <sample>/read_gt.tsv
-```
+This needs the per-sample `annotated.tsv` and `read_gt.tsv` (about 360 MB in total), which are
+not distributed yet. Place them as `data/roc_benchmark/synthetic/<sample>/annotated.tsv` and
+`<sample>/read_gt.tsv`.
 
-Sample names (10 samples from KapK community, synthetic ancient reads):
+The 10 samples are synthetic ancient reads from the KapK community:
 - AT-rich (d_max > 0): 12-1-25, 12-1-33, 12-1-34, 12-1-35, 12-1-36, 12-1-37
 - GC-rich (d_max ≈ 0): 12-1-24, 12-1-27, 12-1-29, 12-1-31
 
 ## Pre-generated Figures
 
-The `figures/` directory contains final PDF and PNG for all four benchmark plots.
-These are the figures used in the paper and DART wiki.
+`figures/` has the PDF and PNG of all four plots, as used in the paper and the DART wiki.
 
 | File | Description | Metric |
 |------|-------------|--------|
