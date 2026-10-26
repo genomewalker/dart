@@ -75,7 +75,7 @@ authenticate several candidate proteins. `max_p_damaged` is taken over every cre
 are excluded by default from protein and gene abundance, coverage, assignment counts,
 damaged-read counts, authentication counts and summary rows. This applies to both an
 explicit `--em-null-model FILE` and an auto-discovered sidecar. `--keep-null-flagged`
-restores the previous abundance treatment; without a null model it is a harmless no-op.
+restores the previous abundance treatment; without a null model it does nothing.
 Reads carrying only margin, effective-reference
 or calibrated-abstain bits keep their existing treatment. The per-read TSV, `.dcx`,
 modern-baseline pool, library-wide damage statistics and `null reject:` lines do not change.
@@ -87,8 +87,8 @@ This trades sensitivity on short hits for fewer chance-hit assignments. On a tes
 runs past that to `--em-tape-dir` (or `DART_EM_TAPE_DIR`). That directory must be on node-local
 disk: NFS, tmpfs and `/tmp` are refused.
 
-**`predict` output no longer depends on the thread count.** The periodic-codon model behind
-Pass 2 trained on the first 50,000 eligible reads each thread happened to see, so output varied with
+**`predict` output no longer depends on the thread count.** The periodic-codon model used
+for gene calling trained on the first 50,000 eligible reads each thread happened to see, so output varied with
 the thread count. The training set is now up to 50,000 reads that are 60 to 200 bp after clipping, every
 k-th such read across the whole input (k = their count / 50,000), collected in file
 order on one thread; genes are written in input order, and output is identical at any thread
