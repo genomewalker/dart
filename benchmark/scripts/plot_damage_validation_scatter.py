@@ -29,8 +29,7 @@ plt.rcParams.update({
     'font.family': 'sans-serif',
 })
 
-SAMPLE_DIR = sys.argv[1] if len(sys.argv) > 1 else \
-    "/path/to/validation_workflow/results/sample_damage"
+SAMPLE_DIR = sys.argv[1] if len(sys.argv) > 1 else "sample_damage"
 OUT_PNG = sys.argv[2] if len(sys.argv) > 2 else "damage_validation_scatter.png"
 OUT_PDF = OUT_PNG.replace(".png", ".pdf")
 
