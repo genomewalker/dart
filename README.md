@@ -7,7 +7,7 @@
 
 DART predicts protein-coding ORFs from ancient DNA reads, writes a damage index, and annotates protein-search alignments. Gene prediction, reference assignment and protein authentication are separate steps.
 
-> Status as of 2026-10-25: checked against DART v2.0.1 (release/v2.0.0; v2.0.1 only re-pins libtaph `c3b3a5d` -> `933877c`, identical source). The default excludes null-flagged reads from EM-weighted abundance; `--keep-null-flagged` restores their credit. Damaged-read and authentication counts remain once per retained read on its best hit.
+> Status as of 2026-10-26: checked against DART v2.0.1 (release/v2.0.0; v2.0.1 only re-pins libtaph `c3b3a5d` -> `933877c`, identical source). The default excludes null-flagged reads from EM-weighted abundance; `--keep-null-flagged` restores their credit. Damaged-read and authentication counts remain once per retained read on its best hit. [dart-nf](https://github.com/genomewalker/dart-nf) runs the full workflow under Nextflow.
 
 This release uses EMI v7. Damage-aware prediction requires an fqdup library damage summary or explicit self-profiling. `--em-use-damage-mapping` controls the joint damage E-step; protein authentication uses library-level damage information and assigned read evidence.
 
@@ -50,6 +50,8 @@ fetches the pinned commit from GitHub. `dart --version` prints the libtaph SHA.
 ---
 
 ## Quick start
+
+For many samples, [dart-nf](https://github.com/genomewalker/dart-nf) runs the same steps (damage profile, predict, MMseqs2 target and decoy searches, hits2emi, damage-annotate) as a Nextflow pipeline; its README lists the DART version it follows.
 
 The bundled tutorial uses synthetic reads and matching reference proteins:
 
