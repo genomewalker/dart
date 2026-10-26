@@ -81,7 +81,7 @@ or calibrated-abstain bits keep their existing treatment. The per-read TSV, `.dc
 modern-baseline pool, library-wide damage statistics and `null reject:` lines do not change.
 The `null drop:` stderr line reports the reads and effective mass actually removed from
 abundance; the opt-out instead reports `null drop: off (--keep-null-flagged)`.
-This trades sensitivity on short hits for fewer chance-hit assignments.
+This trades sensitivity on short hits for fewer chance-hit assignments. On a test sample of known content, the default dropped about half of the true 10–12 aa hits from abundance; pass `--keep-null-flagged` when very short peptides matter.
 
 **`.dcx` sort scratch.** `damage-annotate --dcx` sorts in memory up to 8 GiB and spills sorted
 runs past that to `--em-tape-dir` (or `DART_EM_TAPE_DIR`). That directory must be on node-local
