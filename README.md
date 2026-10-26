@@ -3,235 +3,141 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![GitHub release](https://img.shields.io/github/v/release/genomewalker/dart)](https://github.com/genomewalker/dart/releases/latest)
 [![CI](https://github.com/genomewalker/dart/actions/workflows/ci.yml/badge.svg)](https://github.com/genomewalker/dart/actions/workflows/ci.yml)
-[![install with bioconda](https://img.shields.io/badge/install%20with-bioconda-brightgreen.svg?style=flat)](https://anaconda.org/bioconda/dart-adna)
 
-DART predicts protein-coding ORFs from ancient DNA reads, writes a damage index, and annotates protein-search alignments. Gene prediction, reference assignment and protein authentication are separate steps.
-
-DART uses the EMI v7 index format. Damage-aware prediction requires an fqdup library damage summary or explicit self-profiling. `--em-use-damage-mapping` controls the joint damage E-step; protein authentication uses library-level damage information and assigned read evidence.
+Ancient DNA reads are short and carry deamination damage: C→T near the 5′ end and G→A (or C→T)
+near the 3′ end. These changes create false stop codons and wrong amino acids, so standard gene
+callers and protein searches lose or misplace ancient reads. DART translates damaged reads into
+proteins, assigns each read to the reference protein it most likely came from, and tests whether
+each protein carries the damage pattern of ancient DNA.
 
 ## Workflow
 
-1. Run `predict` to write GFF3, protein FASTA and an AGD damage index, plus reversed decoy
-   peptides by default with `--fasta-aa` (`--decoy-every 10`; `0` opts out).
-2. Search the proteins and the decoys with MMseqs2; `hits2emi` converts the hits to EMI v7 and
-   fits the null model from the decoy hits into `<emi>.null`.
-3. Run `damage-annotate` for read assignments, damage scores and protein summaries.
-4. Optionally run `ref-stats` for coverage of the input library.
+1. `predict` translates the reads, writing GFF3, protein FASTA, a damage index (`.agd`) and
+   reversed decoy peptides used to model chance hits.
+2. MMseqs2 searches the proteins and the decoys against a reference database.
+3. `hits2emi` indexes the hits (EMI format) and fits the chance-hit model from the decoy hits.
+4. `damage-annotate` resolves multi-mapping reads with EM, scores damage per read and tests
+   each protein for ancient damage.
 
 <img src="docs/agp_pipeline.svg" width="700" alt="DART prediction, search and authentication workflow">
+
+To run many samples, use [dart-nf](https://github.com/genomewalker/dart-nf), a Nextflow pipeline
+for the whole workflow.
 
 ## Installation
 
 Requires a C++20 compiler (GCC 10+ or Clang 12+), CMake 3.18+, zlib, zstd, ISA-L, NASM and
-pkg-config. With conda:
+pkg-config.
 
 ```bash
-conda env create -f environment.yml
-conda activate dart
-```
-
-Or with system packages: `apt install zlib1g-dev libzstd-dev libisal-dev nasm pkg-config`.
-Then:
-
-```bash
+conda env create -f environment.yml && conda activate dart   # or: apt install zlib1g-dev libzstd-dev libisal-dev nasm pkg-config
 git clone https://github.com/genomewalker/dart.git
 cd dart
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
-DART's damage estimates come from [libtaph](https://github.com/genomewalker/libtaph), pinned to an
-exact commit. If a local checkout exists at `$REPOS/libtaph` (or `-DLIBTAPH_LOCAL_PATH=...`), it
-must be at the pinned commit and clean, otherwise configure fails. With no local checkout, CMake
-fetches the pinned commit from GitHub. `dart --version` prints the libtaph SHA.
-
-Tests: `ctest --test-dir build`, with `TMPDIR` on a local disk (not NFS or tmpfs).
-
----
+CMake fetches [libtaph](https://github.com/genomewalker/libtaph), which provides the damage
+estimates, at a pinned commit; `dart --version` prints it. To build against a local checkout,
+pass `-DLIBTAPH_LOCAL_PATH=...`; it must be clean and at the pinned commit. Run the tests with
+`ctest --test-dir build`, with `TMPDIR` on a local disk.
 
 ## Quick start
 
-For many samples, [dart-nf](https://github.com/genomewalker/dart-nf) runs the same steps (damage profile, predict, MMseqs2 target and decoy searches, hits2emi, damage-annotate) as a Nextflow pipeline.
-
-The bundled tutorial uses synthetic reads and matching reference proteins:
+The bundled tutorial runs the full workflow on synthetic reads:
 
 ```bash
 cd examples/tutorial
 DART=../../build/dart DB=./ref_proteins.faa.gz bash run_tutorial.sh
 ```
 
-For your own inputs you need one thing the tutorial skips: a damage profile measured with
-[fqdup](https://github.com/genomewalker/fqdup) on the reads before deduplication. The null model
-that keeps reads from proteins missing from your database off the nearest homolog is built into
-the pipeline: `predict --fasta-aa FILE` writes reversed decoy peptides by default (every 10th
-input read). Search them with the same MMseqs2 options, `hits2emi --decoy-hits` fits the null into
-`hits.emi.null`, and `damage-annotate` finds that file by itself.
+On your own data:
 
 ```bash
 mkdir -p out
-# 0) Damage profile from the merged reads, before deduplication
+# Damage profile from the merged reads, before deduplication
 fqdup profile -i merged.fq.gz --damage-summary out/library.tdmg
 
-# 1) Predict genes + damage index. Also writes out/proteins.decoy.faa by default:
-#    the reversed proteins of every 10th read, ids prefixed DECOY_
+# Predict genes; also writes out/proteins.decoy.faa (reversed proteins of every 10th read)
 dart predict -i reads.fq.gz -o out/predictions.gff --fasta-aa out/proteins.faa \
   --damage-index out/predictions.agd --library-profile out/library.tdmg -t 16
 
-# 2) Search against reference proteins. VTML20 suits short aDNA peptides; the matrix
-#    ships in examples/tutorial/data/ of the DART source tree
+# Search proteins and decoys with the same options (VTML20 suits short ancient peptides)
 SEARCH=(--search-type 1 --min-length 12 -e 10.0 --min-seq-id 0.86 -c 0.65 --cov-mode 2
   --sub-mat examples/tutorial/data/VTML20.out --seed-sub-mat examples/tutorial/data/VTML20.out
   -s 2 -k 6 --spaced-kmer-pattern 11011101
   --format-output "query,target,fident,alnlen,mismatch,gapopen,qstart,qend,tstart,tend,evalue,bits,qlen,tlen,qaln,taln"
   --threads 16)
 mmseqs easy-search out/proteins.faa ref_proteins.faa.gz out/hits.tsv out/tmp "${SEARCH[@]}"
-
-# 3) Search the decoy peptides with the same options (null model input)
 mmseqs easy-search out/proteins.decoy.faa ref_proteins.faa.gz out/decoy_hits.tsv out/tmp "${SEARCH[@]}"
 
-# 4) Build the EMI v7 index and fit the null from the decoy hits into out/hits.emi.null
+# Index the hits and fit the chance-hit model into out/hits.emi.null
 dart hits2emi -i out/hits.tsv -o out/hits.emi --damage-index out/predictions.agd \
   --decoy-hits out/decoy_hits.tsv --decoy-fasta out/proteins.decoy.faa -t 16
 
-# 5) EM assignment + damage annotation (picks up out/hits.emi.null by itself)
+# Assign reads, score damage, summarise genes and proteins
 dart damage-annotate --emi out/hits.emi --damage-index out/predictions.agd \
   -o out/annotated.tsv --gene-summary out/gene_summary.tsv \
-  --auto-calibrate-spurious -t 16
+  --protein-summary out/protein_summary.tsv --auto-calibrate-spurious \
+  --em-tape-dir /local/disk/tmp -t 16
 ```
 
-One null per database and search configuration is enough for a study: run `--decoy-every 10`
-and the decoy search on a few representative samples, pool them with
-`dart null -o study.null --db-label mydb sampleA/decoy_hits.tsv sampleB/decoy_hits.tsv ...`,
-and pass `--em-null-model study.null` to every `damage-annotate`; the other samples can opt out
-with `predict --decoy-every 0`.
-`dart damage-info hits.emi.null` prints the fitted bins and the provenance (dart version, inputs,
-decoy counts). Refit when the database, the search options, the library type or the read length
-range changes.
+Things to know:
 
-The null rejects reads by chance probability. For each read's best hit, `null_p` is the
-probability that a decoy query gets its best hit in the same aligned-length bin with at least
-that bit score: `w_b · (1 − exp(−exp(−(bits − mu_b)/beta_b)))`, where `w_b` is the share of submitted
-decoys whose best hit landed in bin `b`. With `Q` queries searched, `Q · null_p` is the number of
-chance best hits expected at or above that score in the bin. Within each bin damage-annotate ranks
-the reads by bit score, divides the expected chance hits at each score by the reads at or above it,
-and takes the running minimum from below: that is the read's q-value, the false discovery rate of
-keeping it and every read above it, written per read as `null_q` (`NA` without a hit, in an unfit
-bin, or under `--null-p-max`), so a stricter cutoff is a filter on one run's table. A read with q above `--null-fdr` (default 0.05) gets reject bit
-`1` and is ambiguous: it leaves the authentication evidence but stays in the modern-baseline pool,
-so `q_modern` and the other reads' posteriors do not move. `Q` is the record count of
-`--damage-index` (one record per predicted protein, the proteins searched); pass
-`--null-queries N` when the searched set differs. Every query counts, including those with a true
-hit, so the rule is conservative. Give the decoy count with `--decoy-fasta` (or
-`--decoys-submitted N`; `dart null` takes the latter). `hits2emi --decoy-hits` requires one
-of these options; omitting both is an error. Older sidecars with an unknown count still use
-decoys with a hit as the denominator, which overstates chance. At the end damage-annotate prints
-one `null reject:` line per bin with
-the reads, the share flagged, `chance` (the chance best hits expected in the bin, `Q · w_b`) and the
-lowest kept bit score (`NA` when nothing in the bin is flagged). A bin with no decoy hits of its own
-never flags. `--null-p-max P` instead rejects a read when `null_p > P`, a fixed per-query chance;
-only a bin holding more than `P` of the decoys can then flag, so on a large database a threshold
-like 0.05 flags nothing. The two options are exclusive. Without a damage index or `--null-queries`
-damage-annotate falls back to `null_p > 0.05` and says so.
-
-The workflow and output interpretation are on the wiki:
-[Quick Start Tutorial](https://github.com/genomewalker/dart/wiki/Quick-Start-Tutorial).
-Use `--fasta-aa-masked` instead of `--fasta-aa` to replace damage-induced stop codons with `X` so
-MMseqs2 can align across them.
-
-### Required choices
-
-| Command | You must pass | Why |
-|---------|---------------|-----|
-| `predict` | `--library-profile FILE` (binary TDM1 sidecar) or `--allow-self-profile` when damage detection is on | Self-profiling is unreliable on deduplicated libraries |
-| `hits2emi --decoy-hits FILE` | `--decoy-fasta FILE` or `--decoys-submitted N` (> 0) | The null denominator counts all decoys searched, including those without hits |
-| `damage-annotate` | a null model when EM is on: `<emi>.null` next to the EMI (written by `hits2emi --decoy-hits`), `--em-null-model FILE`, `--em-calib-model FILE`, or `--no-null` | Without a null model, reads from proteins absent from the database are force-mapped to the nearest homolog |
-| `damage-annotate` (EM on) | `--em-tape-dir DIR` or `DART_EM_TAPE_DIR` | Without `--em-calib-model` and `--em-use-damage-mapping`, EM input uses an `O_DIRECT` tape, with or without a null model (the null adds one double per read); supply node-local disk supporting it. Only the calibrated and damage-in-mapping configurations run EM in memory. |
-
-The tutorial opts into self-profiling for its bundled inputs. Its reference database is the 13,681
-proteins the reads come from, too few for chance hits: the decoy search yields a handful of hits,
-no null bin reaches two decoy queries, and `hits2emi` and `damage-annotate` both say so and run EM
-with the null coordinate off. A real database fills the bins. `predict --no-damage` does not require
-a profile; `damage-annotate --no-em` bypasses the EM null-model choice.
-
-`damage-annotate --lambda F` sets the decay constant explicitly. By default it comes from
-the damage index (or the EMI header when no damage index is supplied); `0.3` is the fallback
-when absent.
-
-### Damage profile only
-
-```bash
-dart profile -i merged.fq.gz -o profile.json --damage-summary library.tdmg -t 16
-```
-
-`dart profile` and `fqdup profile` run the same profiler in libtaph and write byte-identical
-JSON and `.tdmg` for the same reads and options. The `.tdmg` is what `predict --library-profile`
-reads.
-
-Release notes: [CHANGELOG.md](CHANGELOG.md).
-
----
+- **Damage profile.** `predict` needs a library profile from `fqdup profile` or `dart profile`,
+  measured before deduplication, or `--allow-self-profile`.
+- **Chance hits.** Reads whose best hit could be a chance match, judged against the decoy
+  hits (`null_q` above `--null-fdr`, default 0.05), are flagged and left out of gene and protein abundance. This also removes some
+  true short hits: on a test sample of known content, about half of the true 10–12 aa hits.
+  Pass `--keep-null-flagged` to keep them. Details:
+  [Spurious-Hit Filters](https://github.com/genomewalker/dart/wiki/Spurious-Hit-Filters).
+- **One null per study.** The chance-hit model depends on the database and search options, not
+  the sample. Fit it on a few samples, pool them with `dart null -o study.null ...`, and pass
+  `--em-null-model study.null` to the rest (which can skip decoys with `--decoy-every 0`).
+- **EM scratch.** `damage-annotate` streams the EM through `--em-tape-dir` (or
+  `DART_EM_TAPE_DIR`), which must be on local disk, not NFS or tmpfs.
 
 ## Commands
 
 | Command | Purpose |
 |---------|---------|
-| `predict` | Gene prediction + damage index (`.agd`) from reads |
-| `profile` (`damage`) | Reference-free damage profile (JSON) |
-| `hits2emi` | MMseqs2 16-column TSV → EMI v7; `--decoy-hits` fits the null model into `<emi>.null` |
-| `null` | Fit or pool the decoy null model (`.null`) shared by the runs of one database |
-| `hits2emi-stream` | MMseqs2 result DBs → one EMI v7, streaming, for production-size searches |
-| `emi-merge` | Union EMI v7 files over the same reads for joint EM across databases |
-| `emi-verify` | Check EMI v7 invariants before annotation |
-| `damage-annotate` | EM read assignment, per-read damage posteriors, per-protein authentication |
-| `ref-stats` | Per-reference breadth, depth and identity for one sample (`--trim` for x-filter-comparable breadth) |
-| `damage-info` | Print the damage profile stored in an `.agd`, or a `.null` null model with its provenance |
-| `simulate` | Synthetic aDNA reads (Briggs model) with ground truth |
+| `predict` | Gene prediction and damage index (`.agd`) from reads |
+| `profile` | Reference-free damage profile (JSON and `.tdmg`) |
+| `hits2emi` | MMseqs2 TSV → EMI index; `--decoy-hits` fits the chance-hit model |
+| `hits2emi-stream` | MMseqs2 result databases → EMI, streaming, for large searches |
+| `emi-merge` | Merge EMI files over the same reads for joint EM across databases |
+| `emi-verify` | Check an EMI before annotation |
+| `null` | Fit or pool the chance-hit model for a set of samples |
+| `damage-annotate` | EM read assignment, per-read damage and per-protein authentication |
+| `ref-stats` | Per-reference breadth, depth and identity for one sample |
+| `damage-info` | Print the damage profile in an `.agd` or a `.null` model |
+| `simulate` | Synthetic ancient reads (Briggs model) with ground truth |
 | `eval` | Score `predict` against `simulate` truth |
-| `fit-calib` | Fit the coherent-LR EM calibration model from a labelled search |
+| `fit-calib` | Fit the EM calibration model from a labelled search |
 | `damage-profile` | Terminal nucleotide profiles of protein-mapped reads |
 | `validate` | Validate predictions against aMGSIM ground truth |
 
-Command flags and known help-text discrepancies are documented in the
-[Command Reference](https://github.com/genomewalker/dart/wiki/Command-Reference).
+Flags and defaults: [Command Reference](https://github.com/genomewalker/dart/wiki/Command-Reference).
 
-### Per-sample coverage
+## Outputs
 
-```bash
-dart ref-stats --emi SAMPLE.emi --sample SAMPLE --out SAMPLE.cov.tsv --trim --threads 32
-```
+- **Per read** (`-o`): `posterior` is the probability that the read is ancient, combining terminal
+  damage, damage-consistent substitutions and identity. The EM columns (`gamma`, `em_keep`,
+  `em_margin`, `em_reject_reason`) say how confidently the read was assigned.
+- **Per gene and protein** (`--gene-summary`, `--protein-summary`): use `eff_reads` for
+  abundance. The ancient call is `auth_binom_call`; trust it when `protein_auth_tier` is
+  `detected`. A `library_not_authenticatable` warning means the library has no usable damage
+  rate, so no protein can be called ancient.
 
-One row per reference: `sample_id ref_id ref_length n_reads n_alns breadth depth_mean avg_identity`.
-`breadth` is covered positions / reference length (0–1). `depth_mean` is aligned target residues / covered positions. Run `ref-stats` separately for each library; measure memory and I/O requirements on your own inputs.
-
-### Production-scale EMI
-
-```bash
-dart hits2emi-stream targetDB db1.emi 32 manifest.txt     # manifest: "queryDB resultDB" per line
-dart emi-merge joint.emi 32 db1.emi db2.emi
-dart emi-verify joint.emi                                  # must print VERIFY: PASS
-```
-
----
-
-## Interpreting results
-
-- **Per read** (`-o`): `posterior` combines terminal (`p_read`), substitution and identity evidence;
-  `tier` says which evidence is present. EM columns (`gamma`, `em_keep`, `em_margin`,
-  `em_ambiguous`, `em_reject_reason`) say how confidently the read was assigned; ambiguous reads
-  do not count as damage evidence.
-- **Per protein** (`--protein-summary`): the ancient call is `auth_binom_call`, a binomial test of
-  damaged vs modern-rate reads. Trust it when `protein_auth_tier = detected`. A
-  `library_not_authenticatable` warning means the library has no usable damage rate, so no protein
-  can be called ancient.
-
-Full guide: [Interpreting Results](https://github.com/genomewalker/dart/wiki/Interpreting-Results).
-Column schemas: [Output Formats](https://github.com/genomewalker/dart/wiki/Output-Formats).
-
----
+Column definitions: [Output Formats](https://github.com/genomewalker/dart/wiki/Output-Formats)
+and [Interpreting Results](https://github.com/genomewalker/dart/wiki/Interpreting-Results).
+Model details: [Methods and Model](https://github.com/genomewalker/dart/wiki/Methods-and-Model).
+Release notes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Benchmarks
 
-The [benchmark directory](benchmark/) contains evaluation scripts and retained results. The [wiki benchmark page](https://github.com/genomewalker/dart/wiki/Benchmarks) describes how to report a versioned comparison. Earlier release measurements are not performance or accuracy guarantees for the current model.
+Evaluation scripts and results are in [benchmark/](benchmark/); see the
+[Benchmarks](https://github.com/genomewalker/dart/wiki/Benchmarks) wiki page.
 
 ## Citation
 
@@ -263,8 +169,6 @@ If you use DART in your research, please cite:
 - **Steinegger & Söding 2017.** MMseqs2. *Nature Biotechnology* 35(11):1026–1028. [doi:10.1038/nbt.3988](https://doi.org/10.1038/nbt.3988)
 - **Van der Jeugt et al. 2022.** FragGeneScanRs. *BMC Bioinformatics* 23(1):198. [doi:10.1186/s12859-022-04736-5](https://doi.org/10.1186/s12859-022-04736-5)
 
----
-
 ## License
 
-MIT License; see LICENSE file for details.
+MIT. See [LICENSE](LICENSE).
