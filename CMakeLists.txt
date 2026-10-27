@@ -126,6 +126,9 @@ set(TAPH_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 # 2026-10-26: re-pinned 933877c -> 1e83aff (v2.0.2). libtaph history was rewritten again; the code
 # differs only in comments, so the built code and damage numbers are unchanged.
 #
+# 2026-10-27: re-pinned 1e83aff -> b9e7cd2 (v2.0.3). libtaph history was rewritten again;
+# b9e7cd2 has the identical source tree, so the built code and damage numbers are unchanged.
+#
 # A local checkout (LIBTAPH_LOCAL_PATH) wins when present; otherwise FetchContent fetches exactly the
 # pinned commit from GitHub (CI, release, fresh clones). Never fall back to a tag or branch: building
 # against a different revision would emit different numbers under the same version string.
