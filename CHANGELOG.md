@@ -1,5 +1,9 @@
 # Changelog
 
+## v2.0.3
+
+Re-pins libtaph to `b9e7cd2`, which has the same source as the v2.0.2 pin. Results are unchanged.
+
 ## v2.0.2
 
 Re-pins libtaph to `1e83aff`, the same code as the v2.0.1 pin with only comments changed.
